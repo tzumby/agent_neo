@@ -1,0 +1,16 @@
+# Dynamic inventory: running instances tagged Project=cloud-desktops, grouped by
+# their Role tag (desktop, control_plane). Hosts are reached over SSM by
+# instance id. Credentials come from AWS_PROFILE.
+plugin: amazon.aws.aws_ec2
+regions:
+  - ca-central-1 # keep in sync with terraform var.region
+filters:
+  tag:Project: cloud-desktops
+  instance-state-name: running
+hostnames:
+  - instance-id
+keyed_groups:
+  - key: ec2_tags.Role
+    separator: ""
+compose:
+  ansible_aws_ssm_instance_id: instance_id

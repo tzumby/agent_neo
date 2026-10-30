@@ -1,0 +1,8 @@
+#!/bin/sh
+# Wait up to 30 s for the X display in $DISPLAY to accept connections.
+for _ in $(seq 1 60); do
+  xdpyinfo >/dev/null 2>&1 && exit 0
+  sleep 0.5
+done
+echo "display ${DISPLAY} not ready after 30 s" >&2
+exit 1

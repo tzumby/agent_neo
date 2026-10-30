@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+[Unit]
+Description=x11vnc on {{ desktop_display }} (localhost only)
+Wants=xvfb.service
+After=xvfb.service
+StartLimitIntervalSec=0
+
+[Service]
+User={{ desktop_user }}
+Environment=DISPLAY={{ desktop_display }}
+ExecStartPre={{ desktop_libexec_dir }}/wait-for-display
+ExecStart=/usr/bin/x11vnc -display {{ desktop_display }} -forever -shared -localhost -rfbport {{ vnc_port }} -rfbauth {{ desktop_config_dir }}/vncpass
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

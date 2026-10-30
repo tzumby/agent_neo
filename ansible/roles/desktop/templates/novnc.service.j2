@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+# Listens on all interfaces; the desktop security group only admits the
+# control plane.
+[Unit]
+Description=noVNC websocket proxy on :{{ novnc_port }}
+Wants=x11vnc.service
+After=x11vnc.service
+StartLimitIntervalSec=0
+
+[Service]
+DynamicUser=yes
+ExecStart=/usr/bin/websockify --web /usr/share/novnc 0.0.0.0:{{ novnc_port }} localhost:{{ vnc_port }}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

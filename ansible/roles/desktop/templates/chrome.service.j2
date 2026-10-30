@@ -1,0 +1,29 @@
+# {{ ansible_managed }}
+# Chrome runs as the agent user with its sandbox on. Never add --no-sandbox,
+# and don't add NoNewPrivileges= (it breaks the setuid sandbox fallback).
+[Unit]
+Description=Google Chrome on {{ desktop_display }}
+Wants=xfce.service
+After=xfce.service
+StartLimitIntervalSec=0
+
+[Service]
+User={{ desktop_user }}
+WorkingDirectory={{ desktop_home }}
+Environment=DISPLAY={{ desktop_display }} HOME={{ desktop_home }} XDG_RUNTIME_DIR=/run/user/{{ desktop_user_info.uid }}
+ExecStartPre={{ desktop_libexec_dir }}/wait-for-display
+ExecStart=/usr/bin/google-chrome \
+  --user-data-dir={{ desktop_home }}/chrome-profile \
+  --no-first-run \
+  --no-default-browser-check \
+  --start-maximized \
+  --password-store=basic \
+  --hide-crash-restore-bubble \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port={{ chrome_debug_port }} {{ chrome_start_url }}
+# Restart if the user (or agent) closes the window.
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

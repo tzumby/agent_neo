@@ -1,0 +1,10 @@
+- name: Configure desktops
+  hosts: desktop
+  become: true
+  serial: "10%"
+  module_defaults:
+    ansible.builtin.apt:
+      lock_timeout: 600
+  roles:
+    - common
+    - desktop

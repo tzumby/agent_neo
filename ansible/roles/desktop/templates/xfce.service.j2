@@ -1,0 +1,18 @@
+# {{ ansible_managed }}
+[Unit]
+Description=XFCE session on {{ desktop_display }}
+Wants=xvfb.service
+After=xvfb.service user@{{ desktop_user_info.uid }}.service
+StartLimitIntervalSec=0
+
+[Service]
+User={{ desktop_user }}
+WorkingDirectory={{ desktop_home }}
+Environment=DISPLAY={{ desktop_display }} HOME={{ desktop_home }} XDG_RUNTIME_DIR=/run/user/{{ desktop_user_info.uid }}
+ExecStartPre={{ desktop_libexec_dir }}/wait-for-display
+ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/startxfce4
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

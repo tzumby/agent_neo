@@ -1,0 +1,42 @@
+- name: Wait for cloud-init to finish
+  ansible.builtin.command: cloud-init status --wait
+  register: common_cloud_init
+  changed_when: false
+  # 2 means "done, with recoverable errors"
+  failed_when: common_cloud_init.rc not in [0, 2]
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+    install_recommends: false
+    update_cache: true
+    cache_valid_time: 3600
+
+# Hosts are managed over SSM only.
+- name: Remove the SSH server
+  ansible.builtin.apt:
+    name: "{{ common_removed_packages }}"
+    state: absent
+
+# needrestart would otherwise restart Xvfb/XFCE/Chrome after unattended
+# upgrades and interrupt whatever the agent is doing. List only.
+- name: Stop needrestart from restarting services automatically
+  ansible.builtin.copy:
+    dest: /etc/needrestart/conf.d/90-cloud-desktops.conf
+    content: |
+      $nrconf{restart} = 'l';
+    mode: "0644"
+
+- name: Configure zram swap
+  ansible.builtin.template:
+    src: zramswap.j2
+    dest: /etc/default/zramswap
+    mode: "0644"
+  notify: Restart zramswap
+
+- name: Enable zram swap
+  ansible.builtin.systemd_service:
+    name: zramswap
+    enabled: true
+    state: started

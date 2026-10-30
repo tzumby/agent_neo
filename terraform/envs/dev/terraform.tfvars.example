@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and adjust.
+
+region = "ca-central-1"
+
+# Egress for private subnets. Off for step 1 (the test desktop uses a public IP).
+enable_nat_gateway   = false
+nat_per_az           = false
+enable_ssm_endpoints = false
+
+desktop_instance_type = "t4g.medium"
+cpu_credits           = "unlimited"
+ubuntu_version        = "26.04"
+
+# Step 1: one test desktop, temporarily in a public subnet with a public IP.
+# Its security group has no inbound rules from the internet; access is SSM only.
+create_test_desktop    = true
+test_desktop_public_ip = true

@@ -1,0 +1,12 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+terraform.tfvars
+
+# Ansible
+*.retry
+
+# Local output
+screenshots/

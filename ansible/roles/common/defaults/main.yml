@@ -1,0 +1,14 @@
+common_packages:
+  - acl
+  - ca-certificates
+  - curl
+  - gnupg
+  - unattended-upgrades
+  - zram-tools
+
+common_removed_packages:
+  - openssh-server
+  - ec2-instance-connect
+
+common_zram_size_mb: 2048
+common_zram_algo: zstd

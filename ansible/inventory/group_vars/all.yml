@@ -1,0 +1,9 @@
+# All hosts are reached through SSM Session Manager; no SSH.
+ansible_connection: amazon.aws.aws_ssm
+ansible_aws_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"
+ansible_aws_ssm_s3_addressing_style: virtual
+# Ubuntu 26.04's default sudo-rs relays the SSM session's tty input into the
+# command, swallowing the plugin's end-of-command marker so every become task
+# hangs until timeout. Classic sudo is still installed as sudo.ws.
+ansible_become_exe: sudo.ws
+# ansible_aws_ssm_bucket_name is passed by the Makefile from `terraform output ssm_transfer_bucket`.

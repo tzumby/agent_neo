@@ -1,0 +1,160 @@
+- name: Check the host is arm64
+  ansible.builtin.command: dpkg --print-architecture
+  register: desktop_dpkg_arch
+  changed_when: false
+  failed_when: desktop_dpkg_arch.stdout != 'arm64'
+
+# --- Packages ----------------------------------------------------------------
+
+- name: Install the X stack, XFCE, VNC and fonts
+  ansible.builtin.apt:
+    name: "{{ desktop_packages }}"
+    state: present
+    install_recommends: false
+
+- name: Remove screen lockers and power management
+  ansible.builtin.apt:
+    name: "{{ desktop_removed_packages }}"
+    state: absent
+
+# --- Google Chrome (arm64) from Google's signed apt repo ----------------------
+
+- name: Download Google's apt signing key
+  ansible.builtin.get_url:
+    url: https://dl.google.com/linux/linux_signing_key.pub
+    dest: /etc/apt/keyrings/google-chrome.asc
+    mode: "0644"
+
+# Only bootstraps the first install. After that the Chrome package (postinst
+# and /etc/cron.daily/google-chrome) owns this file and rewrites it with its
+# own URI and embedded signing key, so don't overwrite it.
+- name: Add the Google Chrome apt repo
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/google-chrome.sources
+    content: |
+      Types: deb
+      URIs: https://dl.google.com/linux/chrome/deb/
+      Suites: stable
+      Components: main
+      Architectures: arm64
+      Signed-By: /etc/apt/keyrings/google-chrome.asc
+    mode: "0644"
+    force: false
+  register: desktop_chrome_repo
+
+- name: Install Google Chrome stable
+  ansible.builtin.apt:
+    name: google-chrome-stable
+    state: present
+    update_cache: "{{ desktop_chrome_repo is changed }}"
+
+- name: Check that Chrome runs
+  ansible.builtin.command: google-chrome --version
+  register: desktop_chrome_version
+  changed_when: false
+
+- name: Show the Chrome version
+  ansible.builtin.debug:
+    msg: "{{ desktop_chrome_version.stdout }}"
+
+# --- The agent user ----------------------------------------------------------
+
+- name: Create the agent user
+  ansible.builtin.user:
+    name: "{{ desktop_user }}"
+    home: "{{ desktop_home }}"
+    shell: /bin/bash
+    create_home: true
+  register: desktop_user_info
+
+# Gives the user a /run/user/<uid> runtime dir without a login session.
+- name: Enable lingering for the agent user
+  ansible.builtin.command: loginctl enable-linger {{ desktop_user }}
+  args:
+    creates: /var/lib/systemd/linger/{{ desktop_user }}
+
+- name: Create the XFCE config directories
+  ansible.builtin.file:
+    path: "{{ desktop_home }}/{{ item }}"
+    state: directory
+    owner: "{{ desktop_user }}"
+    group: "{{ desktop_user }}"
+    mode: "0700"
+  loop:
+    - .config
+    - .config/xfce4
+    - .config/xfce4/xfconf
+    - .config/xfce4/xfconf/xfce-perchannel-xml
+
+# Without this, the panel asks "use default config / one empty panel?" on
+# first start.
+- name: Seed the default XFCE panel layout
+  ansible.builtin.copy:
+    src: /etc/xdg/xfce4/panel/default.xml
+    dest: "{{ desktop_home }}/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+    remote_src: true
+    force: false
+    owner: "{{ desktop_user }}"
+    group: "{{ desktop_user }}"
+    mode: "0644"
+
+# --- VNC password ------------------------------------------------------------
+# TODO(M2): generate per desktop at boot from desktop.env instead. Generating
+# it here would bake one password into the AMI for every desktop.
+
+- name: Create the config directory
+  ansible.builtin.file:
+    path: "{{ desktop_config_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Generate a VNC password
+  ansible.builtin.shell: |
+    umask 077
+    openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 8 > {{ desktop_config_dir }}/vnc-password
+  args:
+    creates: "{{ desktop_config_dir }}/vnc-password"
+
+- name: Write the x11vnc password file
+  ansible.builtin.shell: |
+    x11vnc -storepasswd "$(cat {{ desktop_config_dir }}/vnc-password)" {{ desktop_config_dir }}/vncpass
+  args:
+    creates: "{{ desktop_config_dir }}/vncpass"
+
+- name: Let the agent user read the x11vnc password file
+  ansible.builtin.file:
+    path: "{{ desktop_config_dir }}/vncpass"
+    owner: "{{ desktop_user }}"
+    group: "{{ desktop_user }}"
+    mode: "0400"
+
+# --- systemd units -----------------------------------------------------------
+
+- name: Create the helper script directory
+  ansible.builtin.file:
+    path: "{{ desktop_libexec_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Install the wait-for-display helper
+  ansible.builtin.copy:
+    src: wait-for-display
+    dest: "{{ desktop_libexec_dir }}/wait-for-display"
+    mode: "0755"
+
+- name: Install the desktop units
+  ansible.builtin.template:
+    src: "{{ item }}.service.j2"
+    dest: /etc/systemd/system/{{ item }}.service
+    mode: "0644"
+  loop: "{{ desktop_units }}"
+  register: desktop_unit_files
+  notify: Restart changed desktop units
+
+- name: Enable and start the desktop units
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: "{{ desktop_units }}"

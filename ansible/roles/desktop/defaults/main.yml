@@ -1,0 +1,48 @@
+desktop_user: agent
+desktop_home: /home/agent
+
+desktop_display: ":1"
+desktop_width: 1280
+desktop_height: 800
+desktop_depth: 24
+
+desktop_config_dir: /etc/cloud-desktops
+desktop_libexec_dir: /usr/local/lib/cloud-desktops
+
+chrome_start_url: ""
+chrome_debug_port: 9222
+vnc_port: 5900
+novnc_port: 6080
+
+desktop_packages:
+  - xvfb
+  - xfce4
+  - xfce4-terminal
+  - dbus-x11
+  - x11vnc
+  - novnc
+  - websockify
+  - xdotool
+  - scrot
+  - x11-utils
+  - x11-xserver-utils
+  - adwaita-icon-theme
+  - fonts-noto-core
+  - fonts-noto-color-emoji
+  - fonts-noto-cjk
+  - fonts-liberation2
+  - python3-venv
+
+# Anything that could blank or lock the screen.
+desktop_removed_packages:
+  - light-locker
+  - xfce4-screensaver
+  - xfce4-power-manager
+
+# Started in this order.
+desktop_units:
+  - xvfb
+  - xfce
+  - chrome
+  - x11vnc
+  - novnc

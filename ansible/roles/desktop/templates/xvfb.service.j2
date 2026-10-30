@@ -1,0 +1,18 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Xvfb virtual display {{ desktop_display }}
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+User={{ desktop_user }}
+Environment=DISPLAY={{ desktop_display }}
+ExecStart=/usr/bin/Xvfb {{ desktop_display }} -screen 0 {{ desktop_width }}x{{ desktop_height }}x{{ desktop_depth }} -nolisten tcp
+ExecStartPost={{ desktop_libexec_dir }}/wait-for-display
+# No screensaver or blanking. Xvfb has no DPMS, so ignore xset's complaint.
+ExecStartPost=-/usr/bin/xset s off -dpms s noblank
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

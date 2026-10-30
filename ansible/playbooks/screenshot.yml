@@ -1,0 +1,19 @@
+# Captures the X display of each desktop to ../../screenshots/<instance-id>.png
+- name: Capture desktop screenshots
+  hosts: desktop
+  become: true
+  gather_facts: false
+  vars:
+    screenshot_remote_path: /tmp/cloud-desktops-screenshot.png
+  tasks:
+    - name: Capture the display
+      ansible.builtin.command: scrot --overwrite {{ screenshot_remote_path }}
+      environment:
+        DISPLAY: ":1"
+      changed_when: false
+
+    - name: Download the screenshot
+      ansible.builtin.fetch:
+        src: "{{ screenshot_remote_path }}"
+        dest: "{{ playbook_dir }}/../../screenshots/{{ inventory_hostname }}.png"
+        flat: true

@@ -9,15 +9,20 @@ struct CloudDesktopApp: App {
 
     var body: some Scene {
         WindowGroup {
-            #if DEBUG
-                if let preview = TakeOverPreview.fromEnvironment() {
-                    preview
-                } else {
+            Group {
+                #if DEBUG
+                    if let preview = TakeOverPreview.fromEnvironment() {
+                        preview
+                    } else if let preview = ChatPreview.fromEnvironment() {
+                        preview
+                    } else {
+                        root
+                    }
+                #else
                     root
-                }
-            #else
-                root
-            #endif
+                #endif
+            }
+            .preferredColorScheme(.dark)  // Grok-style: dark only
         }
         .onChange(of: scenePhase) { old, new in
             if new == .background {

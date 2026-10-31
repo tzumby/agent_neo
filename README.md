@@ -152,7 +152,7 @@ apps can do everything it does.
 
 ## Apple apps (`apps/apple`)
 
-SwiftUI app for iPhone (iOS 18.1+; a Mac target follows), generated with XcodeGen
+SwiftUI app for iPhone (iOS 26+, dark, Liquid Glass; a Mac target follows), generated with XcodeGen
 from `apps/apple/project.yml`. `DesktopKit` holds the shared code: `Tailnet`
 (the app's own Tailscale node via TailscaleKit; you sign in with Tailscale in the
 app, no Tailscale app needed), `AgentAPI` (agentd's API and event stream over the

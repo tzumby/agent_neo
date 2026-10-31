@@ -11,6 +11,7 @@ public struct ChatTimeline: Sendable, Equatable {
     private var workIndex: [String: Int] = [:]  // task → index of its work item
     private var approvalIndex: [String: Int] = [:]
     private var actionIndex: [String: Int] = [:]
+    private var openTerminal: [String: Int] = [:]  // task → its command still waiting for output
 
     public init() {}
 
@@ -38,18 +39,46 @@ public struct ChatTimeline: Sendable, Equatable {
                 id: event.seq, tool: "run_shell", detail: data["command"]?.string ?? "",
                 asRoot: data["as_root"]?.bool ?? false)
             updateWork(task) { $0.steps.append(step) }
+            openTerminal[task] = items.count
+            items.append(
+                .terminal(
+                    Terminal(
+                        id: event.seq, task: task, command: step.detail, asRoot: step.asRoot,
+                        state: data["needs_approval"]?.bool == true ? .waitingForApproval : .running)))
+        case "shell.output":
+            updateTerminal(task, closing: true) {
+                $0.state = .finished
+                $0.exitCode = data["exit_code"]?.int
+                $0.timedOut = data["timed_out"]?.bool ?? false
+                $0.output = data["output"]?.string ?? ""
+                $0.seconds = data["seconds"]?.double
+            }
         case "approval.requested":
             let id = data["id"]?.string ?? ""
-            approvalIndex[id] = items.count
-            items.append(
-                .approval(
-                    Approval(
-                        id: id, seq: event.seq, command: data["command"]?.string ?? "",
-                        reason: data["reason"]?.string ?? "")))
+            var approval = Approval(
+                id: id, seq: event.seq, command: data["command"]?.string ?? "", reason: data["reason"]?.string ?? "")
+            if data["kind"]?.string == "browser" {
+                approval.browser = BrowserAction(
+                    action: data["action"]?.string ?? "", target: data["target"]?.string ?? "",
+                    text: data["text"]?.string, key: data["key"]?.string, submit: data["submit"]?.bool ?? false,
+                    site: data["site"]?.string ?? "")
+            }
+            // Asked about the command that's running: the approval goes on its terminal card.
+            if approval.browser == nil, let index = openTerminal[task], case .terminal(var terminal) = items[index],
+                terminal.command == approval.command
+            {
+                terminal.approval = approval
+                items[index] = .terminal(terminal)
+                approvalIndex[id] = index
+            } else {
+                approvalIndex[id] = items.count
+                items.append(.approval(approval))
+            }
         case "approval.resolved":
             let id = data["id"]?.string ?? ""
             let approved = data["approved"]?.bool ?? false
             update(approval: id) { $0.state = approved ? .approved : .denied }
+            updateTerminal(task, closing: !approved) { $0.state = approved ? .running : .denied }
         case "action_needed":
             let id = data["id"]?.string ?? ""
             actionIndex[id] = items.count
@@ -68,6 +97,8 @@ public struct ChatTimeline: Sendable, Equatable {
             }
         case "task.finished":
             busy = false
+            let cancelled = data["status"]?.string == "cancelled"
+            updateTerminal(task, closing: true) { $0.state = cancelled ? .didNotFinish : .unrecorded }
             let usage = data["usage"]
             updateWork(task) {
                 $0.finished = Work.Finished(
@@ -98,10 +129,27 @@ public struct ChatTimeline: Sendable, Equatable {
         items[index] = .work(work)
     }
 
+    private mutating func updateTerminal(_ task: String, closing: Bool, _ change: (inout Terminal) -> Void) {
+        guard let index = openTerminal[task], case .terminal(var terminal) = items[index] else { return }
+        change(&terminal)
+        items[index] = .terminal(terminal)
+        if closing { openTerminal[task] = nil }
+    }
+
     private mutating func update(approval id: String, _ change: (inout Approval) -> Void) {
-        guard let index = approvalIndex[id], case .approval(var approval) = items[index] else { return }
-        change(&approval)
-        items[index] = .approval(approval)
+        guard let index = approvalIndex[id] else { return }
+        switch items[index] {
+        case .approval(var approval):
+            change(&approval)
+            items[index] = .approval(approval)
+        case .terminal(var terminal):
+            guard var approval = terminal.approval else { return }
+            change(&approval)
+            terminal.approval = approval
+            items[index] = .terminal(terminal)
+        default:
+            break
+        }
     }
 
     private mutating func update(action id: String, _ change: (inout Action) -> Void) {
@@ -115,6 +163,7 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
     case user(Message)
     case assistant(Message)
     case work(Work)
+    case terminal(Terminal)
     case approval(Approval)
     case action(Action)
     case image(Picture)
@@ -124,6 +173,7 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
         case .user(let m): "user-\(m.id)"
         case .assistant(let m): "assistant-\(m.id)"
         case .work(let w): "work-\(w.id)"
+        case .terminal(let t): "terminal-\(t.id)"
         case .approval(let a): "approval-\(a.id)"
         case .action(let a): "action-\(a.id)"
         case .image(let p): "image-\(p.id)"
@@ -161,6 +211,30 @@ public struct Work: Sendable, Equatable {
     public var finished: Finished?
 }
 
+/// A shell command the agent ran, shown as a terminal card with its output.
+public struct Terminal: Sendable, Equatable {
+    public enum State: Sendable, Equatable {
+        case waitingForApproval, running, finished, denied
+        /// The task was stopped while the command ran.
+        case didNotFinish
+        /// The task ended without an output event (agentd before 0.2.0).
+        case unrecorded
+    }
+
+    public let id: Int
+    public let task: String
+    public let command: String
+    public let asRoot: Bool
+    public var state: State
+    public var exitCode: Int?
+    public var timedOut = false
+    /// The end of what it printed (stdout, then stderr).
+    public var output = ""
+    public var seconds: Double?
+    /// Set when the command needed the user's approval (root or risky).
+    public var approval: Approval?
+}
+
 public struct Approval: Sendable, Equatable {
     public enum State: Sendable, Equatable { case pending, approved, denied, expired }
     public let id: String
@@ -168,6 +242,23 @@ public struct Approval: Sendable, Equatable {
     public let command: String
     public let reason: String
     public var state: State = .pending
+    /// Set when it's a browser action (typing, a key, a click) rather than a command.
+    public var browser: BrowserAction?
+}
+
+/// A change the agent wants to make in the desktop's browser.
+public struct BrowserAction: Sendable, Equatable {
+    /// "type", "key" or "click".
+    public let action: String
+    /// The field, button or focused element (its accessible name).
+    public let target: String
+    /// What it will type.
+    public let text: String?
+    public let key: String?
+    /// Presses Enter after typing.
+    public let submit: Bool
+    /// The page's host, e.g. app.slack.com.
+    public let site: String
 }
 
 /// "Action needed": the agent stopped for something only the user can do.

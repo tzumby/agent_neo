@@ -15,6 +15,7 @@ use crate::browser::Browser;
 use crate::cdp::Cdp;
 use crate::config::Config;
 use crate::llm::{Together, Usage, truncate};
+use crate::policy::Gate;
 use crate::policy::Policy;
 use crate::shell::{Shell, split_sudo};
 use crate::store::{Event, Store};
@@ -101,7 +102,8 @@ impl Agent {
         let get = |key: &str| self.store.setting(key).ok().flatten();
         Settings {
             model: get("model").unwrap_or_else(|| self.cfg.model.clone()),
-            allow_actions: get("allow_actions").as_deref() == Some("true"),
+            // On by default: writing and sending in the browser ask first.
+            allow_actions: get("allow_actions").as_deref() != Some("false"),
         }
     }
 
@@ -359,23 +361,51 @@ impl Agent {
             "read_text" => browser.read_text(max_chars).await,
             "snapshot" => browser.snapshot(max_chars).await,
             "click" => {
-                browser
-                    .click(number("ref"), text("role"), text("name"), text("text"))
-                    .await
+                let find = (number("ref"), text("role"), text("name"), text("text"));
+                let element = browser.find(find.0, find.1, find.2, find.3).await?;
+                let gate = browser.click_gate(&element);
+                let card = json!({"action": "click", "target": element.label, "site": browser.host().await});
+                match self.gate(task_id, gate, card, cancel).await {
+                    Err(refusal) => Ok(refusal),
+                    // The page may have changed while the user decided.
+                    Ok(true) => {
+                        browser
+                            .click(&browser.find(find.0, find.1, find.2, find.3).await?)
+                            .await
+                    }
+                    Ok(false) => browser.click(&element).await,
+                }
             }
             "type_text" => {
                 let submit = args["submit"].as_bool().unwrap_or(false);
-                browser
-                    .type_text(
-                        number("ref"),
-                        text("role"),
-                        text("name"),
-                        required("text")?,
-                        submit,
-                    )
-                    .await
+                let value = required("text")?;
+                let find = (number("ref"), text("role"), text("name"));
+                let element = browser.find(find.0, find.1, find.2, None).await?;
+                let gate = browser.type_gate(&element, submit);
+                let card = json!({
+                    "action": "type", "target": element.label, "text": truncate(value, 4000),
+                    "submit": submit, "site": browser.host().await,
+                });
+                match self.gate(task_id, gate, card, cancel).await {
+                    Err(refusal) => Ok(refusal),
+                    Ok(true) => {
+                        let element = browser.find(find.0, find.1, find.2, None).await?;
+                        browser.type_text(&element, value, submit).await
+                    }
+                    Ok(false) => browser.type_text(&element, value, submit).await,
+                }
             }
-            "press_key" => browser.press_key(required("key")?).await,
+            "press_key" => {
+                let key = required("key")?;
+                let gate = browser.key_gate(key);
+                let card = json!({
+                    "action": "key", "key": key, "target": browser.focused().await, "site": browser.host().await,
+                });
+                match self.gate(task_id, gate, card, cancel).await {
+                    Err(refusal) => Ok(refusal),
+                    Ok(_) => browser.press_key(key).await,
+                }
+            }
             "show_screenshot" => {
                 let id = self.save_image(&browser.screenshot_jpeg().await?)?;
                 self.emit(
@@ -411,29 +441,68 @@ impl Agent {
             json!({"task": task_id, "command": command, "as_root": as_root, "needs_approval": reason.is_some()}),
         );
         if let Some(reason) = reason
-            && !self.approve(task_id, command, reason, cancel).await
+            && !self
+                .approve(
+                    task_id,
+                    json!({"kind": "shell", "command": command, "reason": reason}),
+                    cancel,
+                )
+                .await
         {
             return Ok(format!(
                 "denied: the user did not approve this command (it {reason})"
             ));
         }
-        self.shell.run(inner, as_root, timeout).await
+        let started = std::time::Instant::now();
+        let output = self.shell.run(inner, as_root, timeout).await?;
+        // The app shows each command as a terminal card with its output.
+        self.emit(
+            "shell.output",
+            json!({
+                "task": task_id, "command": command, "exit_code": output.code,
+                "timed_out": output.timed_out, "output": output.tail(4000),
+                "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+            }),
+        );
+        Ok(output.for_model())
     }
 
-    async fn approve(
+    /// Runs a browser action's gate: `Ok(asked)` to go ahead (`asked`: after
+    /// the user approved), `Err(text for the model)` if refused or denied.
+    async fn gate(
         &self,
         task_id: &str,
-        command: &str,
-        reason: &str,
+        gate: Gate,
+        mut card: Value,
         cancel: &mut watch::Receiver<bool>,
-    ) -> bool {
+    ) -> Result<bool, String> {
+        match gate {
+            Gate::Allow => Ok(false),
+            Gate::Block(refusal) => Err(refusal),
+            Gate::Ask(reason) => {
+                card["kind"] = json!("browser");
+                card["reason"] = json!(reason);
+                if self.approve(task_id, card, cancel).await {
+                    Ok(true)
+                } else {
+                    Err(format!(
+                        "denied: the user did not approve this (it {reason}). Don't try another way; \
+                         tell the user what you would have done."
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Asks the user (an approval card in the apps) and waits for the answer.
+    /// `details` describes what's asked: a shell command, or a browser action.
+    async fn approve(&self, task_id: &str, mut details: Value, cancel: &mut watch::Receiver<bool>) -> bool {
         let id = short_id();
         let (reply, answer) = oneshot::channel();
         self.approvals.lock().unwrap().insert(id.clone(), reply);
-        self.emit(
-            "approval.requested",
-            json!({"task": task_id, "id": id, "command": command, "reason": reason}),
-        );
+        details["task"] = json!(task_id);
+        details["id"] = json!(id);
+        self.emit("approval.requested", details);
         let approved = tokio::select! {
             result = tokio::time::timeout(APPROVAL_TIMEOUT, answer) => matches!(result, Ok(Ok(true))),
             _ = cancel.wait_for(|stopped| *stopped) => false,

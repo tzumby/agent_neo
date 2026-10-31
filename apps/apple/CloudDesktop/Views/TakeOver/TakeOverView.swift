@@ -34,19 +34,24 @@ struct TakeOverView: View {
     var body: some View {
         NavigationStack {
             DesktopCanvas(desktop: desktop, keyboardUp: $keyboardUp)
-                .overlay { status }
+                .overlay(alignment: .top) { status }
+                .background(Color.black)
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
                         Button("Close", systemImage: "xmark") { dismiss() }
                     }
                     ToolbarItem(placement: .principal) {
-                        VStack(spacing: 0) {
-                            Text("Your desktop").font(.headline)
+                        VStack(spacing: 1) {
+                            HStack(spacing: 6) {
+                                Circle().fill(desktop.state == .live ? .green : .orange).frame(width: 7, height: 7)
+                                Text("Your desktop").font(.headline)
+                            }
                             if let action, action.state == .pending {
                                 Text(action.reason).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                             }
                         }
+                        .frame(maxWidth: 260)
                     }
                 }
                 .safeAreaInset(edge: .bottom, spacing: 0) { bottomBar }
@@ -64,57 +69,71 @@ struct TakeOverView: View {
             EmptyView()
         case .connecting:
             if desktop.size == .zero {
-                ProgressView("Connecting to your desktop…").tint(.white).foregroundStyle(.white)
+                Label("Connecting to your desktop…", systemImage: "display")
+                    .font(.subheadline.weight(.medium))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .glassEffect(.regular, in: .capsule)
+                    .padding(.top, 12)
             }
         case .offline(let reason):
-            VStack(spacing: 8) {
-                Label("Reconnecting…", systemImage: "wifi.exclamationmark").font(.headline)
-                Text(reason).font(.caption).multilineTextAlignment(.center)
+            VStack(spacing: 4) {
+                Label("Reconnecting…", systemImage: "wifi.exclamationmark").font(.subheadline.weight(.semibold))
+                Text(reason).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
             }
-            .padding()
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-            .padding()
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .glassEffect(.regular, in: .rect(cornerRadius: 20))
+            .padding(12)
         }
     }
 
+    /// Floating glass controls, as in Grok: paste, I'm done, keyboard.
     private var bottomBar: some View {
-        HStack(spacing: 12) {
-            // Types the phone's clipboard on the desktop (PasteButton needs no
-            // clipboard permission prompt).
-            PasteButton(payloadType: String.self) { strings in
-                let text = strings.joined()
-                Task { @MainActor in desktop.type(text) }
-            }
-            .labelStyle(.iconOnly)
-            .buttonBorderShape(.capsule)
-
-            Spacer()
-            if let action, action.state == .pending {
-                Button("I'm done") {
-                    Task {
-                        await store.resolve(action, done: true, client: client)
-                        dismiss()
-                    }
+        GlassEffectContainer(spacing: 12) {
+            HStack(spacing: 12) {
+                // Types the phone's clipboard on the desktop (PasteButton needs no
+                // clipboard permission prompt).
+                PasteButton(payloadType: String.self) { strings in
+                    let text = strings.joined()
+                    Task { @MainActor in desktop.type(text) }
                 }
-                .buttonStyle(.borderedProminent)
-                .buttonBorderShape(.capsule)
-            }
-            Spacer()
+                .labelStyle(.iconOnly)
+                .buttonBorderShape(.circle)
+                .controlSize(.large)
+                .tint(.white.opacity(0.18))
 
-            Button(
-                keyboardUp ? "Hide keyboard" : "Show keyboard",
-                systemImage: keyboardUp ? "keyboard.chevron.compact.down" : "keyboard"
-            ) {
-                keyboardUp.toggle()
+                Spacer(minLength: 0)
+                if let action, action.state == .pending {
+                    Button {
+                        Task {
+                            await store.resolve(action, done: true, client: client)
+                            dismiss()
+                        }
+                    } label: {
+                        Text("I'm done").font(.headline).foregroundStyle(.black).padding(.horizontal, 18)
+                    }
+                    .primaryGlass()
+                    .controlSize(.large)
+                }
+                Spacer(minLength: 0)
+
+                Button {
+                    keyboardUp.toggle()
+                } label: {
+                    Image(systemName: keyboardUp ? "keyboard.chevron.compact.down" : "keyboard")
+                        .font(.title3)
+                        .frame(width: 30, height: 30)
+                }
+                .accessibilityLabel(keyboardUp ? "Hide keyboard" : "Show keyboard")
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .controlSize(.large)
             }
-            .labelStyle(.iconOnly)
-            .font(.title3)
-            .buttonStyle(.bordered)
-            .buttonBorderShape(.circle)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-        .background(.bar)
+        .sensoryFeedback(.impact(weight: .light), trigger: keyboardUp)
     }
 }
 

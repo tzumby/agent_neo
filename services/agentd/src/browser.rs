@@ -12,7 +12,14 @@ use serde_json::{Value, json};
 
 use crate::cdp::{Cdp, Page};
 use crate::llm::truncate;
-use crate::policy::{NAVIGATION_KEYS, Policy};
+use crate::policy::{Gate, Policy};
+
+/// An element a tool call refers to, found in the accessibility tree.
+pub struct Element {
+    node: i64,
+    pub role: Option<String>,
+    pub label: String,
+}
 
 pub struct Browser {
     cdp: Cdp,
@@ -143,59 +150,94 @@ impl Browser {
         Ok(truncate(&format_snapshot(&nodes), max_chars))
     }
 
-    pub async fn click(
+    /// Finds the element a click or type_text call means.
+    pub async fn find(
         &self,
         reference: Option<i64>,
         role: Option<&str>,
         name: Option<&str>,
         text: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<Element> {
         let nodes = self.ax_nodes().await?;
-        let (node_id, found_role, label) = resolve(&nodes, reference, role, name, text)?;
-        if !self.allow_actions && self.policy.risky_click(found_role.as_deref(), &label) {
-            return Ok(format!(
-                "blocked: clicking '{label}' is not allowed in read-only mode"
-            ));
-        }
-        self.click_node(node_id).await?;
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        Ok(format!("clicked '{label}'; now at {}", self.where_am_i().await?))
+        let (node, role, label) = resolve(&nodes, reference, role, name, text)?;
+        Ok(Element { node, role, label })
     }
 
-    pub async fn type_text(
-        &self,
-        reference: Option<i64>,
-        role: Option<&str>,
-        name: Option<&str>,
-        text: &str,
-        submit: bool,
-    ) -> Result<String> {
-        if !self.allow_actions {
-            return Ok("blocked: typing in the browser is not allowed in read-only mode".into());
-        }
-        let nodes = self.ax_nodes().await?;
-        let (node_id, _, label) = resolve(&nodes, reference, role, name, None)?;
+    pub fn click_gate(&self, element: &Element) -> Gate {
+        self.policy
+            .click_gate(self.allow_actions, element.role.as_deref(), &element.label)
+    }
+
+    pub fn type_gate(&self, element: &Element, submit: bool) -> Gate {
+        self.policy.type_gate(
+            self.allow_actions,
+            element.role.as_deref(),
+            &element.label,
+            submit,
+        )
+    }
+
+    pub fn key_gate(&self, key: &str) -> Gate {
+        self.policy.key_gate(self.allow_actions, key)
+    }
+
+    pub async fn click(&self, element: &Element) -> Result<String> {
+        self.click_node(element.node).await?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        Ok(format!(
+            "clicked '{}'; now at {}",
+            element.label,
+            self.where_am_i().await?
+        ))
+    }
+
+    pub async fn type_text(&self, element: &Element, text: &str, submit: bool) -> Result<String> {
         let page = self.page()?;
-        page.call("DOM.focus", json!({"backendNodeId": node_id})).await?;
+        page.call("DOM.focus", json!({"backendNodeId": element.node}))
+            .await?;
         page.call("Input.insertText", json!({"text": text})).await?;
         if submit {
             self.key("Enter").await?;
             self.settle().await?;
         }
         Ok(format!(
-            "typed into '{label}'; now at {}",
+            "typed into '{}'; now at {}",
+            element.label,
             self.where_am_i().await?
         ))
     }
 
     pub async fn press_key(&self, key: &str) -> Result<String> {
-        if !self.allow_actions && !NAVIGATION_KEYS.contains(&key) {
-            return Ok(format!(
-                "blocked: only navigation keys are allowed in read-only mode, not {key}"
-            ));
-        }
         self.key(key).await?;
         Ok("pressed".into())
+    }
+
+    /// The open page's host, for approval cards (e.g. app.slack.com).
+    pub async fn host(&self) -> String {
+        match self.page() {
+            Ok(page) => page
+                .eval("location.hostname")
+                .await
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// What has the keyboard focus (its label), for approving a key press.
+    pub async fn focused(&self) -> String {
+        const FOCUSED: &str = "(() => { const e = document.activeElement; if (!e || e === document.body) return ''; \
+            return e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.getAttribute('name') || ''; })()";
+        match self.page() {
+            Ok(page) => page
+                .eval(FOCUSED)
+                .await
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        }
     }
 
     pub async fn screenshot_jpeg(&self) -> Result<Vec<u8>> {

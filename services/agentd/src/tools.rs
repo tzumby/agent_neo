@@ -31,9 +31,13 @@ in the current tab, then call needs_user saying exactly what to do (e.g. \"Sign 
 tab\"). Always use needs_user for this, never a text reply: needs_user shows the user the tab and lets \
 them take over the screen, while a text reply ends the task. Never type passwords or codes yourself. \
 After the user takes over, they tell you to continue or to skip.
-- Some browser actions are blocked in read-only mode. If a tool says an action is blocked, say what you \
-would have done instead.
+- Browser changes (typing on a page, pressing Enter, clicking Send, Delete and the like) wait for the \
+user's approval, or are blocked in read-only mode. If one is denied or blocked, don't look for another \
+way; say what you would have done. When asked to draft something, type it but don't send it; send only \
+when the user asked you to send.
 - Use show_screenshot when seeing the page would help the user.
+- The user sees each shell command and its output, so don't paste output back unless asked; say what it \
+means. Put code and multi-line text in fenced code blocks.
 - When done, reply with the answer only, without a tool call. Be concise and never repeat passwords, \
 security phrases, one-time codes, booking codes or full account numbers.",
         and_shell = if shell { ", and a bash shell" } else { "" },
@@ -108,13 +112,13 @@ pub fn schemas(shell: bool) -> Value {
         ),
         tool(
             "type_text",
-            "Type into a field (by ref, or role and name).",
+            "Type into a field (by ref, or role and name). Outside search fields the user approves the text first.",
             type_text,
             &["text"],
         ),
         tool(
             "press_key",
-            "Press a key such as PageDown, Escape or Enter.",
+            "Press a key such as PageDown, Escape or Enter. Keys other than navigation keys need the user's approval.",
             json!({"key": {"type": "string"}}),
             &["key"],
         ),

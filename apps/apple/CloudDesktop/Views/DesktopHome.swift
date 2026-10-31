@@ -26,9 +26,10 @@ struct DesktopHome: View {
         } else {
             ContentUnavailableView(
                 "No desktop yet",
-                systemImage: "desktopcomputer",
+                systemImage: "display",
                 description: Text("No device tagged tag:cloud-desktop is on your tailnet.")
             )
+            .background(Color.black)
         }
     }
 

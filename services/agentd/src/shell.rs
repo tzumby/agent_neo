@@ -15,6 +15,36 @@ pub struct Shell {
     pub workdir: PathBuf,
 }
 
+/// What a command printed (stdout, then stderr) and how it ended.
+pub struct ShellOutput {
+    pub code: Option<i32>,
+    pub timed_out: bool,
+    pub text: String,
+    limit_secs: u64,
+}
+
+impl ShellOutput {
+    /// For the model: the exit code, then the start of the output.
+    pub fn for_model(&self) -> String {
+        if self.timed_out && self.code.is_none() {
+            return format!("error: timed out after {}s", self.limit_secs);
+        }
+        let code = self.code.map_or("?".to_string(), |c| c.to_string());
+        let note = if self.timed_out { " (timed out)" } else { "" };
+        format!("exit code {code}{note}\n{}", truncate(&self.text, 8000))
+    }
+
+    /// For the app: the end of the output, which usually matters most.
+    pub fn tail(&self, max_chars: usize) -> String {
+        let count = self.text.chars().count();
+        if count <= max_chars {
+            return self.text.clone();
+        }
+        let kept: String = self.text.chars().skip(count - max_chars).collect();
+        format!("[{} earlier characters]\n{kept}", count - max_chars)
+    }
+}
+
 fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
@@ -28,7 +58,7 @@ pub fn split_sudo(command: &str) -> (bool, &str) {
 }
 
 impl Shell {
-    pub async fn run(&self, command: &str, as_root: bool, timeout_secs: u64) -> Result<String> {
+    pub async fn run(&self, command: &str, as_root: bool, timeout_secs: u64) -> Result<ShellOutput> {
         let timeout_secs = timeout_secs.clamp(1, 900);
         let script = format!("cd {} && {command}", quote(&self.workdir.to_string_lossy()));
         let local = !as_root && self.run_as.is_empty();
@@ -57,19 +87,25 @@ impl Shell {
         }
         let output =
             match tokio::time::timeout(Duration::from_secs(timeout_secs + 15), command.output()).await {
-                Err(_) => return Ok(format!("error: timed out after {timeout_secs}s")),
+                Err(_) => {
+                    return Ok(ShellOutput {
+                        code: None,
+                        timed_out: true,
+                        text: String::new(),
+                        limit_secs: timeout_secs,
+                    });
+                }
                 Ok(output) => output?,
             };
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
         let code = output.status.code();
-        let note = if code == Some(124) && !local {
-            " (timed out)"
-        } else {
-            ""
-        };
-        let code = code.map_or("?".to_string(), |c| c.to_string());
-        Ok(format!("exit code {code}{note}\n{}", truncate(text.trim(), 8000)))
+        Ok(ShellOutput {
+            code,
+            timed_out: code == Some(124) && !local,
+            text: text.trim().to_string(),
+            limit_secs: timeout_secs,
+        })
     }
 }
 
@@ -91,8 +127,25 @@ mod tests {
             workdir: std::env::temp_dir(),
         };
         let out = shell.run("echo hi && pwd", false, 10).await.unwrap();
-        assert!(out.starts_with("exit code 0\nhi"), "{out}");
+        assert!(
+            out.for_model().starts_with("exit code 0\nhi"),
+            "{}",
+            out.for_model()
+        );
         let out = shell.run("exit 3", false, 10).await.unwrap();
-        assert!(out.starts_with("exit code 3"), "{out}");
+        assert_eq!(out.code, Some(3));
+        assert!(out.for_model().starts_with("exit code 3"), "{}", out.for_model());
+    }
+
+    #[test]
+    fn tail_keeps_the_end() {
+        let out = ShellOutput {
+            code: Some(0),
+            timed_out: false,
+            text: "abcdef".into(),
+            limit_secs: 1,
+        };
+        assert_eq!(out.tail(10), "abcdef");
+        assert_eq!(out.tail(2), "[4 earlier characters]\nef");
     }
 }

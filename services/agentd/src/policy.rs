@@ -1,6 +1,6 @@
 //! Guardrails: which shell commands need the user's approval, and which
-//! browser actions are blocked in read-only mode. Loaded from a root-owned
-//! TOML file so the agent can't change them.
+//! browser actions need it (or are blocked in read-only mode). Loaded from a
+//! root-owned TOML file so the agent can't change them.
 
 use std::path::Path;
 
@@ -23,6 +23,7 @@ struct Rule {
 pub struct Policy {
     dangerous: Vec<(Regex, String)>,
     risky_label: Regex,
+    search_label: Regex,
 }
 
 /// Commands matching these need approval. A speed bump against mistakes and
@@ -71,8 +72,22 @@ const DEFAULT_DANGEROUS: &[(&str, &str)] = &[
     (r"\btailscale\b", "touches Tailscale"),
 ];
 
-/// In read-only mode, clicking controls whose label matches this is refused.
+/// Clicking controls whose label matches this needs approval (and is refused
+/// in read-only mode).
 const RISKY_LABEL: &str = r"(?i)\b(send|delete|trash|archive|reply|forward|spam|move to|mark as|unsubscribe|buy|pay|purchase|order|submit|confirm|sign out|log ?out|remove|discard)\b";
+
+/// Typing into these needs no approval: it only looks things up.
+const SEARCH_LABEL: &str = r"(?i)\b(search|find|filter|jump to)\b";
+
+/// What a browser action needs before it runs.
+#[derive(Debug, PartialEq)]
+pub enum Gate {
+    Allow,
+    /// Refused (read-only mode); the text goes back to the model.
+    Block(String),
+    /// Runs once the user approves; the reason is shown on the card.
+    Ask(&'static str),
+}
 
 /// Roles that navigate rather than act (opening an email from the list).
 pub const NAVIGATION_ROLES: &[&str] = &["link", "row", "tab", "option", "treeitem", "gridcell", "heading"];
@@ -116,6 +131,7 @@ impl Policy {
         Ok(Self {
             dangerous,
             risky_label: Regex::new(RISKY_LABEL)?,
+            search_label: Regex::new(SEARCH_LABEL)?,
         })
     }
 
@@ -134,6 +150,49 @@ impl Policy {
 
     pub fn risky_click(&self, role: Option<&str>, label: &str) -> bool {
         !role.is_some_and(|r| NAVIGATION_ROLES.contains(&r)) && self.risky_label.is_match(label)
+    }
+
+    /// Clicks that navigate or focus run; ones that may send or change
+    /// something ask (or are refused in read-only mode).
+    pub fn click_gate(&self, allow_actions: bool, role: Option<&str>, label: &str) -> Gate {
+        if !self.risky_click(role, label) {
+            Gate::Allow
+        } else if !allow_actions {
+            Gate::Block(format!(
+                "blocked: clicking '{label}' is not allowed in read-only mode"
+            ))
+        } else {
+            Gate::Ask("may send, delete or change something")
+        }
+    }
+
+    /// Writing on a page asks, except in search fields.
+    pub fn type_gate(&self, allow_actions: bool, role: Option<&str>, label: &str, submit: bool) -> Gate {
+        if !allow_actions {
+            Gate::Block("blocked: typing in the browser is not allowed in read-only mode".into())
+        } else if role == Some("searchbox") || self.search_label.is_match(label) {
+            Gate::Allow
+        } else if submit {
+            Gate::Ask("writes on the page, then presses Enter (which may send it)")
+        } else {
+            Gate::Ask("writes on the page")
+        }
+    }
+
+    /// Navigation keys run; others (Enter sends in chat apps, letters are
+    /// shortcuts) ask.
+    pub fn key_gate(&self, allow_actions: bool, key: &str) -> Gate {
+        if NAVIGATION_KEYS.contains(&key) {
+            Gate::Allow
+        } else if !allow_actions {
+            Gate::Block(format!(
+                "blocked: only navigation keys are allowed in read-only mode, not {key}"
+            ))
+        } else if key == "Enter" {
+            Gate::Ask("may send or submit what's typed")
+        } else {
+            Gate::Ask("may trigger a shortcut on the page")
+        }
     }
 }
 
@@ -175,5 +234,42 @@ mod tests {
         assert!(policy.risky_click(None, "Delete"));
         assert!(!policy.risky_click(Some("link"), "Confirm your payment"));
         assert!(!policy.risky_click(Some("button"), "Older"));
+    }
+
+    #[test]
+    fn browser_gates() {
+        let policy = Policy::defaults();
+        // Navigation and focus never ask.
+        assert_eq!(policy.click_gate(true, Some("link"), "Alice"), Gate::Allow);
+        assert_eq!(
+            policy.click_gate(true, Some("textbox"), "Message to Alice"),
+            Gate::Allow
+        );
+        assert_eq!(policy.key_gate(false, "PageDown"), Gate::Allow);
+        // Writing and sending ask when actions are on, and are refused when off.
+        assert!(matches!(
+            policy.click_gate(true, Some("button"), "Send now"),
+            Gate::Ask(_)
+        ));
+        assert!(matches!(
+            policy.click_gate(false, Some("button"), "Send now"),
+            Gate::Block(_)
+        ));
+        assert!(matches!(
+            policy.type_gate(true, Some("textbox"), "Message to Alice", false),
+            Gate::Ask(_)
+        ));
+        assert!(matches!(
+            policy.type_gate(false, Some("textbox"), "Message to Alice", false),
+            Gate::Block(_)
+        ));
+        assert!(matches!(policy.key_gate(true, "Enter"), Gate::Ask(_)));
+        assert!(matches!(policy.key_gate(false, "e"), Gate::Block(_)));
+        // Searching doesn't ask.
+        assert_eq!(policy.type_gate(true, Some("searchbox"), "", true), Gate::Allow);
+        assert_eq!(
+            policy.type_gate(true, Some("combobox"), "Search mail", true),
+            Gate::Allow
+        );
     }
 }

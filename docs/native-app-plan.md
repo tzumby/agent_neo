@@ -143,7 +143,7 @@ pointing at a proxy in the Mac app, over the tailnet.
   | GET | `/api/v1/status` | desktop, model, busy, settings |
   | GET | `/api/v1/messages?after=` | history |
   | POST | `/api/v1/messages` `{text}` | start a task (202) |
-  | GET | `/api/v1/events?after=<seq>` | **SSE** stream: `task.started`, `step`, `shell`, `approval.requested`/`resolved`, `action_needed` (with a thumbnail URL), `message`, `task.finished` (tokens, cost) |
+  | GET | `/api/v1/events?after=<seq>` | **SSE** stream: `task.started`, `step`, `shell`, `shell.output` (exit code, end of the output; since 0.2.0), `approval.requested`/`resolved`, `action_needed` (with a thumbnail URL), `message`, `task.finished` (tokens, cost) |
   | POST | `/api/v1/approvals/{id}` `{approved}` | answer an approval |
   | POST | `/api/v1/actions/{id}` `{done \| skip}` | answer "action needed" |
   | POST | `/api/v1/stop` | stop the task |
@@ -196,7 +196,8 @@ guardrails.
 - **Location:** `apps/apple/`, generated with **XcodeGen** (installed). Xcode
   26.3 and iOS 18.6 / 26.x simulators are available.
 - **Targets:** iOS 18+ and macOS 15+, SwiftUI.
-  - iOS 18 is the floor for TailscaleKit's listener and swift-rfb.
+  - iOS 18 is the floor for TailscaleKit's listener and swift-rfb (the
+    `DesktopKit` package). The iPhone app itself needs iOS 26 for Liquid Glass.
   - macOS is arm64 only, because of TailscaleKit.
 - **Local package `DesktopKit`**, with modules `Tailnet`, `AgentAPI`, `Chat`,
   `DesktopViewer`.

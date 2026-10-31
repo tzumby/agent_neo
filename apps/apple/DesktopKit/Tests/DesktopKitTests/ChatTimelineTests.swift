@@ -30,12 +30,25 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     ]
     events.forEach { timeline.apply($0) }
     #expect(timeline.busy)
-    #expect(timeline.items.count == 3)  // user, work, approval
+    #expect(timeline.items.count == 4)  // user, work, terminal, terminal (with its approval)
     guard case .work(let work) = timeline.items[1] else { Issue.record("no work item"); return }
     #expect(work.steps.map(\.tool) == ["run_shell", "read_text", "run_shell"])
     #expect(work.steps.last?.asRoot == true)
+    guard case .terminal(let whoami) = timeline.items[2], case .terminal(let root) = timeline.items[3] else {
+        Issue.record("no terminals")
+        return
+    }
+    #expect(whoami.state == .running)
+    #expect(root.state == .waitingForApproval && root.asRoot)
+    #expect(root.approval?.state == .pending && root.approval?.reason == "runs as root")
 
     timeline.apply(try event(8, "approval.resolved", #"{"task":"t1","id":"a1","approved":true}"#))
+    timeline.apply(
+        try event(
+            85, "shell.output",
+            #"{"task":"t1","command":"sudo id -u","exit_code":0,"timed_out":false,"output":"0","seconds":0.1}"#))
+    guard case .terminal(let ran) = timeline.items[3] else { Issue.record("no terminal"); return }
+    #expect(ran.state == .finished && ran.exitCode == 0 && ran.output == "0")
     timeline.apply(try event(9, "message", #"{"role":"assistant","text":"agent; 0","task":"t1"}"#))
     timeline.apply(
         try event(
@@ -43,8 +56,8 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
             #"{"task":"t1","status":"done","steps":2,"seconds":3,"cost":0.0038,"usage":{"input":100,"cached":0,"output":20}}"#
         ))
     #expect(!timeline.busy)
-    guard case .approval(let approval) = timeline.items[2] else { Issue.record("no approval"); return }
-    #expect(approval.state == .approved)
+    guard case .terminal(let approved) = timeline.items[3] else { Issue.record("no terminal"); return }
+    #expect(approved.approval?.state == .approved)
     guard case .work(let finished) = timeline.items[1] else { Issue.record("no work item"); return }
     #expect(finished.finished?.cost == 0.0038)
     #expect(timeline.items.last == .assistant(Message(id: 9, text: "agent; 0")))
@@ -68,4 +81,44 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     #expect(first.imagePath == "/api/v1/images/ab")
     #expect(second.state == .expired)
     #expect(second.imagePath == nil)
+}
+
+@Test func deniedOrUnfinishedCommands() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(try event(1, "task.started", #"{"task":"t1","model":"m"}"#))
+    timeline.apply(try event(2, "shell", #"{"task":"t1","command":"sudo reboot","as_root":true,"needs_approval":true}"#))
+    timeline.apply(try event(3, "approval.requested", #"{"task":"t1","id":"a1","command":"sudo reboot","reason":"runs as root"}"#))
+    timeline.apply(try event(4, "approval.resolved", #"{"task":"t1","id":"a1","approved":false}"#))
+    timeline.apply(try event(5, "shell", #"{"task":"t1","command":"sleep 999","as_root":false,"needs_approval":false}"#))
+    timeline.apply(try event(6, "task.finished", #"{"task":"t1","status":"cancelled","steps":2,"seconds":9}"#))
+    guard case .terminal(let denied) = timeline.items[1], case .terminal(let stopped) = timeline.items[2] else {
+        Issue.record("no terminals")
+        return
+    }
+    #expect(denied.state == .denied && denied.approval?.state == .denied)
+    #expect(stopped.state == .didNotFinish)
+
+    // History from an agentd without output events: the command ran, nothing was recorded.
+    timeline.apply(try event(7, "task.started", #"{"task":"t2","model":"m"}"#))
+    timeline.apply(try event(8, "shell", #"{"task":"t2","command":"whoami","as_root":false,"needs_approval":false}"#))
+    timeline.apply(try event(9, "task.finished", #"{"task":"t2","status":"done","steps":1,"seconds":1}"#))
+    guard case .terminal(let old) = timeline.items.last else { Issue.record("no terminal"); return }
+    #expect(old.state == .unrecorded)
+}
+
+@Test func browserApprovalsAreTheirOwnCards() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(try event(1, "task.started", #"{"task":"t1","model":"m"}"#))
+    timeline.apply(
+        try event(
+            2, "approval.requested",
+            #"{"task":"t1","id":"b1","kind":"browser","action":"type","target":"Message to Alice","text":"Hi Alice!","submit":false,"site":"app.slack.com","reason":"writes on the page"}"#
+        ))
+    timeline.apply(try event(3, "approval.resolved", #"{"task":"t1","id":"b1","approved":true}"#))
+    guard case .approval(let approval) = timeline.items.last else { Issue.record("no approval card"); return }
+    #expect(approval.state == .approved)
+    #expect(approval.browser?.action == "type")
+    #expect(approval.browser?.target == "Message to Alice")
+    #expect(approval.browser?.text == "Hi Alice!")
+    #expect(approval.browser?.site == "app.slack.com")
 }

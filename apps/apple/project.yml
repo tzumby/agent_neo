@@ -19,6 +19,7 @@ targets:
   CloudDesktop:
     type: application
     platform: iOS
+    deploymentTarget: "26.0" # Liquid Glass; the DesktopKit package stays at 18.1
     sources: [CloudDesktop]
     dependencies:
       - package: DesktopKit
@@ -31,7 +32,6 @@ targets:
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
-        UIRequiresFullScreen: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.tzumby.clouddesktop

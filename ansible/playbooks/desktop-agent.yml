@@ -1,0 +1,10 @@
+# Deploys the Telegram-driven desktop agent. Needs these SSM parameters
+# (see `make llm-keys`, `make telegram-token`, `make telegram-users`):
+#   /cloud-desktops/<env>/telegram/bot_token       SecureString
+#   /cloud-desktops/<env>/telegram/allowed_users   String (comma-separated IDs)
+#   /cloud-desktops/<env>/llm/together_api_key     SecureString
+- name: Deploy the desktop agent
+  hosts: desktop
+  become: true
+  roles:
+    - desktop_agent

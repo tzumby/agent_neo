@@ -57,6 +57,21 @@
   ansible.builtin.debug:
     msg: "{{ desktop_chrome_version.stdout }}"
 
+- name: Create the Chrome managed policy directory
+  ansible.builtin.file:
+    path: /etc/opt/chrome/policies/managed
+    state: directory
+    mode: "0755"
+
+# Users log in to sites themselves through the viewer; the browser must never
+# store their passwords (PLAN.MD ground rule 4). Chrome picks up changes here
+# without a restart.
+- name: Install the Chrome policy
+  ansible.builtin.copy:
+    dest: /etc/opt/chrome/policies/managed/cloud-desktops.json
+    content: "{{ desktop_chrome_policy | to_nice_json }}\n"
+    mode: "0644"
+
 # --- The agent user ----------------------------------------------------------
 
 - name: Create the agent user

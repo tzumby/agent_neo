@@ -46,3 +46,7 @@ desktop_units:
   - chrome
   - x11vnc
   - novnc
+
+# Chrome enterprise policies (/etc/opt/chrome/policies/managed).
+desktop_chrome_policy:
+  PasswordManagerEnabled: false

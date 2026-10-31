@@ -1,0 +1,16 @@
+desktop_agent_user: agent
+desktop_agent_home: /home/agent
+
+# Code and virtualenv, owned by root so the agent can't change its own code
+# without sudo (which needs the user's approval).
+desktop_agent_dir: /opt/desktop-agent
+desktop_agent_config_dir: "{{ desktop_agent_home }}/.config/desktop-agent"
+desktop_agent_workdir: "{{ desktop_agent_home }}/work"
+
+desktop_agent_model: zai-org/GLM-5.3
+desktop_agent_shell_tool: "on"
+desktop_agent_max_steps: 40
+
+# Secrets and settings read from SSM on the controller (your AWS credentials).
+desktop_agent_ssm_prefix: /cloud-desktops/dev
+desktop_agent_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"

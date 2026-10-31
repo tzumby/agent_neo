@@ -10,3 +10,6 @@ terraform.tfvars
 
 # Local output
 screenshots/
+
+# Python
+__pycache__/

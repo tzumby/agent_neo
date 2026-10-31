@@ -11,7 +11,7 @@ INSTANCE ?= $(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot viewer vnc-password shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agent telegram-token telegram-users agent-deploy agent-logs cdp viewer vnc-password shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -40,7 +40,7 @@ fmt: ## Format Terraform code
 lint: ## Check formatting, validate Terraform, syntax-check playbooks
 	terraform fmt -check -recursive terraform
 	$(TF) validate
-	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml
+	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/desktop-agent.yml
 
 # --- Ansible -----------------------------------------------------------------
 
@@ -57,7 +57,34 @@ desktop: ## Run the desktop playbook against running desktops
 screenshot: ## Download a screenshot of each desktop to screenshots/
 	$(ANSIBLE_PLAYBOOK) playbooks/screenshot.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
+# --- Agent -------------------------------------------------------------------
+
+llm-keys: ## Store the Together API key in SSM (prompted, not echoed)
+	scripts/put-secret.py /cloud-desktops/$(ENV)/llm/together_api_key
+
+agent: ## Run the browser agent: make agent TASK='...' [MODEL=...] [ARGS=--allow-actions] (needs make cdp)
+	TOGETHER_KEY_PARAM=/cloud-desktops/$(ENV)/llm/together_api_key \
+	  scripts/agent.py $(if $(MODEL),--model $(MODEL)) $(ARGS) "$(TASK)"
+
+telegram-token: ## Store the Telegram bot token from @BotFather in SSM (prompted, not echoed)
+	scripts/put-secret.py /cloud-desktops/$(ENV)/telegram/bot_token
+
+telegram-users: ## List who messaged the bot; make telegram-users ALLOW=<id> to allow one
+	SSM_PREFIX=/cloud-desktops/$(ENV) scripts/telegram-users.py $(if $(ALLOW),allow $(ALLOW))
+
+agent-deploy: ## Deploy the Telegram desktop agent to running desktops
+	find services -name __pycache__ -prune -exec rm -rf {} +
+	$(ANSIBLE_PLAYBOOK) playbooks/desktop-agent.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+
+agent-logs: ## Show the desktop agent's recent log
+	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \
+	  --parameters '{"command":["sudo journalctl -u desktop-agent -n 50 --no-pager"]}'
+
 # --- Access (SSM only) -------------------------------------------------------
+
+cdp: ## Forward Chrome's debugging port to localhost:9222 (full control of the logged-in browser while open)
+	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartPortForwardingSession \
+	  --parameters '{"portNumber":["9222"],"localPortNumber":["9222"]}'
 
 viewer: ## Forward noVNC to http://localhost:6080/vnc.html
 	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartPortForwardingSession \

@@ -150,6 +150,19 @@ make agentd-logs        # recent log
 The Python Telegram bot (`services/desktop-agent`) still runs alongside until the
 apps can do everything it does.
 
+## Apple apps (`apps/apple`)
+
+SwiftUI app for iPhone (iOS 18.1+; a Mac target follows), generated with XcodeGen
+from `apps/apple/project.yml`. `DesktopKit` holds the shared code: `Tailnet`
+(the app's own Tailscale node via TailscaleKit; you sign in with Tailscale in the
+app, no Tailscale app needed) and `AgentAPI` (agentd's API over the tailnet).
+
+```sh
+make app-tailscalekit   # once: build TailscaleKit.xcframework (Go + Xcode)
+make app-test           # DesktopKit unit tests
+make app-device         # build, sign (team 4UVAPZYV4Q), install and launch on your iPhone
+```
+
 ## Teardown
 
 ```sh

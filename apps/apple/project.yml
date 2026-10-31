@@ -1,0 +1,39 @@
+# XcodeGen spec: `xcodegen generate` creates CloudDesktop.xcodeproj (not checked in).
+name: CloudDesktop
+options:
+  bundleIdPrefix: com.tzumby
+  deploymentTarget:
+    iOS: "18.1" # TailscaleKit's minimum
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: 4UVAPZYV4Q
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+packages:
+  DesktopKit:
+    path: DesktopKit
+targets:
+  CloudDesktop:
+    type: application
+    platform: iOS
+    sources: [CloudDesktop]
+    dependencies:
+      - package: DesktopKit
+        products: [Tailnet, AgentAPI]
+    info:
+      path: CloudDesktop/Info.plist
+      properties:
+        CFBundleDisplayName: Cloud Desktop
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIRequiresFullScreen: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tzumby.clouddesktop
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: false

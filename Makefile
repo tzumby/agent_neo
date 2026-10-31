@@ -11,7 +11,7 @@ INSTANCE ?= $(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agent telegram-token telegram-users agent-deploy agent-logs agentd-test agentd-build agentd-deploy agentd-logs tailnet-build tailnet-deploy tailscale-key cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agent telegram-token telegram-users agent-deploy agent-logs agentd-test agentd-build agentd-deploy agentd-logs tailnet-build tailnet-deploy tailscale-key app-tailscalekit app-test app-sim app-device cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -104,6 +104,21 @@ tailscale-key: ## Store a Tailscale auth key (tagged tag:cloud-desktop) in SSM (
 
 tailnet-deploy: tailnet-build ## Put the desktop on your tailnet (agent API, noVNC, VNC); deploy agentd first
 	$(ANSIBLE_PLAYBOOK) playbooks/tailnet-proxy.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+
+# --- Apple apps (apps/apple) -------------------------------------------------------
+
+app-tailscalekit: ## Build TailscaleKit.xcframework from libtailscale (Go + Xcode, a few minutes)
+	apps/apple/scripts/build-tailscalekit.sh
+
+app-test: ## Unit tests for DesktopKit (macOS)
+	cd apps/apple/DesktopKit && swift test
+
+app-sim: ## Build the iPhone app for the Simulator
+	cd apps/apple && xcodegen generate --quiet && xcodebuild -project CloudDesktop.xcodeproj \
+	  -scheme CloudDesktop -destination 'generic/platform=iOS Simulator' -derivedDataPath build/sim build -quiet
+
+app-device: ## Build, install and launch the iPhone app on your paired iPhone (unlock it first)
+	apps/apple/scripts/run-on-device.sh
 
 # --- Access (SSM only) -------------------------------------------------------
 

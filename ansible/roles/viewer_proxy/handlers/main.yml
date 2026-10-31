@@ -1,0 +1,5 @@
+- name: Restart viewer-proxy
+  ansible.builtin.systemd_service:
+    name: viewer-proxy
+    state: restarted
+    daemon_reload: true

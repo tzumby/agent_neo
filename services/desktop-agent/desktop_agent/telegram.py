@@ -105,6 +105,14 @@ def split(text, limit=MAX_MESSAGE):
     return chunks
 
 
-def buttons(*rows):
-    """Inline keyboard: buttons(("Approve", "approve:1"), ("Deny", "deny:1"))."""
-    return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in rows]]}
+def keyboard(*buttons):
+    """One row of inline buttons: keyboard(callback("Deny", "deny:1"), link("Open", url))."""
+    return {"inline_keyboard": [list(buttons)]}
+
+
+def callback(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def link(text, url):
+    return {"text": text, "url": url}

@@ -1,0 +1,8 @@
+# Puts the desktop's noVNC viewer on your tailnet. Needs the SSM parameter
+# /cloud-desktops/<env>/tailscale/auth_key (`make tailscale-key`) and the
+# binary from `make viewer-build`.
+- name: Deploy viewer-proxy
+  hosts: desktop
+  become: true
+  roles:
+    - viewer_proxy

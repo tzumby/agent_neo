@@ -114,8 +114,10 @@
     mode: "0644"
 
 # --- VNC password ------------------------------------------------------------
-# TODO(M2): generate per desktop at boot from desktop.env instead. Generating
-# it here would bake one password into the AMI for every desktop.
+# Off by default: the viewer is only reachable over SSM port forwarding and the
+# tailnet (viewer-proxy), which already limit access to you.
+# TODO(M2): when on, generate per desktop at boot from desktop.env instead.
+# Generating it here would bake one password into the AMI for every desktop.
 
 - name: Create the config directory
   ansible.builtin.file:
@@ -129,12 +131,14 @@
     openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 8 > {{ desktop_config_dir }}/vnc-password
   args:
     creates: "{{ desktop_config_dir }}/vnc-password"
+  when: vnc_password_enabled
 
 - name: Write the x11vnc password file
   ansible.builtin.shell: |
     x11vnc -storepasswd "$(cat {{ desktop_config_dir }}/vnc-password)" {{ desktop_config_dir }}/vncpass
   args:
     creates: "{{ desktop_config_dir }}/vncpass"
+  when: vnc_password_enabled
 
 - name: Let the agent user read the x11vnc password file
   ansible.builtin.file:
@@ -142,6 +146,16 @@
     owner: "{{ desktop_user }}"
     group: "{{ desktop_user }}"
     mode: "0400"
+  when: vnc_password_enabled
+
+- name: Remove the VNC password when it's turned off
+  ansible.builtin.file:
+    path: "{{ desktop_config_dir }}/{{ item }}"
+    state: absent
+  loop:
+    - vnc-password
+    - vncpass
+  when: not vnc_password_enabled
 
 # --- systemd units -----------------------------------------------------------
 

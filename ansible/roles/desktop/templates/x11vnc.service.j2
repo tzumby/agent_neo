@@ -9,7 +9,7 @@ StartLimitIntervalSec=0
 User={{ desktop_user }}
 Environment=DISPLAY={{ desktop_display }}
 ExecStartPre={{ desktop_libexec_dir }}/wait-for-display
-ExecStart=/usr/bin/x11vnc -display {{ desktop_display }} -forever -shared -localhost -rfbport {{ vnc_port }} -rfbauth {{ desktop_config_dir }}/vncpass
+ExecStart=/usr/bin/x11vnc -display {{ desktop_display }} -forever -shared -localhost -rfbport {{ vnc_port }} {{ '-rfbauth ' ~ desktop_config_dir ~ '/vncpass' if vnc_password_enabled else '-nopw' }}
 Restart=always
 RestartSec=2
 

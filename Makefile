@@ -11,7 +11,7 @@ INSTANCE ?= $(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agent telegram-token telegram-users agent-deploy agent-logs cdp viewer vnc-password shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agent telegram-token telegram-users agent-deploy agent-logs viewer-build viewer-deploy tailscale-key cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -40,7 +40,7 @@ fmt: ## Format Terraform code
 lint: ## Check formatting, validate Terraform, syntax-check playbooks
 	terraform fmt -check -recursive terraform
 	$(TF) validate
-	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/desktop-agent.yml
+	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/desktop-agent.yml playbooks/viewer-proxy.yml
 
 # --- Ansible -----------------------------------------------------------------
 
@@ -80,6 +80,18 @@ agent-logs: ## Show the desktop agent's recent log
 	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \
 	  --parameters '{"command":["sudo journalctl -u desktop-agent -n 50 --no-pager"]}'
 
+# --- Viewer on the tailnet ----------------------------------------------------
+
+viewer-build: ## Build viewer-proxy (tsnet) for the desktop (linux/arm64)
+	cd services/viewer-proxy && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+	  go build -trimpath -ldflags "-s -w" -o build/viewer-proxy-linux-arm64 .
+
+tailscale-key: ## Store a Tailscale auth key (tagged tag:cloud-desktop) in SSM (prompted, not echoed)
+	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/auth_key
+
+viewer-deploy: viewer-build ## Put the desktop viewer on your tailnet
+	$(ANSIBLE_PLAYBOOK) playbooks/viewer-proxy.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+
 # --- Access (SSM only) -------------------------------------------------------
 
 cdp: ## Forward Chrome's debugging port to localhost:9222 (full control of the logged-in browser while open)
@@ -89,10 +101,6 @@ cdp: ## Forward Chrome's debugging port to localhost:9222 (full control of the l
 viewer: ## Forward noVNC to http://localhost:6080/vnc.html
 	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartPortForwardingSession \
 	  --parameters '{"portNumber":["6080"],"localPortNumber":["6080"]}'
-
-vnc-password: ## Print the desktop's VNC password
-	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \
-	  --parameters '{"command":["sudo cat /etc/cloud-desktops/vnc-password; echo"]}'
 
 shell: ## Open a shell on the desktop over SSM
 	aws ssm start-session --target $(INSTANCE)

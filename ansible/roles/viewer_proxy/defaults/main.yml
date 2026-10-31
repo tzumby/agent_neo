@@ -1,0 +1,10 @@
+# Built by `make viewer-build` (services/viewer-proxy).
+viewer_proxy_binary: "{{ playbook_dir }}/../../services/viewer-proxy/build/viewer-proxy-linux-arm64"
+viewer_proxy_hostname: cloud-desktop-dev
+viewer_proxy_target: http://127.0.0.1:6080
+# Tailscale login names let in (comma-separated). Empty: anyone the tailnet
+# policy lets through.
+viewer_proxy_allow: ""
+
+viewer_proxy_ssm_prefix: /cloud-desktops/dev
+viewer_proxy_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"

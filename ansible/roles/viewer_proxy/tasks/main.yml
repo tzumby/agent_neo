@@ -1,0 +1,50 @@
+# viewer-proxy: the desktop's noVNC viewer on your tailnet (tsnet), so you can
+# open it from any of your devices, including your phone.
+
+- name: Create the viewer-proxy system user
+  ansible.builtin.user:
+    name: viewer-proxy
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/viewer-proxy
+    create_home: false
+
+- name: Create the state directory (the node's Tailscale identity)
+  ansible.builtin.file:
+    path: /var/lib/viewer-proxy
+    state: directory
+    owner: viewer-proxy
+    group: viewer-proxy
+    mode: "0700"
+
+- name: Install the binary
+  ansible.builtin.copy:
+    src: "{{ viewer_proxy_binary }}"
+    dest: /usr/local/bin/viewer-proxy
+    mode: "0755"
+  notify: Restart viewer-proxy
+
+# Only used for the first login; afterwards the identity in the state
+# directory is enough. Read on the controller with your AWS credentials.
+- name: Write the auth key (from SSM)
+  ansible.builtin.copy:
+    dest: /etc/viewer-proxy.env
+    content: |
+      TS_AUTHKEY={{ lookup('amazon.aws.ssm_parameter', viewer_proxy_ssm_prefix ~ '/tailscale/auth_key', region=viewer_proxy_ssm_region) }}
+    mode: "0600"
+  no_log: true
+  notify: Restart viewer-proxy
+
+- name: Install the systemd unit
+  ansible.builtin.template:
+    src: viewer-proxy.service.j2
+    dest: /etc/systemd/system/viewer-proxy.service
+    mode: "0644"
+  notify: Restart viewer-proxy
+
+- name: Enable and start viewer-proxy
+  ansible.builtin.systemd_service:
+    name: viewer-proxy
+    enabled: true
+    state: started
+    daemon_reload: true

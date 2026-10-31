@@ -13,3 +13,6 @@ screenshots/
 
 # Python
 __pycache__/
+
+# Go build output
+services/viewer-proxy/build/

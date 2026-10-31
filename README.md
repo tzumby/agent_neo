@@ -35,7 +35,6 @@ make desktop               # Ansible: common + desktop roles over SSM
 
 ```sh
 make screenshot            # → screenshots/<instance-id>.png
-make vnc-password          # prints the 8-character VNC password
 make viewer                # then open http://localhost:6080/vnc.html
 make shell                 # shell over SSM
 ```
@@ -110,6 +109,27 @@ and page content goes to Together. Log in to sites (Gmail etc.) yourself
 through `make viewer`; credentials are never stored, the session persists in
 the Chrome profile on the VM.
 
+## Desktop on your tailnet (phone, anywhere)
+
+`services/viewer-proxy` embeds Tailscale (tsnet) and serves the noVNC viewer at
+`https://cloud-desktop-dev.<tailnet>.ts.net/vnc.html`. Only this process joins
+the tailnet: the VM and the agent's commands can't reach your other devices or
+change Tailscale settings. It connects outbound only; no security-group change.
+
+One-time, in the Tailscale admin console: enable MagicDNS and HTTPS
+certificates, add `tag:cloud-desktop` to `tagOwners` with a grant from you to
+`tag:cloud-desktop` on `tcp:443`, and create a pre-approved auth key with that
+tag. Then:
+
+```sh
+make tailscale-key      # paste the auth key (hidden input)
+make viewer-deploy      # builds the binary and installs the service
+```
+
+When the agent needs you (a login, 2FA, ...), the Telegram bot sends an
+**Open desktop** button with this link and an **I'm done – continue** button.
+`/desktop` sends the link any time.
+
 ## Teardown
 
 ```sh
@@ -137,8 +157,9 @@ make destroy               # dev env. The state bucket is protected (prevent_des
 - The Chrome package owns `/etc/apt/sources.list.d/google-chrome.sources` once
   installed. Ansible only writes it for the first install.
 - `openssh-server` is removed from desktops; access is SSM only.
-- The VNC password is generated on the host by Ansible. This changes in M2,
-  where each desktop gets its own password at boot (otherwise the baked AMI
-  would share one).
+- The VNC password is off (`vnc_password_enabled: false`) and noVNC listens on
+  127.0.0.1 only: it's reachable through SSM port forwarding and viewer-proxy
+  (your tailnet), nothing else. The control-plane milestone brings its own
+  per-session auth.
 - Cost while step 1 is up: one t4g.medium (~$0.04/h in ca-central-1), a 20 GB
   gp3 volume and a public IPv4 address (~$0.005/h).

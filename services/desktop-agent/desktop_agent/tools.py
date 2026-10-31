@@ -235,6 +235,7 @@ DANGEROUS = [
     ),
     (r"\b(useradd|usermod|userdel|passwd|visudo)\b", "changes users"),
     (r"chrome-profile|\.config/google-chrome", "touches the browser profile"),
+    (r"\btailscale|viewer-proxy", "touches remote access to the desktop"),
 ]
 DANGEROUS_RE = [(re.compile(pattern), reason) for pattern, reason in DANGEROUS]
 

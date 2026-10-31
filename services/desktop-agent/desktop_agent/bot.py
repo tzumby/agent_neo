@@ -15,6 +15,8 @@ stay in this process; commands the agent runs don't inherit them.
   STATE_DIR               default ~/.local/state/desktop-agent
   SHELL_TOOL              on|off (default on)
   MAX_STEPS               default 40
+  VIEWER_URL              link to the desktop viewer (noVNC), sent when the
+                          agent needs you, e.g. to log in
 """
 
 import json
@@ -32,7 +34,7 @@ from playwright.sync_api import sync_playwright
 
 from .llm import PRICES, LLMError, Together, Usage
 from .loop import SYSTEM_PROMPT, run_task
-from .telegram import Telegram, TelegramError, buttons
+from .telegram import Telegram, TelegramError, callback, keyboard, link
 from .tools import BrowserTools, ShellTool, Toolbox, find_page, schema, target_id
 
 HELP = """\
@@ -43,10 +45,12 @@ Chrome, or run commands. Risky commands wait for your approval.
 /model [id] – show or change the model
 /actions on|off – allow typing and Send/Delete-style clicks in the browser
 /screenshot – screenshot of the current tab
+/desktop – link to open the desktop (to log in, watch or take over)
 /stop – stop the current request
 """
 APPROVAL_TIMEOUT = 600  # seconds before an unanswered approval counts as denied
 HISTORY_LIMIT = 20  # messages kept between requests (user + final answers)
+RESUME_TEXT = "I've done what you asked on the desktop. Continue where you left off."
 
 
 def log(*parts):
@@ -65,7 +69,7 @@ def load_config():
                 config[key.strip()] = value.strip()
     for key in (
         "TELEGRAM_BOT_TOKEN", "TOGETHER_API_KEY", "TELEGRAM_ALLOWED_USERS", "MODEL",
-        "CDP_URL", "WORKDIR", "STATE_DIR", "SHELL_TOOL", "MAX_STEPS",
+        "CDP_URL", "WORKDIR", "STATE_DIR", "SHELL_TOOL", "MAX_STEPS", "VIEWER_URL",
     ):  # fmt: skip
         if not config.get(key) and os.environ.get(key):
             config[key] = os.environ[key]
@@ -102,6 +106,7 @@ class Bot:
         self.state_dir = self.state_dir.expanduser()
         self.shell = (config.get("SHELL_TOOL") or "on") == "on"
         self.max_steps = int(config.get("MAX_STEPS") or 40)
+        self.viewer_url = config.get("VIEWER_URL") or ""
         self.chats = {}
         self.worker = None
         self.cancel = threading.Event()
@@ -176,11 +181,12 @@ class Bot:
                 "Still working on the previous request. Send /stop to cancel it.",
             )
         else:
-            self.cancel.clear()
-            self.worker = threading.Thread(
-                target=self.work, args=(chat, text), daemon=True
-            )
-            self.worker.start()
+            self.start(chat, text)
+
+    def start(self, chat, text):
+        self.cancel.clear()
+        self.worker = threading.Thread(target=self.work, args=(chat, text), daemon=True)
+        self.worker.start()
 
     def on_command(self, chat, text):
         command, _, arg = text.partition(" ")
@@ -214,6 +220,8 @@ class Bot:
             reply(f"Browser actions: {state}")
         elif command == "/screenshot":
             self.screenshot_now(chat)
+        elif command == "/desktop":
+            self.send_desktop_link(chat, "Your desktop:")
         else:
             reply(HELP)
 
@@ -222,6 +230,16 @@ class Bot:
             self.tg.call("answerCallbackQuery", callback_query_id=query["id"])
             return
         action, _, approval_id = (query.get("data") or "").partition(":")
+        if action == "resume":
+            busy = self.busy()
+            self.tg.call(
+                "answerCallbackQuery",
+                callback_query_id=query["id"],
+                text="Still working; send /stop first." if busy else "Continuing.",
+            )
+            if not busy:
+                self.start(self.chat(query["message"]["chat"]["id"]), RESUME_TEXT)
+            return
         entry = self.approvals.get(approval_id)
         if entry is None:
             self.tg.call(
@@ -238,7 +256,7 @@ class Bot:
     # --- Running a request ---------------------------------------------------
 
     def work(self, chat, text):
-        usage, started, steps = Usage(), time.monotonic(), 0
+        usage, started, steps, status = Usage(), time.monotonic(), 0, "error"
         model = chat.model
         log(f"chat {chat.chat_id}: new request with {model}")
         self.tg.typing(chat.chat_id)
@@ -282,7 +300,7 @@ class Bot:
                     ),
                     cancelled=self.cancel.is_set,
                 )
-                answer, steps = result.answer, result.steps
+                answer, steps, status = result.answer, result.steps, result.status
                 try:
                     chat.tab_target = target_id(context, browser.page)
                 except PlaywrightError:
@@ -305,8 +323,11 @@ class Bot:
         seconds = time.monotonic() - started
         footer = f"\n\n— {model.split('/')[-1]}, {steps} steps, {seconds:.0f}s, "
         footer += usage.describe(model)
-        log(f"chat {chat.chat_id}: done{footer.replace(chr(10), ' ')}")
-        self.tg.send_message(chat.chat_id, answer + footer)
+        log(f"chat {chat.chat_id}: {status}{footer.replace(chr(10), ' ')}")
+        if status == "needs_user":
+            self.send_desktop_link(chat, answer + footer, resume=True)
+        else:
+            self.tg.send_message(chat.chat_id, answer + footer)
 
     def on_step(self, chat, step, name, raw_args):
         log(f"chat {chat.chat_id} step {step}: {name} {(raw_args or '')[:200]}")
@@ -325,8 +346,9 @@ class Bot:
         self.tg.send_message(
             chat.chat_id,
             f"Run this command? It {reason}.\n\n{command}",
-            reply_markup=buttons(
-                ("Approve", f"approve:{approval_id}"), ("Deny", f"deny:{approval_id}")
+            reply_markup=keyboard(
+                callback("Approve", f"approve:{approval_id}"),
+                callback("Deny", f"deny:{approval_id}"),
             ),
         )
         deadline = time.monotonic() + APPROVAL_TIMEOUT
@@ -338,6 +360,18 @@ class Bot:
             f"chat {chat.chat_id}: command {'approved' if entry['approved'] else 'denied'}"
         )
         return entry["approved"]
+
+    def send_desktop_link(self, chat, text, resume=False):
+        """Message with an Open desktop button (and Continue, to resume a task)."""
+        buttons = []
+        if self.viewer_url:
+            buttons.append(link("Open desktop", self.viewer_url))
+        else:
+            text += "\n\n(No viewer link configured: use `make viewer` on your Mac.)"
+        if resume:
+            buttons.append(callback("I'm done – continue", "resume:"))
+        markup = keyboard(*buttons) if buttons else None
+        self.tg.send_message(chat.chat_id, text, reply_markup=markup)
 
     def send_screenshot(self, chat, browser, caption=None):
         self.tg.send_photo(chat.chat_id, browser.screenshot(), caption)

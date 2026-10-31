@@ -79,8 +79,20 @@ struct ChatView: View {
         .environment(\.chatStore, store)
         .environment(\.agentClient, client)
         .environment(\.takeOver, endpoint == nil ? nil : TakeOverAction { takeOver = TakeOverRequest(actionID: $0.id) })
+        // Until the first sync, the splash covers everything (bars included).
+        .overlay {
+            if loading {
+                SplashView(status: "Connecting to \(desktopName)…", detail: offlineDetail)
+                    .transition(.opacity)
+            }
+        }
+        .toolbarVisibility(loading ? .hidden : .automatic, for: .navigationBar)
+        .animation(.easeOut(duration: 0.25), value: loading)
         .task(id: connectionKey) { await store.run(client: client) }
-        .task(id: connectionKey) { await push.register() }
+        // Ask for notifications once the chat is up, not over the splash.
+        .task(id: store.connection == .live) {
+            if store.connection == .live { await push.register() }
+        }
         .task(id: "\(push.deviceToken ?? "")|\(connectionKey)") { await registerForPush() }
         .task(id: push.pendingAnswer) { await sendPendingAnswer() }
     }
@@ -106,7 +118,8 @@ struct ChatView: View {
     /// Approve/Deny tapped on a notification: send it once connected.
     private func sendPendingAnswer() async {
         guard let answer = push.pendingAnswer else { return }
-        for _ in 0..<20 where store.connection != .live {
+        // After a cold launch from the notification, Tailscale needs a few seconds.
+        for _ in 0..<45 where store.connection != .live {
             try? await Task.sleep(for: .seconds(1))
             if Task.isCancelled { return }
         }
@@ -118,6 +131,14 @@ struct ChatView: View {
             store.notice = "Couldn't send your answer: \(error.localizedDescription)"
         }
         push.pendingAnswer = nil
+    }
+
+    /// The first sync with the desktop hasn't finished yet.
+    private var loading: Bool { store.status == nil && store.timeline.items.isEmpty }
+
+    private var offlineDetail: String? {
+        if case .offline(let reason) = store.connection { return "Still trying: \(reason)" }
+        return nil
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {

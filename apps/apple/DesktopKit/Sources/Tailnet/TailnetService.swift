@@ -32,6 +32,11 @@ public final class TailnetService {
     public private(set) var status: TailnetStatus?
     /// The user's desktops, as last seen while running (kept while reconnecting).
     public private(set) var desktops: [TailnetStatus.Peer] = []
+    /// Whether the device list has arrived. Right after start the node can be
+    /// "Running" before it knows its peers, which isn't the same as having no
+    /// desktop.
+    public private(set) var peersLoaded = false
+    private var runningSince: Date?
     /// Requests through the tailnet (SOCKS5 proxy into the node). Set while running.
     public private(set) var session: URLSession?
     /// The node's loopback SOCKS5 proxy, for raw connections such as VNC. Set while running.
@@ -116,11 +121,13 @@ public final class TailnetService {
     private func stop(keepingConnections: Bool) async {
         poller?.cancel()
         poller = nil
+        runningSince = nil
         if !keepingConnections {
             session = nil
             proxy = nil
             connectedNode = nil
             desktops = []
+            peersLoaded = false
             phase = .stopped
         }
         if let node {
@@ -139,8 +146,9 @@ public final class TailnetService {
                 self.status = status
                 await apply(status, node: node)
             }
-            let running = phase == .running
-            try? await Task.sleep(for: running ? .seconds(15) : .seconds(1))
+            // Poll quickly until running with the device list, then rarely.
+            let settled = phase == .running && peersLoaded
+            try? await Task.sleep(for: settled ? .seconds(15) : .seconds(1))
         }
     }
 
@@ -169,6 +177,11 @@ public final class TailnetService {
                 }
             }
             desktops = status.desktops
+            // Any peer means the list arrived; with none, give it a few seconds.
+            if runningSince == nil { runningSince = .now }
+            if !(status.peers ?? [:]).isEmpty || Date.now.timeIntervalSince(runningSince ?? .now) > 8 {
+                peersLoaded = true
+            }
             phase = .running
         case "Stopped":
             phase = .failed("Tailscale stopped")

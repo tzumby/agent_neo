@@ -7,7 +7,7 @@ struct RootView: View {
     var body: some View {
         switch tailnet.phase {
         case .stopped, .starting:
-            ProgressView("Connecting to Tailscale…")
+            SplashView(status: "Connecting…")
         case .needsLogin(let url):
             LoginView(loginURL: url)
         case .running, .reconnecting:

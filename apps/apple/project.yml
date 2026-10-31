@@ -32,7 +32,8 @@ targets:
       path: CloudDesktop/Info.plist
       properties:
         CFBundleDisplayName: Cloud Desktop
-        UILaunchScreen: {}
+        UILaunchScreen:
+          UIColorName: LaunchBackground # black, like the splash
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]

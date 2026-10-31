@@ -52,22 +52,34 @@ final class PushCenter: NSObject {
     }
 }
 
+// The completion-handler forms on purpose: with the async forms, Swift calls
+// UIKit's completion handler from a background thread, and UIKit aborts the
+// app (it asserts the main thread) as soon as a notification action is tapped.
 extension PushCenter: UNUserNotificationCenterDelegate {
     /// The chat already shows everything while the app is open.
     nonisolated func userNotificationCenter(
-        _ center: UNUserNotificationCenter, willPresent notification: UNNotification
-    ) async -> UNNotificationPresentationOptions {
-        []
+        _ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        nonisolated(unsafe) let done = completionHandler
+        DispatchQueue.main.async { done([]) }
     }
 
     nonisolated func userNotificationCenter(
-        _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse
-    ) async {
+        _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
         let action = response.actionIdentifier
-        guard action == Self.approve || action == Self.deny,
-            let id = response.notification.request.content.userInfo["approval"] as? String
-        else { return }
-        await MainActor.run { pendingAnswer = Answer(approvalID: id, approved: action == Self.approve) }
+        let id = response.notification.request.content.userInfo["approval"] as? String
+        nonisolated(unsafe) let done = completionHandler
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                if let id, action == Self.approve || action == Self.deny {
+                    self.pendingAnswer = Answer(approvalID: id, approved: action == Self.approve)
+                }
+            }
+            done()
+        }
     }
 }
 

@@ -193,10 +193,12 @@ impl Policy {
         }
     }
 
-    /// Navigation keys run; others (Enter sends in chat apps, letters are
-    /// shortcuts) ask.
-    pub fn key_gate(&self, allow_actions: bool, key: &str) -> Gate {
-        if NAVIGATION_KEYS.contains(&key) {
+    /// Navigation keys run, and so does Enter in a search or switcher field
+    /// (a searchbox or combobox: it picks a result). Other keys ask: Enter sends
+    /// in chat apps, letters are shortcuts.
+    pub fn key_gate(&self, allow_actions: bool, key: &str, role: Option<&str>, label: &str) -> Gate {
+        let in_search = matches!(role, Some("searchbox" | "combobox")) || self.search_label.is_match(label);
+        if NAVIGATION_KEYS.contains(&key) || (key == "Enter" && in_search) {
             Gate::Allow
         } else if !allow_actions {
             Gate::Block(format!(
@@ -284,7 +286,7 @@ mod tests {
             policy.click_gate(true, Some("textbox"), "Message to Alice"),
             Gate::Allow
         );
-        assert_eq!(policy.key_gate(false, "PageDown"), Gate::Allow);
+        assert_eq!(policy.key_gate(false, "PageDown", None, ""), Gate::Allow);
         // Writing and sending ask when actions are on, and are refused when off.
         assert!(matches!(
             policy.click_gate(true, Some("button"), "Send now"),
@@ -302,8 +304,18 @@ mod tests {
             policy.type_gate(false, Some("textbox"), "Message to Alice", false),
             Gate::Block(_)
         ));
-        assert!(matches!(policy.key_gate(true, "Enter"), Gate::Ask(_)));
-        assert!(matches!(policy.key_gate(false, "e"), Gate::Block(_)));
+        assert!(matches!(
+            policy.key_gate(true, "Enter", Some("textbox"), "Message to Alice"),
+            Gate::Ask(_)
+        ));
+        assert!(matches!(policy.key_gate(true, "Enter", None, ""), Gate::Ask(_)));
+        assert!(matches!(policy.key_gate(false, "e", None, ""), Gate::Block(_)));
+        // Enter in a search or switcher field picks a result (Slack's jump box).
+        assert_eq!(
+            policy.key_gate(true, "Enter", Some("combobox"), "Channel or user name"),
+            Gate::Allow
+        );
+        assert_eq!(policy.key_gate(true, "Enter", None, "Search mail"), Gate::Allow);
         // Searching doesn't ask.
         assert_eq!(policy.type_gate(true, Some("searchbox"), "", true), Gate::Allow);
         assert_eq!(

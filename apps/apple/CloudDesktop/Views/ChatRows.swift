@@ -616,6 +616,19 @@ private struct ApprovalCard: View {
 
 /// "Write this?": the agent wants to type, press a key or click something
 /// that may send or change things in the desktop's browser.
+/// A keyboard key, drawn like a keycap.
+private struct KeyCap: View {
+    let key: String
+
+    var body: some View {
+        Text(key)
+            .font(.callout.monospaced().weight(.semibold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.secondary.opacity(0.6), lineWidth: 1))
+    }
+}
+
 private struct BrowserApprovalCard: View {
     let approval: Approval
     let action: BrowserAction
@@ -632,15 +645,31 @@ private struct BrowserApprovalCard: View {
                     Label(site, systemImage: "globe").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
-            if !action.target.isEmpty, action.action != "click" {
-                Text("In “\(action.target)”").font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+            // What the agent would do, shown as a quote or a key, not a box that
+            // looks like a text field: the card asks for a yes or a no.
+            switch action.action {
+            case "type":
+                if !action.target.isEmpty {
+                    Text("In “\(action.target)”").font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+                }
+                HStack(alignment: .top, spacing: 10) {
+                    Capsule().fill(.orange.opacity(0.6)).frame(width: 3)
+                    Text(action.text ?? "")
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .fixedSize(horizontal: false, vertical: true)
+            case "key":
+                HStack(spacing: 8) {
+                    KeyCap(key: action.key ?? "?")
+                    if !action.target.isEmpty {
+                        Text("in “\(action.target)”").foregroundStyle(.secondary).lineLimit(2)
+                    }
+                }
+                .font(.callout)
+            default:
+                Text("“\(action.target)”").font(.callout.weight(.medium)).lineLimit(3)
             }
-            Text(shown)
-                .font(action.action == "type" ? .body : .callout.monospaced())
-                .textSelection(.enabled)
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.inset, in: .rect(cornerRadius: 12))
             if action.action == "type", action.submit {
                 Label("Then presses Enter, which may send it", systemImage: "return")
                     .font(.footnote)
@@ -684,14 +713,6 @@ private struct BrowserApprovalCard: View {
         }
     }
 
-    /// The text to type, the key, or the button's name.
-    private var shown: String {
-        switch action.action {
-        case "type": action.text ?? ""
-        case "key": action.key ?? ""
-        default: action.target
-        }
-    }
 
     /// app.slack.com → slack.com
     private var site: String {

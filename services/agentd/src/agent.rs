@@ -774,9 +774,11 @@ impl Agent {
             }
             "press_key" => {
                 let key = required("key")?;
-                let gate = browser.key_gate(key);
+                let focused = browser.focused().await;
+                let gate = browser.key_gate(key, &focused);
                 let card = json!({
-                    "action": "key", "key": key, "target": browser.focused().await, "site": browser.host().await,
+                    "action": "key", "key": key, "target": focused.label, "role": focused.role,
+                    "site": browser.host().await,
                 });
                 match self.gate(task_id, gate, card, resumed)? {
                     Err(refusal) => Ok(refusal),

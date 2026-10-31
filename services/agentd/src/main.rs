@@ -54,17 +54,29 @@ async fn main() -> Result<()> {
         let listener = tokio::net::UnixListener::bind(path).with_context(|| format!("binding {path}"))?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
         tracing::info!(socket = path, model = %cfg.model, "listening");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown())
-            .await?;
+        serve_until_stopped(axum::serve(listener, app).with_graceful_shutdown(shutdown())).await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&cfg.listen)
             .await
             .with_context(|| format!("binding {}", cfg.listen))?;
         tracing::info!(address = %cfg.listen, model = %cfg.model, "listening");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown())
-            .await?;
+        serve_until_stopped(axum::serve(listener, app).with_graceful_shutdown(shutdown())).await?;
+    }
+    Ok(())
+}
+
+/// Serves until SIGTERM, then gives open requests a few seconds. The apps'
+/// event streams never end on their own: without a limit, every restart would
+/// hang until systemd kills agentd (90 s), with the apps cut off meanwhile.
+async fn serve_until_stopped(
+    server: impl std::future::IntoFuture<Output = std::io::Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        result = server.into_future() => result?,
+        () = async {
+            shutdown().await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        } => tracing::info!("stopping with event streams still open"),
     }
     Ok(())
 }

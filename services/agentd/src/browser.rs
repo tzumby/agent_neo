@@ -15,6 +15,13 @@ use crate::cdp::{Cdp, Page};
 use crate::llm::truncate;
 use crate::policy::{Gate, Policy};
 
+/// The element with keyboard focus: its role (explicit, or implied by the
+/// tag) and its label.
+pub struct Focused {
+    pub role: Option<String>,
+    pub label: String,
+}
+
 /// An element a tool call refers to, found in the accessibility tree.
 pub struct Element {
     node: i64,
@@ -239,8 +246,9 @@ impl Browser {
         )
     }
 
-    pub fn key_gate(&self, key: &str) -> Gate {
-        self.policy.key_gate(self.allow_actions, key)
+    pub fn key_gate(&self, key: &str, focused: &Focused) -> Gate {
+        self.policy
+            .key_gate(self.allow_actions, key, focused.role.as_deref(), &focused.label)
     }
 
     pub async fn click(&self, element: &Element) -> Result<String> {
@@ -293,17 +301,20 @@ impl Browser {
     }
 
     /// What has the keyboard focus (its label), for approving a key press.
-    pub async fn focused(&self) -> String {
-        const FOCUSED: &str = "(() => { const e = document.activeElement; if (!e || e === document.body) return ''; \
-            return e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.getAttribute('name') || ''; })()";
-        match self.page() {
-            Ok(page) => page
-                .eval(FOCUSED)
-                .await
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_default(),
-            Err(_) => String::new(),
+    pub async fn focused(&self) -> Focused {
+        const FOCUSED: &str = "(() => { const e = document.activeElement; if (!e || e === document.body) return null; \
+            const label = e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.getAttribute('name') || ''; \
+            let role = e.getAttribute('role'); \
+            if (!role && e.tagName === 'INPUT') role = e.type === 'search' ? 'searchbox' : e.getAttribute('list') ? 'combobox' : 'textbox'; \
+            if (!role && (e.tagName === 'TEXTAREA' || e.isContentEditable)) role = 'textbox'; \
+            return {role: role || '', label}; })()";
+        let found = match self.page() {
+            Ok(page) => page.eval(FOCUSED).await.unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        Focused {
+            role: found["role"].as_str().filter(|r| !r.is_empty()).map(String::from),
+            label: found["label"].as_str().unwrap_or_default().to_string(),
         }
     }
 

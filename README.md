@@ -66,15 +66,26 @@ browser, so close it when you're done.
 history in SQLite (`/var/lib/agentd`), and an HTTP + Server-Sent Events API for
 the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
 
-- its model key (`/etc/agentd/secrets.env`) and state are readable only by `agentd`,
-  and the desktops' AWS role is denied our SSM secrets;
+- it holds none of our keys: model calls go through the **model gateway** and
+  notifications through the **push relay**, two Lambdas behind IAM-authenticated
+  function URLs that agentd signs with the desktop's own role. The gateway holds
+  the Together key, allows known models and keeps a daily budget per desktop
+  (`model_daily_budget_usd`); the relay holds the APNs key. Each desktop has its
+  own IAM role (`desktop_identity`), denied our SSM secrets; its state is readable
+  only by `agentd`;
 - the agent's shell commands run as `worker` (no sudo), each in its own hardened
   systemd unit (no privilege escalation, no capabilities, private `/tmp`, limits on
   memory, processes, CPU and time; Stop kills the whole unit). `worker` is cut off
   from the desktop session: a firewall (`cloud-desktop-guard`) blocks it from
   Chrome DevTools, VNC and noVNC, the X display needs a cookie only `agent` can
   read, and `/home/agent` (the Chrome profile) is private. Only root and agentd
-  can reach the EC2 metadata service (AWS credentials);
+  can reach the EC2 metadata service (AWS credentials). `worker` reaches the
+  internet only through a local Squid proxy: listed hosts
+  (`agentd_shell_allowed_domains`: code hosts and package registries), never
+  internal addresses, every request in `/var/log/squid/access.log`, and no DNS
+  of its own;
+- `open_url` only opens http(s) sites, never `file://`, localhost or internal
+  addresses (the logged-in Chrome would hand over its profile or DevTools);
 - commands starting with `sudo`, risky ones, and (after the agent has read a web
   page or command output) ones that can send data out (`curl`, `scp`, `git push`,
   ...) wait for approval in the app; approvals record who answered;
@@ -175,11 +186,16 @@ make destroy               # dev env. The state bucket is protected (prevent_des
 - [docs/native-app-plan.md](docs/native-app-plan.md): `agentd` (Rust agent on each
   user's VM) and the iPhone + Mac apps (TailscaleKit, chat, native take-over view)
   (replaced the earlier Python agent and Telegram bot).
-- **Step 1 deviation from the plan:** the test desktop sits in a public subnet
-  with a public IP so it can reach the internet without a NAT gateway. Its
-  security group has no inbound rules from the internet; access is SSM only. To
-  switch to the planned layout, set `enable_nat_gateway = true` and
-  `test_desktop_public_ip = false` (NAT costs about $1.10/day in ca-central-1).
+- [docs/agents-and-bots.md](docs/agents-and-bots.md): design for a main agent with
+  its own memory, and user-created bots it manages (draft, not built yet).
+- [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'
+  prompts and data unreadable to us (attested gateway and desktops; draft).
+- **No public IPs on desktops:** they sit in private subnets and reach the
+  internet through a fck-nat instance (`enable_nat_instance`, a t4g.nano; switch
+  to `enable_nat_gateway` when the product needs high availability). No inbound
+  rules, no SSH; administration is SSM Session Manager only.
+- **Each user's disks use their own KMS key** (`users`; deleting the key makes
+  them unreadable).
 - Ansible `become` uses classic sudo (`sudo.ws`). Ubuntu 26.04's default
   `sudo-rs` swallows the SSM connection plugin's end-of-command marker, so
   every privileged task hangs until timeout. See `ansible/inventory/group_vars/all.yml`.
@@ -195,5 +211,5 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   127.0.0.1 only: it's reachable through SSM port forwarding and tailnet-proxy
   (your tailnet), nothing else. The control-plane milestone brings its own
   per-session auth.
-- Cost while step 1 is up: one t4g.medium (~$0.04/h in ca-central-1), a 20 GB
-  gp3 volume and a public IPv4 address (~$0.005/h).
+- Cost while step 1 is up: one t4g.medium (~$0.04/h in ca-central-1) with a 20 GB
+  gp3 volume, plus the shared fck-nat t4g.nano and its Elastic IP.

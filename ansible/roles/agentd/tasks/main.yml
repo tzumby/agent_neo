@@ -104,6 +104,11 @@
     mode: "0755"
   notify: Restart agentd
 
+# The model gateway's URL (not a secret), read on the controller.
+- name: Look up the model gateway
+  ansible.builtin.set_fact:
+    agentd_model_gateway_url: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/model-gateway/url', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
+
 - name: Write the settings
   ansible.builtin.template:
     src: agentd.env.j2
@@ -113,7 +118,15 @@
     mode: "0640"
   notify: Restart agentd
 
-# Read on the controller with your AWS credentials.
+# With the gateway, the desktop holds no provider key: remove the old one.
+- name: Remove the model key from the desktop (the gateway holds it)
+  ansible.builtin.file:
+    path: /etc/agentd/secrets.env
+    state: absent
+  when: agentd_model_gateway_url | length > 0
+  notify: Restart agentd
+
+# Without a gateway (bootstrap only), read on the controller with your AWS credentials.
 - name: Write the secrets (from SSM)
   ansible.builtin.copy:
     dest: /etc/agentd/secrets.env
@@ -123,7 +136,11 @@
     group: agentd
     mode: "0640"
   no_log: true
+  when: agentd_model_gateway_url | length == 0
   notify: Restart agentd
+
+- name: Set up the shell user's egress proxy
+  ansible.builtin.import_tasks: egress.yml
 
 - name: Write the approval rules override
   ansible.builtin.template:

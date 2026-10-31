@@ -35,3 +35,15 @@ variable "enable_ssm_endpoints" {
   type        = bool
   default     = false
 }
+
+variable "enable_nat_instance" {
+  description = "Give private subnets internet access through a fck-nat instance (cheaper than NAT gateways, not highly available)."
+  type        = bool
+  default     = false
+}
+
+variable "nat_instance_type" {
+  description = "Instance type for the fck-nat instance (arm64)."
+  type        = string
+  default     = "t4g.nano"
+}

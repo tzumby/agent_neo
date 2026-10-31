@@ -75,7 +75,7 @@ impl Agent {
         }
         Ok(Self {
             push,
-            llm: Together::new(cfg.together_api_key.clone())?,
+            llm: Together::new(&cfg)?,
             cdp: Cdp::new(&cfg.cdp_url)?,
             shell: Shell {
                 run_as: cfg.run_as.clone(),
@@ -83,6 +83,7 @@ impl Agent {
                 memory_max: cfg.shell_memory_max.clone(),
                 tasks_max: cfg.shell_tasks_max.clone(),
                 cpu_quota: cfg.shell_cpu_quota.clone(),
+                proxy: cfg.shell_proxy.clone(),
             },
             policy,
             store: Arc::new(store),
@@ -442,8 +443,12 @@ impl Agent {
                     .await
             }
             "open_url" => {
+                let url = required("url")?;
+                if let Err(reason) = guard::check_url(url) {
+                    return Ok(format!("blocked: {reason}"));
+                }
                 browser
-                    .open_url(required("url")?, args["new_tab"].as_bool().unwrap_or(false))
+                    .open_url(url, args["new_tab"].as_bool().unwrap_or(false))
                     .await
             }
             "read_text" => browser.read_text(max_chars).await,

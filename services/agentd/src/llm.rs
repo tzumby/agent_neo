@@ -1,9 +1,14 @@
-//! Together AI chat completions (OpenAI-compatible API).
+//! Together AI chat completions (OpenAI-compatible API): through the model
+//! gateway (production: the desktop holds no API key) or directly with a key
+//! (local development).
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use secrecy::{ExposeSecret, SecretString};
+
+use crate::aws::FunctionUrl;
+use crate::config::Config;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -44,20 +49,53 @@ pub fn for_history(message: &Value, model: &str) -> Value {
     message
 }
 
-#[derive(Clone)]
 pub struct Together {
-    http: reqwest::Client,
-    api_key: SecretString,
+    backend: Backend,
+}
+
+enum Backend {
+    /// The model gateway Lambda holds the key; calls are signed as this desktop.
+    Gateway(FunctionUrl),
+    Direct {
+        http: reqwest::Client,
+        api_key: SecretString,
+    },
 }
 
 impl Together {
-    pub fn new(api_key: SecretString) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            // Cloudflare in front of the API rejects some default User-Agents (error 1010).
-            .user_agent("cloud-desktops-agentd/0.1")
-            .timeout(Duration::from_secs(180))
-            .build()?;
-        Ok(Self { http, api_key })
+    pub fn new(cfg: &Config) -> Result<Self> {
+        let backend = if !cfg.model_gateway_url.is_empty() {
+            Backend::Gateway(FunctionUrl::new(
+                &cfg.model_gateway_url,
+                Duration::from_secs(200),
+            )?)
+        } else if let Some(api_key) = cfg.together_api_key.clone() {
+            let http = reqwest::Client::builder()
+                // Cloudflare in front of the API rejects some default User-Agents (error 1010).
+                .user_agent("cloud-desktops-agentd/0.1")
+                .timeout(Duration::from_secs(180))
+                .build()?;
+            Backend::Direct { http, api_key }
+        } else {
+            bail!("set MODEL_GATEWAY_URL (or TOGETHER_API_KEY for local development)");
+        };
+        Ok(Self { backend })
+    }
+
+    async fn send(&self, body: &Value) -> Result<reqwest::Response> {
+        match &self.backend {
+            Backend::Gateway(gateway) => {
+                gateway
+                    .post("/v1/chat/completions", &serde_json::to_vec(body)?)
+                    .await
+            }
+            Backend::Direct { http, api_key } => Ok(http
+                .post(API_URL)
+                .bearer_auth(api_key.expose_secret())
+                .json(body)
+                .send()
+                .await?),
+        }
     }
 
     /// POST a chat completion, retrying rate limits and outages.
@@ -65,13 +103,7 @@ impl Together {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let result = self
-                .http
-                .post(API_URL)
-                .bearer_auth(self.api_key.expose_secret())
-                .json(body)
-                .send()
-                .await;
+            let result = self.send(body).await;
             let delay = match result {
                 Ok(response) if response.status().is_success() => return Ok(response.json().await?),
                 Ok(response) => {

@@ -115,6 +115,124 @@ resource "aws_route" "private_nat" {
   nat_gateway_id         = aws_nat_gateway.this[var.nat_per_az ? count.index : 0].id
 }
 
+# --- NAT instance (fck-nat) ---------------------------------------------------
+# A cheaper alternative to managed NAT gateways: one t4g.nano running the
+# fck-nat AMI (https://fck-nat.dev), in the first public subnet with its own
+# Elastic IP. Not highly available; fine until the product needs more.
+
+data "aws_ami" "fck_nat" {
+  count = var.enable_nat_instance ? 1 : 0
+
+  most_recent = true
+  owners      = ["568608671756"] # fck-nat
+
+  filter {
+    name   = "name"
+    values = ["fck-nat-al2023-*"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["arm64"]
+  }
+}
+
+resource "aws_security_group" "nat" {
+  count = var.enable_nat_instance ? 1 : 0
+
+  name        = "${var.name}-nat"
+  description = "NAT instance: forwards traffic from the VPC to the internet"
+  vpc_id      = aws_vpc.this.id
+
+  tags = {
+    Name = "${var.name}-nat"
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "nat_from_vpc" {
+  count = var.enable_nat_instance ? 1 : 0
+
+  security_group_id = aws_security_group.nat[0].id
+  description       = "Anything from inside the VPC, to forward"
+  ip_protocol       = "-1"
+  cidr_ipv4         = var.vpc_cidr
+}
+
+resource "aws_vpc_security_group_egress_rule" "nat_out" {
+  count = var.enable_nat_instance ? 1 : 0
+
+  security_group_id = aws_security_group.nat[0].id
+  description       = "To the internet"
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_network_interface" "nat" {
+  count = var.enable_nat_instance ? 1 : 0
+
+  subnet_id         = aws_subnet.public[0].id
+  security_groups   = [aws_security_group.nat[0].id]
+  source_dest_check = false
+
+  tags = {
+    Name = "${var.name}-nat"
+  }
+}
+
+resource "aws_eip" "nat_instance" {
+  count = var.enable_nat_instance ? 1 : 0
+
+  domain            = "vpc"
+  network_interface = aws_network_interface.nat[0].id
+
+  tags = {
+    Name = "${var.name}-nat"
+  }
+
+  depends_on = [aws_internet_gateway.this]
+}
+
+resource "aws_instance" "nat" {
+  count = var.enable_nat_instance ? 1 : 0
+
+  ami           = data.aws_ami.fck_nat[0].id
+  instance_type = var.nat_instance_type
+
+  network_interface {
+    network_interface_id = aws_network_interface.nat[0].id
+    device_index         = 0
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  root_block_device {
+    volume_type = "gp3"
+    encrypted   = true
+  }
+
+  tags = {
+    Name = "${var.name}-nat"
+    Role = "nat"
+  }
+
+  lifecycle {
+    # A new fck-nat release shouldn't replace the NAT under running desktops.
+    ignore_changes = [ami]
+  }
+}
+
+resource "aws_route" "private_nat_instance" {
+  count = var.enable_nat_instance ? length(var.azs) : 0
+
+  route_table_id         = aws_route_table.private[count.index].id
+  destination_cidr_block = "0.0.0.0/0"
+  network_interface_id   = aws_network_interface.nat[0].id
+}
+
 resource "aws_route_table_association" "private" {
   count = length(var.azs)
 

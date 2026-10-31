@@ -3,7 +3,7 @@ import { generateKeyPairSync, verify } from "node:crypto";
 import { test } from "node:test";
 import { buildPayload, callerDesktop, outcome, signJwt, validDeviceToken } from "../src/lib.mjs";
 
-const config = { accountId: "461553546091", roleName: "cloud-desktops-dev-desktop" };
+const config = { accountId: "461553546091", rolePrefix: "cloud-desktops-dev-desktop" };
 const event = (userArn, accountId = "461553546091") => ({
   requestContext: { authorizer: { iam: { accountId, userArn } } },
 });
@@ -11,6 +11,10 @@ const event = (userArn, accountId = "461553546091") => ({
 test("only the desktop role's instance sessions in this account are desktops", () => {
   const desktop = "arn:aws:sts::461553546091:assumed-role/cloud-desktops-dev-desktop/i-0f2c0538dc0b1c670";
   assert.equal(callerDesktop(event(desktop), config), "i-0f2c0538dc0b1c670");
+  // A desktop's own role.
+  const own = "arn:aws:sts::461553546091:assumed-role/cloud-desktops-dev-desktop-tzumby/i-0a1b2c3d4e5f60718";
+  assert.equal(callerDesktop(event(own), config), "i-0a1b2c3d4e5f60718");
+  assert.equal(callerDesktop(event(own.replace("desktop-tzumby", "desktopx")), config), null);
   // Another role, a user, a non-instance session, another account, no IAM context.
   assert.equal(callerDesktop(event("arn:aws:sts::461553546091:assumed-role/admin/i-0f2c0538dc0b1c670"), config), null);
   assert.equal(callerDesktop(event("arn:aws:iam::461553546091:user/tzumby"), config), null);

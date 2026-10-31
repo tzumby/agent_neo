@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentd"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "aws-credential-types",
@@ -24,6 +24,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

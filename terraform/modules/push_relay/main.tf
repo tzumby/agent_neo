@@ -102,14 +102,14 @@ resource "aws_lambda_function" "relay" {
 
   environment {
     variables = {
-      ACCOUNT_ID        = data.aws_caller_identity.current.account_id
-      DESKTOP_ROLE_NAME = var.desktop_role_name
-      TABLE             = aws_dynamodb_table.devices.name
-      KEY_PARAM         = "${var.ssm_prefix}/apns/key_p8"
-      KEY_ID_PARAM      = "${var.ssm_prefix}/apns/key_id"
-      TEAM_ID           = var.apns_team_id
-      TOPIC             = var.apns_topic
-      APNS_HOST         = var.apns_environment == "production" ? "api.push.apple.com" : "api.sandbox.push.apple.com"
+      ACCOUNT_ID          = data.aws_caller_identity.current.account_id
+      DESKTOP_ROLE_PREFIX = var.desktop_role_prefix
+      TABLE               = aws_dynamodb_table.devices.name
+      KEY_PARAM           = "${var.ssm_prefix}/apns/key_p8"
+      KEY_ID_PARAM        = "${var.ssm_prefix}/apns/key_id"
+      TEAM_ID             = var.apns_team_id
+      TOPIC               = var.apns_topic
+      APNS_HOST           = var.apns_environment == "production" ? "api.push.apple.com" : "api.sandbox.push.apple.com"
     }
   }
 
@@ -149,9 +149,16 @@ data "aws_iam_policy_document" "desktop_invoke" {
 }
 
 resource "aws_iam_role_policy" "desktop_invoke" {
+  for_each = toset(var.desktop_role_names)
+
   name   = "push-relay-invoke"
-  role   = var.desktop_role_name
+  role   = each.value
   policy = data.aws_iam_policy_document.desktop_invoke.json
+}
+
+moved {
+  from = aws_iam_role_policy.desktop_invoke
+  to   = aws_iam_role_policy.desktop_invoke["cloud-desktops-dev-desktop"]
 }
 
 # Not a secret: where agentd sends notifications (read by Ansible).

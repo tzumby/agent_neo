@@ -75,12 +75,6 @@ variable "create_test_desktop" {
   default     = false
 }
 
-variable "test_desktop_public_ip" {
-  description = "Temporary: put the test desktop in a public subnet with a public IP (no inbound rules) instead of behind a NAT gateway."
-  type        = bool
-  default     = false
-}
-
 variable "apns_team_id" {
   description = "Apple Developer team ID for push notifications."
   type        = string
@@ -97,4 +91,28 @@ variable "apns_environment" {
   description = "sandbox while the app is installed from Xcode; production for TestFlight or the App Store."
   type        = string
   default     = "sandbox"
+}
+
+variable "enable_nat_instance" {
+  description = "Internet access for private subnets through a fck-nat instance (instead of NAT gateways)."
+  type        = bool
+  default     = false
+}
+
+variable "users" {
+  description = "Users with a desktop; each gets their own encryption key."
+  type        = list(string)
+  default     = ["tzumby"]
+}
+
+variable "test_desktop_user" {
+  description = "Whose desktop the test desktop is (picks its role and encryption key)."
+  type        = string
+  default     = "tzumby"
+}
+
+variable "model_daily_budget_usd" {
+  description = "Model spend allowed per desktop per day (UTC), enforced by the model gateway."
+  type        = number
+  default     = 20
 }

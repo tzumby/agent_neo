@@ -28,6 +28,10 @@ pub struct Shell {
     pub memory_max: String,
     pub tasks_max: String,
     pub cpu_quota: String,
+    /// The guarded egress proxy for the shell user (empty: none). The firewall
+    /// lets the shell user out only through it; it allows listed hosts, refuses
+    /// internal addresses and logs every request.
+    pub proxy: String,
 }
 
 /// What a command printed (stdout, then stderr) and how it ended.
@@ -132,6 +136,13 @@ impl Shell {
             for property in HARDENING {
                 argv.push(format!("--property={property}"));
             }
+            if !self.proxy.is_empty() {
+                for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                    argv.push(format!("--setenv={name}={}", self.proxy));
+                }
+                argv.push("--setenv=NO_PROXY=localhost,127.0.0.1,::1".into());
+                argv.push("--setenv=no_proxy=localhost,127.0.0.1,::1".into());
+            }
             argv.push(format!("--property=MemoryMax={}", self.memory_max));
             argv.push(format!("--property=TasksMax={}", self.tasks_max));
             argv.push(format!("--property=CPUQuota={}", self.cpu_quota));
@@ -218,6 +229,7 @@ mod tests {
             memory_max: "2G".into(),
             tasks_max: "512".into(),
             cpu_quota: "200%".into(),
+            proxy: "http://127.0.0.1:3128".into(),
         }
     }
 
@@ -237,6 +249,10 @@ mod tests {
         assert!(has("--working-directory=/home/worker/work"));
         assert!(has("--property=NoNewPrivileges=yes") && has("--property=PrivateTmp=yes"));
         assert!(has("--property=MemoryMax=2G") && has("--property=RuntimeMaxSec=60"));
+        assert!(
+            has("--setenv=HTTPS_PROXY=http://127.0.0.1:3128")
+                && has("--setenv=NO_PROXY=localhost,127.0.0.1,::1")
+        );
         assert_eq!(&argv[argv.len() - 4..], ["--", "bash", "-lc", "ls -la"]);
     }
 
@@ -246,7 +262,7 @@ mod tests {
         assert!(
             !argv
                 .iter()
-                .any(|a| a.starts_with("--uid") || a.contains("NoNewPrivileges"))
+                .any(|a| a.starts_with("--uid") || a.contains("NoNewPrivileges") || a.contains("PROXY"))
         );
         assert!(argv.iter().any(|a| a == "--setenv=HOME=/root"));
         assert_eq!(argv.last().unwrap(), "apt install -y jq");

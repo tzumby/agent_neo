@@ -3,9 +3,14 @@ variable "name" {
   type        = string
 }
 
-variable "desktop_role_name" {
-  description = "IAM role of the desktop instances. Only its instance sessions may call the relay."
+variable "desktop_role_prefix" {
+  description = "Desktop roles are this name or <name>-<user>; only their instance sessions may call the relay."
   type        = string
+}
+
+variable "desktop_role_names" {
+  description = "Desktop roles to grant permission to call the relay's URL."
+  type        = list(string)
 }
 
 variable "ssm_prefix" {

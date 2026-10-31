@@ -14,7 +14,8 @@ pub fn system_prompt(shell: bool, now: &str) -> String {
     let shell_rule = if shell {
         "- Shell: run_shell runs bash as its own user in ~/work. Commands that start with sudo run \
          as root. Those, and other risky commands, wait for the user's approval; if one is denied, don't \
-         look for a workaround.\n"
+         look for a workaround. The shell reaches the internet only through a proxy that allows package \
+         registries and code hosts; if a host is blocked, tell the user rather than working around it.\n"
     } else {
         ""
     };

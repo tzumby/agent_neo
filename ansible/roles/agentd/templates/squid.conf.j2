@@ -1,0 +1,25 @@
+# {{ ansible_managed }}
+# Egress proxy for the agent's shell user (the firewall lets that user out
+# only through here): listed hosts only, never internal addresses, every
+# request logged to /var/log/squid/access.log.
+http_port 127.0.0.1:{{ agentd_egress_proxy_port }}
+
+acl allowed dstdomain {{ agentd_shell_allowed_domains | join(' ') }}
+# Internal: this machine, the VPC, link-local (the metadata service), CGNAT
+# (Tailscale), private ranges. Checked on the resolved address, so a listed
+# name that resolves inside is refused too.
+acl internal dst 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 ::1 fc00::/7 fe80::/10
+acl https port 443
+acl CONNECT method CONNECT
+
+http_access deny internal
+http_access deny CONNECT !https
+http_access allow allowed
+http_access deny all
+
+# A pass-through, not a cache; don't tell sites about the desktop.
+cache deny all
+forwarded_for delete
+via off
+access_log daemon:/var/log/squid/access.log squid
+logfile_rotate 7

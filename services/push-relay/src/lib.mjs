@@ -10,17 +10,20 @@ const DATA_KEYS = new Set(["task", "approval", "action"]);
 
 /**
  * The desktop calling, from the function URL's IAM context: its EC2 instance
- * ID, when the caller is the desktop role's instance-profile session in this
+ * ID, when the caller is a desktop role's instance-profile session in this
  * account. Anything else gets null.
  *
  * Only safe because desktops may invoke the function through its URL alone
  * (lambda:InvokedViaFunctionUrl): a direct Invoke could forge this context.
  */
-export function callerDesktop(event, { accountId, roleName }) {
+export function callerDesktop(event, { accountId, rolePrefix }) {
   const iam = event?.requestContext?.authorizer?.iam;
   if (!iam || iam.accountId !== accountId) return null;
   const match = /^arn:aws:sts::(\d{12}):assumed-role\/([\w+=,.@-]+)\/(i-[0-9a-f]{8,17})$/.exec(iam.userArn ?? "");
-  if (!match || match[1] !== accountId || match[2] !== roleName) return null;
+  if (!match || match[1] !== accountId) return null;
+  // The fleet role, or a desktop's own role (<prefix>-<user>).
+  const role = match[2];
+  if (role !== rolePrefix && !role.startsWith(`${rolePrefix}-`)) return null;
   return match[3];
 }
 

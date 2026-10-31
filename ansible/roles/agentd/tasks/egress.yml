@@ -1,0 +1,25 @@
+# The shell user's way out: Squid on localhost. The firewall
+# (guard.nft) lets that user reach the internet only through it, without DNS
+# of its own; the proxy allows listed hosts, refuses internal addresses (also
+# when a listed name resolves to one) and logs every request.
+
+- name: Install Squid
+  ansible.builtin.apt:
+    name: squid
+    state: present
+
+- name: Configure Squid as the shell user's egress proxy
+  ansible.builtin.template:
+    src: squid.conf.j2
+    dest: /etc/squid/squid.conf
+    owner: root
+    group: root
+    mode: "0644"
+    validate: squid -k parse -f %s
+  notify: Restart Squid
+
+- name: Run Squid
+  ansible.builtin.systemd_service:
+    name: squid
+    enabled: true
+    state: started

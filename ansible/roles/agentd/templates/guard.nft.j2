@@ -19,5 +19,14 @@ table inet cloud_desktop_guard {
     # the approvals.
     meta skuid {{ agentd_shell_uid }} ip daddr 127.0.0.0/8 tcp dport { {{ agentd_guarded_ports | join(', ') }} } counter reject
     meta skuid {{ agentd_shell_uid }} ip6 daddr ::1 tcp dport { {{ agentd_guarded_ports | join(', ') }} } counter reject
+
+    # No DNS of its own (the proxy resolves names), so no data out through
+    # DNS lookups.
+    meta skuid {{ agentd_shell_uid }} meta l4proto { tcp, udp } th dport 53 counter reject
+
+    # Local services (a dev server it started, the egress proxy) are fine;
+    # everything else goes through the proxy.
+    meta skuid {{ agentd_shell_uid }} oifname "lo" accept
+    meta skuid {{ agentd_shell_uid }} counter reject
   }
 }

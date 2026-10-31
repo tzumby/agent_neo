@@ -3,6 +3,7 @@
 
 mod agent;
 mod api;
+mod aws;
 mod browser;
 mod cdp;
 mod clock;
@@ -16,7 +17,7 @@ mod store;
 mod tools;
 
 use std::io::IsTerminal;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -25,6 +26,15 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().nth(1).is_some_and(|arg| arg == "--version") {
+        println!("agentd {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    // agentd runs as its own user; as root it would leave root-owned state.
+    // /proc/self belongs to the process's effective user.
+    if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
+        anyhow::bail!("agentd must not run as root (it runs as the agentd user, under systemd)");
+    }
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("agentd=info")))
         .with_ansi(std::io::stdout().is_terminal()) // plain text in the journal
@@ -36,7 +46,10 @@ async fn main() -> Result<()> {
 
     if let Some(path) = cfg.listen.strip_prefix("unix:") {
         // Only agentd and tailnet-proxy (via the socket's group) can connect;
-        // the desktop user, which runs the agent's commands, can't.
+        // the shell user, which runs the agent's commands, can't.
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            anyhow::bail!("another agentd is already listening on {path}");
+        }
         let _ = std::fs::remove_file(path);
         let listener = tokio::net::UnixListener::bind(path).with_context(|| format!("binding {path}"))?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;

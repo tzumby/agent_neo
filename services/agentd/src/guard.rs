@@ -129,6 +129,46 @@ pub fn is_bare_date(command: &str) -> bool {
         })
 }
 
+/// Where open_url may go: http(s) sites, not this machine or internal
+/// addresses. In the logged-in Chrome, `file://` would read the profile and
+/// localhost the DevTools endpoint; link-local is the metadata service.
+pub fn check_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| format!("not a valid URL: {url}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "only http and https pages can be opened, not {}:",
+            parsed.scheme()
+        ));
+    }
+    let internal = match parsed.host() {
+        None => true,
+        Some(url::Host::Domain(name)) => {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost") || name.ends_with(".internal")
+        }
+        Some(url::Host::Ipv4(ip)) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                // 100.64.0.0/10: carrier-grade NAT, which Tailscale uses.
+                || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64)
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00 // unique local
+                || (ip.segments()[0] & 0xffc0) == 0xfe80 // link-local
+                || ip.to_ipv4_mapped().is_some()
+        }
+    };
+    if internal {
+        return Err("that address is on this machine or an internal network".into());
+    }
+    Ok(())
+}
+
 /// What the loop should do after a tool call.
 #[derive(Debug, PartialEq)]
 pub enum Repeat {
@@ -219,6 +259,35 @@ mod tests {
         assert_eq!(messages[4]["content"].as_str().unwrap().len(), 50_000);
         // Under budget: untouched.
         assert_eq!(enforce_budget(&mut [tool(10), tool(10)], 120_000), 0);
+    }
+
+    #[test]
+    fn open_url_stays_on_the_web() {
+        for ok in [
+            "https://mail.google.com/mail/u/0/",
+            "http://example.com",
+            "https://8.8.8.8/",
+        ] {
+            assert!(check_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "file:///home/agent/chrome-profile/Default/Cookies",
+            "chrome://settings",
+            "javascript:alert(1)",
+            "http://127.0.0.1:9222/json",
+            "http://localhost:6080/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.40.0.12/",
+            "http://192.168.1.1/",
+            "http://100.101.102.103/",
+            "http://[::1]:9222/",
+            "http://[fd7a:115c:a1e0::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0.0.0.0:9222/",
+            "http://metadata.google.internal/",
+        ] {
+            assert!(check_url(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

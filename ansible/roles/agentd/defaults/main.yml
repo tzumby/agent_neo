@@ -14,6 +14,27 @@ agentd_shell_cpu_quota: 200%
 # Local ports of the desktop's controls the shell user may not reach:
 # Chrome DevTools, VNC, noVNC.
 agentd_guarded_ports: [9222, 5900, 6080]
+# The shell user reaches the internet only through this proxy (Squid on
+# localhost): listed hosts, never internal addresses, every request logged.
+# A leading dot also allows subdomains.
+agentd_egress_proxy_port: 3128
+agentd_shell_allowed_domains:
+  - .github.com
+  - .githubusercontent.com
+  - .npmjs.org
+  - .yarnpkg.com
+  - pypi.org
+  - files.pythonhosted.org
+  - crates.io
+  - static.crates.io
+  - index.crates.io
+  - .rust-lang.org
+  - proxy.golang.org
+  - sum.golang.org
+  - rubygems.org
+  - nodejs.org
+  - .anthropic.com
+  - claude.ai
 agentd_model: zai-org/GLM-5.3
 agentd_max_steps: 40
 agentd_shell_tool: "on"

@@ -10,8 +10,11 @@ use secrecy::SecretString;
 pub struct Config {
     /// `unix:/run/agentd/agentd.sock` (production) or `127.0.0.1:8765` (local dev).
     pub listen: String,
-    /// Never printed: Debug shows [REDACTED].
-    pub together_api_key: SecretString,
+    /// Only for local development: on desktops, model calls go through the
+    /// model gateway and no key is here. Never printed (Debug shows [REDACTED]).
+    pub together_api_key: Option<SecretString>,
+    /// The model gateway's function URL.
+    pub model_gateway_url: String,
     pub model: String,
     pub cdp_url: String,
     pub state_dir: PathBuf,
@@ -24,6 +27,8 @@ pub struct Config {
     pub shell_memory_max: String,
     pub shell_tasks_max: String,
     pub shell_cpu_quota: String,
+    /// The shell user's egress proxy, e.g. http://127.0.0.1:3128 (empty: none).
+    pub shell_proxy: String,
     pub policy_path: PathBuf,
     pub max_steps: u32,
     pub shell_tool: bool,
@@ -68,12 +73,14 @@ impl Config {
                 .unwrap_or_else(|| default.to_string())
         };
         let together_api_key = get("TOGETHER_API_KEY", "");
-        if together_api_key.is_empty() {
-            bail!("TOGETHER_API_KEY is not set (AGENTD_SECRETS file or environment)");
+        let model_gateway_url = get("MODEL_GATEWAY_URL", "");
+        if together_api_key.is_empty() && model_gateway_url.is_empty() {
+            bail!("set MODEL_GATEWAY_URL, or TOGETHER_API_KEY for local development");
         }
         Ok(Self {
             listen: get("LISTEN", "unix:/run/agentd/agentd.sock"),
-            together_api_key: together_api_key.into(),
+            together_api_key: (!together_api_key.is_empty()).then(|| together_api_key.into()),
+            model_gateway_url,
             model: get("MODEL", "zai-org/GLM-5.3"),
             cdp_url: get("CDP_URL", "http://127.0.0.1:9222"),
             state_dir: get("STATE_DIR", "/var/lib/agentd").into(),
@@ -82,6 +89,7 @@ impl Config {
             shell_memory_max: get("SHELL_MEMORY_MAX", "2G"),
             shell_tasks_max: get("SHELL_TASKS_MAX", "512"),
             shell_cpu_quota: get("SHELL_CPU_QUOTA", "200%"),
+            shell_proxy: get("SHELL_PROXY", ""),
             policy_path: get("POLICY", "/etc/agentd/policy.toml").into(),
             max_steps: get("MAX_STEPS", "40").parse().context("MAX_STEPS")?,
             shell_tool: get("SHELL_TOOL", "on") == "on",

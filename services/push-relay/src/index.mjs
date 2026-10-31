@@ -134,7 +134,7 @@ async function notify(desktop, body) {
 }
 
 export async function handler(event) {
-  const desktop = callerDesktop(event, { accountId: env.ACCOUNT_ID, roleName: env.DESKTOP_ROLE_NAME });
+  const desktop = callerDesktop(event, { accountId: env.ACCOUNT_ID, rolePrefix: env.DESKTOP_ROLE_PREFIX });
   if (!desktop) {
     console.log(JSON.stringify({ action: "rejected", caller: event?.requestContext?.authorizer?.iam?.userArn ?? null }));
     return reply(403, { error: "only desktops can use the push relay" });

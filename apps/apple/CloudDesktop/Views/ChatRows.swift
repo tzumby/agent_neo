@@ -498,6 +498,7 @@ enum StepText {
         case "list_tabs": "Checking the open tabs"
         case "switch_tab": "Switching tabs"
         case "show_screenshot": "Taking a screenshot"
+        case "wait_for": argument("text", in: step.detail).map { "Waiting for “\($0)”" } ?? "Waiting for the page"
         case "needs_user": "Asking you to step in"
         case "run_shell": "Running \(step.detail)"
         default: step.tool
@@ -514,18 +515,26 @@ enum StepText {
         case "type_text", "press_key": "keyboard"
         case "list_tabs", "switch_tab": "square.on.square"
         case "show_screenshot": "camera"
+        case "wait_for": "hourglass"
         case "needs_user": "hand.raised"
         default: "gearshape"
         }
     }
 
     private static func host(of arguments: String) -> String? {
+        guard let url = argument("url", in: arguments).flatMap(URL.init(string:)), let host = url.host() else {
+            return nil
+        }
+        return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+    }
+
+    /// A string argument from a step's JSON arguments.
+    private static func argument(_ key: String, in arguments: String) -> String? {
         guard let data = arguments.data(using: .utf8),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let url = (object["url"] as? String).flatMap(URL.init(string:)),
-            let host = url.host()
+            let value = object[key] as? String, !value.isEmpty
         else { return nil }
-        return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        return value
     }
 }
 

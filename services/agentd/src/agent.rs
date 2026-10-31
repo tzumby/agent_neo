@@ -317,12 +317,23 @@ impl Agent {
                 for call in calls {
                     let name = call["function"]["name"].as_str().unwrap_or_default().to_string();
                     let raw = call["function"]["arguments"].as_str().unwrap_or("{}").to_string();
+                    let args: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                    // A shell sleep to wait for a page: not run, not shown to the user.
+                    if name == "run_shell" && args["command"].as_str().is_some_and(guard::is_bare_sleep) {
+                        tracing::info!(task = %task_id, step, "refused a shell sleep");
+                        let refusal = guard::SLEEP_REFUSAL;
+                        if let guard::Repeat::Stop(answer) = loops.record(&name, &raw, refusal) {
+                            break 'task (answer, "stuck", step);
+                        }
+                        messages
+                            .push(json!({"role": "tool", "tool_call_id": call["id"], "content": refusal}));
+                        continue;
+                    }
                     tracing::info!(task = %task_id, step, tool = %name, "tool call");
                     self.emit(
                         "step",
                         json!({"task": task_id, "step": step, "tool": name, "args": truncate(&raw, 300)}),
                     );
-                    let args: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
                     if name == "needs_user" {
                         let reason = args["reason"]
                             .as_str()
@@ -454,6 +465,10 @@ impl Agent {
                     Err(refusal) => Ok(refusal),
                     Ok(_) => browser.press_key(key).await,
                 }
+            }
+            "wait_for" => {
+                let timeout = number("timeout").map_or(10, |n| n.max(1) as u64);
+                browser.wait_for(text("text"), timeout).await
             }
             "show_screenshot" => {
                 let id = self.save_image(&browser.screenshot_jpeg().await?)?;

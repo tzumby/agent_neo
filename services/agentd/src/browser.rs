@@ -2,13 +2,14 @@
 //! Elements are found through the accessibility tree; `ref`s in snapshots
 //! are Chrome's backend DOM node IDs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
 use crate::cdp::{Cdp, Page};
 use crate::llm::truncate;
@@ -85,17 +86,77 @@ impl Browser {
             .unwrap_or(false)
     }
 
-    async fn settle(&self) -> Result<()> {
-        // Wait for the document, then give client-side apps a moment to render.
-        for _ in 0..60 {
-            let state = self.page()?.eval("document.readyState").await.unwrap_or_default();
-            if state == "complete" || state == "interactive" {
-                break;
+    /// Starts listening to the tab's network events. Call before the action
+    /// whose effects `settle` should wait for, so no request is missed.
+    fn watch(&self) -> Result<NetworkWatch> {
+        Ok(NetworkWatch::new(self.page()?.events()))
+    }
+
+    /// Waits until the page has settled, up to `max_ms`: the DOM has stopped
+    /// changing (a MutationObserver in the page, no loading indicator) and the
+    /// network is quiet (the tab's DevTools request events). Single-page apps
+    /// such as Slack sit still while their code and data download, so the DOM
+    /// alone isn't enough. All on events; nothing polls. Returns how it ended.
+    async fn settle(&self, mut network: NetworkWatch, max_ms: u64) -> Result<String> {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(max_ms);
+        let took = |how: &str| format!("{how} after {} ms", started.elapsed().as_millis());
+        loop {
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .max(1);
+            let dom = self
+                .eval_across_navigation(&DOM_QUIET.replace("MAX_MS", &left.to_string()))
+                .await?;
+            let dom_quiet = Instant::now();
+            if dom != "quiet" {
+                return Ok(took("still changing, stopped waiting"));
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            if !network.idle(deadline).await {
+                return Ok(took("still loading, stopped waiting"));
+            }
+            // Requests that finished since the DOM went quiet may still render.
+            if !network.active_since(dom_quiet) {
+                return Ok(took("settled"));
+            }
         }
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        Ok(())
+    }
+
+    /// Evaluates a promise in the page. A click can start a navigation that
+    /// destroys the page's JavaScript context mid-wait; then evaluate again in
+    /// the new document.
+    async fn eval_across_navigation(&self, script: &str) -> Result<String> {
+        let mut last = None;
+        for _ in 0..3 {
+            match self.page()?.eval(script).await {
+                Ok(value) => return Ok(value.as_str().unwrap_or_default().to_string()),
+                Err(err) => {
+                    let text = err.to_string();
+                    if !(text.contains("context") || text.contains("navigated")) {
+                        return Err(err);
+                    }
+                    last = Some(err);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow!("the page kept navigating")))
+    }
+
+    /// The wait_for tool: until `text` shows on the page (or, without text,
+    /// until the page settles), reacting to DOM changes; never polling.
+    pub async fn wait_for(&self, text: Option<&str>, timeout_secs: u64) -> Result<String> {
+        let max_ms = timeout_secs.clamp(1, 25) * 1000;
+        let outcome = match text.map(str::trim).filter(|t| !t.is_empty()) {
+            None => self.settle(self.watch()?, max_ms).await?,
+            Some(text) => {
+                let script = WAIT_FOR_TEXT
+                    .replace("TEXT_JSON", &serde_json::to_string(&text.to_lowercase())?)
+                    .replace("MAX_MS", &max_ms.to_string());
+                self.eval_across_navigation(&script).await?
+            }
+        };
+        Ok(format!("{outcome}; now at {}", self.where_am_i().await?))
     }
 
     // --- Tools ---------------------------------------------------------------
@@ -129,12 +190,13 @@ impl Browser {
             let target = self.cdp.new_page().await?;
             self.switch_to(&target).await?;
         }
+        let network = self.watch()?;
         let result = self.page()?.call("Page.navigate", json!({"url": url})).await?;
         if let Some(error) = result["errorText"].as_str() {
             bail!("couldn't load {url}: {error}");
         }
-        self.settle().await?;
-        self.where_am_i().await
+        let settled = self.settle(network, 15_000).await?;
+        Ok(format!("{} ({settled})", self.where_am_i().await?))
     }
 
     pub async fn read_text(&self, max_chars: usize) -> Result<String> {
@@ -182,10 +244,11 @@ impl Browser {
     }
 
     pub async fn click(&self, element: &Element) -> Result<String> {
+        let network = self.watch()?;
         self.click_node(element.node).await?;
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let settled = self.settle(network, 10_000).await?;
         Ok(format!(
-            "clicked '{}'; now at {}",
+            "clicked '{}' ({settled}); now at {}",
             element.label,
             self.where_am_i().await?
         ))
@@ -197,8 +260,9 @@ impl Browser {
             .await?;
         page.call("Input.insertText", json!({"text": text})).await?;
         if submit {
+            let network = self.watch()?;
             self.key("Enter").await?;
-            self.settle().await?;
+            self.settle(network, 10_000).await?;
         }
         Ok(format!(
             "typed into '{}'; now at {}",
@@ -208,8 +272,11 @@ impl Browser {
     }
 
     pub async fn press_key(&self, key: &str) -> Result<String> {
+        // Keys can send, open or scroll in more content.
+        let network = self.watch()?;
         self.key(key).await?;
-        Ok("pressed".into())
+        let settled = self.settle(network, 6_000).await?;
+        Ok(format!("pressed ({settled})"))
     }
 
     /// The open page's host, for approval cards (e.g. app.slack.com).
@@ -341,6 +408,135 @@ fn key_definition(key: &str) -> Result<(String, String, i64, Option<String>)> {
 // --- Accessibility tree ---------------------------------------------------------
 
 /// Roles that only add structure; their children are shown in their place.
+/// Resolves "quiet" once the document has loaded and the DOM has had no
+/// relevant change for 600 ms with no loading indicator showing, or "busy"
+/// after MAX_MS. On the page's events (DOMContentLoaded, MutationObserver);
+/// the timers only measure quiet.
+const DOM_QUIET: &str = r#"(async () => {
+  const started = Date.now(), max = MAX_MS, quietMs = 600;
+  if (document.readyState === "loading") {
+    await new Promise((done) => document.addEventListener("DOMContentLoaded", done, { once: true }));
+  }
+  const busy = () => !!document.querySelector('[aria-busy="true"], [role="progressbar"]:not([aria-hidden="true"])');
+  return await new Promise((resolve) => {
+    let quiet;
+    const finish = (how) => { observer.disconnect(); clearTimeout(quiet); clearTimeout(cap); resolve(how); };
+    // When quiet but a loading indicator shows, wait for the next change.
+    const arm = () => { clearTimeout(quiet); quiet = setTimeout(() => { if (!busy()) finish("quiet"); }, quietMs); };
+    const observer = new MutationObserver(arm);
+    observer.observe(document.documentElement, {
+      subtree: true, childList: true, characterData: true,
+      attributes: true, attributeFilter: ["aria-busy", "hidden", "aria-hidden", "disabled", "src", "value"],
+    });
+    const cap = setTimeout(() => finish("busy"), Math.max(0, max - (Date.now() - started)));
+    arm();
+  });
+})()"#;
+
+/// Resolves when TEXT_JSON appears in the page's text (checked when the DOM
+/// changes, at most every 150 ms), or after MAX_MS.
+const WAIT_FOR_TEXT: &str = r#"(async () => {
+  const started = Date.now(), text = TEXT_JSON;
+  const has = () => (document.body?.innerText ?? "").toLowerCase().includes(text);
+  if (has()) return "found it right away";
+  return await new Promise((resolve) => {
+    let pending = false;
+    const finish = (how) => { observer.disconnect(); clearTimeout(cap); resolve(how); };
+    const observer = new MutationObserver(() => {
+      if (pending) return;
+      pending = true;
+      setTimeout(() => { pending = false; if (has()) finish(`found it after ${Date.now() - started} ms`); }, 150);
+    });
+    observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+    const cap = setTimeout(() => finish(`not on the page after ${MAX_MS} ms`), MAX_MS);
+  });
+})()"#;
+
+/// How long the network must be quiet before a page counts as loaded.
+const NETWORK_QUIET: Duration = Duration::from_millis(500);
+
+/// Requests in flight on a tab, from its DevTools network events.
+struct NetworkWatch {
+    events: broadcast::Receiver<Value>,
+    in_flight: HashSet<String>,
+    last_activity: Instant,
+}
+
+impl NetworkWatch {
+    fn new(events: broadcast::Receiver<Value>) -> Self {
+        Self {
+            events,
+            in_flight: HashSet::new(),
+            last_activity: Instant::now(),
+        }
+    }
+
+    fn apply(&mut self, event: &Value) {
+        let params = &event["params"];
+        let id = params["requestId"].as_str().unwrap_or_default().to_string();
+        match event["method"].as_str() {
+            Some("Network.requestWillBeSent") => {
+                // Live connections (event streams) never finish; don't wait on them.
+                if !matches!(
+                    params["type"].as_str(),
+                    Some("EventSource" | "WebSocket" | "Ping")
+                ) {
+                    self.in_flight.insert(id);
+                }
+                self.last_activity = Instant::now();
+            }
+            Some("Network.loadingFinished" | "Network.loadingFailed") => {
+                self.in_flight.remove(&id);
+                self.last_activity = Instant::now();
+            }
+            _ => {}
+        }
+    }
+
+    fn catch_up(&mut self) {
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => self.apply(&event),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Waits until at most one request is in flight (a long poll, say) and
+    /// nothing has started or finished for NETWORK_QUIET. False at `deadline`.
+    async fn idle(&mut self, deadline: Instant) -> bool {
+        loop {
+            self.catch_up();
+            let now = Instant::now();
+            let quiet_for = now.saturating_duration_since(self.last_activity);
+            let calm = self.in_flight.len() <= 1;
+            if calm && quiet_for >= NETWORK_QUIET {
+                return true;
+            }
+            if now >= deadline {
+                return false;
+            }
+            let wait = if calm {
+                NETWORK_QUIET - quiet_for
+            } else {
+                deadline - now
+            };
+            match tokio::time::timeout(wait.min(deadline - now), self.events.recv()).await {
+                Ok(Ok(event)) => self.apply(&event),
+                Ok(Err(broadcast::error::RecvError::Closed)) => return true,
+                // Lagged, or the quiet period ran out: look again.
+                _ => {}
+            }
+        }
+    }
+
+    fn active_since(&mut self, moment: Instant) -> bool {
+        self.catch_up();
+        self.last_activity > moment
+    }
+}
+
 const SIGN_IN_CHECK: &str = r#"(() => {
   const visible = (el) => el.getClientRects().length > 0;
   if ([...document.querySelectorAll('input[type=password]')].some(visible)) return true;
@@ -487,6 +683,30 @@ fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opens SETTLE_URL in a new tab of a real Chrome (CDP_URL, e.g. through
+    /// `make cdp`) and checks that SETTLE_TEXT is on the page as soon as
+    /// open_url returns. Prints the tab's id so it can be closed afterwards.
+    #[tokio::test]
+    #[ignore = "needs CDP_URL pointing at a Chrome"]
+    async fn live_open_url_waits_for_the_page_to_settle() {
+        let cdp = Cdp::new(&std::env::var("CDP_URL").expect("CDP_URL")).unwrap();
+        let target = cdp.new_page().await.unwrap();
+        println!("tab {}", target.id);
+        let mut browser = Browser::new(cdp.clone(), false, Arc::new(Policy::defaults()));
+        browser.switch_to(&target).await.unwrap();
+        let url = std::env::var("SETTLE_URL").unwrap_or_else(|_| "https://example.com".into());
+        let expect = std::env::var("SETTLE_TEXT").unwrap_or_else(|_| "documentation".into());
+        let started = Instant::now();
+        let result = browser.open_url(&url, false).await.unwrap();
+        let text = browser.read_text(500_000).await.unwrap().to_lowercase();
+        println!(
+            "{result}\nreturned after {:?}; page has {expect:?}: {}",
+            started.elapsed(),
+            text.contains(&expect.to_lowercase())
+        );
+        assert!(text.contains(&expect.to_lowercase()));
+    }
 
     fn tree() -> Vec<Value> {
         serde_json::from_str(

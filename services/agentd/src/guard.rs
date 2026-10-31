@@ -18,7 +18,7 @@ const KEEP_NEWEST: usize = 2;
 
 /// Results agentd itself produced (refusals, errors), not outside content.
 fn from_agentd(result: &str) -> bool {
-    ["error:", "blocked:", "denied:", "the page changed"]
+    ["error:", "blocked:", "denied:", "not run:", "the page changed"]
         .iter()
         .any(|prefix| result.starts_with(prefix))
 }
@@ -35,6 +35,7 @@ pub fn carries_outside_content(tool: &str) -> bool {
             | "open_url"
             | "click"
             | "type_text"
+            | "wait_for"
             | "run_shell"
     )
 }
@@ -80,6 +81,35 @@ pub fn enforce_budget(messages: &mut [Value], budget: usize) -> usize {
         cut += 1;
     }
     cut
+}
+
+/// What the model gets instead of running a shell sleep.
+pub const SLEEP_REFUSAL: &str = "not run: don't sleep in the shell to wait for the browser. Opening a page, \
+     clicking and pressing keys already wait until the page stops changing; to wait for something specific, \
+     use wait_for with the text you expect.";
+
+/// A command that only sleeps (`sleep 5`, `sleep 2 && sleep 3`, `sleep 1s;`):
+/// models use it to wait for pages, which the browser tools now do.
+pub fn is_bare_sleep(command: &str) -> bool {
+    let parts: Vec<&str> = command
+        .split(['\n', ';'])
+        .flat_map(|part| part.split("&&"))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    !parts.is_empty()
+        && parts.iter().all(|part| {
+            let mut words = part.split_whitespace();
+            let durations: Vec<&str> = match words.next() {
+                Some("sleep") => words.collect(),
+                _ => return false,
+            };
+            !durations.is_empty()
+                && durations.iter().all(|w| {
+                    let n = w.trim_end_matches(['s', 'm', 'h']);
+                    !n.is_empty() && n.chars().all(|c| c.is_ascii_digit() || c == '.')
+                })
+        })
 }
 
 /// What the loop should do after a tool call.
@@ -172,6 +202,28 @@ mod tests {
         assert_eq!(messages[4]["content"].as_str().unwrap().len(), 50_000);
         // Under budget: untouched.
         assert_eq!(enforce_budget(&mut [tool(10), tool(10)], 120_000), 0);
+    }
+
+    #[test]
+    fn spots_bare_sleeps_only() {
+        for command in [
+            "sleep 5",
+            " sleep 2 && sleep 3 ",
+            "sleep 1s;",
+            "sleep 0.5\nsleep 1",
+        ] {
+            assert!(is_bare_sleep(command), "{command}");
+        }
+        for command in [
+            "sleep 5 && ls",
+            "npm test",
+            "sleep",
+            "sleep abc",
+            "echo sleep 5",
+            "sleep 5; curl x",
+        ] {
+            assert!(!is_bare_sleep(command), "{command}");
+        }
     }
 
     #[test]

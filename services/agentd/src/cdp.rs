@@ -12,7 +12,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -90,6 +90,8 @@ pub struct Page {
     pub target_id: String,
     sink: Mutex<Sink>,
     pending: Pending,
+    /// DevTools events from the tab (network requests and so on).
+    events: broadcast::Sender<Value>,
     next_id: AtomicU64,
     reader: tokio::task::JoinHandle<()>,
 }
@@ -105,13 +107,19 @@ impl Page {
         let (sink, mut stream) = ws.split();
         let pending: Pending = Arc::default();
         let replies = pending.clone();
+        let (events, _) = broadcast::channel(4096);
+        let notify = events.clone();
         let reader = tokio::spawn(async move {
             while let Some(Ok(message)) = stream.next().await {
                 let Message::Text(text) = message else { continue };
                 let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
                     continue;
                 };
-                let Some(id) = value["id"].as_u64() else { continue }; // an event
+                let Some(id) = value["id"].as_u64() else {
+                    // An event: for whoever listens (nobody, most of the time).
+                    let _ = notify.send(value);
+                    continue;
+                };
                 let Some(reply) = replies.lock().unwrap().remove(&id) else {
                     continue;
                 };
@@ -129,14 +137,26 @@ impl Page {
             target_id: target.id.clone(),
             sink: Mutex::new(sink),
             pending,
+            events,
             next_id: AtomicU64::new(1),
             reader,
         };
-        // Needed for node IDs, quads and the accessibility tree.
-        for domain in ["Page.enable", "DOM.enable", "Accessibility.enable"] {
+        // Node IDs, quads and the accessibility tree; network events tell
+        // when a page has finished loading.
+        for domain in [
+            "Page.enable",
+            "DOM.enable",
+            "Accessibility.enable",
+            "Network.enable",
+        ] {
             page.call(domain, json!({})).await?;
         }
         Ok(page)
+    }
+
+    /// Listens to the tab's events from now on.
+    pub fn events(&self) -> broadcast::Receiver<Value> {
+        self.events.subscribe()
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {

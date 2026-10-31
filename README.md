@@ -78,6 +78,10 @@ the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
 - commands starting with `sudo`, risky ones, and (after the agent has read a web
   page or command output) ones that can send data out (`curl`, `scp`, `git push`,
   ...) wait for approval in the app; approvals record who answered;
+- browser actions wait for the page to settle on events, not timers: the page's DOM
+  changes (a MutationObserver) and its network requests (DevTools events), so a
+  slow single-page app like Slack is loaded when the next step looks at it. A
+  `wait_for` tool waits for specific text; shell `sleep`s are refused unseen;
 - web pages and command output reach the model wrapped in `<untrusted>` tags; old
   tool output is trimmed past a budget, and a model repeating the same failing
   call is nudged, then stopped (patterns adapted from moltis, MIT);

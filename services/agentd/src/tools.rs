@@ -36,6 +36,9 @@ After the user takes over, they tell you to continue or to skip.
 user's approval, or are blocked in read-only mode. If one is denied or blocked, don't look for another \
 way; say what you would have done. When asked to draft something, type it but don't send it; send only \
 when the user asked you to send.
+- Opening a page, clicking and pressing keys already wait for the page to load and stop changing \
+before they return. If something you expect isn't there yet, use wait_for with the text you expect. \
+Never use the shell to sleep or wait for the browser.
 - Use show_screenshot when seeing the page would help the user.
 - The user sees each shell command and its output, so don't paste output back unless asked; say what it \
 means. Put code and multi-line text in fenced code blocks.
@@ -122,6 +125,16 @@ pub fn schemas(shell: bool) -> Value {
             "Press a key such as PageDown, Escape or Enter. Keys other than navigation keys need the user's approval.",
             json!({"key": {"type": "string"}}),
             &["key"],
+        ),
+        tool(
+            "wait_for",
+            "Wait until some text appears on the page (a message, a name, a button label), or, with no \
+             text, until the page stops changing. Use this, never a shell sleep, when a page is still loading.",
+            json!({
+                "text": {"type": "string", "description": "text to wait for (case-insensitive)"},
+                "timeout": {"type": "integer", "description": "seconds, at most 25 (default 10)"},
+            }),
+            &[],
         ),
         tool(
             "show_screenshot",

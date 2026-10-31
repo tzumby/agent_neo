@@ -7,6 +7,7 @@ agentd_desktop_user: agent
 # Shell commands run as this user, in hardened systemd units, cut off from the
 # desktop: no Chrome DevTools, VNC, screen or Chrome profile.
 agentd_shell_user: worker
+agentd_shell_home: /home/worker
 agentd_workdir: /home/worker/work
 agentd_shell_memory_max: 2G
 agentd_shell_tasks_max: "512"
@@ -35,6 +36,19 @@ agentd_shell_allowed_domains:
   - nodejs.org
   - .anthropic.com
   - claude.ai
+  # Nix: the binary cache, the flake registry, source tarballs.
+  - .nixos.org
+# Nix for the shell user (tasks/nix.yml): the release, its published SHA-256
+# per architecture, and the tools installed up front.
+agentd_nix_version: 2.35.4
+agentd_nix_sha256:
+  x86_64: ff66236d2f7e2a21f3350e73668e021ac6a8881ef277a38e16e952bfb22718c3
+  aarch64: 14a940a2d0ae5b2c623dc2ca168311c9367fd4bc416f6ded0c1087089d6de934
+agentd_nix_baseline: [uv, nodejs, gh, jq, ripgrep]
+agentd_nix_baseline_marker: uv
+# The agent's how-tos (services/agentd/skills).
+agentd_skills_dir: "{{ playbook_dir }}/../../services/agentd/skills/"
+
 agentd_model: zai-org/GLM-5.3
 agentd_max_steps: 40
 agentd_shell_tool: "on"

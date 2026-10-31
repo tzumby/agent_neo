@@ -66,20 +66,30 @@ browser, so close it when you're done.
 history in SQLite (`/var/lib/agentd`), and an HTTP + Server-Sent Events API for
 the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
 
-- **the attested model gateway** (`services/gatewayd`, `images/gateway`; see
-  `docs/operator-isolation.md`) replaces the Lambda gateway once its image is
-  built (`enable_image_builder = true`, apply, `make gateway-image`, then
-  `gateway_ami = "<ami>"`, apply, `make agentd-deploy`). It runs from an image
-  nobody can log into, and agentd sends prompts only after checking its
-  attestation (AWS's signature, the published measurements, its TLS
-  certificate);
-- it holds none of our keys: model calls go through the **model gateway** and
-  notifications through the **push relay**, two Lambdas behind IAM-authenticated
-  function URLs that agentd signs with the desktop's own role. The gateway holds
-  the Together key, allows known models and keeps a daily budget per desktop
-  (`model_daily_budget_usd`); the relay holds the APNs key. Each desktop has its
-  own IAM role (`desktop_identity`), denied our SSM secrets; its state is readable
-  only by `agentd`;
+- it holds none of our keys. Model calls go only to the **attested model
+  gateway** (`services/gatewayd` on `images/gateway`; see
+  `docs/operator-isolation.md`): an instance nobody can log into, which agentd
+  checks before sending anything (AWS's signature on its attestation, the
+  published image measurements, its TLS certificate). It holds the Together
+  key, allows known models and keeps a daily budget per desktop
+  (`model_daily_budget_usd`). A new gateway image: `enable_image_builder =
+  true`, apply, `make gateway-image`, set `gateway_ami`, apply, `make
+  agentd-deploy`. Notifications go through the **push relay**, a Lambda behind
+  an IAM-authenticated function URL that agentd signs with the desktop's own
+  role; it holds the APNs key. Each desktop has its own IAM role
+  (`desktop_identity`), denied our SSM secrets; its state is readable only by
+  `agentd`;
+- the shell user installs software with **Nix** (single-user, `/nix` owned by
+  `worker`, packages from nixpkgs-unstable through the egress proxy; uv, node,
+  gh, jq and ripgrep preinstalled). `curl … | bash` is refused. **Skills**
+  (`services/agentd/skills`, deployed to `/etc/agentd/skills`) are how-tos the
+  agent reads on demand: installing software, Python with uv, Node, git;
+- the agent **remembers** facts across conversations (`remember` / `forget`,
+  shown in each task's instructions). Facts saved after it read outside content
+  stay unverified until confirmed in the app's Settings → Memory;
+- a message takes **one approval**: approving what it types into a message
+  field (Slack's "Message …", "Reply…") also lets it press Enter or Send right
+  after;
 - the agent's shell commands run as `worker` (no sudo), each in its own hardened
   systemd unit (no privilege escalation, no capabilities, private `/tmp`, limits on
   memory, processes, CPU and time; Stop kills the whole unit). `worker` is cut off

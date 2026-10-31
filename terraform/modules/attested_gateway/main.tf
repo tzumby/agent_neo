@@ -14,6 +14,33 @@ locals {
   enabled       = var.ami != ""
 }
 
+# Per desktop and day: calls, tokens and cost (gatewayd's daily budget).
+resource "aws_dynamodb_table" "usage" {
+  name         = "${var.name}-model-usage"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "desktop"
+  range_key    = "day"
+
+  attribute {
+    name = "desktop"
+    type = "S"
+  }
+
+  attribute {
+    name = "day"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires"
+    enabled        = true
+  }
+
+  server_side_encryption {
+    enabled = true
+  }
+}
+
 resource "aws_security_group" "gateway" {
   name        = "${var.name}-model-gateway"
   description = "Attested model gateway: 8443 from desktops; out to HTTPS only"
@@ -68,7 +95,7 @@ data "aws_iam_policy_document" "gateway" {
   statement {
     sid       = "Usage"
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
-    resources = [var.usage_table_arn]
+    resources = [aws_dynamodb_table.usage.arn]
   }
 }
 
@@ -110,7 +137,7 @@ resource "aws_instance" "gateway" {
     account_id          = data.aws_caller_identity.current.account_id
     desktop_role_prefix = var.desktop_role_prefix
     audience            = var.audience
-    usage_table         = var.usage_table_name
+    usage_table         = aws_dynamodb_table.usage.name
     key_parameter       = local.key_parameter
     daily_budget_usd    = var.daily_budget_usd
     prices              = var.prices

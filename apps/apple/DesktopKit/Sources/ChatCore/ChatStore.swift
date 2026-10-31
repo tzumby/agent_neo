@@ -24,6 +24,7 @@ public final class ChatStore {
     public init() {}
 
     public var busy: Bool { timeline.busy }
+    public var stopping: Bool { timeline.stopping }
 
     /// Runs until the calling task is cancelled (e.g. the view disappears or
     /// the Tailscale session is replaced).
@@ -55,6 +56,8 @@ public final class ChatStore {
     }
 
     public func stop(client: AgentClient) async {
+        // Show it at once; agentd confirms with task.stopping, then task.finished.
+        timeline.markStopping()
         await attempt { try await client.stop() }
     }
 

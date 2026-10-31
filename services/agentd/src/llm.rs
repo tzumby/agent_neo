@@ -1,13 +1,12 @@
 //! Together AI chat completions (OpenAI-compatible API): through the attested
-//! model gateway, or the Lambda gateway before it (production: the desktop
-//! holds no API key), or directly with a key (local development).
+//! model gateway (production: the desktop holds no API key), or directly with
+//! a key (local development).
 
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::aws::FunctionUrl;
 use crate::config::Config;
 use crate::gateway::AttestedGateway;
 use serde::{Deserialize, Serialize};
@@ -57,9 +56,7 @@ pub struct Together {
 enum Backend {
     /// The attested gateway holds the key; prompts go only to its attested
     /// TLS certificate, with this desktop's identity proof.
-    Attested(AttestedGateway),
-    /// The model gateway Lambda holds the key; calls are signed as this desktop.
-    Gateway(FunctionUrl),
+    Attested(Box<AttestedGateway>),
     Direct {
         http: reqwest::Client,
         api_key: SecretString,
@@ -71,18 +68,13 @@ impl Together {
         // The attested gateway, when configured, is the only way out: no
         // fallback that would send prompts somewhere unverified.
         let backend = if !cfg.gateway_url.is_empty() {
-            Backend::Attested(AttestedGateway::new(
+            Backend::Attested(Box::new(AttestedGateway::new(
                 &cfg.gateway_url,
                 &cfg.aws_region,
                 &cfg.gateway_audience,
                 cfg.gateway_measurements.clone(),
                 Duration::from_secs(200),
-            )?)
-        } else if !cfg.model_gateway_url.is_empty() {
-            Backend::Gateway(FunctionUrl::new(
-                &cfg.model_gateway_url,
-                Duration::from_secs(200),
-            )?)
+            )?))
         } else if let Some(api_key) = cfg.together_api_key.clone() {
             let http = reqwest::Client::builder()
                 // Cloudflare in front of the API rejects some default User-Agents (error 1010).
@@ -99,11 +91,6 @@ impl Together {
     async fn send(&self, body: &Value) -> Result<reqwest::Response> {
         match &self.backend {
             Backend::Attested(gateway) => gateway.chat(&serde_json::to_vec(body)?).await,
-            Backend::Gateway(gateway) => {
-                gateway
-                    .post("/v1/chat/completions", &serde_json::to_vec(body)?)
-                    .await
-            }
             Backend::Direct { http, api_key } => Ok(http
                 .post(API_URL)
                 .bearer_auth(api_key.expose_secret())

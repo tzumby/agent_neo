@@ -1,6 +1,16 @@
 import Foundation
 
 /// GET /api/v1/status from agentd (through tailnet-proxy).
+/// Something the agent remembers across conversations.
+public struct AgentMemory: Decodable, Sendable, Equatable, Identifiable {
+    public let id: Int
+    public let text: String
+    /// False: saved after the agent read outside content (a page, an email,
+    /// command output); the agent treats it as a hint until the user confirms it.
+    public let trusted: Bool
+    public let created: String
+}
+
 public struct AgentStatus: Decodable, Sendable, Equatable {
     public let desktop: String
     public let busy: Bool
@@ -145,6 +155,22 @@ public struct AgentClient: Sendable {
 
     public func update(settings: AgentSettings) async throws -> AgentSettings {
         try await send("PUT", "/api/v1/settings", body: settings)
+    }
+
+    /// What the agent remembers across conversations.
+    public func memories() async throws -> [AgentMemory] {
+        struct Reply: Decodable { let memories: [AgentMemory] }
+        let reply: Reply = try await get("/api/v1/memory")
+        return reply.memories
+    }
+
+    public func forget(memory id: Int) async throws {
+        let _: [String: Bool] = try await send("DELETE", "/api/v1/memory/\(id)", body: [String: String]())
+    }
+
+    /// Vouches for a memory saved after the agent read outside content.
+    public func confirm(memory id: Int) async throws {
+        let _: [String: Bool] = try await post("/api/v1/memory/\(id)/confirm", body: [String: String]())
     }
 
     // MARK: Plumbing

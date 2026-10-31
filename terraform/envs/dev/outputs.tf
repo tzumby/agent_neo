@@ -43,10 +43,6 @@ output "push_relay_url" {
   value = module.push_relay.relay_url
 }
 
-output "model_gateway_url" {
-  value = module.model_gateway.url
-}
-
 output "user_kms_keys" {
   value = { for user, key in aws_kms_key.user : user => key.arn }
 }

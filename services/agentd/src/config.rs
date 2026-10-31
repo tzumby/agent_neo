@@ -13,9 +13,6 @@ pub struct Config {
     /// Only for local development: on desktops, model calls go through the
     /// model gateway and no key is here. Never printed (Debug shows [REDACTED]).
     pub together_api_key: Option<SecretString>,
-    /// The model gateway's function URL (the Lambda; until the attested
-    /// gateway takes over).
-    pub model_gateway_url: String,
     /// The attested model gateway (https://<address>:8443). When set, model
     /// calls go only there, after its attestation checks out.
     pub gateway_url: String,
@@ -40,6 +37,8 @@ pub struct Config {
     /// The shell user's egress proxy, e.g. http://127.0.0.1:3128 (empty: none).
     pub shell_proxy: String,
     pub policy_path: PathBuf,
+    /// Skills: Markdown how-tos the agent reads on demand (skills.rs).
+    pub skills_dir: PathBuf,
     pub max_steps: u32,
     pub shell_tool: bool,
     pub desktop_name: String,
@@ -83,10 +82,9 @@ impl Config {
                 .unwrap_or_else(|| default.to_string())
         };
         let together_api_key = get("TOGETHER_API_KEY", "");
-        let model_gateway_url = get("MODEL_GATEWAY_URL", "");
         let gateway_url = get("GATEWAY_URL", "");
-        if together_api_key.is_empty() && model_gateway_url.is_empty() && gateway_url.is_empty() {
-            bail!("set GATEWAY_URL (or MODEL_GATEWAY_URL, or TOGETHER_API_KEY for local development)");
+        if together_api_key.is_empty() && gateway_url.is_empty() {
+            bail!("set GATEWAY_URL (or TOGETHER_API_KEY for local development)");
         }
         let gateway_measurements = if gateway_url.is_empty() {
             Vec::new()
@@ -97,7 +95,6 @@ impl Config {
         Ok(Self {
             listen: get("LISTEN", "unix:/run/agentd/agentd.sock"),
             together_api_key: (!together_api_key.is_empty()).then(|| together_api_key.into()),
-            model_gateway_url,
             gateway_url,
             gateway_measurements,
             gateway_audience: get("GATEWAY_AUDIENCE", "cloud-desktops/model-gateway"),
@@ -112,6 +109,7 @@ impl Config {
             shell_cpu_quota: get("SHELL_CPU_QUOTA", "200%"),
             shell_proxy: get("SHELL_PROXY", ""),
             policy_path: get("POLICY", "/etc/agentd/policy.toml").into(),
+            skills_dir: get("SKILLS_DIR", "/etc/agentd/skills").into(),
             max_steps: get("MAX_STEPS", "40").parse().context("MAX_STEPS")?,
             shell_tool: get("SHELL_TOOL", "on") == "on",
             desktop_name: get("DESKTOP_NAME", "cloud-desktop"),

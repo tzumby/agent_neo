@@ -24,45 +24,44 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
         try event(2, "task.started", #"{"task":"t1","model":"zai-org/GLM-5.3"}"#),
         try event(3, "step", #"{"task":"t1","step":1,"tool":"run_shell","args":"{}"}"#),
         try event(4, "shell", #"{"task":"t1","command":"whoami","as_root":false,"needs_approval":false}"#),
+        try event(41, "shell.output", #"{"task":"t1","command":"whoami","exit_code":0,"timed_out":false,"output":"worker"}"#),
         try event(5, "step", #"{"task":"t1","step":2,"tool":"read_text","args":"{}"}"#),
         try event(6, "shell", #"{"task":"t1","command":"sudo id -u","as_root":true,"needs_approval":true}"#),
         try event(7, "approval.requested", #"{"task":"t1","id":"a1","command":"sudo id -u","reason":"runs as root"}"#),
     ]
     events.forEach { timeline.apply($0) }
     #expect(timeline.busy)
-    // user, work, and a card only for the command that needs an answer; whoami stays a step.
-    #expect(timeline.items.count == 3)
-    guard case .work(let work) = timeline.items[1] else { Issue.record("no work item"); return }
-    #expect(work.steps.map(\.tool) == ["run_shell", "read_text", "run_shell"])
-    #expect(work.steps.last?.asRoot == true)
-    #expect(work.steps.first?.run?.state == .running)
-    #expect(work.steps.last?.run == nil)
-    guard case .terminal(let root) = timeline.items[2] else {
-        Issue.record("no terminal")
+    // user, work, and the pending approval; no terminal cards.
+    #expect(timeline.visibleItems.count == 3)
+    guard case .work(let work) = timeline.items[1], case .approval(let pending) = timeline.items[2] else {
+        Issue.record("no work or approval")
         return
     }
-    #expect(root.state == .waitingForApproval && root.asRoot)
-    #expect(root.approval?.state == .pending && root.approval?.reason == "runs as root")
+    #expect(work.steps.map(\.tool) == ["run_shell", "read_text", "run_shell"])
+    #expect(work.steps.first?.run?.state == .finished && work.steps.first?.run?.output == "worker")
+    #expect(work.steps.last?.asRoot == true && work.steps.last?.run?.state == .waitingForApproval)
+    #expect(pending.state == .pending && pending.reason == "runs as root" && pending.browser == nil)
 
+    // Answered: the card leaves the chat, the step runs and gets its output.
     timeline.apply(try event(8, "approval.resolved", #"{"task":"t1","id":"a1","approved":true}"#))
+    #expect(timeline.visibleItems.count == 2)
+    guard case .work(let running) = timeline.items[1] else { Issue.record("no work item"); return }
+    #expect(running.steps.last?.run?.state == .running)
     timeline.apply(
         try event(
             85, "shell.output",
             #"{"task":"t1","command":"sudo id -u","exit_code":0,"timed_out":false,"output":"0","seconds":0.1}"#))
-    guard case .terminal(let ran) = timeline.items[2] else { Issue.record("no terminal"); return }
-    #expect(ran.state == .finished && ran.exitCode == 0 && ran.output == "0")
-    timeline.apply(try event(9, "message", #"{"role":"assistant","text":"agent; 0","task":"t1"}"#))
+    timeline.apply(try event(9, "message", #"{"role":"assistant","text":"worker; 0","task":"t1"}"#))
     timeline.apply(
         try event(
             10, "task.finished",
             #"{"task":"t1","status":"done","steps":2,"seconds":3,"cost":0.0038,"usage":{"input":100,"cached":0,"output":20}}"#
         ))
     #expect(!timeline.busy)
-    guard case .terminal(let approved) = timeline.items[2] else { Issue.record("no terminal"); return }
-    #expect(approved.approval?.state == .approved)
     guard case .work(let finished) = timeline.items[1] else { Issue.record("no work item"); return }
+    #expect(finished.steps.last?.run == ShellRun(state: .finished, exitCode: 0, output: "0", seconds: 0.1))
     #expect(finished.finished?.cost == 0.0038)
-    #expect(timeline.items.last == .assistant(Message(id: 9, text: "agent; 0")))
+    #expect(timeline.items.last == .assistant(Message(id: 9, text: "worker; 0")))
 }
 
 @Test func actionNeededIsResolvedOrExpired() throws {
@@ -92,23 +91,14 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     timeline.apply(try event(3, "approval.requested", #"{"task":"t1","id":"a1","command":"sudo reboot","reason":"runs as root"}"#))
     timeline.apply(try event(4, "approval.resolved", #"{"task":"t1","id":"a1","approved":false}"#))
     timeline.apply(try event(5, "shell", #"{"task":"t1","command":"sleep 999","as_root":false,"needs_approval":false}"#))
-    timeline.apply(try event(6, "task.finished", #"{"task":"t1","status":"cancelled","steps":2,"seconds":9}"#))
-    guard case .terminal(let denied) = timeline.items[1], case .work(let work) = timeline.items[0] else {
-        Issue.record("no terminal or work")
-        return
-    }
-    #expect(denied.state == .denied && denied.approval?.state == .denied)
-    #expect(timeline.items.count == 2)  // the sleep needed no answer: a step, not a card
-    #expect(work.steps.last?.run?.state == .didNotFinish)
-
-    // A command that ran and finished, inside its step.
-    timeline.apply(try event(7, "task.started", #"{"task":"t2","model":"m"}"#))
-    timeline.apply(try event(8, "shell", #"{"task":"t2","command":"ls","as_root":false,"needs_approval":false}"#))
-    timeline.apply(
-        try event(9, "shell.output", #"{"task":"t2","command":"ls","exit_code":2,"timed_out":false,"output":"no such file","seconds":0.2}"#))
-    timeline.apply(try event(10, "task.finished", #"{"task":"t2","status":"done","steps":1,"seconds":1}"#))
-    guard case .work(let ran) = timeline.items.last else { Issue.record("no work item"); return }
-    #expect(ran.steps.last?.run == ShellRun(state: .finished, exitCode: 2, output: "no such file", seconds: 0.2))
+    timeline.markStopping()
+    #expect(timeline.stopping)
+    timeline.apply(try event(6, "task.stopping", "{}"))
+    timeline.apply(try event(7, "task.finished", #"{"task":"t1","status":"cancelled","steps":2,"seconds":9}"#))
+    #expect(!timeline.stopping)
+    guard case .work(let work) = timeline.items[0] else { Issue.record("no work"); return }
+    #expect(work.steps.map { $0.run?.state } == [.denied, .didNotFinish])
+    #expect(timeline.visibleItems.count == 1)  // the answered approval is gone from the chat
 
     // History from an agentd without output events: the command ran, nothing was recorded.
     timeline.apply(try event(11, "task.started", #"{"task":"t3","model":"m"}"#))
@@ -124,7 +114,7 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     timeline.apply(
         try event(
             2, "approval.requested",
-            #"{"task":"t1","id":"b1","kind":"browser","action":"type","target":"Message to Alice","text":"Hi Alice!","submit":false,"site":"app.slack.com","reason":"writes on the page"}"#
+            #"{"task":"t1","id":"b1","kind":"browser","action":"type","target":"Message to Alice","text":"Hi Alice!","submit":false,"sends":true,"site":"app.slack.com","reason":"writes on the page"}"#
         ))
     timeline.apply(try event(3, "approval.resolved", #"{"task":"t1","id":"b1","approved":true}"#))
     guard case .approval(let approval) = timeline.items.last else { Issue.record("no approval card"); return }
@@ -133,6 +123,9 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     #expect(approval.browser?.target == "Message to Alice")
     #expect(approval.browser?.text == "Hi Alice!")
     #expect(approval.browser?.site == "app.slack.com")
+    #expect(approval.browser?.sends == true)
+    // Browser approvals stay in the chat after they're answered (what was sent, and where).
+    #expect(timeline.visibleItems.count == 2)
 }
 
 @Test func aTaskPausesForApprovalAndResumes() throws {
@@ -145,18 +138,15 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     guard case .work(let paused) = timeline.items[0] else { Issue.record("no work item"); return }
     #expect(paused.waiting && paused.finished == nil)
 
-    // Answered (maybe after a restart): the same task carries on, the command's card fills in.
+    // Answered (maybe after a restart): the same task carries on, the step fills in.
     timeline.apply(try event(5, "approval.resolved", #"{"task":"t1","id":"a1","approved":true}"#))
     timeline.apply(try event(6, "task.resumed", #"{"task":"t1"}"#))
     #expect(timeline.busy)
     timeline.apply(
         try event(7, "shell.output", #"{"task":"t1","command":"sudo apt update","exit_code":0,"timed_out":false,"output":"ok"}"#))
-    guard case .work(let resumed) = timeline.items[0], case .terminal(let ran) = timeline.items[1] else {
-        Issue.record("no work or terminal")
-        return
-    }
+    guard case .work(let resumed) = timeline.items[0] else { Issue.record("no work item"); return }
     #expect(!resumed.waiting)
-    #expect(ran.state == .finished && ran.approval?.state == .approved)
+    #expect(resumed.steps.last?.run?.state == .finished)
 
     // Given up on while paused: the card expires and the command never ran.
     timeline.apply(try event(8, "shell", #"{"task":"t1","command":"sudo reboot","as_root":true,"needs_approval":true}"#))
@@ -164,6 +154,9 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     timeline.apply(try event(10, "task.paused", #"{"task":"t1","approval":"a2"}"#))
     timeline.apply(try event(11, "approval.resolved", #"{"task":"t1","id":"a2","approved":false,"expired":true}"#))
     timeline.apply(try event(12, "task.finished", #"{"task":"t1","status":"cancelled","steps":3,"seconds":5}"#))
-    guard case .terminal(let expired) = timeline.items[2] else { Issue.record("no terminal"); return }
-    #expect(expired.approval?.state == .expired && expired.state == .didNotFinish)
+    guard case .work(let ended) = timeline.items[0], case .approval(let expired) = timeline.items[2] else {
+        Issue.record("no work or approval")
+        return
+    }
+    #expect(expired.state == .expired && ended.steps.last?.run?.state == .didNotFinish)
 }

@@ -52,14 +52,6 @@ variable "ssm_prefix" {
   type = string
 }
 
-variable "usage_table_name" {
-  type = string
-}
-
-variable "usage_table_arn" {
-  type = string
-}
-
 variable "prices" {
   description = "Model → [input, cached input, output] USD per 1M tokens; only these models are allowed."
   type        = map(list(number))

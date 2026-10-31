@@ -8,7 +8,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
 use serde::Deserialize;
@@ -34,6 +34,9 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/screenshot", get(screenshot))
         .route("/api/v1/settings", get(settings).put(put_settings))
         .route("/api/v1/devices", post(register_device))
+        .route("/api/v1/memory", get(memories))
+        .route("/api/v1/memory/{id}", delete(forget_memory))
+        .route("/api/v1/memory/{id}/confirm", post(confirm_memory))
         .with_state(agent)
 }
 
@@ -207,6 +210,37 @@ async fn resolve_action(
 
 async fn stop(State(agent): App) -> Json<Value> {
     Json(json!({"stopping": agent.stop()}))
+}
+
+/// What the agent remembers, for the app's Memory screen.
+async fn memories(State(agent): App) -> Response {
+    match agent.store.memories(500) {
+        Ok(memories) => Json(json!({"memories": memories})).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+async fn forget_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
+    match agent.store.forget(id) {
+        Ok(true) => {
+            agent.emit("memory.forgotten", json!({"id": id, "by": caller(&headers)}));
+            Json(json!({"ok": true})).into_response()
+        }
+        Ok(false) => error(StatusCode::NOT_FOUND, "no such memory"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// The user vouches for an unverified memory.
+async fn confirm_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
+    match agent.store.confirm_memory(id) {
+        Ok(true) => {
+            agent.emit("memory.confirmed", json!({"id": id, "by": caller(&headers)}));
+            Json(json!({"ok": true})).into_response()
+        }
+        Ok(false) => error(StatusCode::NOT_FOUND, "no such memory"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
 }
 
 async fn image(State(agent): App, Path(id): Path<String>) -> Response {

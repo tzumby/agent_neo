@@ -1,5 +1,5 @@
 //! SQLite state: the event log the apps stream, the chat history the model
-//! sees, runs (tasks) and what they wait on, and settings.
+//! sees, runs (tasks) and what they wait on, the agent's memory, and settings.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -26,6 +26,17 @@ pub struct HistoryEntry {
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// Something the agent remembers across conversations. Trusted when it came
+/// from a task that hadn't read outside content (web pages, emails, command
+/// output); unverified otherwise, until the user confirms it in the app.
+#[derive(Clone, Debug, Serialize)]
+pub struct Memory {
+    pub id: i64,
+    pub text: String,
+    pub trusted: bool,
+    pub created: String,
 }
 
 /// Something the user is asked: an approval a parked task waits on (with the
@@ -76,7 +87,13 @@ impl Store {
                  run TEXT NOT NULL,
                  card TEXT NOT NULL DEFAULT '{{}}',
                  checkpoint TEXT,
-                 created INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)));"
+                 created INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)));
+             CREATE TABLE IF NOT EXISTS memory (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 agent TEXT NOT NULL DEFAULT 'main',
+                 text TEXT NOT NULL,
+                 trusted INTEGER NOT NULL,
+                 created TEXT NOT NULL DEFAULT ({NOW}));"
         ))?;
         migrate(&conn)?;
         Ok(Self {
@@ -128,6 +145,40 @@ impl Store {
         let mut stmt = conn.prepare("SELECT id FROM runs WHERE status = ?1 ORDER BY started")?;
         let rows = stmt.query_map(params![status], |row| row.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // --- Memory -------------------------------------------------------------------
+
+    pub fn remember(&self, text: &str, trusted: bool) -> Result<Memory> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "INSERT INTO memory (text, trusted) VALUES (?1, ?2) RETURNING id, text, trusted, created",
+            params![text, trusted],
+            memory_row,
+        )?)
+    }
+
+    /// The latest `limit` memories, oldest first.
+    pub fn memories(&self, limit: i64) -> Result<Vec<Memory>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, text, trusted, created FROM
+               (SELECT id, text, trusted, created FROM memory ORDER BY id DESC LIMIT ?1)
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![limit], memory_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn forget(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM memory WHERE id = ?1", params![id])? > 0)
+    }
+
+    /// The user vouches for an unverified memory.
+    pub fn confirm_memory(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("UPDATE memory SET trusted = 1 WHERE id = ?1", params![id])? > 0)
     }
 
     // --- What the user is asked ---------------------------------------------------
@@ -276,6 +327,15 @@ impl Store {
     }
 }
 
+fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
+    Ok(Memory {
+        id: row.get(0)?,
+        text: row.get(1)?,
+        trusted: row.get(2)?,
+        created: row.get(3)?,
+    })
+}
+
 /// Schema changes to databases made by earlier versions (PRAGMA user_version).
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -342,6 +402,30 @@ mod tests {
         assert!(store.any_parked().unwrap().is_none());
         store.finish_run("r1", "done", 4, Some(0.01), "ok").unwrap();
         assert_eq!(store.runs_with_status("done").unwrap(), ["r1"]);
+    }
+
+    #[test]
+    fn remembers_forgets_and_confirms() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let a = store.remember("The user's manager is Lawrence", true).unwrap();
+        let b = store
+            .remember("Invoices go to billing@example.com", false)
+            .unwrap();
+        assert!(a.trusted && !b.trusted);
+        assert_eq!(
+            store
+                .memories(10)
+                .unwrap()
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>(),
+            [a.id, b.id]
+        );
+        assert!(store.confirm_memory(b.id).unwrap());
+        assert!(store.memories(10).unwrap()[1].trusted);
+        assert!(store.forget(a.id).unwrap());
+        assert!(!store.forget(a.id).unwrap());
+        assert_eq!(store.memories(1).unwrap().len(), 1);
     }
 
     #[test]

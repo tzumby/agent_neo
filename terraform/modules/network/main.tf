@@ -198,9 +198,8 @@ resource "aws_instance" "nat" {
   ami           = data.aws_ami.fck_nat[0].id
   instance_type = var.nat_instance_type
 
-  network_interface {
+  primary_network_interface {
     network_interface_id = aws_network_interface.nat[0].id
-    device_index         = 0
   }
 
   metadata_options {

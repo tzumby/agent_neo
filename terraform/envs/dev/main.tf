@@ -69,26 +69,6 @@ module "push_relay" {
   source_dir          = "${path.root}/../../../services/push-relay/src"
 }
 
-# Model calls for desktops. The Together key stays in SSM and this gateway,
-# which also keeps a daily budget per desktop.
-module "model_gateway" {
-  source = "../../modules/model_gateway"
-
-  name                = local.name
-  desktop_role_prefix = local.desktop_role_prefix
-  desktop_role_names  = local.desktop_role_names
-  ssm_prefix          = "/${var.project}/${var.env}"
-  daily_budget_usd    = var.model_daily_budget_usd
-  source_dir          = "${path.root}/../../../services/model-gateway/src"
-  # USD per 1M tokens: input, cached input, output (Together, 2026-10-30;
-  # same as agentd's table).
-  prices = {
-    "zai-org/GLM-5.3"       = [1.40, 0.26, 4.40]
-    "zai-org/GLM-5.3-Flash" = [0.15, 0.03, 0.50]
-    "moonshotai/Kimi-K3"    = [3.00, 0.30, 15.00]
-  }
-}
-
 # The attested model gateway (docs/operator-isolation.md): gatewayd on an
 # image nobody can log into. Desktops send prompts only after checking its
 # measurements, which the image build published for that image.
@@ -106,6 +86,12 @@ data "aws_ssm_parameter" "gateway_measurements" {
   name  = "/${var.project}/${var.env}/gateway/images/${var.gateway_ami}"
 }
 
+# The Lambda model gateway is retired; its usage table lives on here.
+moved {
+  from = module.model_gateway.aws_dynamodb_table.usage
+  to   = module.attested_gateway.aws_dynamodb_table.usage
+}
+
 module "attested_gateway" {
   source = "../../modules/attested_gateway"
 
@@ -119,8 +105,6 @@ module "attested_gateway" {
   desktop_role_prefix = local.desktop_role_prefix
   audience            = "${local.name}/model-gateway"
   ssm_prefix          = "/${var.project}/${var.env}"
-  usage_table_name    = module.model_gateway.usage_table_name
-  usage_table_arn     = module.model_gateway.usage_table_arn
   daily_budget_usd    = var.model_daily_budget_usd
   prices = {
     "zai-org/GLM-5.3"       = [1.40, 0.26, 4.40]

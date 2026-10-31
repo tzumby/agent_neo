@@ -1,0 +1,100 @@
+# Nix for the shell user: single-user (no root daemon) with /nix owned by
+# that user, so everything it downloads goes through the egress proxy.
+# Packages come from nixpkgs-unstable (the flake registry), so they're
+# current. The agent's install-software skill says how to use it.
+
+- name: Create /nix for the shell user
+  ansible.builtin.file:
+    path: /nix
+    state: directory
+    owner: "{{ agentd_shell_user }}"
+    group: "{{ agentd_shell_user }}"
+    mode: "0755"
+
+- name: Check for Nix
+  ansible.builtin.stat:
+    path: "{{ agentd_shell_home }}/.nix-profile/bin/nix"
+  register: agentd_nix
+
+- name: Install Nix from its release tarball (checksum pinned), as the shell user
+  when: not agentd_nix.stat.exists
+  block:
+    - name: Make a place to unpack Nix
+      ansible.builtin.file:
+        path: /tmp/nix-install
+        state: directory
+        owner: "{{ agentd_shell_user }}"
+        mode: "0755"
+
+    - name: Download Nix {{ agentd_nix_version }}
+      ansible.builtin.get_url:
+        url: "https://releases.nixos.org/nix/nix-{{ agentd_nix_version }}/nix-{{ agentd_nix_version }}-{{ ansible_facts.architecture }}-linux.tar.xz"
+        dest: /tmp/nix-install/nix.tar.xz
+        checksum: "sha256:{{ agentd_nix_sha256[ansible_facts.architecture] }}"
+        mode: "0644"
+
+    - name: Unpack and install Nix (single-user)
+      ansible.builtin.command:
+        cmd: >-
+          runuser -u {{ agentd_shell_user }} -- env HOME={{ agentd_shell_home }} USER={{ agentd_shell_user }}
+          sh -c 'tar -xJf nix.tar.xz && cd nix-{{ agentd_nix_version }}-{{ ansible_facts.architecture }}-linux
+          && ./install --no-daemon --no-channel-add --no-modify-profile --yes'
+        chdir: /tmp/nix-install
+        creates: "{{ agentd_shell_home }}/.nix-profile/bin/nix"
+  always:
+    - name: Remove the installer
+      ansible.builtin.file:
+        path: /tmp/nix-install
+        state: absent
+
+- name: Create the shell user's config directories
+  ansible.builtin.file:
+    path: "{{ agentd_shell_home }}/{{ item }}"
+    state: directory
+    owner: "{{ agentd_shell_user }}"
+    group: "{{ agentd_shell_user }}"
+    mode: "0755"
+  loop: [.config, .config/nix, .npm-global]
+
+- name: Configure Nix
+  ansible.builtin.copy:
+    dest: "{{ agentd_shell_home }}/.config/nix/nix.conf"
+    content: |
+      # {{ ansible_managed }}
+      experimental-features = nix-command flakes
+      # Ubuntu blocks unprivileged user namespaces (AppArmor), which Nix's
+      # build sandbox needs; builds run as the shell user anyway.
+      sandbox = false
+      warn-dirty = false
+    owner: "{{ agentd_shell_user }}"
+    group: "{{ agentd_shell_user }}"
+    mode: "0644"
+
+- name: Keep npm's global packages in the shell user's home
+  ansible.builtin.copy:
+    dest: "{{ agentd_shell_home }}/.npmrc"
+    content: "prefix={{ agentd_shell_home }}/.npm-global\n"
+    owner: "{{ agentd_shell_user }}"
+    group: "{{ agentd_shell_user }}"
+    mode: "0644"
+
+# Commands run in a login shell (bash -lc), which reads ~/.profile.
+- name: Put Nix and npm's global packages on the shell user's PATH
+  ansible.builtin.blockinfile:
+    path: "{{ agentd_shell_home }}/.profile"
+    create: true
+    owner: "{{ agentd_shell_user }}"
+    group: "{{ agentd_shell_user }}"
+    mode: "0644"
+    marker: "# {mark} cloud-desktops: Nix and npm"
+    block: |
+      if [ -e "$HOME/.nix-profile/etc/profile.d/nix.sh" ]; then . "$HOME/.nix-profile/etc/profile.d/nix.sh"; fi
+      export PATH="$HOME/.npm-global/bin:$PATH"
+
+- name: Install the shell user's baseline tools (Nix, through the proxy)
+  ansible.builtin.command:
+    cmd: >-
+      runuser -u {{ agentd_shell_user }} -- env HOME={{ agentd_shell_home }} USER={{ agentd_shell_user }}
+      https_proxy=http://127.0.0.1:{{ agentd_egress_proxy_port }} http_proxy=http://127.0.0.1:{{ agentd_egress_proxy_port }}
+      bash -lc 'nix profile add {{ agentd_nix_baseline | map("regex_replace", "^", "nixpkgs#") | join(" ") }}'
+    creates: "{{ agentd_shell_home }}/.nix-profile/bin/{{ agentd_nix_baseline_marker }}"

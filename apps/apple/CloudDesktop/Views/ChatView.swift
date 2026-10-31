@@ -21,7 +21,7 @@ struct ChatView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 20) {
-                ForEach(store.timeline.items) { item in
+                ForEach(store.timeline.visibleItems) { item in
                     ChatRow(item: item).equatable()
                 }
             }
@@ -44,7 +44,8 @@ struct ChatView: View {
                     Suggestions { send($0) }
                 }
                 Composer(
-                    text: $draft, busy: store.busy, canSend: store.connection == .live, focus: $composing,
+                    text: $draft, busy: store.busy, stopping: store.stopping, canSend: store.connection == .live,
+                    focus: $composing,
                     onSend: { send(draft) }, onStop: { Task { await store.stop(client: client) } })
             }
             .padding(.horizontal, 12)
@@ -171,6 +172,7 @@ struct ChatView: View {
 private struct Composer: View {
     @Binding var text: String
     let busy: Bool
+    let stopping: Bool
     let canSend: Bool
     var focus: FocusState<Bool>.Binding
     let onSend: () -> Void
@@ -186,7 +188,15 @@ private struct Composer: View {
                 .padding(.leading, 18)
                 .padding(.vertical, 14)
             Group {
-                if busy {
+                if busy && stopping {
+                    // Pressed: feedback at once, until the task has ended.
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(.black)
+                        .frame(width: 38, height: 38)
+                        .background(.white, in: .circle)
+                        .accessibilityLabel("Stopping")
+                } else if busy {
                     Button(action: onStop) {
                         Image(systemName: "stop.fill").font(.system(size: 14, weight: .bold))
                     }
@@ -202,6 +212,7 @@ private struct Composer: View {
             .buttonStyle(SendButtonStyle())
             .padding(6)
             .animation(.snappy(duration: 0.2), value: busy)
+            .animation(.snappy(duration: 0.2), value: stopping)
         }
         .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 26))
     }

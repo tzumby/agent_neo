@@ -25,6 +25,9 @@ pub struct Policy {
     risky_label: Regex,
     search_label: Regex,
     sends_data: Regex,
+    message_label: Regex,
+    send_label: Regex,
+    destructive_label: Regex,
 }
 
 /// Commands matching these need approval. A speed bump against mistakes and
@@ -87,6 +90,15 @@ const SENDS_DATA: &str = r"\b(curl|wget|nc|ncat|netcat|socat|telnet|ssh|scp|sftp
 /// Typing into these needs no approval: it only looks things up.
 const SEARCH_LABEL: &str = r"(?i)\b(search|find|filter|jump to)\b";
 
+/// Fields that take a message (Slack's "Message Lawrence", Gmail's "Message
+/// Body", "Reply…", "Add a comment"): approving what's typed there also lets
+/// the agent send it (agent.rs: ArmedSend), so a message takes one approval.
+const MESSAGE_LABEL: &str = r"(?i)\b(message|reply|comment|chat|dm|compose|post|thread)\b";
+
+/// The buttons that send what was just approved (never ones that destroy).
+const SEND_LABEL: &str = r"(?i)\b(send|post|reply|submit|comment)\b";
+const DESTRUCTIVE_LABEL: &str = r"(?i)\b(delete|remove|discard|trash|unsubscribe)\b";
+
 /// What a browser action needs before it runs.
 #[derive(Debug, PartialEq)]
 pub enum Gate {
@@ -141,6 +153,9 @@ impl Policy {
             risky_label: Regex::new(RISKY_LABEL)?,
             search_label: Regex::new(SEARCH_LABEL)?,
             sends_data: Regex::new(SENDS_DATA)?,
+            message_label: Regex::new(MESSAGE_LABEL)?,
+            send_label: Regex::new(SEND_LABEL)?,
+            destructive_label: Regex::new(DESTRUCTIVE_LABEL)?,
         })
     }
 
@@ -155,6 +170,16 @@ impl Policy {
             .iter()
             .find(|(re, _)| re.is_match(command))
             .map(|(_, reason)| reason.as_str())
+    }
+
+    /// A field where typing writes a message (see MESSAGE_LABEL).
+    pub fn message_field(&self, role: Option<&str>, label: &str) -> bool {
+        role.is_none_or(|r| matches!(r, "textbox" | "combobox")) && self.message_label.is_match(label)
+    }
+
+    /// A button that sends a message (see SEND_LABEL); never one that deletes.
+    pub fn send_button(&self, label: &str) -> bool {
+        self.send_label.is_match(label) && !self.destructive_label.is_match(label)
     }
 
     /// Whether a command can send data off the desktop (see SENDS_DATA).
@@ -316,6 +341,15 @@ mod tests {
             Gate::Allow
         );
         assert_eq!(policy.key_gate(true, "Enter", None, "Search mail"), Gate::Allow);
+        // Message fields and send buttons (one approval covers writing and sending).
+        assert!(policy.message_field(Some("textbox"), "Message Lawrence"));
+        assert!(policy.message_field(None, "Reply to thread"));
+        assert!(!policy.message_field(Some("textbox"), "Document title"));
+        assert!(!policy.message_field(Some("button"), "Message Lawrence"));
+        assert!(policy.send_button("Send now"));
+        assert!(policy.send_button("Post"));
+        assert!(!policy.send_button("Delete and send"));
+        assert!(!policy.send_button("Archive"));
         // Searching doesn't ask.
         assert_eq!(policy.type_gate(true, Some("searchbox"), "", true), Gate::Allow);
         assert_eq!(

@@ -15,6 +15,7 @@ mod llm;
 mod policy;
 mod push;
 mod shell;
+mod skills;
 mod store;
 mod tools;
 

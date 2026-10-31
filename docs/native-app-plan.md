@@ -10,6 +10,21 @@ Liquid Glass redesign, terminal cards, and approvals for browser writes and send
 the README. Library facts checked on that date (sources at
 the end). Items marked UNVERIFIED need a spike before we rely on them.*
 
+> **Since this plan (2026-10-31):**
+> - **Model calls** go to the attested model gateway (gatewayd; `docs/operator-isolation.md`):
+>   no provider key on desktops, and agentd checks the gateway's attestation before sending. The
+>   Lambda gateway is retired.
+> - **Shell commands** run as `worker` in hardened systemd units, out only through a local Squid
+>   allowlist (package registries, code hosts, Nix), with nftables keeping that user away from
+>   instance metadata, DNS and the desktop's controls. Software comes from Nix (single-user, as
+>   `worker`); skills tell the agent how.
+> - **Desktops** are x86_64 (t3a.medium) in a private subnet behind a fck-nat instance, with no
+>   public IP; disks use each user's own KMS key.
+> - **agentd 0.9 to 0.11:** approvals park the task and survive restarts; a wrap-up at the step
+>   limit; memory; skills; one approval per message; Stop interrupts at once.
+> - **The app:** commands are steps in the task's row (only pending approvals are cards), a
+>   Memory screen, and Stopping… feedback.
+
 ## Decisions so far
 
 - **The agent runs on each user's own VM** as `agentd`, a single Rust binary:
@@ -322,9 +337,9 @@ guardrails.
   - an APNs push relay (the push key stays central);
   - optionally model calls through the gateway, to enforce budgets;
   - usage reported as counts, never content.
-- **Desktops:** private subnet behind NAT, the data volume for Chrome's
-  profile and `agentd` state (PLAN M2), per-user encryption keys, baked
-  images.
+- **Desktops:** the data volume for Chrome's profile and `agentd` state
+  (PLAN M2) and baked images. (Private subnet behind NAT and per-user
+  encryption keys are done.)
 - **Features:**
   - secure forms (§3A);
   - egress through the user's computer;

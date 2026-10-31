@@ -42,6 +42,11 @@ struct SettingsView: View {
                     Text("On: the agent can type, click and send in the browser, and asks you before each change. Off: it can only read and navigate.")
                 }
             }
+            Section {
+                NavigationLink("Memory") { MemoryView(client: client) }
+            } footer: {
+                Text("What the agent remembers between conversations.")
+            }
             Section("Desktop") {
                 LabeledContent("Name", value: store.status?.desktop ?? "…")
                 LabeledContent("Address", value: client.baseURL.host() ?? "")

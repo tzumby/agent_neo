@@ -13,7 +13,6 @@ struct ChatRow: View, Equatable {
         case .user(let message): UserBubble(text: message.text)
         case .assistant(let message): AssistantMessage(text: message.text)
         case .work(let work): WorkRow(work: work)
-        case .terminal(let terminal): TerminalCard(terminal: terminal)
         case .approval(let approval):
             if let action = approval.browser {
                 BrowserApprovalCard(approval: approval, action: action)
@@ -248,143 +247,6 @@ private struct CodeBlock: View {
 
 /// One card per command: what ran, Approve/Deny when it needs you, and what it
 /// printed, in an inset panel like the approval card's command box.
-private struct TerminalCard: View {
-    let terminal: Terminal
-    @Environment(\.chatStore) private var store
-    @Environment(\.agentClient) private var client
-    @State private var showAll = false
-    private let tailLines = 12
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: "apple.terminal").foregroundStyle(.secondary)
-                Text("Terminal").font(.headline)
-                if terminal.asRoot {
-                    Text("root")
-                        .font(.caption.bold())
-                        .foregroundStyle(.orange)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 2)
-                        .background(.orange.opacity(0.15), in: .capsule)
-                }
-                Spacer()
-                status.font(.subheadline)
-            }
-
-            HStack(alignment: .firstTextBaseline, spacing: 0) {
-                Text("$ ").foregroundStyle(.green)
-                Text(terminal.command)
-            }
-            .font(.system(.callout, design: .monospaced))
-            .textSelection(.enabled)
-
-            if let approval = terminal.approval, approval.state == .pending {
-                Text("It \(approval.reason). Run it?").font(.footnote).foregroundStyle(.secondary)
-                HStack(spacing: 10) {
-                    Button { answer(approval, approved: false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                        .buttonStyle(.glass)
-                    Button { answer(approval, approved: true) } label: {
-                        Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
-                    }
-                    .primaryGlass()
-                }
-                .controlSize(.large)
-            }
-
-            if terminal.state == .finished {
-                output
-            } else if terminal.state == .unrecorded {
-                Text("Output not recorded").font(.footnote).foregroundStyle(.tertiary)
-            }
-        }
-        .card()
-        .sensoryFeedback(.success, trigger: terminal.state) { _, new in new == .finished && terminal.exitCode == 0 }
-    }
-
-    /// What the command printed, in an inset panel; it scrolls sideways so
-    /// columns stay lined up, and long output shows its last lines first.
-    @ViewBuilder private var output: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Output").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Spacer()
-                CopyButton(text: terminal.output.isEmpty ? terminal.command : terminal.output).font(.caption)
-            }
-            .padding(.leading, 12)
-            .padding(.trailing, 4)
-            .padding(.top, 2)
-            if hiddenLines > 0 {
-                Button("Show \(hiddenLines) earlier lines") { withAnimation(.snappy) { showAll = true } }
-                    .font(.caption)
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-            }
-            ScrollView(.horizontal) {
-                Text(terminal.output.isEmpty ? "(no output)" : shownOutput)
-                    .font(.system(.footnote, design: .monospaced))
-                    .foregroundStyle(terminal.output.isEmpty ? Color.secondary : Color(white: 0.85))
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 12)
-            }
-            .scrollIndicators(.hidden)
-            .padding(.bottom, 12)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.inset, in: .rect(cornerRadius: 12))
-    }
-
-    @ViewBuilder private var status: some View {
-        switch terminal.state {
-        case .waitingForApproval:
-            Label("Needs approval", systemImage: "hand.raised.fill").foregroundStyle(.orange)
-        case .running:
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("Running").foregroundStyle(.secondary)
-            }
-        case .finished:
-            if terminal.timedOut {
-                Label("Timed out", systemImage: "clock.badge.exclamationmark").foregroundStyle(.orange)
-            } else if terminal.exitCode == 0 {
-                Label(duration ?? "Done", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-            } else {
-                Label("Exit \(terminal.exitCode.map(String.init) ?? "?")", systemImage: "xmark.circle.fill")
-                    .foregroundStyle(.red)
-            }
-        case .denied:
-            Label("Denied", systemImage: "xmark.circle.fill").foregroundStyle(.red)
-        case .didNotFinish:
-            Label("Stopped", systemImage: "stop.circle.fill").foregroundStyle(.secondary)
-        case .unrecorded:
-            if terminal.approval?.state == .approved {
-                Label("Approved", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-            }
-        }
-    }
-
-    private var duration: String? {
-        guard let seconds = terminal.seconds else { return nil }
-        return seconds < 1 ? "<1s" : String(format: "%.0fs", seconds)
-    }
-
-    private var lines: [Substring] {
-        terminal.output.split(separator: "\n", omittingEmptySubsequences: false)
-    }
-
-    private var hiddenLines: Int { showAll ? 0 : max(0, lines.count - tailLines) }
-
-    private var shownOutput: String {
-        hiddenLines > 0 ? lines.suffix(tailLines).joined(separator: "\n") : terminal.output
-    }
-
-    private func answer(_ approval: Approval, approved: Bool) {
-        guard let store, let client else { return }
-        Task { await store.answer(approval, approved: approved, client: client) }
-    }
-}
-
 // MARK: - Work (the agent's steps)
 
 private struct WorkRow: View {
@@ -534,7 +396,9 @@ private struct RunStatus: View {
     var body: some View {
         Group {
             switch run.state {
-            case .running, .waitingForApproval:
+            case .waitingForApproval:
+                Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
+            case .running:
                 ProgressView().controlSize(.mini)
             case .finished where run.timedOut:
                 Image(systemName: "clock.badge.exclamationmark").foregroundStyle(.orange)
@@ -547,7 +411,9 @@ private struct RunStatus: View {
                 }
             case .finished:
                 Text("exit \(run.exitCode.map(String.init) ?? "?")").foregroundStyle(.red)
-            case .didNotFinish, .denied:
+            case .denied:
+                Text("denied").foregroundStyle(.red)
+            case .didNotFinish:
                 Image(systemName: "stop.circle").foregroundStyle(.secondary)
             case .unrecorded:
                 EmptyView()
@@ -573,6 +439,9 @@ enum StepText {
         case "wait_for": argument("text", in: step.detail).map { "Waiting for “\($0)”" } ?? "Waiting for the page"
         case "needs_user": "Asking you to step in"
         case "run_shell": "Running \(step.detail)"
+        case "remember": argument("text", in: step.detail).map { "Remembering “\($0)”" } ?? "Remembering"
+        case "forget": "Forgetting something"
+        case "read_skill": argument("name", in: step.detail).map { "Reading the \($0) how-to" } ?? "Reading a how-to"
         default: step.tool
         }
     }
@@ -589,6 +458,8 @@ enum StepText {
         case "show_screenshot": "camera"
         case "wait_for": "hourglass"
         case "needs_user": "hand.raised"
+        case "remember", "forget": "brain"
+        case "read_skill": "book"
         default: "gearshape"
         }
     }
@@ -651,11 +522,12 @@ private struct ApprovalCard: View {
             } icon: {
                 Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange)
             }
-            Text(approval.command)
-                .font(.callout.monospaced())
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.inset, in: .rect(cornerRadius: 12))
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
+                Text("$ ").foregroundStyle(.green)
+                Text(approval.command).textSelection(.enabled)
+            }
+            .font(.callout.monospaced())
+            .lineLimit(6)
             Text("It \(approval.reason).").font(.footnote).foregroundStyle(.secondary)
             switch approval.state {
             case .pending:
@@ -743,6 +615,10 @@ private struct BrowserApprovalCard: View {
                 Label("Then presses Enter, which may send it", systemImage: "return")
                     .font(.footnote)
                     .foregroundStyle(.orange)
+            } else if action.action == "type", action.sends {
+                Label("Approving also lets it send this", systemImage: "paperplane")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
             } else if action.action != "type", !approval.reason.isEmpty {
                 Text("It \(approval.reason).").font(.footnote).foregroundStyle(.secondary)
             }
@@ -768,7 +644,7 @@ private struct BrowserApprovalCard: View {
 
     private var title: String {
         switch action.action {
-        case "type": action.submit ? "Write and send this?" : "Write this?"
+        case "type": action.submit || action.sends ? "Write and send this?" : "Write this?"
         case "key": "Press \(action.key ?? "a key")?"
         default: "Click this?"
         }

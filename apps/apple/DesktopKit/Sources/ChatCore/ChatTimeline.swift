@@ -8,14 +8,29 @@ public struct ChatTimeline: Sendable, Equatable {
     /// A task is running (between task.started and task.finished, except while
     /// it's paused waiting for an approval).
     public private(set) var busy = false
+    /// The user pressed Stop and the task hasn't ended yet.
+    public private(set) var stopping = false
 
     private var workIndex: [String: Int] = [:]  // task → index of its work item
     private var approvalIndex: [String: Int] = [:]
     private var actionIndex: [String: Int] = [:]
-    private var openTerminal: [String: Int] = [:]  // task → its command card still waiting for output
-    private var openRun: [String: Int] = [:]  // task → index of its running command step (no card)
+    private var openRun: [String: Int] = [:]  // task → index of its command step still waiting for output
 
     public init() {}
+
+    /// What the chat shows: everything but command approvals already answered
+    /// (their outcome is on the command's step).
+    public var visibleItems: [ChatItem] {
+        items.filter {
+            if case .approval(let approval) = $0, approval.browser == nil, approval.state != .pending { return false }
+            return true
+        }
+    }
+
+    /// Stop was pressed: show it at once, before agentd's events arrive.
+    public mutating func markStopping() {
+        if busy { stopping = true }
+    }
 
     public mutating func apply(_ event: AgentEvent) {
         let data = event.data
@@ -30,61 +45,40 @@ public struct ChatTimeline: Sendable, Equatable {
             }
         case "task.started":
             busy = true
+            stopping = false
             workIndex[task] = items.count
             items.append(.work(Work(id: event.seq, task: task, model: data["model"]?.string ?? "")))
         case "task.paused":  // parked on an approval: the desktop is free meanwhile
             busy = false
+            stopping = false
             updateWork(task) { $0.waiting = true }
         case "task.resumed":
             busy = true
             updateWork(task) { $0.waiting = false }
+        case "task.stopping":
+            stopping = busy
         case "step":
             let tool = data["tool"]?.string ?? "?"
             guard tool != "run_shell" else { return }  // shown by the "shell" event instead
             updateWork(task) { $0.steps.append(Work.Step(id: event.seq, tool: tool, detail: data["args"]?.string ?? "")) }
         case "shell":
+            // Every command is a step in the task's row; one that needs an answer
+            // also gets an approval card until it's answered.
             var step = Work.Step(
                 id: event.seq, tool: "run_shell", detail: data["command"]?.string ?? "",
                 asRoot: data["as_root"]?.bool ?? false)
-            if data["needs_approval"]?.bool == true {
-                // The user has to answer: the command gets its own card in the chat.
-                updateWork(task) { $0.steps.append(step) }
-                openTerminal[task] = items.count
-                items.append(
-                    .terminal(
-                        Terminal(
-                            id: event.seq, task: task, command: step.detail, asRoot: step.asRoot,
-                            state: .waitingForApproval)))
-            } else {
-                // Nothing to answer: it stays a step in the task's collapsed row.
-                step.run = ShellRun()
-                if let index = workIndex[task], case .work(let work) = items[index] {
-                    openRun[task] = work.steps.count
-                }
-                updateWork(task) { $0.steps.append(step) }
+            step.run = ShellRun(state: data["needs_approval"]?.bool == true ? .waitingForApproval : .running)
+            if let index = workIndex[task], case .work(let work) = items[index] {
+                openRun[task] = work.steps.count
             }
+            updateWork(task) { $0.steps.append(step) }
         case "shell.output":
-            let state: Terminal.State = data["stopped"]?.bool == true ? .didNotFinish : .finished
-            let exitCode = data["exit_code"]?.int
-            let timedOut = data["timed_out"]?.bool ?? false
-            let output = data["output"]?.string ?? ""
-            let seconds = data["seconds"]?.double
-            if openTerminal[task] != nil {
-                updateTerminal(task, closing: true) {
-                    $0.state = state
-                    $0.exitCode = exitCode
-                    $0.timedOut = timedOut
-                    $0.output = output
-                    $0.seconds = seconds
-                }
-            } else {
-                closeRun(task) {
-                    $0.state = state
-                    $0.exitCode = exitCode
-                    $0.timedOut = timedOut
-                    $0.output = output
-                    $0.seconds = seconds
-                }
+            closeRun(task) {
+                $0.state = data["stopped"]?.bool == true ? .didNotFinish : .finished
+                $0.exitCode = data["exit_code"]?.int
+                $0.timedOut = data["timed_out"]?.bool ?? false
+                $0.output = data["output"]?.string ?? ""
+                $0.seconds = data["seconds"]?.double
             }
         case "approval.requested":
             let id = data["id"]?.string ?? ""
@@ -94,29 +88,30 @@ public struct ChatTimeline: Sendable, Equatable {
                 approval.browser = BrowserAction(
                     action: data["action"]?.string ?? "", target: data["target"]?.string ?? "",
                     text: data["text"]?.string, key: data["key"]?.string, submit: data["submit"]?.bool ?? false,
-                    site: data["site"]?.string ?? "")
+                    sends: data["sends"]?.bool ?? false, site: data["site"]?.string ?? "")
             }
-            // Asked about the command that's running: the approval goes on its terminal card.
-            if approval.browser == nil, let index = openTerminal[task], case .terminal(var terminal) = items[index],
-                terminal.command == approval.command
-            {
-                terminal.approval = approval
-                items[index] = .terminal(terminal)
-                approvalIndex[id] = index
-            } else {
-                approvalIndex[id] = items.count
-                items.append(.approval(approval))
-            }
+            approvalIndex[id] = items.count
+            items.append(.approval(approval))
         case "approval.resolved":
             let id = data["id"]?.string ?? ""
             let approved = data["approved"]?.bool ?? false
+            let isCommand = approvalIndex[id].map { index -> Bool in
+                if case .approval(let approval) = items[index] { return approval.browser == nil }
+                return false
+            } ?? false
             if data["expired"]?.bool == true {
-                // Given up (stopped, or a new message): the task.finished that follows closes its card.
+                // Given up (stopped, or a new message): task.finished closes its step.
                 update(approval: id) { $0.state = .expired }
                 return
             }
             update(approval: id) { $0.state = approved ? .approved : .denied }
-            updateTerminal(task, closing: !approved) { $0.state = approved ? .running : .denied }
+            if isCommand {
+                if approved {
+                    updateRun(task) { $0.state = .running }
+                } else {
+                    closeRun(task) { $0.state = .denied }
+                }
+            }
         case "action_needed":
             let id = data["id"]?.string ?? ""
             actionIndex[id] = items.count
@@ -135,8 +130,8 @@ public struct ChatTimeline: Sendable, Equatable {
             }
         case "task.finished":
             busy = false
+            stopping = false
             let cancelled = data["status"]?.string == "cancelled"
-            updateTerminal(task, closing: true) { $0.state = cancelled ? .didNotFinish : .unrecorded }
             closeRun(task) { $0.state = cancelled ? .didNotFinish : .unrecorded }
             let usage = data["usage"]
             updateWork(task) {
@@ -168,9 +163,9 @@ public struct ChatTimeline: Sendable, Equatable {
         items[index] = .work(work)
     }
 
-    /// Ends the task's running command step (one without a card).
-    private mutating func closeRun(_ task: String, _ change: (inout ShellRun) -> Void) {
-        guard let step = openRun.removeValue(forKey: task) else { return }
+    /// Changes the task's open command step.
+    private mutating func updateRun(_ task: String, _ change: (inout ShellRun) -> Void) {
+        guard let step = openRun[task] else { return }
         updateWork(task) { work in
             guard work.steps.indices.contains(step), var run = work.steps[step].run else { return }
             change(&run)
@@ -178,27 +173,17 @@ public struct ChatTimeline: Sendable, Equatable {
         }
     }
 
-    private mutating func updateTerminal(_ task: String, closing: Bool, _ change: (inout Terminal) -> Void) {
-        guard let index = openTerminal[task], case .terminal(var terminal) = items[index] else { return }
-        change(&terminal)
-        items[index] = .terminal(terminal)
-        if closing { openTerminal[task] = nil }
+    /// Changes the task's open command step for the last time.
+    private mutating func closeRun(_ task: String, _ change: (inout ShellRun) -> Void) {
+        updateRun(task, change)
+        openRun[task] = nil
     }
 
     private mutating func update(approval id: String, _ change: (inout Approval) -> Void) {
         guard let index = approvalIndex[id] else { return }
-        switch items[index] {
-        case .approval(var approval):
-            change(&approval)
-            items[index] = .approval(approval)
-        case .terminal(var terminal):
-            guard var approval = terminal.approval else { return }
-            change(&approval)
-            terminal.approval = approval
-            items[index] = .terminal(terminal)
-        default:
-            break
-        }
+        guard case .approval(var approval) = items[index] else { return }
+        change(&approval)
+        items[index] = .approval(approval)
     }
 
     private mutating func update(action id: String, _ change: (inout Action) -> Void) {
@@ -212,7 +197,6 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
     case user(Message)
     case assistant(Message)
     case work(Work)
-    case terminal(Terminal)
     case approval(Approval)
     case action(Action)
     case image(Picture)
@@ -222,7 +206,6 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
         case .user(let m): "user-\(m.id)"
         case .assistant(let m): "assistant-\(m.id)"
         case .work(let w): "work-\(w.id)"
-        case .terminal(let t): "terminal-\(t.id)"
         case .approval(let a): "approval-\(a.id)"
         case .action(let a): "action-\(a.id)"
         case .image(let p): "image-\(p.id)"
@@ -242,7 +225,7 @@ public struct Work: Sendable, Equatable {
         public let tool: String
         public let detail: String
         public var asRoot = false
-        /// A command that needed no approval: its result, shown inside the step.
+        /// For a command: how it went, shown inside the step.
         public var run: ShellRun?
     }
 
@@ -264,39 +247,23 @@ public struct Work: Sendable, Equatable {
     public var waiting = false
 }
 
-/// A command that ran without needing approval, shown inside its step (not as a card).
+/// A command the agent ran, shown inside its step: how it ended and the end of
+/// its output.
 public struct ShellRun: Sendable, Equatable {
-    public var state: Terminal.State = .running
-    public var exitCode: Int?
-    public var timedOut = false
-    /// The end of what it printed (stdout, then stderr).
-    public var output = ""
-    public var seconds: Double?
-}
-
-/// A shell command that needed the user's approval, shown as a terminal card
-/// with the approval and then its output.
-public struct Terminal: Sendable, Equatable {
     public enum State: Sendable, Equatable {
         case waitingForApproval, running, finished, denied
-        /// The task was stopped while the command ran.
+        /// The task was stopped before it finished.
         case didNotFinish
         /// The task ended without an output event (agentd before 0.2.0).
         case unrecorded
     }
 
-    public let id: Int
-    public let task: String
-    public let command: String
-    public let asRoot: Bool
-    public var state: State
+    public var state: State = .running
     public var exitCode: Int?
     public var timedOut = false
     /// The end of what it printed (stdout, then stderr).
     public var output = ""
     public var seconds: Double?
-    /// Set when the command needed the user's approval (root or risky).
-    public var approval: Approval?
 }
 
 public struct Approval: Sendable, Equatable {
@@ -321,6 +288,8 @@ public struct BrowserAction: Sendable, Equatable {
     public let key: String?
     /// Presses Enter after typing.
     public let submit: Bool
+    /// Typed into a message field: approving it also lets the agent send it.
+    public let sends: Bool
     /// The page's host, e.g. app.slack.com.
     public let site: String
 }

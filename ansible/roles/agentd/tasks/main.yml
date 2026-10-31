@@ -104,11 +104,6 @@
     mode: "0755"
   notify: Restart agentd
 
-# The model gateway's URL (not a secret), read on the controller.
-- name: Look up the model gateway
-  ansible.builtin.set_fact:
-    agentd_model_gateway_url: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/model-gateway/url', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
-
 # The attested gateway, once it exists: where it is, the images to accept
 # and the audience to sign identity proofs for (none of them secret).
 - name: Look up the attested model gateway
@@ -131,7 +126,7 @@
   ansible.builtin.file:
     path: /etc/agentd/secrets.env
     state: absent
-  when: agentd_model_gateway_url | length > 0
+  when: agentd_gateway_url | length > 0
   notify: Restart agentd
 
 # Without a gateway (bootstrap only), read on the controller with your AWS credentials.
@@ -144,11 +139,28 @@
     group: agentd
     mode: "0640"
   no_log: true
-  when: agentd_model_gateway_url | length == 0
+  when: agentd_gateway_url | length == 0
   notify: Restart agentd
 
 - name: Set up the shell user's egress proxy
   ansible.builtin.import_tasks: egress.yml
+
+# Squid must run with its new allowlist before the shell user downloads anything.
+- name: Apply the proxy changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Set up Nix for the shell user
+  ansible.builtin.import_tasks: nix.yml
+
+- name: Install the agent's skills
+  ansible.builtin.copy:
+    src: "{{ agentd_skills_dir }}"
+    dest: /etc/agentd/skills/
+    owner: root
+    group: agentd
+    mode: "0640"
+    directory_mode: "0750"
+  notify: Restart agentd
 
 - name: Write the approval rules override
   ansible.builtin.template:

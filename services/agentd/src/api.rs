@@ -17,6 +17,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent::{Agent, StartError};
+use crate::clock::UserClock;
 use crate::llm::KNOWN_MODELS;
 
 type App = State<Arc<Agent>>;
@@ -107,12 +108,23 @@ async fn register_device(State(agent): App, headers: HeaderMap, Json(body): Json
 #[derive(Deserialize)]
 struct NewMessage {
     text: String,
+    /// The app's time zone (IANA name) and current UTC offset in seconds, so
+    /// the agent knows the user's date ("yesterday").
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    utc_offset: Option<i64>,
 }
 
 async fn post_message(State(agent): App, headers: HeaderMap, Json(body): Json<NewMessage>) -> Response {
     let text = body.text.trim().to_string();
     if text.is_empty() {
         return error(StatusCode::BAD_REQUEST, "text is empty");
+    }
+    if let (Some(timezone), Some(offset)) = (&body.timezone, body.utc_offset)
+        && let Some(clock) = UserClock::from_app(timezone, offset)
+    {
+        agent.set_user_clock(&clock);
     }
     match agent.start(text, caller(&headers)) {
         Ok(task) => (StatusCode::ACCEPTED, Json(json!({"task": task}))).into_response(),

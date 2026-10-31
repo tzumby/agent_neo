@@ -13,6 +13,7 @@ use tokio::sync::{broadcast, oneshot, watch};
 
 use crate::browser::Browser;
 use crate::cdp::Cdp;
+use crate::clock::UserClock;
 use crate::config::Config;
 use crate::guard;
 use crate::llm::{self, Together, Usage, truncate};
@@ -149,6 +150,26 @@ impl Agent {
         busy
     }
 
+    /// Remembers the user's time zone (sent with each message) for later
+    /// tasks, resumed ones included.
+    pub fn set_user_clock(&self, clock: &UserClock) {
+        let _ = self.store.set_setting("user_timezone", &clock.timezone);
+        let _ = self
+            .store
+            .set_setting("user_utc_offset", &clock.utc_offset_secs.to_string());
+    }
+
+    fn user_clock(&self) -> UserClock {
+        let get = |key: &str| self.store.setting(key).ok().flatten();
+        match (
+            get("user_timezone"),
+            get("user_utc_offset").and_then(|o| o.parse().ok()),
+        ) {
+            (Some(timezone), Some(offset)) => UserClock::from_app(&timezone, offset).unwrap_or_default(),
+            _ => UserClock::default(),
+        }
+    }
+
     pub fn answer_approval(&self, id: &str, approved: bool, by: Option<String>) -> bool {
         match self.approvals.lock().unwrap().remove(id) {
             Some(reply) => reply.send((approved, by)).is_ok(),
@@ -261,12 +282,13 @@ impl Agent {
         settings: &Settings,
         usage: &mut Usage,
     ) -> Result<(String, &'static str, u32)> {
+        let now = self.user_clock().now();
         let mut browser = Browser::new(self.cdp.clone(), settings.allow_actions, self.policy.clone());
         browser
             .attach(self.store.setting("tab_target")?.as_deref())
             .await?;
         let mut messages =
-            vec![json!({"role": "system", "content": tools::system_prompt(self.cfg.shell_tool)})];
+            vec![json!({"role": "system", "content": tools::system_prompt(self.cfg.shell_tool, &now)})];
         messages.extend(history.iter().map(|h| json!({"role": h.role, "content": h.text})));
         messages.push(json!({"role": "user", "content": text}));
         let schemas = tools::schemas(self.cfg.shell_tool);
@@ -318,11 +340,23 @@ impl Agent {
                     let name = call["function"]["name"].as_str().unwrap_or_default().to_string();
                     let raw = call["function"]["arguments"].as_str().unwrap_or("{}").to_string();
                     let args: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-                    // A shell sleep to wait for a page: not run, not shown to the user.
-                    if name == "run_shell" && args["command"].as_str().is_some_and(guard::is_bare_sleep) {
-                        tracing::info!(task = %task_id, step, "refused a shell sleep");
-                        let refusal = guard::SLEEP_REFUSAL;
-                        if let guard::Repeat::Stop(answer) = loops.record(&name, &raw, refusal) {
+                    // Shell commands the model doesn't need (a sleep to wait for a
+                    // page, `date` to learn the date): not run, not shown to the user.
+                    let refusal = match args["command"].as_str() {
+                        Some(command) if name == "run_shell" && guard::is_bare_sleep(command) => {
+                            Some(guard::SLEEP_REFUSAL.to_string())
+                        }
+                        Some(command) if name == "run_shell" && guard::is_bare_date(command) => {
+                            Some(format!(
+                                "not run: you don't need the shell for the date. It's now {now} for the user; \
+                             work out other dates from that."
+                            ))
+                        }
+                        _ => None,
+                    };
+                    if let Some(refusal) = refusal {
+                        tracing::info!(task = %task_id, step, "answered a shell command without running it");
+                        if let guard::Repeat::Stop(answer) = loops.record(&name, &raw, &refusal) {
                             break 'task (answer, "stuck", step);
                         }
                         messages

@@ -75,7 +75,9 @@ const DEFAULT_DANGEROUS: &[(&str, &str)] = &[
 
 /// Clicking controls whose label matches this needs approval (and is refused
 /// in read-only mode).
-const RISKY_LABEL: &str = r"(?i)\b(send|delete|trash|archive|reply|forward|spam|move to|mark as|unsubscribe|buy|pay|purchase|order|submit|confirm|sign out|log ?out|remove|discard)\b";
+/// Not "reply" or "forward": those open a thread or a draft (typing and
+/// sending each ask on their own).
+const RISKY_LABEL: &str = r"(?i)\b(send|delete|trash|archive|spam|move to|mark as|unsubscribe|buy|pay|purchase|order|submit|confirm|sign out|log ?out|remove|discard)\b";
 
 /// Commands that can send data off the desktop. Once a task has read outside
 /// content (which may carry injected instructions), these ask first. A speed
@@ -246,6 +248,9 @@ mod tests {
         assert!(policy.risky_click(None, "Delete"));
         assert!(!policy.risky_click(Some("link"), "Confirm your payment"));
         assert!(!policy.risky_click(Some("button"), "Older"));
+        // Opening a thread or a reply draft sends nothing.
+        assert!(!policy.risky_click(Some("button"), "Reply to thread"));
+        assert!(!policy.risky_click(Some("button"), "Forward"));
     }
 
     #[test]

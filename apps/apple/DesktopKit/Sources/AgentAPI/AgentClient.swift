@@ -103,9 +103,23 @@ public struct AgentClient: Sendable {
 
     /// Starts a task. Throws AgentError.http(409, …) while another one runs.
     @discardableResult
-    public func send(_ text: String) async throws -> String {
-        let reply: [String: String] = try await post("/api/v1/messages", body: ["text": text])
+    /// Sends a message with this device's time zone, so the agent knows the
+    /// user's date ("yesterday").
+    public func send(_ text: String, timeZone: TimeZone = .current) async throws -> String {
+        let message = NewMessage(text: text, timezone: timeZone.identifier, utcOffset: timeZone.secondsFromGMT())
+        let reply: [String: String] = try await post("/api/v1/messages", body: message)
         return reply["task"] ?? ""
+    }
+
+    private struct NewMessage: Encodable {
+        let text: String
+        let timezone: String
+        let utcOffset: Int
+
+        enum CodingKeys: String, CodingKey {
+            case text, timezone
+            case utcOffset = "utc_offset"
+        }
     }
 
     public func answer(approval id: String, approved: Bool) async throws {

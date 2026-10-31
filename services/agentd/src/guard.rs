@@ -112,6 +112,23 @@ pub fn is_bare_sleep(command: &str) -> bool {
         })
 }
 
+/// A command that only prints the date (`date`, `date -d yesterday +%A`,
+/// `TZ=UTC date`): the model gets the user's date in its instructions.
+pub fn is_bare_date(command: &str) -> bool {
+    let parts: Vec<&str> = command
+        .split(['\n', ';'])
+        .flat_map(|part| part.split("&&"))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    !parts.is_empty()
+        && parts.iter().all(|part| {
+            // Skip leading VAR=value assignments.
+            let program = part.split_whitespace().find(|word| !word.contains('='));
+            program == Some("date") && !part.contains('|') && !part.contains('>') && !part.contains('`')
+        })
+}
+
 /// What the loop should do after a tool call.
 #[derive(Debug, PartialEq)]
 pub enum Repeat {
@@ -223,6 +240,26 @@ mod tests {
             "sleep 5; curl x",
         ] {
             assert!(!is_bare_sleep(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn spots_bare_date_commands_only() {
+        for command in [
+            "date",
+            "date; date -d yesterday \"+%A, %B %d\"",
+            "TZ=America/Toronto date +%F",
+        ] {
+            assert!(is_bare_date(command), "{command}");
+        }
+        for command in [
+            "date > now.txt",
+            "date | tee x",
+            "update-db",
+            "ls; date",
+            "echo $(date)",
+        ] {
+            assert!(!is_bare_date(command), "{command}");
         }
     }
 

@@ -5,6 +5,7 @@ mod agent;
 mod api;
 mod browser;
 mod cdp;
+mod clock;
 mod config;
 mod guard;
 mod llm;

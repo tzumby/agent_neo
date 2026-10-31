@@ -22,7 +22,7 @@ targets:
     sources: [CloudDesktop]
     dependencies:
       - package: DesktopKit
-        products: [Tailnet, AgentAPI, ChatCore]
+        products: [Tailnet, AgentAPI, ChatCore, DesktopViewer]
     info:
       path: CloudDesktop/Info.plist
       properties:

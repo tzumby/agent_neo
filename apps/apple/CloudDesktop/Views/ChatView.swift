@@ -1,15 +1,18 @@
 import AgentAPI
 import ChatCore
+import DesktopViewer
 import SwiftUI
 
 struct ChatView: View {
     let store: ChatStore
     let client: AgentClient
     let desktopName: String
+    let endpoint: DesktopEndpoint?
     let connectionKey: String
 
     @State private var draft = ""
     @State private var showingSettings = false
+    @State private var takeOver: TakeOverRequest?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -19,7 +22,7 @@ struct ChatView: View {
                         EmptyChat()
                     }
                     ForEach(store.timeline.items) { item in
-                        ChatItemView(item: item, store: store, client: client)
+                        ChatItemView(item: item, store: store, client: client, onTakeOver: openDesktop)
                             .id(item.id)
                     }
                     if store.busy {
@@ -38,12 +41,25 @@ struct ChatView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) { ConnectionBadge(connection: store.connection) }
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button("Desktop", systemImage: "desktopcomputer") { takeOver = TakeOverRequest(actionID: nil) }
+                    .disabled(endpoint == nil)
                 Button("Settings", systemImage: "gearshape") { showingSettings = true }
             }
         }
         .sheet(isPresented: $showingSettings) {
             NavigationStack { SettingsView(store: store, client: client) }
+        }
+        .fullScreenCover(item: $takeOver) { request in
+            if let endpoint {
+                TakeOverView(endpoint: endpoint, actionID: request.actionID, store: store, client: client)
+            } else {
+                // Tailscale is restarting (e.g. the app was in the background).
+                VStack(spacing: 16) {
+                    ProgressView("Reconnecting to Tailscale…")
+                    Button("Close") { takeOver = nil }
+                }
+            }
         }
         .alert(
             "Cloud Desktop",
@@ -80,6 +96,11 @@ struct ChatView: View {
         .padding(.horizontal)
         .padding(.vertical, 8)
         .background(.bar)
+    }
+
+    private var openDesktop: ((Action) -> Void)? {
+        guard endpoint != nil else { return nil }
+        return { takeOver = TakeOverRequest(actionID: $0.id) }
     }
 
     private func send() {

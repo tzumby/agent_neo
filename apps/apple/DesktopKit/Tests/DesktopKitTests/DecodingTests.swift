@@ -13,7 +13,7 @@ import Testing
           "CurrentTailnet": {"Name": "tzumby@gmail.com", "MagicDNSSuffix": "tail57aeb.ts.net"},
           "User": {"42": {"LoginName": "tzumby@gmail.com", "DisplayName": "Raz"}},
           "Peer": {
-            "nodekey:a": {"ID": "n2", "HostName": "cloud-desktop-dev", "DNSName": "cloud-desktop-dev.tail57aeb.ts.net.", "Online": true, "Tags": ["tag:cloud-desktop"]},
+            "nodekey:a": {"ID": "n2", "HostName": "cloud-desktop-dev", "DNSName": "cloud-desktop-dev.tail57aeb.ts.net.", "Online": true, "Tags": ["tag:cloud-desktop"], "TailscaleIPs": ["100.101.102.103", "fd7a:115c:a1e0::1"]},
             "nodekey:b": {"ID": "n3", "HostName": "iphone-15-plus", "DNSName": "iphone-15-plus.tail57aeb.ts.net.", "Online": true}
           }
         }
@@ -23,6 +23,7 @@ import Testing
     #expect(status.loginName == "tzumby@gmail.com")
     #expect(status.desktops.map(\.host) == ["cloud-desktop-dev.tail57aeb.ts.net"])
     #expect(status.currentTailnet?.magicDNSSuffix == "tail57aeb.ts.net")
+    #expect(status.desktops.first?.ipv4 == "100.101.102.103")
 }
 
 @Test func decodesNeedsLogin() throws {

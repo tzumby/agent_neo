@@ -8,9 +8,15 @@ struct CloudDesktopApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environment(tailnet)
-                .task { tailnet.start() }
+            #if DEBUG
+                if let preview = TakeOverPreview.fromEnvironment() {
+                    preview
+                } else {
+                    root
+                }
+            #else
+                root
+            #endif
         }
         .onChange(of: scenePhase) { old, new in
             // iOS takes the Tailscale node's loopback proxy away while the app is
@@ -19,5 +25,11 @@ struct CloudDesktopApp: App {
                 Task { await tailnet.restart() }
             }
         }
+    }
+
+    private var root: some View {
+        RootView()
+            .environment(tailnet)
+            .task { tailnet.start() }
     }
 }

@@ -156,18 +156,27 @@ SwiftUI app for iPhone (iOS 18.1+; a Mac target follows), generated with XcodeGe
 from `apps/apple/project.yml`. `DesktopKit` holds the shared code: `Tailnet`
 (the app's own Tailscale node via TailscaleKit; you sign in with Tailscale in the
 app, no Tailscale app needed), `AgentAPI` (agentd's API and event stream over the
-tailnet) and `ChatCore` (turns the event stream into the chat timeline).
+tailnet), `ChatCore` (turns the event stream into the chat timeline) and
+`DesktopViewer` (VNC to the desktop through the node's SOCKS5 proxy).
 
 The app opens on a chat with the first desktop tagged `tag:cloud-desktop`. It
 shows the agent's replies, its steps (tap to expand), Approve/Deny cards for risky
 commands and "Action needed" cards with a screenshot when a site needs you to sign
-in (Skip / I'm done; Take over comes with the in-app desktop view). Stop cancels
-the running task. Settings (gear) has the model, the browser-actions switch and
+in (Skip / I'm done / Take over). Stop cancels the running task.
+
+**Take over** (on a card, or the desktop button in the toolbar) shows the desktop
+full screen over VNC through the app's own Tailscale node (`DesktopViewer`, using
+swift-rfb). Tap to click, two-finger tap to right-click, pinch to zoom, drag to
+move around, two-finger drag to scroll the page, and long-press then drag to drag.
+The keyboard button opens the iPhone keyboard with Esc, Tab, Ctrl, Alt and arrow
+keys. Paste types the phone's clipboard on the desktop, and I'm done tells the
+agent to carry on. Settings (gear) has the model, the browser-actions switch and
 Tailscale log out. After a disconnect the app resumes from the last event it saw.
 
 ```sh
 make app-tailscalekit   # once: build TailscaleKit.xcframework (Go + Xcode)
-make app-test           # DesktopKit unit tests (AGENTD_URL=http://127.0.0.1:8765 adds a live test against a local agentd)
+make app-test           # DesktopKit unit tests (AGENTD_URL=http://127.0.0.1:8765 adds a live test against a local agentd;
+                        # VNC_ADDR=127.0.0.1:15900 one against x11vnc through an SSM port forward)
 make app-device         # build, sign (team 4UVAPZYV4Q), install and launch on your iPhone
 ```
 

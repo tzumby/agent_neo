@@ -27,6 +27,7 @@ public struct TailnetStatus: Decodable, Sendable {
         public let online: Bool?
         public let tags: [String]?
         public let userID: Int64?
+        public let tailscaleIPs: [String]?
 
         enum CodingKeys: String, CodingKey {
             case id = "ID"
@@ -35,7 +36,11 @@ public struct TailnetStatus: Decodable, Sendable {
             case online = "Online"
             case tags = "Tags"
             case userID = "UserID"
+            case tailscaleIPs = "TailscaleIPs"
         }
+
+        /// The peer's tailnet IPv4 address (100.x.y.z).
+        public var ipv4: String? { tailscaleIPs?.first { !$0.contains(":") } }
 
         /// MagicDNS name without the trailing dot, e.g. cloud-desktop-dev.tail57aeb.ts.net.
         public var host: String {

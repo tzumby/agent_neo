@@ -2,7 +2,9 @@
 
 *Status: draft v2, 2026-10-30. **Phase 1 deployed 2026-10-31** (`agentd` + `tailnet-proxy`
 on the dev desktop). **Phase 2 done 2026-10-31**: the iPhone app signs in with Tailscale
-(TailscaleKit, no Tailscale app) and shows the desktop's and agentd's status. **Phase 3 (chat)
+(TailscaleKit, no Tailscale app) and shows the desktop's and agentd's status. **Phase 3 done
+2026-10-31**: chat on the iPhone, with steps, approvals and Action needed cards (agentd now
+reminds the model to call `needs_user` when it stops on a sign-in page). **Phase 4 (take over)
 is built and installed on the iPhone**; its done-when test is still to run. See the README. Library facts checked on that date (sources at
 the end). Items marked UNVERIFIED need a spike before we rely on them.*
 
@@ -241,13 +243,16 @@ guardrails.
 - **Settings:** model, browser actions, Tailscale status / log in again.
 
 ### 5.4 Take-over view (`DesktopViewer`)
-- **VNC library: RoyalVNCKit 1.1.0** (MIT; Tight/ZRLE; **archived**, so we
-  pin and fork it). It connects to a host and port, which our loopback
-  forwarder provides.
-  - On iOS we write the `UIView` from its framebuffer (`cgImage` / IOSurface).
-  - On the Mac we use its Metal `VNCCAFramebufferView`.
-  - **Spike** against **swift-rfb** (MIT, iOS 18+, swappable transport, tested
-    with x11vnc, v0.1.0) before committing.
+- **VNC library: swift-rfb 0.1.0** (MIT; Tight with JPEG, ZRLE; platform-neutral
+  core; pluggable transport). Chosen after the phase 4 spike: it streamed the
+  desktop's x11vnc (1280x800) in about 1.6 s from the Mac. RoyalVNCKit was
+  archived in Oct 2026 and its iOS view was unfinished.
+  - **Transport:** TailscaleKit's `OutgoingConnection` can only send, so there is
+    no loopback forwarder. `SOCKSTransport` opens the VNC connection through the
+    node's loopback SOCKS5 proxy (user `tsnet`, the proxy credential) to the
+    desktop's tailnet IP, port 5900.
+  - On iOS we draw each frame (`makeImage()`) into a layer in a `UIScrollView`.
+  - On the Mac we can use its Metal `RFBView`.
 - **Keyboard:**
   - a hidden `UIKeyInput` view with every text-assistance feature off;
   - characters mapped to X11 keysyms (Latin-1 as the code point, everything
@@ -258,8 +263,9 @@ guardrails.
 - **Bottom bar** as in Grok: clipboard, I'm done, keyboard toggle, and later
   the 🔑 AutoFill button.
 - **Gestures:**
-  - tap = click; long-press = right-click; drag;
-  - two-finger pan = scroll; pinch = zoom.
+  - tap = click; two-finger tap = right-click;
+  - one-finger drag = move around the zoomed screen; pinch = zoom;
+  - two-finger drag = scroll the page; long-press, then drag = drag on the desktop.
 - **Zooming in on the login:** `agentd` reports the focused field's box, and
   the view zooms there (UNVERIFIED nicety).
 - **Clipboard:** Latin-1 text only. x11vnc drops the connection on

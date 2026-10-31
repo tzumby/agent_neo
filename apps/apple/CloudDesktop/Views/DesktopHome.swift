@@ -1,5 +1,6 @@
 import AgentAPI
 import ChatCore
+import DesktopViewer
 import SwiftUI
 import Tailnet
 
@@ -18,6 +19,7 @@ struct DesktopHome: View {
                 store: store,
                 client: AgentClient(host: desktop.host, session: session),
                 desktopName: desktop.hostName,
+                endpoint: endpoint(for: desktop),
                 // A new Tailscale session (after the app was suspended) restarts the stream.
                 connectionKey: "\(desktop.host)|\(ObjectIdentifier(session))"
             )
@@ -28,5 +30,13 @@ struct DesktopHome: View {
                 description: Text("No device tagged tag:cloud-desktop is on your tailnet.")
             )
         }
+    }
+
+    /// VNC through the node's proxy, to the desktop's tailnet IP (no DNS needed).
+    private func endpoint(for desktop: TailnetStatus.Peer) -> DesktopEndpoint? {
+        guard let proxy = tailnet.proxy else { return nil }
+        return DesktopEndpoint(
+            proxy: SOCKSProxy(host: proxy.host, port: proxy.port, username: proxy.username, password: proxy.password),
+            host: desktop.ipv4 ?? desktop.host)
     }
 }

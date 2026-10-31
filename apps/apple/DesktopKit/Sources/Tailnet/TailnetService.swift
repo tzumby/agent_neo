@@ -27,6 +27,15 @@ public final class TailnetService {
     public private(set) var status: TailnetStatus?
     /// Requests through the tailnet (SOCKS5 proxy into the node). Set while running.
     public private(set) var session: URLSession?
+    /// The node's loopback SOCKS5 proxy, for raw connections such as VNC. Set while running.
+    public private(set) var proxy: Proxy?
+
+    public struct Proxy: Sendable, Hashable {
+        public let host: String
+        public let port: UInt16
+        public let username: String
+        public let password: String
+    }
 
     private let hostName: String
     private let stateDirectory: URL
@@ -88,6 +97,7 @@ public final class TailnetService {
         poller?.cancel()
         poller = nil
         session = nil
+        proxy = nil
         if let node {
             self.node = nil
             try? await node.close()
@@ -116,9 +126,12 @@ public final class TailnetService {
         case "Running":
             if session == nil {
                 do {
-                    let (configuration, _) = try await URLSessionConfiguration.tailscaleSession(node)
+                    let (configuration, loopback) = try await URLSessionConfiguration.tailscaleSession(node)
                     configuration.timeoutIntervalForRequest = 30
                     session = URLSession(configuration: configuration)
+                    proxy = Proxy(
+                        host: loopback.ip ?? "127.0.0.1", port: UInt16(loopback.port ?? 0),
+                        username: "tsnet", password: loopback.proxyCredential)
                 } catch {
                     phase = .failed("Tailscale proxy: \(error.localizedDescription)")
                     return

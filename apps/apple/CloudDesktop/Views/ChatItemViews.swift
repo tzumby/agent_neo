@@ -6,6 +6,8 @@ struct ChatItemView: View {
     let item: ChatItem
     let store: ChatStore
     let client: AgentClient
+    /// Opens the take-over view; nil while the desktop can't be reached.
+    var onTakeOver: ((Action) -> Void)?
 
     var body: some View {
         switch item {
@@ -30,7 +32,7 @@ struct ChatItemView: View {
         case .approval(let approval):
             ApprovalCard(approval: approval, store: store, client: client)
         case .action(let action):
-            ActionCard(action: action, store: store, client: client)
+            ActionCard(action: action, store: store, client: client, onTakeOver: onTakeOver)
         case .image(let picture):
             VStack(alignment: .leading, spacing: 6) {
                 RemoteImage(path: picture.path, client: client)
@@ -179,6 +181,7 @@ private struct ActionCard: View {
     let action: Action
     let store: ChatStore
     let client: AgentClient
+    let onTakeOver: ((Action) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -200,9 +203,9 @@ private struct ActionCard: View {
                         .buttonStyle(.bordered)
                     Button("I'm done") { Task { await store.resolve(action, done: true, client: client) } }
                         .buttonStyle(.bordered)
-                    Button("Take over") {}
+                    Button("Take over") { onTakeOver?(action) }
                         .buttonStyle(.borderedProminent)
-                        .disabled(true)  // the in-app desktop view arrives in phase 4
+                        .disabled(onTakeOver == nil)
                 }
             case .done: Label("Done", systemImage: "checkmark").font(.subheadline).foregroundStyle(.green)
             case .skipped: Text("Skipped").font(.subheadline).foregroundStyle(.secondary)

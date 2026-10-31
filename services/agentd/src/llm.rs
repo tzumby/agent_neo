@@ -9,7 +9,7 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::aws::FunctionUrl;
 use crate::config::Config;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const API_URL: &str = "https://api.together.ai/v1/chat/completions";
@@ -132,7 +132,7 @@ impl Together {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input: u64,
     pub cached: u64,

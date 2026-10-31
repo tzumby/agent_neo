@@ -5,7 +5,8 @@ import Foundation
 /// apply events in order (replaying from 0 rebuilds the whole history).
 public struct ChatTimeline: Sendable, Equatable {
     public private(set) var items: [ChatItem] = []
-    /// A task is running (between task.started and task.finished).
+    /// A task is running (between task.started and task.finished, except while
+    /// it's paused waiting for an approval).
     public private(set) var busy = false
 
     private var workIndex: [String: Int] = [:]  // task → index of its work item
@@ -30,6 +31,12 @@ public struct ChatTimeline: Sendable, Equatable {
             busy = true
             workIndex[task] = items.count
             items.append(.work(Work(id: event.seq, task: task, model: data["model"]?.string ?? "")))
+        case "task.paused":  // parked on an approval: the desktop is free meanwhile
+            busy = false
+            updateWork(task) { $0.waiting = true }
+        case "task.resumed":
+            busy = true
+            updateWork(task) { $0.waiting = false }
         case "step":
             let tool = data["tool"]?.string ?? "?"
             guard tool != "run_shell" else { return }  // shown by the "shell" event instead
@@ -77,6 +84,11 @@ public struct ChatTimeline: Sendable, Equatable {
         case "approval.resolved":
             let id = data["id"]?.string ?? ""
             let approved = data["approved"]?.bool ?? false
+            if data["expired"]?.bool == true {
+                // Given up (stopped, or a new message): the task.finished that follows closes its card.
+                update(approval: id) { $0.state = .expired }
+                return
+            }
             update(approval: id) { $0.state = approved ? .approved : .denied }
             updateTerminal(task, closing: !approved) { $0.state = approved ? .running : .denied }
         case "action_needed":
@@ -209,6 +221,8 @@ public struct Work: Sendable, Equatable {
     public let model: String
     public var steps: [Step] = []
     public var finished: Finished?
+    /// Paused, waiting for the user's approval.
+    public var waiting = false
 }
 
 /// A shell command the agent ran, shown as a terminal card with its output.

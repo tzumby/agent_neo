@@ -52,6 +52,8 @@ async fn status(State(agent): App) -> Json<Value> {
     Json(json!({
         "desktop": agent.cfg.desktop_name,
         "busy": agent.is_busy(),
+        // The approval a parked task waits on.
+        "waiting_on": agent.waiting_on(),
         "settings": agent.settings(),
         "last_seq": agent.store.last_seq().unwrap_or(0),
         "known_models": KNOWN_MODELS,
@@ -170,13 +172,13 @@ async fn answer_approval(
     Json(body): Json<Approval>,
 ) -> Response {
     tracing::info!(id, approved = body.approved, by = ?caller(&headers), "approval answered");
-    if agent.answer_approval(&id, body.approved, caller(&headers)) {
-        Json(json!({"ok": true})).into_response()
-    } else {
-        error(
+    match agent.answer_approval(&id, body.approved, caller(&headers)) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(StartError::NotFound) => error(
             StatusCode::NOT_FOUND,
             "no pending approval with that id (it may have expired)",
-        )
+        ),
+        Err(StartError::Busy) => error(StatusCode::CONFLICT, "busy with another request; stop it first"),
     }
 }
 

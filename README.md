@@ -89,6 +89,11 @@ the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
 - commands starting with `sudo`, risky ones, and (after the agent has read a web
   page or command output) ones that can send data out (`curl`, `scp`, `git push`,
   ...) wait for approval in the app; approvals record who answered;
+- a task waiting for approval parks: its state is saved in `/var/lib/agentd`,
+  the desktop is free, and the answer resumes it, after a restart too (only if
+  the action is still the one on the card; a day-old approval expires). A new
+  message or Stop gives up on it. A task that runs out of steps ends with a
+  summary of what it did and what's left;
 - browser actions wait for the page to settle on events, not timers: the page's DOM
   changes (a MutationObserver) and its network requests (DevTools events), so a
   slow single-page app like Slack is loaded when the next step looks at it. A

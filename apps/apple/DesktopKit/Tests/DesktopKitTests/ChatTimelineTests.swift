@@ -122,3 +122,36 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     #expect(approval.browser?.text == "Hi Alice!")
     #expect(approval.browser?.site == "app.slack.com")
 }
+
+@Test func aTaskPausesForApprovalAndResumes() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(try event(1, "task.started", #"{"task":"t1","model":"m"}"#))
+    timeline.apply(try event(2, "shell", #"{"task":"t1","command":"sudo apt update","as_root":true,"needs_approval":true}"#))
+    timeline.apply(try event(3, "approval.requested", #"{"task":"t1","id":"a1","command":"sudo apt update","reason":"runs as root"}"#))
+    timeline.apply(try event(4, "task.paused", #"{"task":"t1","approval":"a1"}"#))
+    #expect(!timeline.busy)
+    guard case .work(let paused) = timeline.items[0] else { Issue.record("no work item"); return }
+    #expect(paused.waiting && paused.finished == nil)
+
+    // Answered (maybe after a restart): the same task carries on, the command's card fills in.
+    timeline.apply(try event(5, "approval.resolved", #"{"task":"t1","id":"a1","approved":true}"#))
+    timeline.apply(try event(6, "task.resumed", #"{"task":"t1"}"#))
+    #expect(timeline.busy)
+    timeline.apply(
+        try event(7, "shell.output", #"{"task":"t1","command":"sudo apt update","exit_code":0,"timed_out":false,"output":"ok"}"#))
+    guard case .work(let resumed) = timeline.items[0], case .terminal(let ran) = timeline.items[1] else {
+        Issue.record("no work or terminal")
+        return
+    }
+    #expect(!resumed.waiting)
+    #expect(ran.state == .finished && ran.approval?.state == .approved)
+
+    // Given up on while paused: the card expires and the command never ran.
+    timeline.apply(try event(8, "shell", #"{"task":"t1","command":"sudo reboot","as_root":true,"needs_approval":true}"#))
+    timeline.apply(try event(9, "approval.requested", #"{"task":"t1","id":"a2","command":"sudo reboot","reason":"runs as root"}"#))
+    timeline.apply(try event(10, "task.paused", #"{"task":"t1","approval":"a2"}"#))
+    timeline.apply(try event(11, "approval.resolved", #"{"task":"t1","id":"a2","approved":false,"expired":true}"#))
+    timeline.apply(try event(12, "task.finished", #"{"task":"t1","status":"cancelled","steps":3,"seconds":5}"#))
+    guard case .terminal(let expired) = timeline.items[2] else { Issue.record("no terminal"); return }
+    #expect(expired.approval?.state == .expired && expired.state == .didNotFinish)
+}

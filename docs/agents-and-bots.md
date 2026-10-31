@@ -1,6 +1,6 @@
 # Main agent and user bots: design
 
-*Status: draft, 2026-10-31. Builds on agentd 0.8 (see [native-app-plan.md](native-app-plan.md)). Nothing here is built yet.*
+*Status: draft, 2026-10-31. Builds on agentd 0.8 (see [native-app-plan.md](native-app-plan.md)). Phase A is built in agentd 0.9 (runs table, approvals that park and resume across restarts, wrap-up step, `agent` on events); the rest isn't built yet.*
 
 ## 1. Goal
 

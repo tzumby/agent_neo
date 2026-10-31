@@ -168,7 +168,7 @@ pointing at a proxy in the Mac app, over the tailnet.
 
 | Who | Runs | Can |
 |---|---|---|
-| `agentd` (system user, no login) | `agentd` | read `/etc/agentd/secrets.env` (model key, 0600); write `/var/lib/agentd`; run commands as `agent`; run root commands only after your approval (narrow sudoers rule) |
+| `agentd` (system user, no login) | `agentd` | read `/etc/agentd/agentd.env` (no model key: model calls go through the model gateway with the desktop's role); write `/var/lib/agentd`; run commands as `worker` in hardened systemd units; run root commands only after your approval |
 | `agent` (desktop user) | Xvfb, XFCE, Chrome, every shell-tool command | its own home only. **No passwordless sudo** (this removes today's dev setting). Can't read `agentd`'s secrets, state or policy. |
 | root | the binary `/usr/local/bin/agentd` and the policy `/etc/agentd/policy.toml` (denylist, read-only defaults) | Ansible and image builds only |
 

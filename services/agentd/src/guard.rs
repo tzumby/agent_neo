@@ -7,6 +7,7 @@
 //! (`enforce_tool_result_context_budget`) and
 //! `crates/agents/src/tool_loop_detector.rs`.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Characters of tool output kept in the context; older results beyond this
@@ -179,8 +180,8 @@ pub enum Repeat {
     Stop(String),
 }
 
-/// Spots the same failing call made again and again.
-#[derive(Default)]
+/// Spots the same failing call made again and again. Saved with a parked task.
+#[derive(Default, Serialize, Deserialize)]
 pub struct LoopDetector {
     last: Option<String>,
     failures: u32,

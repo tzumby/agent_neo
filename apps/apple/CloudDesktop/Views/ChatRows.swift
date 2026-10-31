@@ -397,7 +397,9 @@ private struct WorkRow: View {
                 withAnimation(.snappy(duration: 0.25)) { expanded.toggle() }
             } label: {
                 HStack(spacing: 6) {
-                    if work.finished == nil {
+                    if work.finished == nil && work.waiting {
+                        Text("Waiting for your approval")
+                    } else if work.finished == nil {
                         Text(working).shimmering()
                     } else {
                         Text(summary)
@@ -442,6 +444,7 @@ private struct WorkRow: View {
         case "cancelled": "Stopped after \(seconds)"
         case "max_steps": "Ran out of steps after \(seconds)"
         case "stuck": "Got stuck after \(seconds)"
+        case "interrupted": "Interrupted · the desktop restarted"
         default: "Something went wrong after \(seconds)"
         }
     }

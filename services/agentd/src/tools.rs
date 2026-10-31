@@ -9,6 +9,10 @@ pub const SKIP_TEXT: &str =
 pub const SIGN_IN_REMINDER: &str = "(agentd) The open tab looks like a sign-in page. If the user has to \
 sign in, enter a code or solve a CAPTCHA there, call needs_user now: a text reply ends the task and gives \
 them no way to reach the tab. If no sign-in is needed, give your answer again.";
+/// Sent by agentd when a task runs out of steps: one last turn, without tools.
+pub const WRAP_UP: &str = "(agentd) You've used all the steps for this task, so you can't use tools any \
+more. Reply to the user now: what you did, what's still undone and why, and what they could ask you next. \
+Keep it short.";
 
 pub fn system_prompt(shell: bool, now: &str) -> String {
     let shell_rule = if shell {

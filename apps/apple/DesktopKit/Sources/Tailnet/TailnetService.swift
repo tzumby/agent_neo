@@ -4,9 +4,12 @@ import Observation
 import Synchronization
 import TailscaleKit
 
-/// Drops TailscaleKit's logs (its BlackholeLogger has no public initializer).
+/// Drops TailscaleKit's logs (its BlackholeLogger has no public initializer),
+/// the Go node's included: -1 makes libtailscale discard them (TsnetSetLogFD).
+/// With nil, the node would print to stderr (tsnet start-up, every closed
+/// SOCKS5 connection, slow subscribers after the app was suspended).
 struct QuietLogger: LogSink {
-    var logFileHandle: Int32? { nil }
+    var logFileHandle: Int32? { -1 }
     func log(_ message: String) {}
 }
 

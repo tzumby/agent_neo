@@ -11,7 +11,7 @@ struct RootView: View {
         case .needsLogin(let url):
             LoginView(loginURL: url)
         case .running:
-            NavigationStack { StatusView() }
+            NavigationStack { DesktopHome() }
         case .failed(let message):
             ContentUnavailableView {
                 Label("Tailscale isn't connected", systemImage: "exclamationmark.triangle")

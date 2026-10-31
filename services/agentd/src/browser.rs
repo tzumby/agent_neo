@@ -68,6 +68,16 @@ impl Browser {
         Ok(format!("{} | {}", pair.0, pair.1))
     }
 
+    /// A heuristic: the open tab shows a visible password field or has a sign-in URL.
+    pub async fn looks_like_sign_in(&self) -> bool {
+        let Ok(page) = self.page() else { return false };
+        page.eval(SIGN_IN_CHECK)
+            .await
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     async fn settle(&self) -> Result<()> {
         // Wait for the document, then give client-side apps a moment to render.
         for _ in 0..60 {
@@ -289,6 +299,13 @@ fn key_definition(key: &str) -> Result<(String, String, i64, Option<String>)> {
 // --- Accessibility tree ---------------------------------------------------------
 
 /// Roles that only add structure; their children are shown in their place.
+const SIGN_IN_CHECK: &str = r#"(() => {
+  const visible = (el) => el.getClientRects().length > 0;
+  if ([...document.querySelectorAll('input[type=password]')].some(visible)) return true;
+  return /^(accounts|login|auth|signin|sso)\./i.test(location.hostname)
+    || /\/(login|log-in|signin|sign-in|sign_in|session|auth|sso)(\/|$)/i.test(location.pathname);
+})()"#;
+
 const SKIPPED_ROLES: &[&str] = &[
     "generic",
     "none",

@@ -250,6 +250,7 @@ impl Agent {
         messages.push(json!({"role": "user", "content": text}));
         let schemas = tools::schemas(self.cfg.shell_tool);
         let mut cancel = self.cancel.subscribe();
+        let mut reminded = false;
 
         let outcome = 'task: {
             for step in 1..=self.cfg.max_steps {
@@ -268,6 +269,14 @@ impl Agent {
                 messages.push(without_nulls(&message));
                 let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
                 if calls.is_empty() {
+                    // Models sometimes ask for a sign-in in their answer, which ends the task
+                    // with no way for the user to reach the tab. Remind them once.
+                    if !reminded && browser.looks_like_sign_in().await {
+                        reminded = true;
+                        tracing::info!(task = %task_id, step, "sign-in page: reminding about needs_user");
+                        messages.push(json!({"role": "user", "content": tools::SIGN_IN_REMINDER}));
+                        continue;
+                    }
                     let answer = message["content"]
                         .as_str()
                         .unwrap_or("(empty answer)")

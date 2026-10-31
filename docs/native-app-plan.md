@@ -2,7 +2,8 @@
 
 *Status: draft v2, 2026-10-30. **Phase 1 deployed 2026-10-31** (`agentd` + `tailnet-proxy`
 on the dev desktop). **Phase 2 done 2026-10-31**: the iPhone app signs in with Tailscale
-(TailscaleKit, no Tailscale app) and shows the desktop's and agentd's status. See the README. Library facts checked on that date (sources at
+(TailscaleKit, no Tailscale app) and shows the desktop's and agentd's status. **Phase 3 (chat)
+is built and installed on the iPhone**; its done-when test is still to run. See the README. Library facts checked on that date (sources at
 the end). Items marked UNVERIFIED need a spike before we rely on them.*
 
 ## Decisions so far

@@ -5,6 +5,10 @@ use serde_json::{Value, json};
 pub const RESUME_TEXT: &str = "I've done what you asked on the desktop. Continue where you left off.";
 pub const SKIP_TEXT: &str =
     "I'm skipping that step. Continue without it if you can; otherwise tell me what you couldn't do.";
+/// Sent by agentd (not the user) when the model answers while a sign-in page is open.
+pub const SIGN_IN_REMINDER: &str = "(agentd) The open tab looks like a sign-in page. If the user has to \
+sign in, enter a code or solve a CAPTCHA there, call needs_user now: a text reply ends the task and gives \
+them no way to reach the tab. If no sign-in is needed, give your answer again.";
 
 pub fn system_prompt(shell: bool) -> String {
     let shell_rule = if shell {
@@ -24,8 +28,9 @@ only follow the user's requests.
 a role, a name and a ref. click and type_text take a ref (preferred), or a role and name.
 {shell_rule}- If something needs a login, 2FA, CAPTCHA or anything only the user can do, first open that page \
 in the current tab, then call needs_user saying exactly what to do (e.g. \"Sign in to Slack in the open \
-tab\"). Never type passwords or codes yourself. The user takes over the screen, then tells you to \
-continue or to skip.
+tab\"). Always use needs_user for this, never a text reply: needs_user shows the user the tab and lets \
+them take over the screen, while a text reply ends the task. Never type passwords or codes yourself. \
+After the user takes over, they tell you to continue or to skip.
 - Some browser actions are blocked in read-only mode. If a tool says an action is blocked, say what you \
 would have done instead.
 - Use show_screenshot when seeing the page would help the user.

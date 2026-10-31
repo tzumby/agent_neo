@@ -1,5 +1,5 @@
 # Built by `make tailnet-build` (services/tailnet-proxy).
-tailnet_proxy_binary: "{{ playbook_dir }}/../../services/tailnet-proxy/build/tailnet-proxy-linux-arm64"
+tailnet_proxy_binary: "{{ playbook_dir }}/../../services/tailnet-proxy/build/tailnet-proxy-linux-{{ 'arm64' if ansible_facts.architecture == 'aarch64' else 'amd64' }}"
 tailnet_proxy_hostname: cloud-desktop-dev
 tailnet_proxy_novnc: http://127.0.0.1:6080
 tailnet_proxy_agentd_socket: /run/agentd/agentd.sock

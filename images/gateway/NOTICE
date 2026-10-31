@@ -1,0 +1,12 @@
+images/gateway is derived from the AL2023 attestable image example in
+https://github.com/amazonlinux/kiwi-image-descriptions-examples
+(al2023/attestable-image-example, commit 4570f0e):
+
+  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+  Licensed under the Apache License, Version 2.0 (LICENSE.sample).
+
+Unchanged: edit_boot_install.sh, add-gpg-key.sh, root/etc/fstab.script,
+root/etc/chrony.d/10-disable-cmdport.conf, root/etc/systemd/system.conf.d/50-limits.conf.
+Changed: appliance.kiwi (name, packages), config.sh (gatewayd user and services).
+Added: root/etc/systemd/system/gatewayd.service, root/etc/sysconfig/nftables.conf,
+root/etc/udev/rules.d/60-tpm.rules; root/usr/local/bin/gatewayd is put in at build time.

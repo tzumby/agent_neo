@@ -462,29 +462,98 @@ private struct WorkRow: View {
 
 private struct StepRow: View {
     let step: Work.Step
+    @State private var showOutput = false
+    private let tailLines = 12
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: StepText.icon(step.tool))
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
-            if step.tool == "run_shell" {
-                Text(step.detail)
-                    .font(.footnote.monospaced())
-                    .lineLimit(3)
-                if step.asRoot {
-                    Text("root")
-                        .font(.caption2.bold())
-                        .foregroundStyle(.orange)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(.orange.opacity(0.15), in: .capsule)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Image(systemName: StepText.icon(step.tool))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18)
+                if step.tool == "run_shell" {
+                    Text(step.detail)
+                        .font(.footnote.monospaced())
+                        .lineLimit(3)
+                    if step.asRoot {
+                        Text("root")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.orange.opacity(0.15), in: .capsule)
+                    }
+                    Spacer(minLength: 4)
+                    if let run = step.run {
+                        RunStatus(run: run)
+                        if !run.output.isEmpty {
+                            Image(systemName: "chevron.down")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.tertiary)
+                                .rotationEffect(.degrees(showOutput ? 180 : 0))
+                        }
+                    }
+                } else {
+                    Text(StepText.describe(step)).font(.footnote).lineLimit(2)
                 }
-            } else {
-                Text(StepText.describe(step)).font(.footnote).lineLimit(2)
+            }
+            .contentShape(.rect)
+            .onTapGesture {
+                guard step.run?.output.isEmpty == false else { return }
+                withAnimation(.snappy(duration: 0.2)) { showOutput.toggle() }
+            }
+            // A command that needed no approval keeps its output here, out of the chat.
+            if showOutput, let run = step.run {
+                ScrollView(.horizontal) {
+                    Text(tail(run.output))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(Color(white: 0.85))
+                        .textSelection(.enabled)
+                        .padding(10)
+                }
+                .scrollIndicators(.hidden)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.inset, in: .rect(cornerRadius: 10))
+                .padding(.leading, 28)
+                .transition(.opacity)
             }
         }
+    }
+
+    private func tail(_ output: String) -> String {
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
+        return lines.count > tailLines ? lines.suffix(tailLines).joined(separator: "\n") : output
+    }
+}
+
+/// How a command step ended (or that it's still running).
+private struct RunStatus: View {
+    let run: ShellRun
+
+    var body: some View {
+        Group {
+            switch run.state {
+            case .running, .waitingForApproval:
+                ProgressView().controlSize(.mini)
+            case .finished where run.timedOut:
+                Image(systemName: "clock.badge.exclamationmark").foregroundStyle(.orange)
+            case .finished where run.exitCode == 0:
+                HStack(spacing: 3) {
+                    Image(systemName: "checkmark").foregroundStyle(.green)
+                    if let seconds = run.seconds, seconds >= 1 {
+                        Text("\(Int(seconds.rounded()))s").foregroundStyle(.secondary)
+                    }
+                }
+            case .finished:
+                Text("exit \(run.exitCode.map(String.init) ?? "?")").foregroundStyle(.red)
+            case .didNotFinish, .denied:
+                Image(systemName: "stop.circle").foregroundStyle(.secondary)
+            case .unrecorded:
+                EmptyView()
+            }
+        }
+        .font(.caption2.weight(.semibold))
     }
 }
 

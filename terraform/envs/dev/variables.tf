@@ -46,10 +46,21 @@ variable "app_port" {
   default     = 8000
 }
 
-variable "desktop_instance_type" {
-  description = "Instance type for desktops (must be arm64/Graviton)."
+variable "desktop_arch" {
+  description = "Desktops' CPU architecture: amd64 (x86_64: most Linux desktop apps, e.g. Slack, ship only for it) or arm64 (Graviton). desktop_instance_type must match."
   type        = string
-  default     = "t4g.medium"
+  default     = "amd64"
+
+  validation {
+    condition     = contains(["amd64", "arm64"], var.desktop_arch)
+    error_message = "desktop_arch must be amd64 or arm64."
+  }
+}
+
+variable "desktop_instance_type" {
+  description = "Instance type for desktops, of desktop_arch (amd64: e.g. t3a.medium; arm64: e.g. t4g.medium)."
+  type        = string
+  default     = "t3a.medium"
 }
 
 variable "cpu_credits" {
@@ -115,4 +126,16 @@ variable "model_daily_budget_usd" {
   description = "Model spend allowed per desktop per day (UTC), enforced by the model gateway."
   type        = number
   default     = 20
+}
+
+variable "enable_image_builder" {
+  description = "IAM role and security group for scripts/build-gateway-image.sh's temporary builder."
+  type        = bool
+  default     = false
+}
+
+variable "gateway_ami" {
+  description = "Attested gateway image from scripts/build-gateway-image.sh. Empty: no attested gateway yet."
+  type        = string
+  default     = ""
 }

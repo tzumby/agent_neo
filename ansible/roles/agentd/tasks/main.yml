@@ -109,6 +109,14 @@
   ansible.builtin.set_fact:
     agentd_model_gateway_url: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/model-gateway/url', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
 
+# The attested gateway, once it exists: where it is, the images to accept
+# and the audience to sign identity proofs for (none of them secret).
+- name: Look up the attested model gateway
+  ansible.builtin.set_fact:
+    agentd_gateway_url: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/gateway/url', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
+    agentd_gateway_measurements: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/gateway/measurements', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
+    agentd_gateway_audience: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/gateway/audience', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
+
 - name: Write the settings
   ansible.builtin.template:
     src: agentd.env.j2

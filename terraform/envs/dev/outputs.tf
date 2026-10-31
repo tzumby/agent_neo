@@ -54,3 +54,18 @@ output "user_kms_keys" {
 output "test_desktop_role" {
   value = one(module.test_desktop_identity[*].role_name)
 }
+
+output "image_builder" {
+  value = var.enable_image_builder ? {
+    instance_profile  = module.image_builder[0].instance_profile_name
+    security_group_id = module.image_builder[0].security_group_id
+    subnet_id         = module.network.private_subnet_ids[0]
+  } : null
+}
+
+output "attested_gateway" {
+  value = {
+    url         = module.attested_gateway.url
+    instance_id = module.attested_gateway.instance_id
+  }
+}

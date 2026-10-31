@@ -89,6 +89,46 @@ module "model_gateway" {
   }
 }
 
+# The attested model gateway (docs/operator-isolation.md): gatewayd on an
+# image nobody can log into. Desktops send prompts only after checking its
+# measurements, which the image build published for that image.
+module "image_builder" {
+  source = "../../modules/image_builder"
+  count  = var.enable_image_builder ? 1 : 0
+
+  name       = local.name
+  vpc_id     = module.network.vpc_id
+  ssm_prefix = "/${var.project}/${var.env}"
+}
+
+data "aws_ssm_parameter" "gateway_measurements" {
+  count = var.gateway_ami != "" ? 1 : 0
+  name  = "/${var.project}/${var.env}/gateway/images/${var.gateway_ami}"
+}
+
+module "attested_gateway" {
+  source = "../../modules/attested_gateway"
+
+  name                = local.name
+  ami                 = var.gateway_ami
+  measurements        = var.gateway_ami != "" ? data.aws_ssm_parameter.gateway_measurements[0].value : ""
+  vpc_id              = module.network.vpc_id
+  subnet_id           = module.network.private_subnet_ids[0]
+  private_ip          = cidrhost(module.network.private_subnet_cidrs[0], 10)
+  desktop_sg_id       = module.security.desktop_sg_id
+  desktop_role_prefix = local.desktop_role_prefix
+  audience            = "${local.name}/model-gateway"
+  ssm_prefix          = "/${var.project}/${var.env}"
+  usage_table_name    = module.model_gateway.usage_table_name
+  usage_table_arn     = module.model_gateway.usage_table_arn
+  daily_budget_usd    = var.model_daily_budget_usd
+  prices = {
+    "zai-org/GLM-5.3"       = [1.40, 0.26, 4.40]
+    "zai-org/GLM-5.3-Flash" = [0.15, 0.03, 0.50]
+    "moonshotai/Kimi-K3"    = [3.00, 0.30, 15.00]
+  }
+}
+
 # One encryption key per user for their desktop's disks and snapshots.
 # Deleting a user's key makes their data unreadable (crypto-shredding).
 resource "aws_kms_key" "user" {
@@ -130,18 +170,24 @@ data "aws_ami" "ubuntu" {
 
   filter {
     name   = "name"
-    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-*-${var.ubuntu_version}-arm64-server-*"]
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-*-${var.ubuntu_version}-${var.desktop_arch}-server-*"]
   }
 
   filter {
     name   = "architecture"
-    values = ["arm64"]
+    values = [var.desktop_arch == "amd64" ? "x86_64" : "arm64"]
   }
 
   filter {
     name   = "virtualization-type"
     values = ["hvm"]
   }
+}
+
+# Changing the architecture means a new desktop from a new image (the AMI
+# itself is ignored below, so new Ubuntu releases don't replace it).
+resource "terraform_data" "desktop_arch" {
+  input = var.desktop_arch
 }
 
 resource "aws_instance" "test_desktop" {
@@ -181,7 +227,8 @@ resource "aws_instance" "test_desktop" {
 
   lifecycle {
     # Don't replace the instance whenever Canonical publishes a new AMI.
-    ignore_changes = [ami]
+    ignore_changes       = [ami]
+    replace_triggered_by = [terraform_data.desktop_arch]
 
     precondition {
       condition     = var.enable_nat_gateway || var.enable_nat_instance

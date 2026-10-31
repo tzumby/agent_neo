@@ -1,8 +1,8 @@
-- name: Check the host is arm64
+- name: Check the host is amd64 or arm64
   ansible.builtin.command: dpkg --print-architecture
   register: desktop_dpkg_arch
   changed_when: false
-  failed_when: desktop_dpkg_arch.stdout != 'arm64'
+  failed_when: desktop_dpkg_arch.stdout not in ['amd64', 'arm64']
 
 # --- Packages ----------------------------------------------------------------
 
@@ -17,7 +17,7 @@
     name: "{{ desktop_removed_packages }}"
     state: absent
 
-# --- Google Chrome (arm64) from Google's signed apt repo ----------------------
+# --- Google Chrome from Google's signed apt repo --------------------------------
 
 - name: Download Google's apt signing key
   ansible.builtin.get_url:
@@ -36,7 +36,7 @@
       URIs: https://dl.google.com/linux/chrome/deb/
       Suites: stable
       Components: main
-      Architectures: arm64
+      Architectures: {{ desktop_dpkg_arch.stdout }}
       Signed-By: /etc/apt/keyrings/google-chrome.asc
     mode: "0644"
     force: false

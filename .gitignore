@@ -19,6 +19,7 @@ services/tailnet-proxy/build/
 
 # Rust build output
 services/agentd/target/
+services/gatewayd/target/
 
 # Apple apps (generated or built)
 apps/apple/vendor/
@@ -27,3 +28,6 @@ apps/apple/DesktopKit/.build/
 apps/apple/*.xcodeproj/
 apps/apple/build/
 terraform/envs/*/.build/
+xcuserdata/
+DerivedData/
+*.xcuserstate

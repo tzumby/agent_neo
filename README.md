@@ -1,6 +1,6 @@
 # cloud-desktops
 
-Always-on Linux desktops (XFCE + Google Chrome, arm64) on AWS for AI agents.
+Always-on Linux desktops (XFCE + Google Chrome; x86_64 by default, `desktop_arch`) on AWS for AI agents.
 See [PLAN.MD](PLAN.MD) for the full design and milestones.
 
 **Current state: step 1.** One test desktop, configured by Ansible over SSM,
@@ -66,6 +66,13 @@ browser, so close it when you're done.
 history in SQLite (`/var/lib/agentd`), and an HTTP + Server-Sent Events API for
 the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
 
+- **the attested model gateway** (`services/gatewayd`, `images/gateway`; see
+  `docs/operator-isolation.md`) replaces the Lambda gateway once its image is
+  built (`enable_image_builder = true`, apply, `make gateway-image`, then
+  `gateway_ami = "<ami>"`, apply, `make agentd-deploy`). It runs from an image
+  nobody can log into, and agentd sends prompts only after checking its
+  attestation (AWS's signature, the published measurements, its TLS
+  certificate);
 - it holds none of our keys: model calls go through the **model gateway** and
   notifications through the **push relay**, two Lambdas behind IAM-authenticated
   function URLs that agentd signs with the desktop's own role. The gateway holds
@@ -124,7 +131,7 @@ pre-approved auth key with that tag. Then:
 ```sh
 make tailscale-key      # paste the auth key (hidden input)
 make agentd-test        # fmt, clippy, unit tests
-make agentd-deploy      # static arm64 binary (cargo-zigbuild), user, secrets, unit
+make agentd-deploy      # static binary for DESKTOP_ARCH (cargo-zigbuild), user, unit
 make tailnet-deploy     # tailnet-proxy (deploy agentd first)
 make agentd-logs        # recent log
 ```
@@ -216,5 +223,9 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   127.0.0.1 only: it's reachable through SSM port forwarding and tailnet-proxy
   (your tailnet), nothing else. The control-plane milestone brings its own
   per-session auth.
-- Cost while step 1 is up: one t4g.medium (~$0.04/h in ca-central-1) with a 20 GB
-  gp3 volume, plus the shared fck-nat t4g.nano and its Elastic IP.
+- Cost while step 1 is up: one t3a.medium desktop (~$0.042/h in ca-central-1) with a
+  20 GB gp3 volume, the attested gateway (c7g.medium, ~$0.040/h), plus the shared
+  fck-nat t4g.nano and its Elastic IP.
+- Desktops are x86_64 (`desktop_arch = "amd64"`): many Linux desktop apps (Slack,
+  Zoom, Discord) ship only for it. arm64 (Graviton) is ~13% cheaper and still
+  supported (`desktop_arch = "arm64"`, `DESKTOP_ARCH=arm64` for the builds).

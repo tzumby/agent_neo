@@ -7,7 +7,8 @@ enable_nat_gateway   = false
 nat_per_az           = false
 enable_ssm_endpoints = false
 
-desktop_instance_type = "t4g.medium"
+desktop_arch          = "amd64"
+desktop_instance_type = "t3a.medium"
 cpu_credits           = "unlimited"
 ubuntu_version        = "26.04"
 

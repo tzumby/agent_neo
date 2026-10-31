@@ -1,6 +1,9 @@
 AWS_PROFILE ?= default
 AWS_REGION  ?= ca-central-1
 ENV         ?= dev
+# Desktops' architecture (Terraform: desktop_arch): amd64 or arm64.
+DESKTOP_ARCH ?= amd64
+DESKTOP_RUST_TARGET = $(if $(filter arm64,$(DESKTOP_ARCH)),aarch64,x86_64)-unknown-linux-musl
 export AWS_PROFILE AWS_REGION
 
 TF_BOOTSTRAP := terraform -chdir=$(CURDIR)/terraform/bootstrap
@@ -11,7 +14,7 @@ INSTANCE ?= $(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-logs tailnet-build tailnet-deploy tailscale-key apns-key app-tailscalekit app-test app-sim app-device cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-logs tailnet-build tailnet-deploy tailscale-key apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -67,8 +70,8 @@ llm-keys: ## Store the Together API key in SSM (prompted, not echoed)
 agentd-test: ## Format check, clippy and unit tests for agentd
 	cd services/agentd && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
-agentd-build: ## Build agentd for the desktop (static linux/arm64 binary)
-	cd services/agentd && cargo zigbuild --release --target aarch64-unknown-linux-musl
+agentd-build: ## Build agentd for the desktop (static linux binary for DESKTOP_ARCH)
+	cd services/agentd && cargo zigbuild --release --target $(DESKTOP_RUST_TARGET)
 
 agentd-deploy: agentd-build ## Install agentd on running desktops
 	$(ANSIBLE_PLAYBOOK) playbooks/agentd.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
@@ -77,9 +80,18 @@ agentd-logs: ## Show agentd's recent log
 	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \
 	  --parameters '{"command":["sudo journalctl -u agentd -n 50 --no-pager"]}'
 
-tailnet-build: ## Build tailnet-proxy (tsnet) for the desktop (linux/arm64)
-	cd services/tailnet-proxy && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-	  go build -trimpath -ldflags "-s -w" -o build/tailnet-proxy-linux-arm64 .
+tailnet-build: ## Build tailnet-proxy (tsnet) for the desktop (linux, DESKTOP_ARCH)
+	cd services/tailnet-proxy && CGO_ENABLED=0 GOOS=linux GOARCH=$(DESKTOP_ARCH) \
+	  go build -trimpath -ldflags "-s -w" -o build/tailnet-proxy-linux-$(DESKTOP_ARCH) .
+
+gatewayd-test: ## Format check, clippy and unit tests for gatewayd (the attested model gateway)
+	cd services/gatewayd && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+
+gatewayd-build: ## Build gatewayd for the gateway image (static linux/arm64 binary)
+	cd services/gatewayd && cargo zigbuild --release --target aarch64-unknown-linux-musl
+
+gateway-image: gatewayd-build ## Build the attested gateway image (AMI) on a temporary builder; prints the AMI and its measurements
+	ENV=$(ENV) scripts/build-gateway-image.sh
 
 apns-key: ## Store the APNs push key in SSM: make apns-key FILE=AuthKey_XXXXXXXXXX.p8 KEY_ID=XXXXXXXXXX
 	SSM_PREFIX=/cloud-desktops/$(ENV) scripts/put-apns-key.py "$(FILE)" "$(KEY_ID)"

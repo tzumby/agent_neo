@@ -12,7 +12,8 @@ public struct ChatTimeline: Sendable, Equatable {
     private var workIndex: [String: Int] = [:]  // task → index of its work item
     private var approvalIndex: [String: Int] = [:]
     private var actionIndex: [String: Int] = [:]
-    private var openTerminal: [String: Int] = [:]  // task → its command still waiting for output
+    private var openTerminal: [String: Int] = [:]  // task → its command card still waiting for output
+    private var openRun: [String: Int] = [:]  // task → index of its running command step (no card)
 
     public init() {}
 
@@ -42,23 +43,48 @@ public struct ChatTimeline: Sendable, Equatable {
             guard tool != "run_shell" else { return }  // shown by the "shell" event instead
             updateWork(task) { $0.steps.append(Work.Step(id: event.seq, tool: tool, detail: data["args"]?.string ?? "")) }
         case "shell":
-            let step = Work.Step(
+            var step = Work.Step(
                 id: event.seq, tool: "run_shell", detail: data["command"]?.string ?? "",
                 asRoot: data["as_root"]?.bool ?? false)
-            updateWork(task) { $0.steps.append(step) }
-            openTerminal[task] = items.count
-            items.append(
-                .terminal(
-                    Terminal(
-                        id: event.seq, task: task, command: step.detail, asRoot: step.asRoot,
-                        state: data["needs_approval"]?.bool == true ? .waitingForApproval : .running)))
+            if data["needs_approval"]?.bool == true {
+                // The user has to answer: the command gets its own card in the chat.
+                updateWork(task) { $0.steps.append(step) }
+                openTerminal[task] = items.count
+                items.append(
+                    .terminal(
+                        Terminal(
+                            id: event.seq, task: task, command: step.detail, asRoot: step.asRoot,
+                            state: .waitingForApproval)))
+            } else {
+                // Nothing to answer: it stays a step in the task's collapsed row.
+                step.run = ShellRun()
+                if let index = workIndex[task], case .work(let work) = items[index] {
+                    openRun[task] = work.steps.count
+                }
+                updateWork(task) { $0.steps.append(step) }
+            }
         case "shell.output":
-            updateTerminal(task, closing: true) {
-                $0.state = data["stopped"]?.bool == true ? .didNotFinish : .finished
-                $0.exitCode = data["exit_code"]?.int
-                $0.timedOut = data["timed_out"]?.bool ?? false
-                $0.output = data["output"]?.string ?? ""
-                $0.seconds = data["seconds"]?.double
+            let state: Terminal.State = data["stopped"]?.bool == true ? .didNotFinish : .finished
+            let exitCode = data["exit_code"]?.int
+            let timedOut = data["timed_out"]?.bool ?? false
+            let output = data["output"]?.string ?? ""
+            let seconds = data["seconds"]?.double
+            if openTerminal[task] != nil {
+                updateTerminal(task, closing: true) {
+                    $0.state = state
+                    $0.exitCode = exitCode
+                    $0.timedOut = timedOut
+                    $0.output = output
+                    $0.seconds = seconds
+                }
+            } else {
+                closeRun(task) {
+                    $0.state = state
+                    $0.exitCode = exitCode
+                    $0.timedOut = timedOut
+                    $0.output = output
+                    $0.seconds = seconds
+                }
             }
         case "approval.requested":
             let id = data["id"]?.string ?? ""
@@ -111,6 +137,7 @@ public struct ChatTimeline: Sendable, Equatable {
             busy = false
             let cancelled = data["status"]?.string == "cancelled"
             updateTerminal(task, closing: true) { $0.state = cancelled ? .didNotFinish : .unrecorded }
+            closeRun(task) { $0.state = cancelled ? .didNotFinish : .unrecorded }
             let usage = data["usage"]
             updateWork(task) {
                 $0.finished = Work.Finished(
@@ -139,6 +166,16 @@ public struct ChatTimeline: Sendable, Equatable {
         guard let index = workIndex[task], case .work(var work) = items[index] else { return }
         change(&work)
         items[index] = .work(work)
+    }
+
+    /// Ends the task's running command step (one without a card).
+    private mutating func closeRun(_ task: String, _ change: (inout ShellRun) -> Void) {
+        guard let step = openRun.removeValue(forKey: task) else { return }
+        updateWork(task) { work in
+            guard work.steps.indices.contains(step), var run = work.steps[step].run else { return }
+            change(&run)
+            work.steps[step].run = run
+        }
     }
 
     private mutating func updateTerminal(_ task: String, closing: Bool, _ change: (inout Terminal) -> Void) {
@@ -205,6 +242,8 @@ public struct Work: Sendable, Equatable {
         public let tool: String
         public let detail: String
         public var asRoot = false
+        /// A command that needed no approval: its result, shown inside the step.
+        public var run: ShellRun?
     }
 
     public struct Finished: Sendable, Equatable {
@@ -225,7 +264,18 @@ public struct Work: Sendable, Equatable {
     public var waiting = false
 }
 
-/// A shell command the agent ran, shown as a terminal card with its output.
+/// A command that ran without needing approval, shown inside its step (not as a card).
+public struct ShellRun: Sendable, Equatable {
+    public var state: Terminal.State = .running
+    public var exitCode: Int?
+    public var timedOut = false
+    /// The end of what it printed (stdout, then stderr).
+    public var output = ""
+    public var seconds: Double?
+}
+
+/// A shell command that needed the user's approval, shown as a terminal card
+/// with the approval and then its output.
 public struct Terminal: Sendable, Equatable {
     public enum State: Sendable, Equatable {
         case waitingForApproval, running, finished, denied

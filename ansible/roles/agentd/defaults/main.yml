@@ -1,5 +1,5 @@
-# Built by `make agentd-build` (services/agentd).
-agentd_binary: "{{ playbook_dir }}/../../services/agentd/target/aarch64-unknown-linux-musl/release/agentd"
+# Built by `make agentd-build` (services/agentd), for this host's architecture.
+agentd_binary: "{{ playbook_dir }}/../../services/agentd/target/{{ ansible_facts.architecture }}-unknown-linux-musl/release/agentd"
 
 # The desktop session (X, Chrome) runs as this user; agentd never runs
 # anything as it.

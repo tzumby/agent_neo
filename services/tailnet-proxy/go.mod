@@ -1,4 +1,4 @@
-module cloud-desktops/viewer-proxy
+module cloud-desktops/tailnet-proxy
 
 go 1.27.3
 

@@ -11,7 +11,7 @@ INSTANCE ?= $(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agent telegram-token telegram-users agent-deploy agent-logs viewer-build viewer-deploy tailscale-key cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agent telegram-token telegram-users agent-deploy agent-logs agentd-test agentd-build agentd-deploy agentd-logs tailnet-build tailnet-deploy tailscale-key cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -40,7 +40,7 @@ fmt: ## Format Terraform code
 lint: ## Check formatting, validate Terraform, syntax-check playbooks
 	terraform fmt -check -recursive terraform
 	$(TF) validate
-	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/desktop-agent.yml playbooks/viewer-proxy.yml
+	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/desktop-agent.yml playbooks/tailnet-proxy.yml playbooks/agentd.yml
 
 # --- Ansible -----------------------------------------------------------------
 
@@ -80,17 +80,30 @@ agent-logs: ## Show the desktop agent's recent log
 	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \
 	  --parameters '{"command":["sudo journalctl -u desktop-agent -n 50 --no-pager"]}'
 
-# --- Viewer on the tailnet ----------------------------------------------------
+# --- agentd and the tailnet ------------------------------------------------------
 
-viewer-build: ## Build viewer-proxy (tsnet) for the desktop (linux/arm64)
-	cd services/viewer-proxy && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-	  go build -trimpath -ldflags "-s -w" -o build/viewer-proxy-linux-arm64 .
+agentd-test: ## Format check, clippy and unit tests for agentd
+	cd services/agentd && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+
+agentd-build: ## Build agentd for the desktop (static linux/arm64 binary)
+	cd services/agentd && cargo zigbuild --release --target aarch64-unknown-linux-musl
+
+agentd-deploy: agentd-build ## Install agentd on running desktops
+	$(ANSIBLE_PLAYBOOK) playbooks/agentd.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+
+agentd-logs: ## Show agentd's recent log
+	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \
+	  --parameters '{"command":["sudo journalctl -u agentd -n 50 --no-pager"]}'
+
+tailnet-build: ## Build tailnet-proxy (tsnet) for the desktop (linux/arm64)
+	cd services/tailnet-proxy && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+	  go build -trimpath -ldflags "-s -w" -o build/tailnet-proxy-linux-arm64 .
 
 tailscale-key: ## Store a Tailscale auth key (tagged tag:cloud-desktop) in SSM (prompted, not echoed)
 	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/auth_key
 
-viewer-deploy: viewer-build ## Put the desktop viewer on your tailnet
-	$(ANSIBLE_PLAYBOOK) playbooks/viewer-proxy.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+tailnet-deploy: tailnet-build ## Put the desktop on your tailnet (agent API, noVNC, VNC); deploy agentd first
+	$(ANSIBLE_PLAYBOOK) playbooks/tailnet-proxy.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
 # --- Access (SSM only) -------------------------------------------------------
 

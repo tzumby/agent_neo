@@ -1,0 +1,111 @@
+# agentd: the agent on this desktop (services/agentd). It runs as its own
+# user, holds the model key, and runs the agent's shell commands as the
+# desktop user, which can't read agentd's secrets, state or socket.
+
+- name: Create the agentd group
+  ansible.builtin.group:
+    name: agentd
+    system: true
+
+- name: Create the agentd system user
+  ansible.builtin.user:
+    name: agentd
+    group: agentd
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/agentd
+    create_home: false
+
+- name: Create the config directory
+  ansible.builtin.file:
+    path: /etc/agentd
+    state: directory
+    owner: root
+    group: agentd
+    mode: "0750"
+
+- name: Create the state directory
+  ansible.builtin.file:
+    path: /var/lib/agentd
+    state: directory
+    owner: agentd
+    group: agentd
+    mode: "0700"
+
+- name: Create the desktop user's workspace
+  ansible.builtin.file:
+    path: "{{ agentd_workdir }}"
+    state: directory
+    owner: "{{ agentd_desktop_user }}"
+    group: "{{ agentd_desktop_user }}"
+    mode: "0700"
+
+- name: Install the binary
+  ansible.builtin.copy:
+    src: "{{ agentd_binary }}"
+    dest: /usr/local/bin/agentd
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart agentd
+
+- name: Write the settings
+  ansible.builtin.template:
+    src: agentd.env.j2
+    dest: /etc/agentd/agentd.env
+    owner: root
+    group: agentd
+    mode: "0640"
+  notify: Restart agentd
+
+# Read on the controller with your AWS credentials.
+- name: Write the secrets (from SSM)
+  ansible.builtin.copy:
+    dest: /etc/agentd/secrets.env
+    content: |
+      TOGETHER_API_KEY={{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/llm/together_api_key', region=agentd_ssm_region) }}
+    owner: root
+    group: agentd
+    mode: "0640"
+  no_log: true
+  notify: Restart agentd
+
+- name: Write the approval rules override
+  ansible.builtin.template:
+    src: policy.toml.j2
+    dest: /etc/agentd/policy.toml
+    owner: root
+    group: agentd
+    mode: "0640"
+  when: agentd_dangerous | length > 0
+  notify: Restart agentd
+
+- name: Use the built-in approval rules
+  ansible.builtin.file:
+    path: /etc/agentd/policy.toml
+    state: absent
+  when: agentd_dangerous | length == 0
+  notify: Restart agentd
+
+- name: Let agentd run commands as the desktop user (and as root after approval)
+  ansible.builtin.template:
+    src: sudoers.j2
+    dest: /etc/sudoers.d/agentd
+    owner: root
+    group: root
+    mode: "0440"
+    validate: visudo -cf %s
+
+- name: Install the systemd unit
+  ansible.builtin.template:
+    src: agentd.service.j2
+    dest: /etc/systemd/system/agentd.service
+    mode: "0644"
+  notify: Restart agentd
+
+- name: Enable and start agentd
+  ansible.builtin.systemd_service:
+    name: agentd
+    enabled: true
+    state: started
+    daemon_reload: true

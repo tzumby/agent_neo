@@ -1,0 +1,16 @@
+# Built by `make agentd-build` (services/agentd).
+agentd_binary: "{{ playbook_dir }}/../../services/agentd/target/aarch64-unknown-linux-musl/release/agentd"
+
+agentd_desktop_user: agent
+agentd_workdir: /home/agent/work
+agentd_model: zai-org/GLM-5.3
+agentd_max_steps: 40
+agentd_shell_tool: "on"
+agentd_desktop_name: cloud-desktop-dev
+
+# Overrides the approval rules built into agentd (list of {pattern, reason};
+# regex patterns without single quotes). Empty: use the built-in rules.
+agentd_dangerous: []
+
+agentd_ssm_prefix: /cloud-desktops/dev
+agentd_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"

@@ -1,0 +1,6 @@
+# {{ ansible_managed }}
+# agentd runs the agent's shell commands as the desktop user, and as root only
+# after the user approved them in the app (agentd enforces the approval). The
+# desktop user itself has no sudo.
+agentd ALL=({{ agentd_desktop_user }}) NOPASSWD: ALL
+agentd ALL=(root) NOPASSWD: ALL

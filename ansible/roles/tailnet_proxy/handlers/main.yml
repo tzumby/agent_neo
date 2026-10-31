@@ -1,5 +1,5 @@
-- name: Restart viewer-proxy
+- name: Restart tailnet-proxy
   ansible.builtin.systemd_service:
-    name: viewer-proxy
+    name: tailnet-proxy
     state: restarted
     daemon_reload: true

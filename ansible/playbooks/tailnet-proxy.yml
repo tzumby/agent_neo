@@ -1,0 +1,8 @@
+# Puts the desktop on your tailnet (agent API, noVNC, VNC). Needs the SSM
+# parameter /cloud-desktops/<env>/tailscale/auth_key (`make tailscale-key`)
+# and the binary from `make tailnet-build`. Deploy agentd first.
+- name: Deploy tailnet-proxy
+  hosts: desktop
+  become: true
+  roles:
+    - tailnet_proxy

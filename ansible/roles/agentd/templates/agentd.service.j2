@@ -1,0 +1,22 @@
+# {{ ansible_managed }}
+[Unit]
+Description=agentd: the agent on this desktop (model loop, browser and shell tools, chat API)
+Wants=network-online.target chrome.service
+After=network-online.target chrome.service
+StartLimitIntervalSec=0
+
+[Service]
+User=agentd
+Group=agentd
+# /run/agentd/agentd.sock: group agentd (tailnet-proxy) only.
+RuntimeDirectory=agentd
+RuntimeDirectoryMode=0750
+Environment=RUST_LOG=agentd=info
+ExecStart=/usr/local/bin/agentd
+Restart=always
+RestartSec=5
+# No NoNewPrivileges, ProtectHome or PrivateTmp: the agent's commands run as
+# children of this service (through sudo) and need the normal system.
+
+[Install]
+WantedBy=multi-user.target

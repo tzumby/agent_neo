@@ -1,0 +1,8 @@
+# {{ ansible_managed }}
+# Shell commands matching these patterns wait for the user's approval.
+{% for rule in agentd_dangerous %}
+
+[[dangerous]]
+pattern = '{{ rule.pattern }}'
+reason = "{{ rule.reason }}"
+{% endfor %}

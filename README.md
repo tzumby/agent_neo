@@ -109,26 +109,46 @@ and page content goes to Together. Log in to sites (Gmail etc.) yourself
 through `make viewer`; credentials are never stored, the session persists in
 the Chrome profile on the VM.
 
-## Desktop on your tailnet (phone, anywhere)
+## agentd and the tailnet (phone, anywhere)
 
-`services/viewer-proxy` embeds Tailscale (tsnet) and serves the noVNC viewer at
-`https://cloud-desktop-dev.<tailnet>.ts.net/vnc.html`. Only this process joins
-the tailnet: the VM and the agent's commands can't reach your other devices or
-change Tailscale settings. It connects outbound only; no security-group change.
+**`services/agentd`** (Rust) is the agent on the desktop: the model loop
+(Together), browser tools on Chrome's DevTools Protocol, a shell tool, chat
+history in SQLite (`/var/lib/agentd`), and an HTTP + Server-Sent Events API for
+the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
+
+- its model key (`/etc/agentd/secrets.env`) and state are readable only by `agentd`;
+- the agent's shell commands run as the desktop user `agent`, which has no sudo;
+  commands starting with `sudo`, and other risky ones, wait for approval in the app;
+- its API listens on `/run/agentd/agentd.sock`, which only `tailnet-proxy` can open
+  (so the agent can't approve its own commands).
+
+**`services/tailnet-proxy`** (Go, Tailscale's tsnet) is the desktop's only presence
+on your tailnet, at `https://cloud-desktop-dev.<tailnet>.ts.net`:
+
+| | |
+|---|---|
+| `/api/*` | agentd's API, with your Tailscale identity in `X-Tailscale-User` |
+| `/vnc.html` | the noVNC viewer (browser fallback) |
+| port 5900 | raw VNC, for native viewers (the apps) |
+
+Only Tailscale logins in `/cloud-desktops/<env>/tailscale/allowed_logins` get in.
+The VM and the agent's commands can't reach your other tailnet devices. It
+connects outbound only; no security-group change.
 
 One-time, in the Tailscale admin console: enable MagicDNS and HTTPS
-certificates, add `tag:cloud-desktop` to `tagOwners` with a grant from you to
-`tag:cloud-desktop` on `tcp:443`, and create a pre-approved auth key with that
-tag. Then:
+certificates, create the tag `tag:cloud-desktop` (owner `autogroup:admin`) and a
+pre-approved auth key with that tag. Then:
 
 ```sh
 make tailscale-key      # paste the auth key (hidden input)
-make viewer-deploy      # builds the binary and installs the service
+make agentd-test        # fmt, clippy, unit tests
+make agentd-deploy      # static arm64 binary (cargo-zigbuild), user, secrets, unit
+make tailnet-deploy     # tailnet-proxy (deploy agentd first)
+make agentd-logs        # recent log
 ```
 
-When the agent needs you (a login, 2FA, ...), the Telegram bot sends an
-**Open desktop** button with this link and an **I'm done – continue** button.
-`/desktop` sends the link any time.
+The Python Telegram bot (`services/desktop-agent`) still runs alongside until the
+apps can do everything it does.
 
 ## Teardown
 
@@ -141,6 +161,9 @@ make destroy               # dev env. The state bucket is protected (prevent_des
 - Design docs: [PLAN.MD](PLAN.MD) (overall build plan) and
   [docs/agent-control.md](docs/agent-control.md) (how an agent controls a desktop:
   a model-agnostic runner with an optional Claude checker).
+- [docs/native-app-plan.md](docs/native-app-plan.md): `agentd` (Rust agent on each
+  user's VM) and the iPhone + Mac apps (TailscaleKit, chat, native take-over view)
+  replacing the Python agent and Telegram.
 - **Step 1 deviation from the plan:** the test desktop sits in a public subnet
   with a public IP so it can reach the internet without a NAT gateway. Its
   security group has no inbound rules from the internet; access is SSM only. To
@@ -158,7 +181,7 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   installed. Ansible only writes it for the first install.
 - `openssh-server` is removed from desktops; access is SSM only.
 - The VNC password is off (`vnc_password_enabled: false`) and noVNC listens on
-  127.0.0.1 only: it's reachable through SSM port forwarding and viewer-proxy
+  127.0.0.1 only: it's reachable through SSM port forwarding and tailnet-proxy
   (your tailnet), nothing else. The control-plane milestone brings its own
   per-session auth.
 - Cost while step 1 is up: one t4g.medium (~$0.04/h in ca-central-1), a 20 GB

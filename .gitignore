@@ -15,4 +15,7 @@ screenshots/
 __pycache__/
 
 # Go build output
-services/viewer-proxy/build/
+services/tailnet-proxy/build/
+
+# Rust build output
+services/agentd/target/

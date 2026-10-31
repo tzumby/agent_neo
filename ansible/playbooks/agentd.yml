@@ -1,0 +1,7 @@
+# Deploys agentd (services/agentd). Needs the binary from `make agentd-build`
+# and /cloud-desktops/<env>/llm/together_api_key in SSM (`make llm-keys`).
+- name: Deploy agentd
+  hosts: desktop
+  become: true
+  roles:
+    - agentd

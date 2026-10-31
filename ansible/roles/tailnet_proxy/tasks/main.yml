@@ -1,0 +1,95 @@
+# tailnet-proxy: the desktop's only presence on your tailnet (tsnet). Serves
+# the agent's API, the noVNC viewer and raw VNC to allowed Tailscale logins.
+
+# --- Migration from viewer-proxy (keeps the same tailnet device) --------------
+
+- name: Check for the old viewer-proxy
+  ansible.builtin.stat:
+    path: /etc/systemd/system/viewer-proxy.service
+  register: tailnet_proxy_old_unit
+
+- name: Stop the old viewer-proxy
+  ansible.builtin.systemd_service:
+    name: viewer-proxy
+    state: stopped
+    enabled: false
+  when: tailnet_proxy_old_unit.stat.exists
+
+- name: Move the old node identity
+  ansible.builtin.command: mv /var/lib/viewer-proxy /var/lib/tailnet-proxy
+  args:
+    removes: /var/lib/viewer-proxy
+    creates: /var/lib/tailnet-proxy
+
+- name: Remove the old viewer-proxy files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/viewer-proxy.service
+    - /usr/local/bin/viewer-proxy
+    - /etc/viewer-proxy.env
+
+- name: Remove the old viewer-proxy user
+  ansible.builtin.user:
+    name: viewer-proxy
+    state: absent
+
+# --- tailnet-proxy ---------------------------------------------------------------
+
+# Members of this group can open agentd's socket.
+- name: Create the agentd group
+  ansible.builtin.group:
+    name: agentd
+    system: true
+
+- name: Create the tailnet-proxy system user
+  ansible.builtin.user:
+    name: tailnet-proxy
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/tailnet-proxy
+    create_home: false
+    groups: agentd
+
+- name: Own the state directory (the node's Tailscale identity)
+  ansible.builtin.file:
+    path: /var/lib/tailnet-proxy
+    state: directory
+    owner: tailnet-proxy
+    group: tailnet-proxy
+    mode: "0700"
+    recurse: true
+
+- name: Install the binary
+  ansible.builtin.copy:
+    src: "{{ tailnet_proxy_binary }}"
+    dest: /usr/local/bin/tailnet-proxy
+    mode: "0755"
+  notify: Restart tailnet-proxy
+
+# Only used if the node has to log in again; the identity in the state
+# directory is normally enough. Read on the controller with your AWS
+# credentials.
+- name: Write the auth key (from SSM)
+  ansible.builtin.copy:
+    dest: /etc/tailnet-proxy.env
+    content: |
+      TS_AUTHKEY={{ lookup('amazon.aws.ssm_parameter', tailnet_proxy_ssm_prefix ~ '/tailscale/auth_key', region=tailnet_proxy_ssm_region) }}
+    mode: "0600"
+  no_log: true
+  notify: Restart tailnet-proxy
+
+- name: Install the systemd unit
+  ansible.builtin.template:
+    src: tailnet-proxy.service.j2
+    dest: /etc/systemd/system/tailnet-proxy.service
+    mode: "0644"
+  notify: Restart tailnet-proxy
+
+- name: Enable and start tailnet-proxy
+  ansible.builtin.systemd_service:
+    name: tailnet-proxy
+    enabled: true
+    state: started
+    daemon_reload: true

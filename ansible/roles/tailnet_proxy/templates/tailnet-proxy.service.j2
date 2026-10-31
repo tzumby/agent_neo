@@ -1,0 +1,26 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Desktop on the tailnet: agent API, noVNC and VNC (tailnet-proxy)
+Wants=network-online.target novnc.service agentd.service
+After=network-online.target novnc.service agentd.service
+StartLimitIntervalSec=0
+
+[Service]
+User=tailnet-proxy
+EnvironmentFile=/etc/tailnet-proxy.env
+ExecStart=/usr/local/bin/tailnet-proxy -hostname {{ tailnet_proxy_hostname }} -state-dir /var/lib/tailnet-proxy -novnc {{ tailnet_proxy_novnc }} -agentd {{ tailnet_proxy_agentd_socket }} -vnc {{ tailnet_proxy_vnc }}{% if tailnet_proxy_allow %} -allow {{ tailnet_proxy_allow }}{% endif %}
+
+Restart=always
+RestartSec=5
+# It only needs the network, its state directory and agentd's socket.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/tailnet-proxy -/run/agentd
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

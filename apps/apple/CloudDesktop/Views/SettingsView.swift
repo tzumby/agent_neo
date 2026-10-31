@@ -39,7 +39,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Agent")
                 } footer: {
-                    Text("With browser actions off, the agent can read and navigate but not type, send or delete.")
+                    Text("On: the agent can type, click and send in the browser, and asks you before each change. Off: it can only read and navigate.")
                 }
             }
             Section("Desktop") {

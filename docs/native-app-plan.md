@@ -4,8 +4,10 @@
 on the dev desktop). **Phase 2 done 2026-10-31**: the iPhone app signs in with Tailscale
 (TailscaleKit, no Tailscale app) and shows the desktop's and agentd's status. **Phase 3 done
 2026-10-31**: chat on the iPhone, with steps, approvals and Action needed cards (agentd now
-reminds the model to call `needs_user` when it stops on a sign-in page). **Phase 4 (take over)
-is built and installed on the iPhone**; its done-when test is still to run. See the README. Library facts checked on that date (sources at
+reminds the model to call `needs_user` when it stops on a sign-in page). **Phase 4 done
+2026-10-31**: take over (VNC over the tailnet, native keyboard), reconnects after app switches, the
+Liquid Glass redesign, terminal cards, and approvals for browser writes and sends (agentd 0.3.0). See
+the README. Library facts checked on that date (sources at
 the end). Items marked UNVERIFIED need a spike before we rely on them.*
 
 ## Decisions so far
@@ -19,8 +21,8 @@ the end). Items marked UNVERIFIED need a spike before we rely on them.*
 - **No central gateway in the POC.** It's only you, so the apps reach your VM
   directly over your tailnet. A stateless Rust **gateway** comes when other
   users join (§7), because they won't have Tailscale.
-- **The Python `desktop-agent` and the Telegram bot are retired** once
-  `agentd` can do what they do.
+- **The Python `desktop-agent` and the Telegram bot are retired** (removed
+  2026-10-31: code, role, service, token).
 
 ## 1. POC scope
 
@@ -127,11 +129,20 @@ pointing at a proxy in the Mac app, over the tailnet.
   | type, keys | `DOM.focus` + `Input.insertText` / `Input.dispatchKeyEvent` |
   | screenshot / thumbnail | `Page.captureScreenshot` (JPEG, scaled) |
 
-  The read-only guard comes along (risky labels and keys); browser actions
-  are allowed only when the user turns them on.
-- **Shell tool:** runs as user `agent` with `sudo -u agent`, in `~/work`. The
-  denylist decides what needs approval. Root-level actions (installing
-  packages) run only after you approve them, carried out by `agentd` itself.
+  Browser actions (since 0.3.0, on by default): navigation, scrolling and
+  clicks that only focus or open things run freely. Typing (except in search
+  fields), non-navigation keys such as Enter, and clicks on Send/Delete-style
+  controls each wait for an approval card showing the site, the field and the
+  exact text. Turned off, the browser is read-only and those are refused.
+- **Shell tool (since 0.5.0):** each command runs in a transient systemd unit
+  (`sudo systemd-run`) as `worker`, in `~/work`, with moltis-style hardening:
+  no new privileges, no capabilities, private `/tmp`, memory/process/CPU/time
+  limits. `worker` can't reach the desktop session: nftables blocks it from
+  Chrome DevTools (9222), VNC (5900) and noVNC (6080), Xvfb requires a cookie
+  only `agent` can read, and `/home/agent` is 0750. Only root and agentd may
+  reach the metadata service. The denylist decides what needs approval; after
+  the task has read outside content, commands that can send data out ask too.
+  Root-level actions run only after you approve them, in their own unit.
 - **State:** SQLite at `/var/lib/agentd/agentd.db` (moving to the data volume
   in M2). It holds conversations, messages, the event log with sequence
   numbers, approvals and settings.
@@ -186,9 +197,9 @@ guardrails.
   static binary.
 - **Deploy:** Ansible role `agentd` adds the users, sudoers rule, secrets
   from SSM, policy, systemd unit and hardening. `make agentd-deploy`.
-- **Side by side:** `agentd` runs next to the Python bot until it can do what
-  the bot does. Then the `desktop_agent` role is removed and the bot's token
-  is revoked.
+- **Side by side:** `agentd` ran next to the Python bot until it could do
+  what the bot did. The bot was removed on 2026-10-31; the agentd role keeps a
+  step that deletes it from any desktop that still has it.
 
 ## 5. Apple apps
 
@@ -292,12 +303,15 @@ guardrails.
   - `agentd` listens on localhost and trusts the proxy's identity header,
     which the proxy removes from incoming requests before setting its own.
 - **The privilege split** (§4.2) keeps the model key and guardrails out of
-  the agent's reach.
+  the agent's reach. The desktop role is denied `/cloud-desktops/*` in SSM
+  (AWS's managed SSM policy would otherwise let any process with the instance
+  credentials read every secret).
 - **TLS:** ts.net certificates for the API. Raw VNC rides inside WireGuard.
 - **Unchanged:** no inbound security-group rules, no SSH, SSM for
   administration.
-- **Approvals** cover root commands and risky commands. Browser actions are
-  read-only until you turn them on.
+- **Approvals** cover root commands, risky commands, and anything the agent
+  writes or sends in the browser. Browser actions can also be turned off
+  (read-only).
 
 ## 7. Later: other users
 
@@ -334,8 +348,16 @@ guardrails.
 
 1. **Apple Developer Program** ($99/year): TestFlight, push, and installs
    signed for longer than 7 days. Do you have one? What's the Team ID?
-2. **Push in phase 6:** with only you, `agentd` can call APNs directly with
-   the key in SSM. With other users, the gateway does it.
+2. **Push (decided 2026-10-31):** never on the desktops, even with one user.
+   Users have root on their own VM, and one leaked team key would let anyone
+   notify every user. The key lives in SSM and is used only by the **push
+   relay** (`services/push-relay`, `terraform/modules/push_relay`): a Lambda
+   behind an IAM-authenticated function URL. Desktops sign their calls with
+   their instance role. The relay takes the caller's instance ID from that
+   role session, stores device tokens per desktop in DynamoDB, and sends only
+   to devices registered through the calling desktop. Desktops may invoke the
+   function only through its URL, so they can't forge that identity. The
+   gateway can take this over later.
 3. **Mac app in the POC:** your Mac's Tailscale must be running.
 4. **Approval needed before phase 1 deploys:** removing passwordless sudo from
    `agent` changes today's behavior. Root actions then go through `agentd`

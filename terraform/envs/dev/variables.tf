@@ -80,3 +80,21 @@ variable "test_desktop_public_ip" {
   type        = bool
   default     = false
 }
+
+variable "apns_team_id" {
+  description = "Apple Developer team ID for push notifications."
+  type        = string
+  default     = "4UVAPZYV4Q"
+}
+
+variable "apns_topic" {
+  description = "The iOS app's bundle ID."
+  type        = string
+  default     = "com.tzumby.clouddesktop"
+}
+
+variable "apns_environment" {
+  description = "sandbox while the app is installed from Xcode; production for TestFlight or the App Store."
+  type        = string
+  default     = "sandbox"
+}

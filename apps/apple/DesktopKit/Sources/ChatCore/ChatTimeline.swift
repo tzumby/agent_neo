@@ -47,7 +47,7 @@ public struct ChatTimeline: Sendable, Equatable {
                         state: data["needs_approval"]?.bool == true ? .waitingForApproval : .running)))
         case "shell.output":
             updateTerminal(task, closing: true) {
-                $0.state = .finished
+                $0.state = data["stopped"]?.bool == true ? .didNotFinish : .finished
                 $0.exitCode = data["exit_code"]?.int
                 $0.timedOut = data["timed_out"]?.bool ?? false
                 $0.output = data["output"]?.string ?? ""

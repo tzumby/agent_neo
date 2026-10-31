@@ -2,6 +2,9 @@ desktop_user: agent
 desktop_home: /home/agent
 
 desktop_display: ":1"
+# X access cookie: only clients that can read it (the desktop user) may use
+# the screen.
+desktop_xauthority: "{{ desktop_home }}/.Xauthority"
 desktop_width: 1280
 desktop_height: 800
 desktop_depth: 24
@@ -29,6 +32,7 @@ desktop_packages:
   - xdotool
   - scrot
   - x11-utils
+  - xauth
   - x11-xserver-utils
   - adwaita-icon-theme
   - fonts-noto-core

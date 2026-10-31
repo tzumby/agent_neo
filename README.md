@@ -56,58 +56,8 @@ scripts/browser.py type 'textarea[name=q]' 'query' --enter
 scripts/browser.py close
 ```
 
-### Browser agent on Together AI
-
-`scripts/agent.py` lets a Together model drive the same browser with tools
-(tabs, open, read text, accessibility snapshot, click, type, keys, and
-`needs_user` for logins). It is read-only by default: typing, shortcut keys and
-clicks on Send/Delete/Archive-style controls are refused unless
-`ARGS=--allow-actions`.
-
-```sh
-make llm-keys                              # once: store the Together key in SSM (hidden input)
-make cdp                                   # in another terminal
-make agent TASK='Summarize my Gmail inbox' [MODEL=zai-org/GLM-5.3]
-```
-
-It prints the answer, then steps, tokens and estimated cost. Default model:
-`zai-org/GLM-5.3-Flash`. Page content goes to Together, so turn on zero data
-retention in your Together organization settings first.
-
 While the tunnel is open, any process on the Mac can control the logged-in
 browser, so close it when you're done.
-
-## Telegram desktop agent
-
-`services/desktop-agent` is a Telegram bot that runs on the desktop (systemd
-unit `desktop-agent`, as user `agent`). Each message you send it becomes a task
-for the agent (default model `zai-org/GLM-5.3` on Together), which can browse
-in the logged-in Chrome and run shell commands in `~/work`.
-
-- Only the Telegram user IDs in `/cloud-desktops/<env>/telegram/allowed_users`
-  can use it, and only in private chats. It long-polls Telegram (outbound only).
-- Every shell command is posted to the chat. Commands that look risky (sudo,
-  forced deletes, `curl | sh`, killing processes, force-push, SSH keys, the
-  agent's own files, ...) wait for your Approve/Deny button. This is a speed
-  bump, not a security boundary.
-- Browser actions are read-only unless you send `/actions on`.
-- Commands: `/new`, `/model [id]`, `/actions on|off`, `/screenshot`, `/stop`.
-
-Setup:
-
-```sh
-make telegram-token                # paste the token from @BotFather (hidden input)
-# send your bot any message in Telegram, then:
-make telegram-users                # shows your numeric user ID
-make telegram-users ALLOW=<id>     # allow it
-make agent-deploy                  # code, virtualenv, config from SSM, service
-make agent-logs                    # recent log
-```
-
-Chats pass through Telegram's servers (bot chats aren't end-to-end encrypted),
-and page content goes to Together. Log in to sites (Gmail etc.) yourself
-through `make viewer`; credentials are never stored, the session persists in
-the Chrome profile on the VM.
 
 ## agentd and the tailnet (phone, anywhere)
 
@@ -116,9 +66,21 @@ the Chrome profile on the VM.
 history in SQLite (`/var/lib/agentd`), and an HTTP + Server-Sent Events API for
 the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
 
-- its model key (`/etc/agentd/secrets.env`) and state are readable only by `agentd`;
-- the agent's shell commands run as the desktop user `agent`, which has no sudo;
-  commands starting with `sudo`, and other risky ones, wait for approval in the app;
+- its model key (`/etc/agentd/secrets.env`) and state are readable only by `agentd`,
+  and the desktops' AWS role is denied our SSM secrets;
+- the agent's shell commands run as `worker` (no sudo), each in its own hardened
+  systemd unit (no privilege escalation, no capabilities, private `/tmp`, limits on
+  memory, processes, CPU and time; Stop kills the whole unit). `worker` is cut off
+  from the desktop session: a firewall (`cloud-desktop-guard`) blocks it from
+  Chrome DevTools, VNC and noVNC, the X display needs a cookie only `agent` can
+  read, and `/home/agent` (the Chrome profile) is private. Only root and agentd
+  can reach the EC2 metadata service (AWS credentials);
+- commands starting with `sudo`, risky ones, and (after the agent has read a web
+  page or command output) ones that can send data out (`curl`, `scp`, `git push`,
+  ...) wait for approval in the app; approvals record who answered;
+- web pages and command output reach the model wrapped in `<untrusted>` tags; old
+  tool output is trimmed past a budget, and a model repeating the same failing
+  call is nudged, then stopped (patterns adapted from moltis, MIT);
 - its API listens on `/run/agentd/agentd.sock`, which only `tailnet-proxy` can open
   (so the agent can't approve its own commands).
 
@@ -147,8 +109,9 @@ make tailnet-deploy     # tailnet-proxy (deploy agentd first)
 make agentd-logs        # recent log
 ```
 
-The Python Telegram bot (`services/desktop-agent`) still runs alongside until the
-apps can do everything it does.
+The earlier Python agent and its Telegram bot were removed on 2026-10-31; agentd
+and the apps replace them. Each `make agentd-deploy` makes sure the bot is gone
+from the desktop.
 
 ## Apple apps (`apps/apple`)
 
@@ -160,8 +123,9 @@ tailnet), `ChatCore` (turns the event stream into the chat timeline) and
 `DesktopViewer` (VNC to the desktop through the node's SOCKS5 proxy).
 
 The app opens on a chat with the first desktop tagged `tag:cloud-desktop`. It
-shows the agent's replies, its steps (tap to expand), Approve/Deny cards for risky
-commands and "Action needed" cards with a screenshot when a site needs you to sign
+shows the agent's replies, its steps (tap to expand), each shell command with its
+output, Approve/Deny cards for risky commands and for anything the agent types or
+sends in the browser (you see the exact text first), and "Action needed" cards with a screenshot when a site needs you to sign
 in (Skip / I'm done / Take over). Stop cancels the running task.
 
 **Take over** (on a card, or the desktop button in the toolbar) shows the desktop
@@ -180,6 +144,19 @@ make app-test           # DesktopKit unit tests (AGENTD_URL=http://127.0.0.1:876
 make app-device         # build, sign (team 4UVAPZYV4Q), install and launch on your iPhone
 ```
 
+**Push notifications** (approvals with Approve/Deny on the notification, Action
+needed, finished tasks) go through a push relay in the AWS account, so the APNs
+key never sits on a desktop. agentd signs its calls to the relay with the VM's
+instance role, and the relay sends only to devices registered through that
+desktop.
+
+```sh
+make apns-key FILE=AuthKey_XXXXXXXXXX.p8 KEY_ID=XXXXXXXXXX   # once: the key from developer.apple.com → SSM
+make plan && make apply                                    # the relay: Lambda, function URL, DynamoDB
+make agentd-deploy                                         # agentd picks up the relay's URL from SSM
+(cd services/push-relay && node --test test/lib.test.mjs)  # relay unit tests
+```
+
 ## Teardown
 
 ```sh
@@ -193,7 +170,7 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   a model-agnostic runner with an optional Claude checker).
 - [docs/native-app-plan.md](docs/native-app-plan.md): `agentd` (Rust agent on each
   user's VM) and the iPhone + Mac apps (TailscaleKit, chat, native take-over view)
-  replacing the Python agent and Telegram.
+  (replaced the earlier Python agent and Telegram bot).
 - **Step 1 deviation from the plan:** the test desktop sits in a public subnet
   with a public IP so it can reach the internet without a NAT gateway. Its
   security group has no inbound rules from the internet; access is SSM only. To

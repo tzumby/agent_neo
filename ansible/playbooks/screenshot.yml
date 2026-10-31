@@ -10,6 +10,7 @@
       ansible.builtin.command: scrot --overwrite {{ screenshot_remote_path }}
       environment:
         DISPLAY: ":1"
+        XAUTHORITY: /home/agent/.Xauthority
       changed_when: false
 
     - name: Download the screenshot

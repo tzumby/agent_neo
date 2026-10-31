@@ -38,3 +38,7 @@ output "ubuntu_ami" {
 output "test_desktop_instance_id" {
   value = one(aws_instance.test_desktop[*].id)
 }
+
+output "push_relay_url" {
+  value = module.push_relay.relay_url
+}

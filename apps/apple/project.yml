@@ -24,6 +24,10 @@ targets:
     dependencies:
       - package: DesktopKit
         products: [Tailnet, AgentAPI, ChatCore, DesktopViewer]
+    entitlements:
+      path: CloudDesktop/CloudDesktop.entitlements
+      properties:
+        aps-environment: development # Xcode installs; production for TestFlight/App Store
     info:
       path: CloudDesktop/Info.plist
       properties:

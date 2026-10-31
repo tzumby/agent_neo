@@ -14,7 +14,12 @@ struct ChatRow: View, Equatable {
         case .assistant(let message): AssistantMessage(text: message.text)
         case .work(let work): WorkRow(work: work)
         case .terminal(let terminal): TerminalCard(terminal: terminal)
-        case .approval(let approval): ApprovalCard(approval: approval)
+        case .approval(let approval):
+            if let action = approval.browser {
+                BrowserApprovalCard(approval: approval, action: action)
+            } else {
+                ApprovalCard(approval: approval)
+            }
         case .action(let action): ActionCard(action: action)
         case .image(let picture): PictureRow(picture: picture)
         }
@@ -436,6 +441,7 @@ private struct WorkRow: View {
         case "needs_user": "Waiting for you · \(steps)"
         case "cancelled": "Stopped after \(seconds)"
         case "max_steps": "Ran out of steps after \(seconds)"
+        case "stuck": "Got stuck after \(seconds)"
         default: "Something went wrong after \(seconds)"
         }
     }
@@ -588,6 +594,100 @@ private struct ApprovalCard: View {
         }
         .card()
         .sensoryFeedback(.success, trigger: approval.state) { _, new in new == .approved }
+    }
+
+    private func answer(_ approved: Bool) {
+        guard let store, let client else { return }
+        Task { await store.answer(approval, approved: approved, client: client) }
+    }
+}
+
+/// "Write this?": the agent wants to type, press a key or click something
+/// that may send or change things in the desktop's browser.
+private struct BrowserApprovalCard: View {
+    let approval: Approval
+    let action: BrowserAction
+    @Environment(\.chatStore) private var store
+    @Environment(\.agentClient) private var client
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: icon).foregroundStyle(.orange)
+                Text(title).font(.headline)
+                Spacer()
+                if !action.site.isEmpty {
+                    Label(site, systemImage: "globe").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            if !action.target.isEmpty, action.action != "click" {
+                Text("In “\(action.target)”").font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Text(shown)
+                .font(action.action == "type" ? .body : .callout.monospaced())
+                .textSelection(.enabled)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.inset, in: .rect(cornerRadius: 12))
+            if action.action == "type", action.submit {
+                Label("Then presses Enter, which may send it", systemImage: "return")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            } else if action.action != "type", !approval.reason.isEmpty {
+                Text("It \(approval.reason).").font(.footnote).foregroundStyle(.secondary)
+            }
+            switch approval.state {
+            case .pending:
+                HStack(spacing: 10) {
+                    Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
+                        .buttonStyle(.glass)
+                    Button { answer(true) } label: {
+                        Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    }
+                    .primaryGlass()
+                }
+                .controlSize(.large)
+            case .approved: Outcome(text: "Approved", icon: "checkmark.circle.fill", color: .green)
+            case .denied: Outcome(text: "Denied", icon: "xmark.circle.fill", color: .red)
+            case .expired: Outcome(text: "Expired", icon: "clock", color: .secondary)
+            }
+        }
+        .card()
+        .sensoryFeedback(.success, trigger: approval.state) { _, new in new == .approved }
+    }
+
+    private var title: String {
+        switch action.action {
+        case "type": action.submit ? "Write and send this?" : "Write this?"
+        case "key": "Press \(action.key ?? "a key")?"
+        default: "Click this?"
+        }
+    }
+
+    private var icon: String {
+        switch action.action {
+        case "type": "keyboard"
+        case "key": action.key == "Enter" ? "return" : "keyboard"
+        default: "cursorarrow.click.2"
+        }
+    }
+
+    /// The text to type, the key, or the button's name.
+    private var shown: String {
+        switch action.action {
+        case "type": action.text ?? ""
+        case "key": action.key ?? ""
+        default: action.target
+        }
+    }
+
+    /// app.slack.com → slack.com
+    private var site: String {
+        var host = action.site
+        for prefix in ["www.", "app.", "mail."] where host.hasPrefix(prefix) {
+            host.removeFirst(prefix.count)
+        }
+        return host
     }
 
     private func answer(_ approved: Bool) {

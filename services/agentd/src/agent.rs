@@ -14,15 +14,19 @@ use tokio::sync::{broadcast, oneshot, watch};
 use crate::browser::Browser;
 use crate::cdp::Cdp;
 use crate::config::Config;
-use crate::llm::{Together, Usage, truncate};
+use crate::guard;
+use crate::llm::{self, Together, Usage, truncate};
 use crate::policy::Gate;
 use crate::policy::Policy;
+use crate::push::{self, Push, Relay};
 use crate::shell::{Shell, split_sudo};
 use crate::store::{Event, Store};
 use crate::tools;
 
 const HISTORY_LIMIT: i64 = 20;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
+const PAGE_CHANGED: &str = "the page changed after the user approved, so nothing was done; look at the page \
+     again and ask again if it's still needed";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Settings {
@@ -35,9 +39,12 @@ pub enum StartError {
     NotFound,
 }
 
+/// An approval's answer and who gave it.
+type ApprovalReply = oneshot::Sender<(bool, Option<String>)>;
+
 pub struct Agent {
     pub cfg: Config,
-    pub store: Store,
+    pub store: Arc<Store>,
     pub bus: broadcast::Sender<Event>,
     llm: Together,
     cdp: Cdp,
@@ -45,25 +52,15 @@ pub struct Agent {
     shell: Shell,
     busy: AtomicBool,
     cancel: watch::Sender<bool>,
-    approvals: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// Pending approvals: the answer and who gave it (their tailnet login).
+    approvals: Mutex<HashMap<String, ApprovalReply>>,
     actions: Mutex<HashSet<String>>,
+    /// Push notifications through the relay; None when it isn't configured.
+    pub push: Option<Arc<Relay>>,
 }
 
 fn short_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
-}
-
-/// Drops `null` fields: the API rejects some of them when sent back.
-fn without_nulls(message: &Value) -> Value {
-    match message.as_object() {
-        Some(map) => Value::Object(
-            map.iter()
-                .filter(|(_, v)| !v.is_null())
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        ),
-        None => message.clone(),
-    }
 }
 
 impl Agent {
@@ -71,15 +68,23 @@ impl Agent {
         let store = Store::open(&cfg.state_dir.join("agentd.db")).context("opening the state database")?;
         let policy = Arc::new(Policy::load(&cfg.policy_path)?);
         let (bus, _) = broadcast::channel(1024);
+        let push = Relay::from_config(&cfg)?.map(Arc::new);
+        if push.is_some() {
+            tracing::info!("push notifications on (relay)");
+        }
         Ok(Self {
+            push,
             llm: Together::new(cfg.together_api_key.clone())?,
             cdp: Cdp::new(&cfg.cdp_url)?,
             shell: Shell {
                 run_as: cfg.run_as.clone(),
                 workdir: cfg.workdir.clone(),
+                memory_max: cfg.shell_memory_max.clone(),
+                tasks_max: cfg.shell_tasks_max.clone(),
+                cpu_quota: cfg.shell_cpu_quota.clone(),
             },
             policy,
-            store,
+            store: Arc::new(store),
             bus,
             busy: AtomicBool::new(false),
             cancel: watch::channel(false).0,
@@ -144,9 +149,9 @@ impl Agent {
         busy
     }
 
-    pub fn answer_approval(&self, id: &str, approved: bool) -> bool {
+    pub fn answer_approval(&self, id: &str, approved: bool, by: Option<String>) -> bool {
         match self.approvals.lock().unwrap().remove(id) {
-            Some(reply) => reply.send(approved).is_ok(),
+            Some(reply) => reply.send((approved, by)).is_ok(),
             None => false,
         }
     }
@@ -231,6 +236,20 @@ impl Agent {
             }),
         );
         tracing::info!(task = %task_id, status, steps, seconds, "task finished");
+        // needs_user already pushed its Action needed; a stop came from the user.
+        if !matches!(status, "needs_user" | "cancelled") {
+            self.notify(Push {
+                title: if status == "done" {
+                    self.cfg.desktop_name.clone()
+                } else {
+                    "Your desktop hit a problem".into()
+                },
+                body: push::clip(&answer, 180),
+                category: None,
+                thread: task_id.clone(),
+                data: json!({"task": task_id}),
+            });
+        }
         self.busy.store(false, Ordering::SeqCst);
     }
 
@@ -253,11 +272,19 @@ impl Agent {
         let schemas = tools::schemas(self.cfg.shell_tool);
         let mut cancel = self.cancel.subscribe();
         let mut reminded = false;
+        let mut loops = guard::LoopDetector::default();
+        // Set once outside content (a web page, command output) is in the
+        // context: from then on, commands that can send data out ask first.
+        let mut tainted = false;
 
         let outcome = 'task: {
             for step in 1..=self.cfg.max_steps {
                 if *cancel.borrow() {
                     break 'task ("Stopped.".to_string(), "cancelled", step - 1);
+                }
+                let cut = guard::enforce_budget(&mut messages, guard::TOOL_OUTPUT_BUDGET);
+                if cut > 0 {
+                    tracing::info!(task = %task_id, step, cut, "trimmed old tool output from the context");
                 }
                 let request = json!({
                     "model": settings.model, "messages": messages, "tools": schemas,
@@ -266,9 +293,9 @@ impl Agent {
                 let reply = self.llm.chat(&request).await?;
                 usage.add(reply.get("usage"));
                 let message = reply["choices"][0]["message"].clone();
-                // Send the whole message back, including reasoning_content:
-                // GLM and Kimi expect it on every turn.
-                messages.push(without_nulls(&message));
+                // Back into the conversation, with reasoning_content for the
+                // models that want it (GLM, Kimi) and without for the rest.
+                messages.push(llm::for_history(&message, &settings.model));
                 let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
                 if calls.is_empty() {
                     // Models sometimes ask for a sign-in in their answer, which ends the task
@@ -286,6 +313,7 @@ impl Agent {
                         .to_string();
                     break 'task (answer, "done", step);
                 }
+                let mut nudge = None;
                 for call in calls {
                     let name = call["function"]["name"].as_str().unwrap_or_default().to_string();
                     let raw = call["function"]["arguments"].as_str().unwrap_or("{}").to_string();
@@ -305,7 +333,7 @@ impl Agent {
                     }
                     let result = if args.is_object() {
                         match self
-                            .call_tool(&mut browser, task_id, &name, &args, &mut cancel)
+                            .call_tool(&mut browser, task_id, &name, &args, tainted, &mut cancel)
                             .await
                         {
                             Ok(result) => result,
@@ -314,7 +342,21 @@ impl Agent {
                     } else {
                         "error: arguments must be a JSON object".to_string()
                     };
+                    let repeat = loops.record(&name, &raw, &result);
+                    if guard::carries_outside_content(&name) {
+                        tainted = true;
+                    }
+                    let result = guard::label_untrusted(&name, result);
                     messages.push(json!({"role": "tool", "tool_call_id": call["id"], "content": result}));
+                    match repeat {
+                        guard::Repeat::Fine => {}
+                        guard::Repeat::Nudge(text) => nudge = Some(text),
+                        guard::Repeat::Stop(answer) => break 'task (answer, "stuck", step),
+                    }
+                }
+                if let Some(text) = nudge {
+                    tracing::info!(task = %task_id, step, "repeated failing call: nudging the model");
+                    messages.push(json!({"role": "user", "content": text}));
                 }
             }
             (
@@ -335,6 +377,7 @@ impl Agent {
         task_id: &str,
         name: &str,
         args: &Value,
+        tainted: bool,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<String> {
         let text = |key: &str| args[key].as_str();
@@ -367,11 +410,14 @@ impl Agent {
                 let card = json!({"action": "click", "target": element.label, "site": browser.host().await});
                 match self.gate(task_id, gate, card, cancel).await {
                     Err(refusal) => Ok(refusal),
-                    // The page may have changed while the user decided.
+                    // The page may have changed while the user decided: act only
+                    // on the element the card showed.
                     Ok(true) => {
-                        browser
-                            .click(&browser.find(find.0, find.1, find.2, find.3).await?)
-                            .await
+                        let now = browser.find(find.0, find.1, find.2, find.3).await?;
+                        if now.label != element.label || now.role != element.role {
+                            return Ok(PAGE_CHANGED.into());
+                        }
+                        browser.click(&now).await
                     }
                     Ok(false) => browser.click(&element).await,
                 }
@@ -389,8 +435,11 @@ impl Agent {
                 match self.gate(task_id, gate, card, cancel).await {
                     Err(refusal) => Ok(refusal),
                     Ok(true) => {
-                        let element = browser.find(find.0, find.1, find.2, None).await?;
-                        browser.type_text(&element, value, submit).await
+                        let now = browser.find(find.0, find.1, find.2, None).await?;
+                        if now.label != element.label || now.role != element.role {
+                            return Ok(PAGE_CHANGED.into());
+                        }
+                        browser.type_text(&now, value, submit).await
                     }
                     Ok(false) => browser.type_text(&element, value, submit).await,
                 }
@@ -416,7 +465,7 @@ impl Agent {
             }
             "run_shell" if self.cfg.shell_tool => {
                 let timeout = number("timeout").map_or(120, |n| n.max(1) as u64);
-                self.run_shell(task_id, required("command")?, timeout, cancel)
+                self.run_shell(task_id, required("command")?, timeout, tainted, cancel)
                     .await
             }
             _ => Ok(format!("error: unknown tool {name}")),
@@ -428,13 +477,19 @@ impl Agent {
         task_id: &str,
         command: &str,
         timeout: u64,
+        tainted: bool,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<String> {
         let (as_root, inner) = split_sudo(command);
         let reason = if as_root {
             Some("runs as root")
+        } else if let Some(reason) = self.policy.danger(inner) {
+            Some(reason)
+        } else if tainted && self.policy.sends_data(inner) {
+            // Injected instructions in a page could try to send data out.
+            Some("could send data off the desktop, after reading outside content")
         } else {
-            self.policy.danger(inner)
+            None
         };
         self.emit(
             "shell",
@@ -454,13 +509,13 @@ impl Agent {
             ));
         }
         let started = std::time::Instant::now();
-        let output = self.shell.run(inner, as_root, timeout).await?;
+        let output = self.shell.run(inner, as_root, timeout, cancel).await?;
         // The app shows each command as a terminal card with its output.
         self.emit(
             "shell.output",
             json!({
                 "task": task_id, "command": command, "exit_code": output.code,
-                "timed_out": output.timed_out, "output": output.tail(4000),
+                "timed_out": output.timed_out, "stopped": output.stopped, "output": output.tail(4000),
                 "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
             }),
         );
@@ -502,15 +557,20 @@ impl Agent {
         self.approvals.lock().unwrap().insert(id.clone(), reply);
         details["task"] = json!(task_id);
         details["id"] = json!(id);
+        self.notify(approval_push(task_id, &id, &details));
         self.emit("approval.requested", details);
-        let approved = tokio::select! {
-            result = tokio::time::timeout(APPROVAL_TIMEOUT, answer) => matches!(result, Ok(Ok(true))),
-            _ = cancel.wait_for(|stopped| *stopped) => false,
+        let (approved, by) = tokio::select! {
+            result = tokio::time::timeout(APPROVAL_TIMEOUT, answer) => match result {
+                Ok(Ok(answer)) => answer,
+                _ => (false, None),
+            },
+            _ = cancel.wait_for(|stopped| *stopped) => (false, None),
         };
         self.approvals.lock().unwrap().remove(&id);
+        // The event log records who decided (an audit trail).
         self.emit(
             "approval.resolved",
-            json!({"task": task_id, "id": id, "approved": approved}),
+            json!({"task": task_id, "id": id, "approved": approved, "by": by}),
         );
         approved
     }
@@ -527,5 +587,53 @@ impl Agent {
             "action_needed",
             json!({"task": task_id, "id": id, "reason": reason, "page": page, "image": image}),
         );
+        self.notify(Push {
+            title: "Action needed".into(),
+            body: push::clip(reason, 180),
+            category: Some("ACTION"),
+            thread: task_id.to_string(),
+            data: json!({"task": task_id, "action": id}),
+        });
+    }
+
+    /// Notifies the user's devices through the relay, in the background.
+    fn notify(&self, notification: Push) {
+        let Some(relay) = self.push.clone() else { return };
+        tokio::spawn(async move {
+            if let Err(err) = relay.notify(&notification).await {
+                tracing::warn!(%err, "push failed");
+            }
+        });
+    }
+}
+
+/// The notification for an approval: what will run or be written, and where.
+fn approval_push(task_id: &str, id: &str, details: &Value) -> Push {
+    let text = |key: &str| details[key].as_str().unwrap_or_default().to_string();
+    let site = text("site");
+    let (title, body) = match (details["kind"].as_str(), details["action"].as_str()) {
+        (Some("browser"), Some("type")) => (
+            format!("Write this on {site}?"),
+            format!("In “{}”: {}", text("target"), text("text")),
+        ),
+        (Some("browser"), Some("key")) => (
+            format!("Press {} on {site}?", text("key")),
+            format!("In “{}”. It {}.", text("target"), text("reason")),
+        ),
+        (Some("browser"), _) => (
+            format!("Click this on {site}?"),
+            format!("“{}”. It {}.", text("target"), text("reason")),
+        ),
+        _ => (
+            "Run this command?".into(),
+            format!("{} (it {})", text("command"), text("reason")),
+        ),
+    };
+    Push {
+        title,
+        body: push::clip(&body, 180),
+        category: Some("APPROVAL"),
+        thread: task_id.to_string(),
+        data: json!({"task": task_id, "approval": id}),
     }
 }

@@ -82,6 +82,14 @@
     create_home: true
   register: desktop_user_info
 
+# Other local users (the agent's shell user) can't read the Chrome profile or
+# the X cookie.
+- name: Keep the agent user's home private
+  ansible.builtin.file:
+    path: "{{ desktop_home }}"
+    state: directory
+    mode: "0750"
+
 # Gives the user a /run/user/<uid> runtime dir without a login session.
 - name: Enable lingering for the agent user
   ansible.builtin.command: loginctl enable-linger {{ desktop_user }}
@@ -165,11 +173,14 @@
     state: directory
     mode: "0755"
 
-- name: Install the wait-for-display helper
+- name: Install the display helpers
   ansible.builtin.copy:
-    src: wait-for-display
-    dest: "{{ desktop_libexec_dir }}/wait-for-display"
+    src: "{{ item }}"
+    dest: "{{ desktop_libexec_dir }}/{{ item }}"
     mode: "0755"
+  loop:
+    - wait-for-display
+    - make-xauthority
 
 - name: Install the desktop units
   ansible.builtin.template:

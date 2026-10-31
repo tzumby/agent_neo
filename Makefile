@@ -11,7 +11,7 @@ INSTANCE ?= $(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agent telegram-token telegram-users agent-deploy agent-logs agentd-test agentd-build agentd-deploy agentd-logs tailnet-build tailnet-deploy tailscale-key app-tailscalekit app-test app-sim app-device cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-logs tailnet-build tailnet-deploy tailscale-key apns-key app-tailscalekit app-test app-sim app-device cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -40,7 +40,7 @@ fmt: ## Format Terraform code
 lint: ## Check formatting, validate Terraform, syntax-check playbooks
 	terraform fmt -check -recursive terraform
 	$(TF) validate
-	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/desktop-agent.yml playbooks/tailnet-proxy.yml playbooks/agentd.yml
+	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/tailnet-proxy.yml playbooks/agentd.yml
 
 # --- Ansible -----------------------------------------------------------------
 
@@ -62,24 +62,6 @@ screenshot: ## Download a screenshot of each desktop to screenshots/
 llm-keys: ## Store the Together API key in SSM (prompted, not echoed)
 	scripts/put-secret.py /cloud-desktops/$(ENV)/llm/together_api_key
 
-agent: ## Run the browser agent: make agent TASK='...' [MODEL=...] [ARGS=--allow-actions] (needs make cdp)
-	TOGETHER_KEY_PARAM=/cloud-desktops/$(ENV)/llm/together_api_key \
-	  scripts/agent.py $(if $(MODEL),--model $(MODEL)) $(ARGS) "$(TASK)"
-
-telegram-token: ## Store the Telegram bot token from @BotFather in SSM (prompted, not echoed)
-	scripts/put-secret.py /cloud-desktops/$(ENV)/telegram/bot_token
-
-telegram-users: ## List who messaged the bot; make telegram-users ALLOW=<id> to allow one
-	SSM_PREFIX=/cloud-desktops/$(ENV) scripts/telegram-users.py $(if $(ALLOW),allow $(ALLOW))
-
-agent-deploy: ## Deploy the Telegram desktop agent to running desktops
-	find services -name __pycache__ -prune -exec rm -rf {} +
-	$(ANSIBLE_PLAYBOOK) playbooks/desktop-agent.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
-
-agent-logs: ## Show the desktop agent's recent log
-	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \
-	  --parameters '{"command":["sudo journalctl -u desktop-agent -n 50 --no-pager"]}'
-
 # --- agentd and the tailnet ------------------------------------------------------
 
 agentd-test: ## Format check, clippy and unit tests for agentd
@@ -98,6 +80,9 @@ agentd-logs: ## Show agentd's recent log
 tailnet-build: ## Build tailnet-proxy (tsnet) for the desktop (linux/arm64)
 	cd services/tailnet-proxy && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
 	  go build -trimpath -ldflags "-s -w" -o build/tailnet-proxy-linux-arm64 .
+
+apns-key: ## Store the APNs push key in SSM: make apns-key FILE=AuthKey_XXXXXXXXXX.p8 KEY_ID=XXXXXXXXXX
+	SSM_PREFIX=/cloud-desktops/$(ENV) scripts/put-apns-key.py "$(FILE)" "$(KEY_ID)"
 
 tailscale-key: ## Store a Tailscale auth key (tagged tag:cloud-desktop) in SSM (prompted, not echoed)
 	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/auth_key

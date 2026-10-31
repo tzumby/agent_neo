@@ -1,0 +1,8 @@
+#!/bin/sh
+# Writes a fresh X access cookie for $DISPLAY to $XAUTHORITY (readable only by
+# the desktop user). Xvfb then accepts only clients holding it, so other local
+# users (such as the agent's shell user) can't use the screen.
+set -eu
+umask 077
+rm -f "$XAUTHORITY"
+xauth -q -f "$XAUTHORITY" add "$DISPLAY" . "$(mcookie)"

@@ -1,0 +1,24 @@
+# The Python agent and its Telegram bot (replaced by agentd and the apps).
+# Kept so every deploy makes sure they're gone, token file included.
+
+- name: Stop and disable the retired Telegram bot
+  ansible.builtin.systemd_service:
+    name: desktop-agent
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: Remove the retired Telegram bot (code, unit, config with its token)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/desktop-agent.service
+    - /opt/desktop-agent
+    - /home/{{ agentd_desktop_user }}/.config/desktop-agent
+  register: agentd_telegram_removed
+
+- name: Forget the retired Telegram bot's unit
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: agentd_telegram_removed.changed

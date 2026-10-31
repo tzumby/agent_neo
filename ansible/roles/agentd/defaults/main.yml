@@ -1,8 +1,19 @@
 # Built by `make agentd-build` (services/agentd).
 agentd_binary: "{{ playbook_dir }}/../../services/agentd/target/aarch64-unknown-linux-musl/release/agentd"
 
+# The desktop session (X, Chrome) runs as this user; agentd never runs
+# anything as it.
 agentd_desktop_user: agent
-agentd_workdir: /home/agent/work
+# Shell commands run as this user, in hardened systemd units, cut off from the
+# desktop: no Chrome DevTools, VNC, screen or Chrome profile.
+agentd_shell_user: worker
+agentd_workdir: /home/worker/work
+agentd_shell_memory_max: 2G
+agentd_shell_tasks_max: "512"
+agentd_shell_cpu_quota: 200%
+# Local ports of the desktop's controls the shell user may not reach:
+# Chrome DevTools, VNC, noVNC.
+agentd_guarded_ports: [9222, 5900, 6080]
 agentd_model: zai-org/GLM-5.3
 agentd_max_steps: 40
 agentd_shell_tool: "on"

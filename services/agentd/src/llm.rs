@@ -3,11 +3,14 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::Value;
 
 const API_URL: &str = "https://api.together.ai/v1/chat/completions";
 const RETRYABLE: [u16; 5] = [429, 500, 502, 503, 504];
+/// Never wait longer than this between retries, whatever Retry-After says.
+const MAX_RETRY_DELAY_SECS: u64 = 30;
 
 /// USD per 1M tokens: input, cached input, output (Together serverless, 2026-10-30).
 pub fn prices(model: &str) -> Option<(f64, f64, f64)> {
@@ -21,14 +24,34 @@ pub fn prices(model: &str) -> Option<(f64, f64, f64)> {
 
 pub const KNOWN_MODELS: [&str; 3] = ["zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash", "moonshotai/Kimi-K3"];
 
+/// Whether the model wants its `reasoning_content` sent back on later turns.
+/// GLM and Kimi do (they reason worse without it); others, such as DeepSeek,
+/// reject it in requests, so it's dropped for anything not known to want it.
+pub fn keeps_reasoning(model: &str) -> bool {
+    model.starts_with("zai-org/GLM") || model.starts_with("moonshotai/Kimi")
+}
+
+/// An assistant message as it goes back into the conversation.
+pub fn for_history(message: &Value, model: &str) -> Value {
+    let mut message = message.clone();
+    if let Some(map) = message.as_object_mut() {
+        map.retain(|_, v| !v.is_null());
+        if !keeps_reasoning(model) {
+            map.remove("reasoning_content");
+            map.remove("reasoning");
+        }
+    }
+    message
+}
+
 #[derive(Clone)]
 pub struct Together {
     http: reqwest::Client,
-    api_key: String,
+    api_key: SecretString,
 }
 
 impl Together {
-    pub fn new(api_key: String) -> Result<Self> {
+    pub fn new(api_key: SecretString) -> Result<Self> {
         let http = reqwest::Client::builder()
             // Cloudflare in front of the API rejects some default User-Agents (error 1010).
             .user_agent("cloud-desktops-agentd/0.1")
@@ -45,7 +68,7 @@ impl Together {
             let result = self
                 .http
                 .post(API_URL)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(self.api_key.expose_secret())
                 .json(body)
                 .send()
                 .await;
@@ -62,7 +85,7 @@ impl Together {
                     if !RETRYABLE.contains(&status) || attempt >= 6 {
                         return Err(anyhow!("Together API error {status}: {}", truncate(&detail, 500)));
                     }
-                    retry_after.unwrap_or(1 << attempt)
+                    retry_after.unwrap_or(1 << attempt).min(MAX_RETRY_DELAY_SECS)
                 }
                 Err(err) => {
                     if attempt >= 6 {

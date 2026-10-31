@@ -119,6 +119,12 @@ public struct AgentClient: Sendable {
         return reply["task"] ?? ""
     }
 
+    /// Registers this device for push notifications (the desktop passes the
+    /// token on to the push relay). 503 when push isn't set up there.
+    public func registerDevice(token: String, name: String) async throws {
+        let _: [String: Bool] = try await post("/api/v1/devices", body: ["token": token, "name": name])
+    }
+
     public func stop() async throws {
         let _: [String: Bool] = try await post("/api/v1/stop", body: [String: String]())
     }

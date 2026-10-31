@@ -15,8 +15,11 @@ Environment=RUST_LOG=agentd=info
 ExecStart=/usr/local/bin/agentd
 Restart=always
 RestartSec=5
-# No NoNewPrivileges, ProtectHome or PrivateTmp: the agent's commands run as
-# children of this service (through sudo) and need the normal system.
+# The agent's commands run in their own systemd units (sudo systemd-run), not
+# in this service, so agentd itself can be confined. No NoNewPrivileges: sudo
+# needs it off.
+PrivateTmp=yes
+ProtectHome=yes
 
 [Install]
 WantedBy=multi-user.target

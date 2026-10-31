@@ -1,6 +1,6 @@
 # {{ ansible_managed }}
-# agentd runs the agent's shell commands as the desktop user, and as root only
-# after the user approved them in the app (agentd enforces the approval). The
-# desktop user itself has no sudo.
-agentd ALL=({{ agentd_desktop_user }}) NOPASSWD: ALL
+# agentd starts each shell command as a transient systemd unit (systemd-run,
+# as root): as the shell user with hardening and limits, or as root only after
+# the user approved the command in the app (agentd enforces the approval).
+# Neither the shell user nor the desktop user has sudo.
 agentd ALL=(root) NOPASSWD: ALL

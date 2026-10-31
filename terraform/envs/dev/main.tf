@@ -44,6 +44,21 @@ module "iam" {
 
   name                    = local.name
   ssm_transfer_bucket_arn = module.desktop_fleet.ssm_transfer_bucket_arn
+  ssm_parameter_prefix    = "/${var.project}"
+}
+
+# Push notifications to the iOS app. The APNs key stays in SSM and this
+# relay; desktops only ask it to notify their owner.
+module "push_relay" {
+  source = "../../modules/push_relay"
+
+  name              = local.name
+  desktop_role_name = module.iam.desktop_role_name
+  ssm_prefix        = "/${var.project}/${var.env}"
+  apns_team_id      = var.apns_team_id
+  apns_topic        = var.apns_topic
+  apns_environment  = var.apns_environment
+  source_dir        = "${path.root}/../../../services/push-relay/src"
 }
 
 # --- Test desktop ------------------------------------------------------------

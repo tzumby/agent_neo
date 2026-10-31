@@ -2,6 +2,10 @@
 # user, holds the model key, and runs the agent's shell commands as the
 # desktop user, which can't read agentd's secrets, state or socket.
 
+- name: Remove the retired Telegram bot
+  ansible.builtin.import_tasks: retire-telegram.yml
+  tags: [retire-telegram]
+
 - name: Create the agentd group
   ansible.builtin.group:
     name: agentd
@@ -32,13 +36,64 @@
     group: agentd
     mode: "0700"
 
-- name: Create the desktop user's workspace
+- name: Create the shell user (no sudo, no access to the desktop session)
+  ansible.builtin.user:
+    name: "{{ agentd_shell_user }}"
+    home: /home/{{ agentd_shell_user }}
+    shell: /bin/bash
+    create_home: true
+
+- name: Keep the shell user's home private
+  ansible.builtin.file:
+    path: /home/{{ agentd_shell_user }}
+    state: directory
+    mode: "0750"
+
+- name: Create the shell user's workspace
   ansible.builtin.file:
     path: "{{ agentd_workdir }}"
     state: directory
-    owner: "{{ agentd_desktop_user }}"
-    group: "{{ agentd_desktop_user }}"
+    owner: "{{ agentd_shell_user }}"
+    group: "{{ agentd_shell_user }}"
     mode: "0700"
+
+- name: Look up user IDs for the firewall
+  ansible.builtin.getent:
+    database: passwd
+
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+
+- name: Write the firewall rules (metadata service, desktop controls)
+  ansible.builtin.template:
+    src: guard.nft.j2
+    dest: /etc/cloud-desktops/guard.nft
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    agentd_uid: "{{ ansible_facts.getent_passwd['agentd'][1] }}"
+    # In check mode the shell user isn't created yet: show a placeholder.
+    agentd_shell_uid: "{{ ansible_facts.getent_passwd.get(agentd_shell_user, ['', 'NEW-USER'])[1] }}"
+  notify: Reload the firewall rules
+
+- name: Install the firewall unit
+  ansible.builtin.template:
+    src: cloud-desktop-guard.service.j2
+    dest: /etc/systemd/system/cloud-desktop-guard.service
+    mode: "0644"
+  notify: Reload the firewall rules
+
+- name: Enable the firewall rules
+  ansible.builtin.systemd_service:
+    name: cloud-desktop-guard
+    enabled: true
+    state: started
+    daemon_reload: true
+  # A dry run hasn't written the unit yet.
+  ignore_errors: "{{ ansible_check_mode }}"
 
 - name: Install the binary
   ansible.builtin.copy:
@@ -87,7 +142,7 @@
   when: agentd_dangerous | length == 0
   notify: Restart agentd
 
-- name: Let agentd run commands as the desktop user (and as root after approval)
+- name: Let agentd start command units (as the shell user, or as root after approval)
   ansible.builtin.template:
     src: sudoers.j2
     dest: /etc/sudoers.d/agentd

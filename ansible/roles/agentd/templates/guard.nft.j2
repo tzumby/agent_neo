@@ -1,0 +1,23 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed }}
+# Who may reach what on this desktop (loaded by cloud-desktop-guard.service).
+# Declare, delete and re-create the table so reloading is atomic.
+table inet cloud_desktop_guard
+delete table inet cloud_desktop_guard
+
+table inet cloud_desktop_guard {
+  chain output {
+    type filter hook output priority filter; policy accept;
+
+    # The instance metadata service hands out the instance role's AWS
+    # credentials: only root (the SSM agent) and agentd (the push relay).
+    ip daddr 169.254.169.254 meta skuid != { 0, {{ agentd_uid }} } counter reject
+    ip6 daddr fd00:ec2::254 meta skuid != { 0, {{ agentd_uid }} } counter reject
+
+    # The shell user can't reach the desktop's controls on localhost (Chrome
+    # DevTools, VNC, noVNC), so it can't drive the logged-in browser around
+    # the approvals.
+    meta skuid {{ agentd_shell_uid }} ip daddr 127.0.0.0/8 tcp dport { {{ agentd_guarded_ports | join(', ') }} } counter reject
+    meta skuid {{ agentd_shell_uid }} ip6 daddr ::1 tcp dport { {{ agentd_guarded_ports | join(', ') }} } counter reject
+  }
+}

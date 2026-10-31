@@ -4,22 +4,32 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use secrecy::SecretString;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     /// `unix:/run/agentd/agentd.sock` (production) or `127.0.0.1:8765` (local dev).
     pub listen: String,
-    pub together_api_key: String,
+    /// Never printed: Debug shows [REDACTED].
+    pub together_api_key: SecretString,
     pub model: String,
     pub cdp_url: String,
     pub state_dir: PathBuf,
     pub workdir: PathBuf,
-    /// User that shell commands run as (via sudo). Empty: run as agentd's own user (dev).
+    /// User that shell commands run as, in a hardened systemd unit. Not the
+    /// desktop user: it can't reach the browser, the screen or the Chrome
+    /// profile. Empty: run as agentd's own user (local development).
     pub run_as: String,
+    /// Limits for each shell command (systemd MemoryMax, TasksMax, CPUQuota).
+    pub shell_memory_max: String,
+    pub shell_tasks_max: String,
+    pub shell_cpu_quota: String,
     pub policy_path: PathBuf,
     pub max_steps: u32,
     pub shell_tool: bool,
     pub desktop_name: String,
+    /// The push relay's function URL; push is off without it.
+    pub push_relay_url: String,
 }
 
 fn read_kv(path: &Path, into: &mut HashMap<String, String>) -> Result<()> {
@@ -63,16 +73,20 @@ impl Config {
         }
         Ok(Self {
             listen: get("LISTEN", "unix:/run/agentd/agentd.sock"),
-            together_api_key,
+            together_api_key: together_api_key.into(),
             model: get("MODEL", "zai-org/GLM-5.3"),
             cdp_url: get("CDP_URL", "http://127.0.0.1:9222"),
             state_dir: get("STATE_DIR", "/var/lib/agentd").into(),
-            workdir: get("WORKDIR", "/home/agent/work").into(),
-            run_as: get("RUN_AS", "agent"),
+            workdir: get("WORKDIR", "/home/worker/work").into(),
+            run_as: get("RUN_AS", "worker"),
+            shell_memory_max: get("SHELL_MEMORY_MAX", "2G"),
+            shell_tasks_max: get("SHELL_TASKS_MAX", "512"),
+            shell_cpu_quota: get("SHELL_CPU_QUOTA", "200%"),
             policy_path: get("POLICY", "/etc/agentd/policy.toml").into(),
             max_steps: get("MAX_STEPS", "40").parse().context("MAX_STEPS")?,
             shell_tool: get("SHELL_TOOL", "on") == "on",
             desktop_name: get("DESKTOP_NAME", "cloud-desktop"),
+            push_relay_url: get("PUSH_RELAY_URL", ""),
         })
     }
 }

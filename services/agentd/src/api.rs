@@ -32,6 +32,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/images/{id}", get(image))
         .route("/api/v1/screenshot", get(screenshot))
         .route("/api/v1/settings", get(settings).put(put_settings))
+        .route("/api/v1/devices", post(register_device))
         .with_state(agent)
 }
 
@@ -67,6 +68,39 @@ async fn messages(State(agent): App, Query(query): Query<Limit>) -> Response {
     match agent.store.history(query.limit.unwrap_or(50).clamp(1, 500)) {
         Ok(history) => Json(json!({"messages": history})).into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct Device {
+    /// The APNs device token, as hex.
+    token: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// The apps register for push notifications here.
+async fn register_device(State(agent): App, headers: HeaderMap, Json(body): Json<Device>) -> Response {
+    let token = body.token.trim().to_ascii_lowercase();
+    if token.len() < 32 || token.len() > 200 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return error(StatusCode::BAD_REQUEST, "token must be the device token in hex");
+    }
+    let Some(relay) = agent.push.clone() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "push notifications aren't set up on this desktop",
+        );
+    };
+    let name: String = body.name.chars().take(80).collect();
+    match relay.register(&token, &name).await {
+        Ok(()) => {
+            tracing::info!(device = %name, by = ?caller(&headers), "device registered for push");
+            Json(json!({"ok": true})).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(%err, "couldn't register a device with the push relay");
+            error(StatusCode::BAD_GATEWAY, "couldn't reach the push relay")
+        }
     }
 }
 
@@ -124,7 +158,7 @@ async fn answer_approval(
     Json(body): Json<Approval>,
 ) -> Response {
     tracing::info!(id, approved = body.approved, by = ?caller(&headers), "approval answered");
-    if agent.answer_approval(&id, body.approved) {
+    if agent.answer_approval(&id, body.approved, caller(&headers)) {
         Json(json!({"ok": true})).into_response()
     } else {
         error(

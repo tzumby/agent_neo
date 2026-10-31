@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Firewall rules for the desktop (metadata service, desktop controls)
+Wants=network-pre.target
+Before=network-pre.target agentd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/cloud-desktops/guard.nft
+ExecReload=/usr/sbin/nft -f /etc/cloud-desktops/guard.nft
+ExecStop=/usr/sbin/nft delete table inet cloud_desktop_guard
+
+[Install]
+WantedBy=multi-user.target

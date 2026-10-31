@@ -6,8 +6,9 @@ StartLimitIntervalSec=0
 
 [Service]
 User={{ desktop_user }}
-Environment=DISPLAY={{ desktop_display }}
-ExecStart=/usr/bin/Xvfb {{ desktop_display }} -screen 0 {{ desktop_width }}x{{ desktop_height }}x{{ desktop_depth }} -nolisten tcp
+Environment=DISPLAY={{ desktop_display }} XAUTHORITY={{ desktop_xauthority }}
+ExecStartPre={{ desktop_libexec_dir }}/make-xauthority
+ExecStart=/usr/bin/Xvfb {{ desktop_display }} -screen 0 {{ desktop_width }}x{{ desktop_height }}x{{ desktop_depth }} -nolisten tcp -auth {{ desktop_xauthority }}
 ExecStartPost={{ desktop_libexec_dir }}/wait-for-display
 # No screensaver or blanking. Xvfb has no DPMS, so ignore xset's complaint.
 ExecStartPost=-/usr/bin/xset s off -dpms s noblank

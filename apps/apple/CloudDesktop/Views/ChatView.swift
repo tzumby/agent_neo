@@ -16,6 +16,7 @@ struct ChatView: View {
     @State private var position = ScrollPosition(edge: .bottom)
     @State private var sent = 0
     @FocusState private var composing: Bool
+    @Environment(PushCenter.self) private var push
 
     var body: some View {
         ScrollView {
@@ -79,6 +80,44 @@ struct ChatView: View {
         .environment(\.agentClient, client)
         .environment(\.takeOver, endpoint == nil ? nil : TakeOverAction { takeOver = TakeOverRequest(actionID: $0.id) })
         .task(id: connectionKey) { await store.run(client: client) }
+        .task(id: connectionKey) { await push.register() }
+        .task(id: "\(push.deviceToken ?? "")|\(connectionKey)") { await registerForPush() }
+        .task(id: push.pendingAnswer) { await sendPendingAnswer() }
+    }
+
+    /// Hands this iPhone's push token to the desktop, which registers it with
+    /// the push relay. Retries while the connection comes up.
+    private func registerForPush() async {
+        guard let token = push.deviceToken else { return }
+        for _ in 0..<10 {
+            if store.connection == .live {
+                do {
+                    try await client.registerDevice(token: token, name: UIDevice.current.name)
+                    return
+                } catch let error as AgentError where error.statusCode == 503 {
+                    return  // push isn't set up on this desktop
+                } catch {}
+            }
+            try? await Task.sleep(for: .seconds(3))
+            if Task.isCancelled { return }
+        }
+    }
+
+    /// Approve/Deny tapped on a notification: send it once connected.
+    private func sendPendingAnswer() async {
+        guard let answer = push.pendingAnswer else { return }
+        for _ in 0..<20 where store.connection != .live {
+            try? await Task.sleep(for: .seconds(1))
+            if Task.isCancelled { return }
+        }
+        do {
+            try await client.answer(approval: answer.approvalID, approved: answer.approved)
+        } catch let error as AgentError where error.statusCode == 404 {
+            store.notice = "That request has expired."
+        } catch {
+            store.notice = "Couldn't send your answer: \(error.localizedDescription)"
+        }
+        push.pendingAnswer = nil
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {

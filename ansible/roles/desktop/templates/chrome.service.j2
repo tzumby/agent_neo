@@ -10,7 +10,7 @@ StartLimitIntervalSec=0
 [Service]
 User={{ desktop_user }}
 WorkingDirectory={{ desktop_home }}
-Environment=DISPLAY={{ desktop_display }} HOME={{ desktop_home }} XDG_RUNTIME_DIR=/run/user/{{ desktop_user_info.uid }}
+Environment=DISPLAY={{ desktop_display }} XAUTHORITY={{ desktop_xauthority }} HOME={{ desktop_home }} XDG_RUNTIME_DIR=/run/user/{{ desktop_user_info.uid }}
 ExecStartPre={{ desktop_libexec_dir }}/wait-for-display
 ExecStart=/usr/bin/google-chrome \
   --user-data-dir={{ desktop_home }}/chrome-profile \

@@ -1,6 +1,6 @@
-//! Together AI chat completions (OpenAI-compatible API): through the model
-//! gateway (production: the desktop holds no API key) or directly with a key
-//! (local development).
+//! Together AI chat completions (OpenAI-compatible API): through the attested
+//! model gateway, or the Lambda gateway before it (production: the desktop
+//! holds no API key), or directly with a key (local development).
 
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::aws::FunctionUrl;
 use crate::config::Config;
+use crate::gateway::AttestedGateway;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -54,6 +55,9 @@ pub struct Together {
 }
 
 enum Backend {
+    /// The attested gateway holds the key; prompts go only to its attested
+    /// TLS certificate, with this desktop's identity proof.
+    Attested(AttestedGateway),
     /// The model gateway Lambda holds the key; calls are signed as this desktop.
     Gateway(FunctionUrl),
     Direct {
@@ -64,7 +68,17 @@ enum Backend {
 
 impl Together {
     pub fn new(cfg: &Config) -> Result<Self> {
-        let backend = if !cfg.model_gateway_url.is_empty() {
+        // The attested gateway, when configured, is the only way out: no
+        // fallback that would send prompts somewhere unverified.
+        let backend = if !cfg.gateway_url.is_empty() {
+            Backend::Attested(AttestedGateway::new(
+                &cfg.gateway_url,
+                &cfg.aws_region,
+                &cfg.gateway_audience,
+                cfg.gateway_measurements.clone(),
+                Duration::from_secs(200),
+            )?)
+        } else if !cfg.model_gateway_url.is_empty() {
             Backend::Gateway(FunctionUrl::new(
                 &cfg.model_gateway_url,
                 Duration::from_secs(200),
@@ -77,13 +91,14 @@ impl Together {
                 .build()?;
             Backend::Direct { http, api_key }
         } else {
-            bail!("set MODEL_GATEWAY_URL (or TOGETHER_API_KEY for local development)");
+            bail!("set GATEWAY_URL (or TOGETHER_API_KEY for local development)");
         };
         Ok(Self { backend })
     }
 
     async fn send(&self, body: &Value) -> Result<reqwest::Response> {
         match &self.backend {
+            Backend::Attested(gateway) => gateway.chat(&serde_json::to_vec(body)?).await,
             Backend::Gateway(gateway) => {
                 gateway
                     .post("/v1/chat/completions", &serde_json::to_vec(body)?)

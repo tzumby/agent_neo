@@ -1,6 +1,7 @@
 //! Calls to our Lambda function URLs (the push relay, the model gateway) as
 //! this desktop: SigV4-signed with the instance role's credentials from the
-//! metadata service, so the desktop holds no keys of ours.
+//! metadata service, so the desktop holds no keys of ours. Also the identity
+//! proof for the attested model gateway (a signed STS GetCallerIdentity).
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -19,6 +20,11 @@ pub struct FunctionUrl {
     url: String,
     region: String,
     client: reqwest::Client,
+    role: InstanceRole,
+}
+
+/// The instance role's credentials, from IMDSv2, cached for a while.
+pub struct InstanceRole {
     imds: reqwest::Client,
     credentials: Mutex<Option<(Credentials, Instant)>>,
 }
@@ -41,11 +47,7 @@ impl FunctionUrl {
                 .user_agent(concat!("agentd/", env!("CARGO_PKG_VERSION")))
                 .timeout(timeout)
                 .build()?,
-            imds: reqwest::Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(2))
-                .build()?,
-            credentials: Mutex::new(None),
+            role: InstanceRole::new()?,
         })
     }
 
@@ -53,7 +55,7 @@ impl FunctionUrl {
     pub async fn post(&self, path: &str, body: &[u8]) -> Result<reqwest::Response> {
         let url = format!("{}{path}", self.url);
         let headers = signed_headers(
-            &self.credentials().await?,
+            &self.role.credentials().await?,
             &self.region,
             &url,
             body,
@@ -65,9 +67,20 @@ impl FunctionUrl {
         }
         request.send().await.with_context(|| format!("calling {url}"))
     }
+}
 
-    /// The instance role's credentials, from IMDSv2.
-    async fn credentials(&self) -> Result<Credentials> {
+impl InstanceRole {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            imds: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()?,
+            credentials: Mutex::new(None),
+        })
+    }
+
+    pub async fn credentials(&self) -> Result<Credentials> {
         let mut cached = self.credentials.lock().await;
         if let Some((credentials, fetched)) = cached.as_ref()
             && fetched.elapsed() < CREDENTIALS_LIFETIME
@@ -135,6 +148,48 @@ fn signed_headers(
     Ok(headers)
 }
 
+/// Signed into identity proofs (gatewayd: identity.rs), with the gateway's
+/// audience value, so a proof only works at that gateway.
+pub const AUDIENCE_HEADER: &str = "x-cloud-desktops-audience";
+const STS_BODY: &str = "Action=GetCallerIdentity&Version=2011-06-15";
+const STS_CONTENT_TYPE: &str = "application/x-www-form-urlencoded; charset=utf-8";
+
+/// This desktop's identity proof for the attested model gateway: the signed
+/// headers of an STS GetCallerIdentity request (base64 JSON). The gateway
+/// sends the request to STS and learns which role session made it.
+pub fn sts_proof(
+    credentials: &Credentials,
+    region: &str,
+    audience: &str,
+    time: SystemTime,
+) -> Result<String> {
+    let identity = credentials.clone().into();
+    let params = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(region)
+        .name("sts")
+        .time(time)
+        .settings(SigningSettings::default())
+        .build()?
+        .into();
+    let url = format!("https://sts.{region}.amazonaws.com/");
+    let headers = [("content-type", STS_CONTENT_TYPE), (AUDIENCE_HEADER, audience)];
+    let signable = SignableRequest::new(
+        "POST",
+        &url,
+        headers.into_iter(),
+        SignableBody::Bytes(STS_BODY.as_bytes()),
+    )?;
+    let (instructions, _) = sign(signable, &params)?.into_parts();
+    let mut proof = serde_json::Map::new();
+    for (name, value) in instructions.headers() {
+        proof.insert(name.to_string(), value.into());
+    }
+    proof.insert("audience".into(), audience.into());
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&proof)?))
+}
+
 /// "https://abc.lambda-url.ca-central-1.on.aws" → "ca-central-1".
 fn region_of(url: &str) -> Option<String> {
     let host = url.strip_prefix("https://")?.split('/').next()?;
@@ -183,5 +238,33 @@ mod tests {
         );
         assert_eq!(get("x-amz-security-token"), Some("session"));
         assert_eq!(get("x-amz-date"), Some("20231114T221320Z"));
+    }
+
+    #[test]
+    fn identity_proofs_are_for_sts_and_name_the_gateway() {
+        use base64::Engine;
+        let credentials = Credentials::new("AKIDEXAMPLE", "secret", Some("session".into()), None, "test");
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let proof = sts_proof(
+            &credentials,
+            "ca-central-1",
+            "cloud-desktops-dev/model-gateway",
+            time,
+        )
+        .unwrap();
+        let proof: serde_json::Value =
+            serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(proof).unwrap())
+                .unwrap();
+        let auth = proof["authorization"].as_str().unwrap();
+        assert!(
+            auth.starts_with(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231114/ca-central-1/sts/aws4_request"
+            ),
+            "{auth}"
+        );
+        assert!(auth.contains(AUDIENCE_HEADER), "{auth}");
+        assert_eq!(proof["x-amz-date"], "20231114T221320Z");
+        assert_eq!(proof["x-amz-security-token"], "session");
+        assert_eq!(proof["audience"], "cloud-desktops-dev/model-gateway");
     }
 }

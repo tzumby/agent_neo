@@ -13,8 +13,18 @@ pub struct Config {
     /// Only for local development: on desktops, model calls go through the
     /// model gateway and no key is here. Never printed (Debug shows [REDACTED]).
     pub together_api_key: Option<SecretString>,
-    /// The model gateway's function URL.
+    /// The model gateway's function URL (the Lambda; until the attested
+    /// gateway takes over).
     pub model_gateway_url: String,
+    /// The attested model gateway (https://<address>:8443). When set, model
+    /// calls go only there, after its attestation checks out.
+    pub gateway_url: String,
+    /// The gateway images agentd accepts (attest.rs: parse_measurements).
+    pub gateway_measurements: Vec<crate::attest::Measurements>,
+    /// Signed into this desktop's identity proofs for the gateway.
+    pub gateway_audience: String,
+    /// For the identity proof (STS in this region).
+    pub aws_region: String,
     pub model: String,
     pub cdp_url: String,
     pub state_dir: PathBuf,
@@ -74,13 +84,24 @@ impl Config {
         };
         let together_api_key = get("TOGETHER_API_KEY", "");
         let model_gateway_url = get("MODEL_GATEWAY_URL", "");
-        if together_api_key.is_empty() && model_gateway_url.is_empty() {
-            bail!("set MODEL_GATEWAY_URL, or TOGETHER_API_KEY for local development");
+        let gateway_url = get("GATEWAY_URL", "");
+        if together_api_key.is_empty() && model_gateway_url.is_empty() && gateway_url.is_empty() {
+            bail!("set GATEWAY_URL (or MODEL_GATEWAY_URL, or TOGETHER_API_KEY for local development)");
         }
+        let gateway_measurements = if gateway_url.is_empty() {
+            Vec::new()
+        } else {
+            crate::attest::parse_measurements(&get("GATEWAY_MEASUREMENTS", ""))
+                .context("GATEWAY_MEASUREMENTS")?
+        };
         Ok(Self {
             listen: get("LISTEN", "unix:/run/agentd/agentd.sock"),
             together_api_key: (!together_api_key.is_empty()).then(|| together_api_key.into()),
             model_gateway_url,
+            gateway_url,
+            gateway_measurements,
+            gateway_audience: get("GATEWAY_AUDIENCE", "cloud-desktops/model-gateway"),
+            aws_region: get("AWS_REGION", "ca-central-1"),
             model: get("MODEL", "zai-org/GLM-5.3"),
             cdp_url: get("CDP_URL", "http://127.0.0.1:9222"),
             state_dir: get("STATE_DIR", "/var/lib/agentd").into(),

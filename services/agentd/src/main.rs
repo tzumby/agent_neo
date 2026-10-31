@@ -3,11 +3,13 @@
 
 mod agent;
 mod api;
+mod attest;
 mod aws;
 mod browser;
 mod cdp;
 mod clock;
 mod config;
+mod gateway;
 mod guard;
 mod llm;
 mod policy;
@@ -34,6 +36,12 @@ async fn main() -> Result<()> {
     // /proc/self belongs to the process's effective user.
     if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
         anyhow::bail!("agentd must not run as root (it runs as the agentd user, under systemd)");
+    }
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--check-gateway")
+    {
+        return check_gateway().await;
     }
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("agentd=info")))
@@ -78,6 +86,22 @@ async fn serve_until_stopped(
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         } => tracing::info!("stopping with event streams still open"),
     }
+    Ok(())
+}
+
+/// `agentd --check-gateway` (as the agentd user): checks the attested model
+/// gateway the way a model call would, without sending a prompt.
+async fn check_gateway() -> Result<()> {
+    let cfg = config::Config::load()?;
+    anyhow::ensure!(!cfg.gateway_url.is_empty(), "GATEWAY_URL isn't set");
+    let gateway = gateway::AttestedGateway::new(
+        &cfg.gateway_url,
+        &cfg.aws_region,
+        &cfg.gateway_audience,
+        cfg.gateway_measurements,
+        std::time::Duration::from_secs(30),
+    )?;
+    println!("{}: {}", cfg.gateway_url, gateway.check().await?);
     Ok(())
 }
 

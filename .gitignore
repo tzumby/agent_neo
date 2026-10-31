@@ -19,7 +19,11 @@ services/tailnet-proxy/build/
 
 # Rust build output
 services/agentd/target/
+services/agentd/target/deps
 services/gatewayd/target/
+services/gatewayd/target/deps
+
+target/
 
 # Apple apps (generated or built)
 apps/apple/vendor/

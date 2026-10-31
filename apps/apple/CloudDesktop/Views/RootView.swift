@@ -10,7 +10,9 @@ struct RootView: View {
             ProgressView("Connecting to Tailscale…")
         case .needsLogin(let url):
             LoginView(loginURL: url)
-        case .running:
+        case .running, .reconnecting:
+            // Stays up while Tailscale reconnects, so the chat and an open
+            // take-over view survive a trip to another app.
             NavigationStack { DesktopHome() }
         case .failed(let message):
             ContentUnavailableView {

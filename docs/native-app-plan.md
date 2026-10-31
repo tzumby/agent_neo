@@ -223,8 +223,19 @@ guardrails.
   - **Raw VNC:** our own `NWListener` on 127.0.0.1 that pipes each accepted
     connection to `tailscale_dial("tcp", "<desktop>:5900")`.
   - **Lifecycle:** iOS takes the loopback listener away when it suspends the
-    app (#20060). On returning to the foreground: `close()`, start a new node,
-    resume SSE with `after=seq`, reconnect VNC. Don't use `down()` (#21005).
+    app (#20060).
+    - On leaving the screen the app asks for background time (about 30 s), so
+      a quick switch (e.g. to an authenticator for a 2FA code) keeps the node,
+      the chat stream and VNC connected. On return it only checks that the
+      proxy still accepts connections.
+    - If the grace time ran out or the proxy is gone: `close()` and start a new
+      node (phase `reconnecting`). The chat, an open take-over view and the last
+      known desktop stay on screen. The new node's session replaces the old one
+      (a generation counter tells views to reconnect). SSE resumes with
+      `after=seq`, and VNC reconnects.
+    - Statuses from a replaced node are ignored. A late one used to bind the
+      app to the closed node's proxy.
+    - Don't use `down()` (#21005).
   - **Key expiry:** 180 days. Detect `HasExpiredAuth` and offer "Log in
     again".
 - **Mac (POC):** uses the Mac's own Tailscale (running and logged in) and

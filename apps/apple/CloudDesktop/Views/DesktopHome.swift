@@ -21,7 +21,7 @@ struct DesktopHome: View {
                 desktopName: desktop.hostName,
                 endpoint: endpoint(for: desktop),
                 // A new Tailscale session (after the app was suspended) restarts the stream.
-                connectionKey: "\(desktop.host)|\(ObjectIdentifier(session))"
+                connectionKey: "\(desktop.host)|\(tailnet.generation)"
             )
         } else {
             ContentUnavailableView(

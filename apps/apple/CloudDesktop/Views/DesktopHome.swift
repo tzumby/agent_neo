@@ -23,8 +23,6 @@ struct DesktopHome: View {
                 // A new Tailscale session (after the app was suspended) restarts the stream.
                 connectionKey: "\(desktop.host)|\(tailnet.generation)"
             )
-        } else if !tailnet.peersLoaded {
-            SplashView(status: "Finding your desktop…")
         } else {
             ContentUnavailableView(
                 "No desktop yet",

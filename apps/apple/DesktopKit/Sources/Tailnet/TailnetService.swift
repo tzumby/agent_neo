@@ -24,9 +24,11 @@ public final class TailnetService {
         case starting
         /// Waiting for the user to sign in; the URL arrives shortly after start.
         case needsLogin(URL?)
+        /// Signed in, with the device list (so `desktops` is meaningful).
         case running
         /// A new node is starting after the app was suspended. The last session,
-        /// proxy and desktops stay in place (connections retry) until it runs.
+        /// proxy and desktops stay in place (connections retry) until it has
+        /// the device list again.
         case reconnecting
         case failed(String)
     }
@@ -35,10 +37,9 @@ public final class TailnetService {
     public private(set) var status: TailnetStatus?
     /// The user's desktops, as last seen while running (kept while reconnecting).
     public private(set) var desktops: [TailnetStatus.Peer] = []
-    /// Whether the device list has arrived. Right after start the node can be
-    /// "Running" before it knows its peers, which isn't the same as having no
-    /// desktop.
-    public private(set) var peersLoaded = false
+    /// When the current node first said "Running". Right after start a node can
+    /// be "Running" before it knows its peers, which isn't the same as having
+    /// no desktop.
     private var runningSince: Date?
     /// Requests through the tailnet (SOCKS5 proxy into the node). Set while running.
     public private(set) var session: URLSession?
@@ -130,7 +131,6 @@ public final class TailnetService {
             proxy = nil
             connectedNode = nil
             desktops = []
-            peersLoaded = false
             phase = .stopped
         }
         if let node {
@@ -150,8 +150,7 @@ public final class TailnetService {
                 await apply(status, node: node)
             }
             // Poll quickly until running with the device list, then rarely.
-            let settled = phase == .running && peersLoaded
-            try? await Task.sleep(for: settled ? .seconds(15) : .seconds(1))
+            try? await Task.sleep(for: phase == .running ? .seconds(15) : .seconds(1))
         }
     }
 
@@ -161,6 +160,17 @@ public final class TailnetService {
             let url = status.authURL.flatMap { $0.isEmpty ? nil : URL(string: $0) }
             phase = .needsLogin(url)
         case "Running":
+            // Wait for the device list. Any peer means it arrived; with none,
+            // give it a few seconds (a tailnet with nothing else on it). After a
+            // restart, wait however long it takes: an empty list would replace
+            // the desktop with "No desktop yet", and the chat keeps retrying.
+            if runningSince == nil { runningSince = .now }
+            let hasPeers = !(status.peers ?? [:]).isEmpty
+            let waited = Date.now.timeIntervalSince(runningSince ?? .now) > 8
+            guard hasPeers || (waited && desktops.isEmpty) else {
+                if case .needsLogin = phase { phase = .starting }  // just signed in
+                return
+            }
             if connectedNode !== node {
                 do {
                     let (configuration, loopback) = try await URLSessionConfiguration.tailscaleSession(node)
@@ -180,11 +190,6 @@ public final class TailnetService {
                 }
             }
             desktops = status.desktops
-            // Any peer means the list arrived; with none, give it a few seconds.
-            if runningSince == nil { runningSince = .now }
-            if !(status.peers ?? [:]).isEmpty || Date.now.timeIntervalSince(runningSince ?? .now) > 8 {
-                peersLoaded = true
-            }
             phase = .running
         case "Stopped":
             phase = .failed("Tailscale stopped")

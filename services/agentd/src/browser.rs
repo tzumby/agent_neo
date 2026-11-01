@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 
 use crate::cdp::{Cdp, Page};
 use crate::llm::truncate;
@@ -32,6 +32,9 @@ pub struct Element {
 pub struct Browser {
     cdp: Cdp,
     page: Option<Page>,
+    /// What's happening on the current tab, followed from its events for as
+    /// long as agentd is connected to it (across tool calls).
+    watch: Mutex<Option<PageWatch>>,
     allow_actions: bool,
     policy: Arc<Policy>,
 }
@@ -41,6 +44,7 @@ impl Browser {
         Self {
             cdp,
             page: None,
+            watch: Mutex::new(None),
             allow_actions,
             policy,
         }
@@ -56,7 +60,13 @@ impl Browser {
                 None => self.cdp.new_page().await?,
             },
         };
-        self.page = Some(Page::connect(&target).await?);
+        self.connect(&target).await
+    }
+
+    async fn connect(&mut self, target: &crate::cdp::Target) -> Result<()> {
+        let page = Page::connect(target).await?;
+        *self.watch.get_mut() = Some(PageWatch::new(page.events(), page.target_id.clone()));
+        self.page = Some(page);
         Ok(())
     }
 
@@ -70,8 +80,7 @@ impl Browser {
 
     async fn switch_to(&mut self, target: &crate::cdp::Target) -> Result<()> {
         self.cdp.activate(&target.id).await?;
-        self.page = Some(Page::connect(target).await?);
-        Ok(())
+        self.connect(target).await
     }
 
     pub async fn where_am_i(&self) -> Result<String> {
@@ -93,39 +102,62 @@ impl Browser {
             .unwrap_or(false)
     }
 
-    /// Starts listening to the tab's network events. Call before the action
-    /// whose effects `settle` should wait for, so no request is missed.
-    fn watch(&self) -> Result<NetworkWatch> {
-        Ok(NetworkWatch::new(self.page()?.events()))
-    }
-
-    /// Waits until the page has settled, up to `max_ms`: the DOM has stopped
-    /// changing (a MutationObserver in the page, no loading indicator) and the
-    /// network is quiet (the tab's DevTools request events). Single-page apps
-    /// such as Slack sit still while their code and data download, so the DOM
-    /// alone isn't enough. All on events; nothing polls. Returns how it ended.
-    async fn settle(&self, mut network: NetworkWatch, max_ms: u64) -> Result<String> {
+    /// Waits until what a navigation or action set off has finished, on
+    /// events only, no quiet timers:
+    /// 1. a new document (if one is on its way) has fired DOMContentLoaded and
+    ///    painted (first contentful paint, or load);
+    /// 2. every request of the main frame's own has finished (iframes and
+    ///    workers finish in other processes and aren't counted);
+    /// 3. two animation frames pass with no element added or removed, no new
+    ///    request and no loading indicator. Otherwise, back to 1.
+    ///
+    /// Measured against the final accessibility tree on Slack, GitHub, Gmail,
+    /// Amazon, Notion and Wikipedia, the page is complete at that point, 0.1
+    /// to 1.3 s after navigating. `cap` is only a safety net (a hidden tab
+    /// doesn't render frames; a request may hang).
+    async fn settle(&self, cap: Duration) -> Result<String> {
         let started = Instant::now();
-        let deadline = started + Duration::from_millis(max_ms);
+        let deadline = started + cap;
         let took = |how: &str| format!("{how} after {} ms", started.elapsed().as_millis());
+        let mut guard = self.watch.lock().await;
+        let watch = guard.as_mut().ok_or_else(|| anyhow!("no tab is open"))?;
         loop {
-            let left = deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis()
-                .max(1);
-            let dom = self
-                .eval_across_navigation(&DOM_QUIET.replace("MAX_MS", &left.to_string()))
-                .await?;
-            let dom_quiet = Instant::now();
-            if dom != "quiet" {
-                return Ok(took("still changing, stopped waiting"));
+            watch.catch_up();
+            if !watch.document_ready() {
+                if !watch.next_event(deadline).await {
+                    return Ok(took("the new page is still loading; stopped waiting"));
+                }
+                continue;
             }
-            if !network.idle(deadline).await {
-                return Ok(took("still loading, stopped waiting"));
+            let now = Instant::now();
+            if watch.pending(now) > 0 {
+                let until = watch.oldest_turns_long(now).min(deadline);
+                if now >= deadline {
+                    return Ok(took("still loading; stopped waiting"));
+                }
+                watch.next_event(until).await;
+                continue;
             }
-            // Requests that finished since the DOM went quiet may still render.
-            if !network.active_since(dom_quiet) {
-                return Ok(took("settled"));
+            let requests = watch.started;
+            let left = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(left, self.page()?.eval(FRAMES)).await {
+                Err(_) => {
+                    return Ok(took(
+                        "the page isn't rendering (a background tab?); stopped waiting",
+                    ));
+                }
+                // A navigation replaced the document mid-check: the watch saw it.
+                Ok(Err(_)) => {}
+                Ok(Ok(frames)) => {
+                    watch.catch_up();
+                    if frames.as_str() == Some("quiet") && watch.started == requests && watch.document_ready()
+                    {
+                        return Ok(took("ready"));
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(took("still changing; stopped waiting"));
             }
         }
     }
@@ -150,17 +182,30 @@ impl Browser {
         Err(last.unwrap_or_else(|| anyhow!("the page kept navigating")))
     }
 
-    /// The wait_for tool: until `text` shows on the page (or, without text,
-    /// until the page settles), reacting to DOM changes; never polling.
+    /// The wait_for tool: until `text` shows on the page (checked on DOM
+    /// changes), or until the page is idle without it (settle), or, without
+    /// text, until the page is idle.
     pub async fn wait_for(&self, text: Option<&str>, timeout_secs: u64) -> Result<String> {
-        let max_ms = timeout_secs.clamp(1, 25) * 1000;
+        let cap = Duration::from_secs(timeout_secs.clamp(1, 25));
         let outcome = match text.map(str::trim).filter(|t| !t.is_empty()) {
-            None => self.settle(self.watch()?, max_ms).await?,
+            None => self.settle(cap).await?,
             Some(text) => {
+                let needle = serde_json::to_string(&text.to_lowercase())?;
                 let script = WAIT_FOR_TEXT
-                    .replace("TEXT_JSON", &serde_json::to_string(&text.to_lowercase())?)
-                    .replace("MAX_MS", &max_ms.to_string());
-                self.eval_across_navigation(&script).await?
+                    .replace("TEXT_JSON", &needle)
+                    .replace("MAX_MS", &cap.as_millis().to_string());
+                tokio::select! {
+                    found = self.eval_across_navigation(&script) => found?,
+                    idle = self.settle(cap) => {
+                        let idle = idle?;
+                        let has = format!("(document.body?.innerText ?? '').toLowerCase().includes({needle})");
+                        if self.page()?.eval(&has).await?.as_bool() == Some(true) {
+                            format!("found it ({idle})")
+                        } else {
+                            format!("not on the page, and the page is idle ({idle})")
+                        }
+                    }
+                }
             }
         };
         Ok(format!("{outcome}; now at {}", self.where_am_i().await?))
@@ -197,12 +242,20 @@ impl Browser {
             let target = self.cdp.new_page().await?;
             self.switch_to(&target).await?;
         }
-        let network = self.watch()?;
+        if let Some(watch) = self.watch.get_mut().as_mut() {
+            watch.catch_up();
+        }
         let result = self.page()?.call("Page.navigate", json!({"url": url})).await?;
         if let Some(error) = result["errorText"].as_str() {
             bail!("couldn't load {url}: {error}");
         }
-        let settled = self.settle(network, 8_000).await?;
+        // A new document is coming (unless only the #fragment changed).
+        if result["loaderId"].as_str().is_some_and(|l| !l.is_empty())
+            && let Some(watch) = self.watch.get_mut().as_mut()
+        {
+            watch.expect_document();
+        }
+        let settled = self.settle(Duration::from_secs(10)).await?;
         Ok(format!(
             "{} ({settled}){}",
             self.where_am_i().await?,
@@ -266,9 +319,11 @@ impl Browser {
     }
 
     pub async fn click(&self, element: &Element) -> Result<String> {
-        let network = self.watch()?;
+        if let Err(problem) = self.actionable(element, true).await {
+            return Ok(format!("not clicked: '{}' {problem}", element.label));
+        }
         self.click_node(element.node).await?;
-        let settled = self.settle(network, 5_000).await?;
+        let settled = self.settle(Duration::from_secs(8)).await?;
         Ok(format!(
             "clicked '{}' ({settled}); now at {}{}",
             element.label,
@@ -278,14 +333,16 @@ impl Browser {
     }
 
     pub async fn type_text(&self, element: &Element, text: &str, submit: bool) -> Result<String> {
+        if let Err(problem) = self.actionable(element, false).await {
+            return Ok(format!("not typed: '{}' {problem}", element.label));
+        }
         let page = self.page()?;
         page.call("DOM.focus", json!({"backendNodeId": element.node}))
             .await?;
         page.call("Input.insertText", json!({"text": text})).await?;
         if submit {
-            let network = self.watch()?;
             self.key("Enter").await?;
-            self.settle(network, 5_000).await?;
+            self.settle(Duration::from_secs(8)).await?;
         }
         Ok(format!(
             "typed into '{}'; now at {}",
@@ -296,9 +353,8 @@ impl Browser {
 
     pub async fn press_key(&self, key: &str) -> Result<String> {
         // Keys can send, open or scroll in more content.
-        let network = self.watch()?;
         self.key(key).await?;
-        let settled = self.settle(network, 4_000).await?;
+        let settled = self.settle(Duration::from_secs(8)).await?;
         Ok(format!("pressed ({settled})"))
     }
 
@@ -352,6 +408,51 @@ impl Browser {
             .call("Accessibility.getFullAXTree", json!({}))
             .await?;
         Ok(tree["nodes"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Playwright-style checks before acting on an element, on animation
+    /// frames rather than timers: it's attached, visible, in the same place
+    /// on two consecutive frames (not animating in), enabled and, for a
+    /// click, actually under the pointer (not covered by a banner or dialog).
+    /// Err says what's wrong, for the model.
+    async fn actionable(&self, element: &Element, hit_test: bool) -> Result<(), String> {
+        let Ok(page) = self.page() else { return Ok(()) };
+        let _ = page
+            .call(
+                "DOM.scrollIntoViewIfNeeded",
+                json!({"backendNodeId": element.node}),
+            )
+            .await;
+        let Ok(resolved) = page
+            .call("DOM.resolveNode", json!({"backendNodeId": element.node}))
+            .await
+        else {
+            return Err("is no longer on the page (take a new snapshot)".into());
+        };
+        let Some(object) = resolved["object"]["objectId"].as_str() else {
+            return Ok(());
+        };
+        let check = page.call(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object, "functionDeclaration": ACTIONABLE,
+                "arguments": [{"value": hit_test}], "awaitPromise": true, "returnByValue": true,
+            }),
+        );
+        // Still moving after a while (an endless animation): act anyway.
+        let verdict = match tokio::time::timeout(Duration::from_secs(2), check).await {
+            Ok(Ok(result)) => result["result"]["value"].as_str().unwrap_or("ok").to_string(),
+            _ => return Ok(()),
+        };
+        match verdict.as_str() {
+            "ok" => Ok(()),
+            "detached" => Err("is no longer on the page (take a new snapshot)".into()),
+            "hidden" => Err("isn't visible".into()),
+            "disabled" => Err("is disabled".into()),
+            covered => Err(format!(
+                "is {covered}; deal with that first (close or accept it), then try again"
+            )),
+        }
     }
 
     async fn click_node(&self, backend_id: i64) -> Result<()> {
@@ -434,67 +535,88 @@ fn key_definition(key: &str) -> Result<(String, String, i64, Option<String>)> {
 // --- Accessibility tree ---------------------------------------------------------
 
 /// Roles that only add structure; their children are shown in their place.
-/// Resolves "quiet" once the document has loaded and no element has been
-/// added or removed (and no loading or hidden flag changed) for 400 ms with no
-/// loading indicator showing, or "busy" after MAX_MS. Text that keeps ticking
-/// (presence, "1m ago") doesn't count: apps like Slack never stop that. On
-/// the page's events (DOMContentLoaded, MutationObserver); the timers only
-/// measure quiet.
-const DOM_QUIET: &str = r#"(async () => {
-  const started = Date.now(), max = MAX_MS, quietMs = 400;
-  const relevant = (records) => records.some((r) => r.type === "attributes"
-    || [...r.addedNodes, ...r.removedNodes].some((n) => n.nodeType === 1));
-  if (document.readyState === "loading") {
-    await new Promise((done) => document.addEventListener("DOMContentLoaded", done, { once: true }));
-  }
-  const busy = () => !!document.querySelector('[aria-busy="true"], [role="progressbar"]:not([aria-hidden="true"])');
-  return await new Promise((resolve) => {
-    let quiet;
-    const finish = (how) => { observer.disconnect(); clearTimeout(quiet); clearTimeout(cap); resolve(how); };
-    // When quiet but a loading indicator shows, wait for the next change.
-    const arm = () => { clearTimeout(quiet); quiet = setTimeout(() => { if (!busy()) finish("quiet"); }, quietMs); };
-    const observer = new MutationObserver((records) => { if (relevant(records)) arm(); });
-    observer.observe(document.documentElement, {
-      subtree: true, childList: true,
-      attributes: true, attributeFilter: ["aria-busy", "hidden", "aria-hidden", "disabled"],
-    });
-    const cap = setTimeout(() => finish("busy"), Math.max(0, max - (Date.now() - started)));
-    arm();
+/// Two animation frames: "quiet" if no element was added or removed (and no
+/// busy/hidden flag changed) meanwhile and no loading indicator shows,
+/// "changed" otherwise. Text that keeps ticking (presence, "1m ago") doesn't
+/// count: apps like Slack never stop that.
+const FRAMES: &str = r#"new Promise((resolve) => {
+  let changed = false;
+  const observer = new MutationObserver((records) => {
+    if (records.some((r) => r.type === "attributes" || [...r.addedNodes, ...r.removedNodes].some((n) => n.nodeType === 1))) changed = true;
   });
-})()"#;
+  observer.observe(document.documentElement, {
+    subtree: true, childList: true, attributes: true, attributeFilter: ["aria-busy", "hidden", "aria-hidden"],
+  });
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    observer.disconnect();
+    const busy = !!document.querySelector('[aria-busy="true"], [role="progressbar"]:not([aria-hidden="true"])');
+    resolve(changed || busy ? "changed" : "quiet");
+  }));
+})"#;
+
+/// Run on an element (`this`) before acting on it: resolves "ok", "detached",
+/// "hidden", "disabled" or "covered by <what>". Its box must match on two
+/// consecutive animation frames; the hit test looks at the element's centre,
+/// where the click lands (through shadow roots).
+const ACTIONABLE: &str = r#"function (hitTest) {
+  const el = this.nodeType === 1 ? this : this.parentElement;
+  if (!el || !el.isConnected) return "detached";
+  return new Promise((resolve) => {
+    let last = "";
+    const check = () => {
+      if (!el.isConnected) return resolve("detached");
+      const r = el.getBoundingClientRect();
+      const box = [r.x, r.y, r.width, r.height].join();
+      if (box !== last) { last = box; return requestAnimationFrame(check); }
+      const style = getComputedStyle(el);
+      if (r.width === 0 || r.height === 0 || style.visibility !== "visible") return resolve("hidden");
+      if (el.disabled || el.closest('[aria-disabled="true"], fieldset[disabled]')) return resolve("disabled");
+      if (hitTest) {
+        const x = r.left + r.width / 2, y = r.top + r.height / 2;
+        let hit = document.elementFromPoint(x, y);
+        while (hit && hit.shadowRoot) {
+          const inner = hit.shadowRoot.elementFromPoint(x, y);
+          if (!inner || inner === hit) break;
+          hit = inner;
+        }
+        const related = !hit || hit === el || el.contains(hit) || hit.contains(el)
+          || (hit.tagName === "LABEL" && hit.control === el)
+          || (el.shadowRoot && el.shadowRoot.contains(hit));
+        if (!related) {
+          const name = (hit.getAttribute("aria-label") || hit.innerText || hit.tagName).trim().replace(/\s+/g, " ").slice(0, 60);
+          return resolve(`covered by "${name}"`);
+        }
+      }
+      resolve("ok");
+    };
+    requestAnimationFrame(check);
+  });
+}"#;
 
 /// Resolves when TEXT_JSON appears in the page's text (checked when the DOM
-/// changes, at most every 150 ms); when it's not there and no element has
-/// changed for 3 s (the page has stopped changing: waiting longer won't help);
-/// or after MAX_MS.
+/// changes, at most every 150 ms), or after MAX_MS. wait_for also stops as
+/// soon as the page is idle without it.
 const WAIT_FOR_TEXT: &str = r#"(async () => {
-  const started = Date.now(), text = TEXT_JSON, stillMs = 3000;
+  const started = Date.now(), text = TEXT_JSON;
   const has = () => (document.body?.innerText ?? "").toLowerCase().includes(text);
   if (has()) return "found it right away";
   return await new Promise((resolve) => {
-    let pending = false, still;
-    const finish = (how) => { observer.disconnect(); clearTimeout(cap); clearTimeout(still); resolve(how); };
-    const settleWatch = () => {
-      clearTimeout(still);
-      still = setTimeout(() => finish(`not on the page; it stopped changing after ${Date.now() - started - stillMs} ms`), stillMs);
-    };
-    const observer = new MutationObserver((records) => {
-      if (records.some((r) => [...r.addedNodes, ...r.removedNodes].some((n) => n.nodeType === 1))) settleWatch();
+    let pending = false;
+    const finish = (how) => { observer.disconnect(); clearTimeout(cap); resolve(how); };
+    const observer = new MutationObserver(() => {
       if (pending) return;
       pending = true;
-      setTimeout(() => { pending = false; if (has()) finish(`found it after ${Date.now() - started} ms`); }, 150);
+      requestAnimationFrame(() => { pending = false; if (has()) finish(`found it after ${Date.now() - started} ms`); });
     });
     observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
     const cap = setTimeout(() => finish(`not on the page after ${MAX_MS} ms`), MAX_MS);
-    settleWatch();
   });
 })()"#;
 
-/// How long the network must be quiet before a page counts as loaded.
-const NETWORK_QUIET: Duration = Duration::from_millis(300);
-/// A request still running after this is a long poll, a stream or a slow
-/// extra (analytics): it doesn't hold the page up.
-const LONG_REQUEST: Duration = Duration::from_secs(2);
+/// A request still running after this is a long poll or a stream. A safety
+/// valve: requests that matter normally finish well before, and those that
+/// never finish here (iframes, workers) aren't counted.
+const LONG_REQUEST: Duration = Duration::from_secs(3);
 /// Requests a page doesn't wait for: images, fonts and media render on their
 /// own; prefetches and pings don't matter; live connections never finish.
 const IGNORED_REQUESTS: &[&str] = &[
@@ -510,102 +632,156 @@ const IGNORED_REQUESTS: &[&str] = &[
     "WebSocket",
 ];
 
-/// Requests in flight on a tab, from its DevTools network events.
-struct NetworkWatch {
+/// What's happening on a tab, from its DevTools events: navigations of the
+/// main frame, the lifecycle of its document (DOMContentLoaded, first paint,
+/// load) and the main frame's own requests. Requests from iframes (cross-site
+/// ones run in other processes) and from workers (no loader) aren't counted:
+/// this session doesn't see most of them finish.
+struct PageWatch {
     events: broadcast::Receiver<Value>,
-    /// Request ID → when it started, and its URL (for diagnostics).
+    /// The main frame's ID (a tab's target ID).
+    main_frame: String,
+    /// Request ID → when it started, and its document's loader.
     in_flight: HashMap<String, (Instant, String)>,
-    last_activity: Instant,
+    /// Requests that matter started so far (to notice new ones).
+    started: u64,
+    /// A new document is on its way and hasn't painted yet.
+    navigating: bool,
+    /// The current document's loader, and the lifecycle events it has fired.
+    loader: Option<String>,
+    lifecycle: Vec<String>,
 }
 
-impl NetworkWatch {
-    fn new(events: broadcast::Receiver<Value>) -> Self {
+impl PageWatch {
+    fn new(events: broadcast::Receiver<Value>, main_frame: String) -> Self {
         Self {
             events,
+            main_frame,
             in_flight: HashMap::new(),
-            last_activity: Instant::now(),
+            started: 0,
+            navigating: false,
+            loader: None,
+            lifecycle: Vec::new(),
         }
+    }
+
+    /// A navigation was asked for: a new document is coming.
+    fn expect_document(&mut self) {
+        self.navigating = true;
+        self.lifecycle.clear();
     }
 
     fn apply(&mut self, event: &Value) {
         let params = &event["params"];
-        let id = params["requestId"].as_str().unwrap_or_default().to_string();
+        let main = |value: &Value| value.as_str() == Some(self.main_frame.as_str());
         match event["method"].as_str() {
             Some("Network.requestWillBeSent") => {
-                if !IGNORED_REQUESTS.contains(&params["type"].as_str().unwrap_or("Other")) {
-                    let url = params["request"]["url"].as_str().unwrap_or_default();
-                    self.in_flight.insert(id, (Instant::now(), truncate(url, 120)));
-                    self.last_activity = Instant::now();
+                let loader = params["loaderId"].as_str().unwrap_or_default();
+                let kind = params["type"].as_str().unwrap_or("Other");
+                if main(&params["frameId"]) && !loader.is_empty() && !IGNORED_REQUESTS.contains(&kind) {
+                    if kind == "Document" {
+                        self.expect_document();
+                    }
+                    let id = params["requestId"].as_str().unwrap_or_default().to_string();
+                    self.in_flight.insert(id, (Instant::now(), loader.to_string()));
+                    self.started += 1;
                 }
             }
             Some("Network.loadingFinished" | "Network.loadingFailed") => {
-                if self.in_flight.remove(&id).is_some() {
-                    self.last_activity = Instant::now();
+                self.in_flight
+                    .remove(params["requestId"].as_str().unwrap_or_default());
+            }
+            Some("Page.frameRequestedNavigation") => {
+                if main(&params["frameId"])
+                    && params["disposition"].as_str().is_none_or(|d| d == "currentTab")
+                {
+                    self.expect_document();
+                }
+            }
+            Some("Page.frameStartedNavigating") => {
+                let same_document = matches!(
+                    params["navigationType"].as_str(),
+                    Some("sameDocument" | "historySameDocument")
+                );
+                if main(&params["frameId"]) && !same_document {
+                    self.expect_document();
+                }
+            }
+            Some("Page.frameNavigated") => {
+                let frame = &params["frame"];
+                if main(&frame["id"]) && frame["parentId"].is_null() {
+                    let loader = frame["loaderId"].as_str().unwrap_or_default().to_string();
+                    // The old document's requests are gone with it.
+                    self.in_flight.retain(|_, (_, of)| *of == loader);
+                    self.loader = Some(loader);
+                    self.expect_document();
+                }
+            }
+            Some("Page.lifecycleEvent") => {
+                if main(&params["frameId"]) && params["loaderId"].as_str() == self.loader.as_deref() {
+                    self.lifecycle
+                        .push(params["name"].as_str().unwrap_or_default().to_string());
+                    let has = |name: &str| self.lifecycle.iter().any(|seen| seen == name);
+                    if has("DOMContentLoaded") && (has("firstContentfulPaint") || has("load")) {
+                        self.navigating = false;
+                    }
                 }
             }
             _ => {}
         }
     }
 
+    /// No new document on its way, or it's parsed and painted.
+    fn document_ready(&self) -> bool {
+        !self.navigating
+    }
+
     fn catch_up(&mut self) {
         loop {
             match self.events.try_recv() {
                 Ok(event) => self.apply(&event),
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                // Some events were lost: forget requests we may never see end.
+                Err(broadcast::error::TryRecvError::Lagged(_)) => self.in_flight.clear(),
                 Err(_) => break,
             }
         }
     }
 
-    /// Requests that still hold the page up: started less than LONG_REQUEST ago.
-    fn pending(&self, now: Instant) -> impl Iterator<Item = &(Instant, String)> {
-        self.in_flight
-            .values()
-            .filter(move |(started, _)| now.saturating_duration_since(*started) < LONG_REQUEST)
-    }
-
-    /// Waits until at most one request that matters is in flight and nothing
-    /// has started or finished for NETWORK_QUIET. False at `deadline`.
-    async fn idle(&mut self, deadline: Instant) -> bool {
-        loop {
-            self.catch_up();
-            let now = Instant::now();
-            let quiet_for = now.saturating_duration_since(self.last_activity);
-            let calm = self.pending(now).count() <= 1;
-            if calm && quiet_for >= NETWORK_QUIET {
-                return true;
+    /// The next event, applied; false once `until` has passed.
+    async fn next_event(&mut self, until: Instant) -> bool {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        match tokio::time::timeout(left, self.events.recv()).await {
+            Ok(Ok(event)) => {
+                self.apply(&event);
+                true
             }
-            if now >= deadline {
-                tracing::debug!(
-                    pending = ?self.pending(now).map(|(_, url)| url.as_str()).collect::<Vec<_>>(),
-                    "network still busy"
-                );
-                return false;
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                self.in_flight.clear();
+                true
             }
-            // Look again when the quiet period ends or the oldest pending
-            // request turns long-running, or on the next network event.
-            let next_change = self
-                .pending(now)
-                .map(|(started, _)| *started + LONG_REQUEST)
-                .min()
-                .unwrap_or(deadline);
-            let wait = if calm {
-                NETWORK_QUIET - quiet_for
-            } else {
-                next_change.saturating_duration_since(now)
-            };
-            match tokio::time::timeout(wait.min(deadline - now), self.events.recv()).await {
-                Ok(Ok(event)) => self.apply(&event),
-                Ok(Err(broadcast::error::RecvError::Closed)) => return true,
-                // Lagged, or a timer ran out: look again.
-                _ => {}
-            }
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => Instant::now() < until,
         }
     }
 
-    fn active_since(&mut self, moment: Instant) -> bool {
-        self.catch_up();
-        self.last_activity > moment
+    /// Requests that hold the page up: started less than LONG_REQUEST ago.
+    fn pending(&self, now: Instant) -> usize {
+        self.in_flight
+            .values()
+            .filter(|(started, _)| now.saturating_duration_since(*started) < LONG_REQUEST)
+            .count()
+    }
+
+    /// When the oldest pending request stops counting.
+    fn oldest_turns_long(&self, now: Instant) -> Instant {
+        self.in_flight
+            .values()
+            .map(|(started, _)| *started + LONG_REQUEST)
+            .filter(|at| *at > now)
+            .min()
+            .unwrap_or(now)
     }
 }
 
@@ -760,29 +936,95 @@ mod tests {
     /// `make cdp`) and checks that SETTLE_TEXT is on the page as soon as
     /// open_url returns. Prints the tab's id so it can be closed afterwards.
     #[test]
-    fn only_requests_a_page_needs_hold_it_up() {
+    fn only_the_main_frames_own_requests_hold_a_page_up() {
         let (_tx, rx) = broadcast::channel(4);
-        let mut watch = NetworkWatch::new(rx);
-        let sent = |id: &str, kind: &str| {
+        let mut watch = PageWatch::new(rx, "MAIN".into());
+        let sent = |id: &str, kind: &str, frame: &str, loader: &str| {
             json!({"method": "Network.requestWillBeSent",
-                   "params": {"requestId": id, "type": kind, "request": {"url": format!("https://x.example/{id}")}}})
+                   "params": {"requestId": id, "type": kind, "frameId": frame, "loaderId": loader,
+                              "request": {"url": format!("https://x.example/{id}")}}})
         };
-        for (id, kind) in [
-            ("1", "Script"),
-            ("2", "XHR"),
-            ("3", "Image"),
-            ("4", "WebSocket"),
-            ("5", "Ping"),
+        for event in [
+            sent("1", "Script", "MAIN", "L1"),
+            sent("2", "XHR", "MAIN", "L1"),
+            sent("3", "Image", "MAIN", "L1"),      // images don't count
+            sent("4", "WebSocket", "MAIN", "L1"),  // nor live connections
+            sent("5", "Document", "IFRAME", "L9"), // nor a tracker iframe
+            sent("6", "Script", "MAIN", ""),       // nor a worker's script
         ] {
-            watch.apply(&sent(id, kind));
+            watch.apply(&event);
         }
         let now = Instant::now();
-        // Images, live connections and pings don't count.
-        assert_eq!(watch.pending(now).count(), 2);
+        assert_eq!(watch.pending(now), 2);
+        assert!(watch.document_ready());
         watch.apply(&json!({"method": "Network.loadingFinished", "params": {"requestId": "1"}}));
-        assert_eq!(watch.pending(now).count(), 1);
+        assert_eq!(watch.pending(now), 1);
         // A request still running after LONG_REQUEST (a long poll) stops counting.
-        assert_eq!(watch.pending(now + LONG_REQUEST).count(), 0);
+        assert_eq!(watch.pending(now + LONG_REQUEST), 0);
+    }
+
+    #[test]
+    fn a_new_document_is_ready_once_parsed_and_painted() {
+        let (_tx, rx) = broadcast::channel(4);
+        let mut watch = PageWatch::new(rx, "MAIN".into());
+        watch.apply(&json!({"method": "Network.requestWillBeSent",
+            "params": {"requestId": "old", "type": "XHR", "frameId": "MAIN", "loaderId": "L1", "request": {"url": "u"}}}));
+        // A click asks for a navigation: wait for the new document.
+        watch.apply(&json!({"method": "Page.frameRequestedNavigation",
+            "params": {"frameId": "MAIN", "disposition": "currentTab"}}));
+        assert!(!watch.document_ready());
+        watch.apply(&json!({"method": "Page.frameNavigated",
+            "params": {"frame": {"id": "MAIN", "loaderId": "L2"}}}));
+        assert_eq!(watch.pending(Instant::now()), 0); // the old document's request went with it
+        let lifecycle = |name: &str, loader: &str| json!({"method": "Page.lifecycleEvent", "params": {"frameId": "MAIN", "loaderId": loader, "name": name}});
+        watch.apply(&lifecycle("load", "L1")); // the old document's: ignored
+        watch.apply(&lifecycle("DOMContentLoaded", "L2"));
+        assert!(!watch.document_ready());
+        watch.apply(&lifecycle("firstContentfulPaint", "L2"));
+        assert!(watch.document_ready());
+        // Same-document navigations (a SPA route) don't wait for a document.
+        watch.apply(&json!({"method": "Page.frameStartedNavigating",
+            "params": {"frameId": "MAIN", "navigationType": "historySameDocument"}}));
+        assert!(watch.document_ready());
+    }
+
+    /// Clicks against a real Chrome (CDP_URL): one that navigates (waits for
+    /// the new page), one on a button a banner covers, one on a disabled one.
+    #[tokio::test]
+    #[ignore = "needs a Chrome with remote debugging: CDP_URL=http://127.0.0.1:9222"]
+    async fn live_clicks_wait_for_their_effects_and_check_the_target() {
+        let cdp = Cdp::new(&std::env::var("CDP_URL").expect("CDP_URL")).unwrap();
+        let target = cdp.new_page().await.unwrap();
+        let mut browser = Browser::new(cdp.clone(), true, Arc::new(Policy::defaults()));
+        browser.switch_to(&target).await.unwrap();
+
+        browser
+            .open_url("https://news.ycombinator.com", false)
+            .await
+            .unwrap();
+        let link = browser.find(None, Some("link"), Some("new"), None).await.unwrap();
+        let started = Instant::now();
+        let clicked = browser.click(&link).await.unwrap();
+        println!("{clicked}\n  in {:?}", started.elapsed());
+        assert!(clicked.contains("newest"), "{clicked}");
+
+        let page = "data:text/html,<button disabled>Off</button><button>Covered</button>\
+            <div style='position:fixed;inset:0;background:rgba(0,0,0,.4)' aria-label='Cookie banner'></div>";
+        browser.open_url(page, false).await.unwrap();
+        let covered = browser
+            .find(None, Some("button"), Some("Covered"), None)
+            .await
+            .unwrap();
+        let result = browser.click(&covered).await.unwrap();
+        println!("{result}");
+        assert!(result.contains("covered by \"Cookie banner\""), "{result}");
+        let off = browser
+            .find(None, Some("button"), Some("Off"), None)
+            .await
+            .unwrap();
+        let result = browser.click(&off).await.unwrap();
+        println!("{result}");
+        assert!(result.contains("disabled"), "{result}");
     }
 
     #[tokio::test]

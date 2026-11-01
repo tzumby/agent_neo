@@ -111,10 +111,15 @@ the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
   the action is still the one on the card; a day-old approval expires). A new
   message or Stop gives up on it. A task that runs out of steps ends with a
   summary of what it did and what's left;
-- browser actions wait for the page to settle on events, not timers: the page's DOM
-  changes (a MutationObserver) and its network requests (DevTools events), so a
-  slow single-page app like Slack is loaded when the next step looks at it. A
-  `wait_for` tool waits for specific text; shell `sleep`s are refused unseen;
+- browser actions wait for exactly what they set off, on events with no quiet
+  timers: a new document's DOMContentLoaded and first paint, the main frame's own
+  requests finishing (iframes and workers, which finish in other processes, don't
+  count), then two animation frames with no new elements or requests. Pages are
+  ready 0.1–1 s after navigating (Slack ~0.9 s, GitHub ~0.4 s), with the final
+  content there. Before a click it checks the target, Playwright-style: visible,
+  enabled, steady across two frames, not covered (a cookie banner is named to the
+  model). `wait_for` returns when its text appears or the page is idle without it;
+  shell `sleep`s are refused unseen;
 - web pages and command output reach the model wrapped in `<untrusted>` tags; old
   tool output is trimmed past a budget, and a model repeating the same failing
   call is nudged, then stopped (patterns adapted from moltis, MIT);

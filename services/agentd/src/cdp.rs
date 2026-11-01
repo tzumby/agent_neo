@@ -1,5 +1,5 @@
 //! Minimal Chrome DevTools Protocol client: Chrome's HTTP endpoints for tabs,
-//! and one WebSocket per page for commands. Events are ignored.
+//! and one WebSocket per page for commands; its events go to whoever listens.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,6 +151,10 @@ impl Page {
         ] {
             page.call(domain, json!({})).await?;
         }
+        // DOMContentLoaded, first paint and load for each document: what
+        // agentd waits on after a navigation (browser.rs: PageWatch).
+        page.call("Page.setLifecycleEventsEnabled", json!({"enabled": true}))
+            .await?;
         Ok(page)
     }
 

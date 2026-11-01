@@ -14,7 +14,7 @@ INSTANCE ?= $(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-logs tailnet-build tailnet-deploy tailscale-key apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-logs tailnet-build tailnet-deploy tailscale-key apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -75,6 +75,13 @@ agentd-build: ## Build agentd for the desktop (static linux binary for DESKTOP_A
 
 agentd-deploy: agentd-build ## Install agentd on running desktops
 	$(ANSIBLE_PLAYBOOK) playbooks/agentd.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+
+agentd-evals: ## Memory evals on this Mac against Together (cents per scenario): MEMORY_V2=on|off SCENARIO=name
+	cd services/agentd && cargo build --quiet
+	TOGETHER_API_KEY="$${TOGETHER_API_KEY:-$$(aws ssm get-parameter --name /cloud-desktops/$(ENV)/llm/together_api_key \
+	  --with-decryption --query Parameter.Value --output text)}" \
+	  services/agentd/evals/run.py --agentd services/agentd/target/debug/agentd \
+	  --memory-v2 $(or $(MEMORY_V2),off) $(if $(SCENARIO),--scenario $(SCENARIO))
 
 agentd-logs: ## Show agentd's recent log
 	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \

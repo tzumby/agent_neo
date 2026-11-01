@@ -44,6 +44,9 @@ pub struct Config {
     pub desktop_name: String,
     /// The push relay's function URL; push is off without it.
     pub push_relay_url: String,
+    /// Memory v2 (docs/memory-v2.md): kinds, trust, retrieval, consolidation.
+    /// Off: the v1 memory path, on the v2 schema (which is always migrated).
+    pub memory_v2: bool,
 }
 
 fn read_kv(path: &Path, into: &mut HashMap<String, String>) -> Result<()> {
@@ -114,6 +117,7 @@ impl Config {
             shell_tool: get("SHELL_TOOL", "on") == "on",
             desktop_name: get("DESKTOP_NAME", "cloud-desktop"),
             push_relay_url: get("PUSH_RELAY_URL", ""),
+            memory_v2: get("MEMORY_V2", "off") == "on",
         })
     }
 }

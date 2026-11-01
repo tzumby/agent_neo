@@ -156,6 +156,8 @@ pub struct Agent {
     pub push: Option<Arc<Relay>>,
     /// Wakes the scheduler when schedules are added or resumed.
     pub schedules_changed: Notify,
+    /// Wakes the effects runner when an effect is enqueued (effects.rs).
+    pub effects_changed: Notify,
     /// Keys and tokens the user saved; their values are redacted from
     /// everything the model, the apps and notifications see.
     pub secrets: Secrets,
@@ -212,6 +214,7 @@ impl Agent {
             busy: AtomicBool::new(false),
             cancel: watch::channel(false).0,
             schedules_changed: Notify::new(),
+            effects_changed: Notify::new(),
             cfg,
         };
         agent.recover();
@@ -272,6 +275,26 @@ impl Agent {
 
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// The rules in force (policy.rs): recorded on runs and parked cards, and
+    /// shown in `/status`. Follows the Browser actions setting.
+    pub fn policy_version(&self) -> String {
+        self.policy.version(
+            self.settings().allow_actions,
+            self.cfg.shell_tool,
+            &self.cfg.run_as,
+            &llm::KNOWN_MODELS,
+        )
+    }
+
+    /// Stores a side effect to be done by the effects runner, and wakes it.
+    /// (Consolidation and push notifications use it from memory v2 phases 3–4.)
+    #[allow(dead_code)]
+    pub fn enqueue(&self, kind: &str, key: &str, payload: &Value, due: i64) -> Result<()> {
+        self.store.enqueue_effect(kind, key, payload, due)?;
+        self.effects_changed.notify_one();
+        Ok(())
     }
 
     /// The approval a parked task waits on, if any.
@@ -511,10 +534,14 @@ impl Agent {
         let by_label = by
             .clone()
             .or_else(|| scheduled.as_ref().map(|_| "schedule".to_string()));
-        if let Err(err) = self
-            .store
-            .start_run(&task_id, &text, by_label.as_deref(), &settings.model)
-        {
+        if let Err(err) = self.store.start_run(
+            &task_id,
+            &text,
+            by_label.as_deref(),
+            &settings.model,
+            &self.policy_version(),
+            scheduled.as_ref().map(|s| s.id),
+        ) {
             tracing::error!(%err, "couldn't store the run");
         }
         let schedule_info = scheduled.as_ref().map(|s| json!({"id": s.id, "name": s.name}));
@@ -574,8 +601,13 @@ impl Agent {
     }
 
     fn save_parked(&self, state: &RunState, park: &Park) -> Result<()> {
-        self.store
-            .park(&park.id, &state.task, &park.card, &serde_json::to_string(state)?)?;
+        self.store.park(
+            &park.id,
+            &state.task,
+            &park.card,
+            &serde_json::to_string(state)?,
+            &self.policy_version(),
+        )?;
         self.store.set_run_status(&state.task, "waiting")
     }
 

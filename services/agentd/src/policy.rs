@@ -172,6 +172,29 @@ impl Policy {
         Self::load(Path::new("/nonexistent")).expect("built-in policy compiles")
     }
 
+    /// The rules in force, as 16 hex characters: SHA-256 over the approval
+    /// patterns (sorted), Browser actions, the shell tool, the shell user and
+    /// the allowed models (sorted). Parked cards and schedules record it, and
+    /// work made under other rules is checked again before it goes ahead
+    /// (docs/memory-v2.md §10). Memory never takes part: it can't grant anything.
+    pub fn version(&self, allow_actions: bool, shell_tool: bool, run_as: &str, models: &[&str]) -> String {
+        let mut rules: Vec<String> = self
+            .dangerous
+            .iter()
+            .map(|(pattern, reason)| format!("{}\t{reason}", pattern.as_str()))
+            .collect();
+        rules.sort();
+        let mut models: Vec<&str> = models.to_vec();
+        models.sort_unstable();
+        let canonical = format!(
+            "dangerous:\n{}\nallow_actions:{allow_actions}\nshell_tool:{shell_tool}\nrun_as:{run_as}\nmodels:{}\n",
+            rules.join("\n"),
+            models.join(","),
+        );
+        let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, canonical.as_bytes());
+        hash.as_ref()[..8].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     /// Why a shell command needs approval, if it does.
     pub fn danger(&self, command: &str) -> Option<&str> {
         self.dangerous
@@ -286,6 +309,41 @@ mod tests {
         // Opening a thread or a reply draft sends nothing.
         assert!(!policy.risky_click(Some("button"), "Reply to thread"));
         assert!(!policy.risky_click(Some("button"), "Forward"));
+    }
+
+    #[test]
+    fn the_policy_version_is_stable_and_follows_every_input() {
+        let policy = Policy::defaults();
+        let models = ["zai-org/GLM-5.3", "moonshotai/Kimi-K3"];
+        let base = policy.version(true, true, "worker", &models);
+        assert_eq!(base.len(), 16);
+        assert!(base.chars().all(|c| c.is_ascii_hexdigit()));
+        // Same inputs, same version (the order of the models doesn't matter).
+        assert_eq!(
+            base,
+            Policy::defaults().version(true, true, "worker", &[models[1], models[0]])
+        );
+        let changed = [
+            policy.version(false, true, "worker", &models),
+            policy.version(true, false, "worker", &models),
+            policy.version(true, true, "", &models),
+            policy.version(true, true, "worker", &models[..1]),
+        ];
+        for version in &changed {
+            assert_ne!(*version, base);
+        }
+        // Other approval patterns (policy.toml) are other rules.
+        let dir = std::env::temp_dir().join(format!("agentd-policy-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(
+            &path,
+            "[[dangerous]]\npattern = '\\bsudo\\b'\nreason = \"runs as root\"\n",
+        )
+        .unwrap();
+        let custom = Policy::load(&path).unwrap();
+        assert_ne!(custom.version(true, true, "worker", &models), base);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

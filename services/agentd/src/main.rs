@@ -9,6 +9,7 @@ mod browser;
 mod cdp;
 mod clock;
 mod config;
+mod effects;
 mod gateway;
 mod guard;
 mod llm;
@@ -65,15 +66,18 @@ async fn main() -> Result<()> {
         let listener = tokio::net::UnixListener::bind(path).with_context(|| format!("binding {path}"))?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
         tracing::info!(socket = path, model = %cfg.model, "listening");
-        // Only once this agentd owns the socket: never two schedulers.
-        tokio::spawn(schedule::run(agent));
+        // Only once this agentd owns the socket: never two schedulers or
+        // effect runners.
+        tokio::spawn(schedule::run(agent.clone()));
+        tokio::spawn(effects::run(agent));
         serve_until_stopped(axum::serve(listener, app).with_graceful_shutdown(shutdown())).await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&cfg.listen)
             .await
             .with_context(|| format!("binding {}", cfg.listen))?;
         tracing::info!(address = %cfg.listen, model = %cfg.model, "listening");
-        tokio::spawn(schedule::run(agent));
+        tokio::spawn(schedule::run(agent.clone()));
+        tokio::spawn(effects::run(agent));
         serve_until_stopped(axum::serve(listener, app).with_graceful_shutdown(shutdown())).await?;
     }
     Ok(())

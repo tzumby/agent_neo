@@ -59,6 +59,11 @@ fn error(status: StatusCode, message: &str) -> Response {
 }
 
 async fn status(State(agent): App) -> Json<Value> {
+    let (waiting, failing) = agent.store.effects_health().unwrap_or_default();
+    let failing: Vec<Value> = failing
+        .iter()
+        .map(|e| json!({"kind": e.kind, "key": e.key, "attempts": e.attempts, "last_error": e.last_error}))
+        .collect();
     Json(json!({
         "desktop": agent.cfg.desktop_name,
         "busy": agent.is_busy(),
@@ -69,6 +74,10 @@ async fn status(State(agent): App) -> Json<Value> {
         "known_models": KNOWN_MODELS,
         "shell_tool": agent.cfg.shell_tool,
         "version": env!("CARGO_PKG_VERSION"),
+        // The rules in force (policy.rs), and the side-effects queue's health.
+        "policy_version": agent.policy_version(),
+        "effects": {"pending": waiting, "failing": failing},
+        "memory_v2": agent.cfg.memory_v2,
     }))
 }
 

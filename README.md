@@ -178,7 +178,14 @@ make agentd-test        # fmt, clippy, unit tests
 make agentd-deploy      # static binary for DESKTOP_ARCH (cargo-zigbuild), user, unit
 make tailnet-deploy     # tailnet-proxy (deploy agentd first)
 make agentd-logs        # recent log
+make agentd-evals       # memory evals on this Mac against Together (cents per scenario)
 ```
+
+**Rolling agentd back.** Schema changes are additive, so an older agentd runs on
+a newer database (0.14.0 was tested on 0.15.0's). Check out the older commit and
+`make agentd-deploy`. Each upgrade first copies the database to
+`/var/lib/agentd/agentd.db.pre-<version>` (SQLite online backup; the last 3 are
+kept). Restore one, with agentd stopped, only to undo what the newer version wrote.
 
 The earlier Python agent and its Telegram bot were removed on 2026-10-31; agentd
 and the apps replace them. Each `make agentd-deploy` makes sure the bot is gone
@@ -245,6 +252,9 @@ make destroy               # dev env. The state bucket is protected (prevent_des
 - [docs/native-app-plan.md](docs/native-app-plan.md): `agentd` (Rust agent on each
   user's VM) and the iPhone + Mac apps (TailscaleKit, chat, native take-over view)
   (replaced the earlier Python agent and Telegram bot).
+- [docs/memory-v2.md](docs/memory-v2.md): the plan for agentd's memory v2 (kinds,
+  trust, retrieval, consolidation) and the effects queue, policy versions,
+  attention budget and stage; phase 0 is built (agentd 0.15.0, `MEMORY_V2=off`).
 - [docs/agents-and-bots.md](docs/agents-and-bots.md): design for a main agent with
   its own memory, and user-created bots it manages (draft, not built yet).
 - [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'

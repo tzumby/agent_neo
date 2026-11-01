@@ -82,7 +82,65 @@ pub struct Pending {
     pub created: i64,
 }
 
+/// A side effect waiting to be done (effects.rs).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Effect {
+    pub kind: String,
+    pub key: String,
+    pub payload: Value,
+    /// The payload as stored: a finished run removes the row only if it's
+    /// still this one (not enqueued again meanwhile).
+    raw: String,
+    /// Unix seconds.
+    pub due: i64,
+    /// Failures so far.
+    pub attempts: i64,
+    pub last_error: Option<String>,
+}
+
+/// After this many failures an effect gives up: it stays, and `/status`
+/// reports it.
+pub const EFFECT_MAX_ATTEMPTS: i64 = 10;
+
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// `Store::enqueue_effect`, for use inside a caller's transaction.
+pub fn enqueue_effect(conn: &Connection, kind: &str, key: &str, payload: &Value, due: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO effects (kind, key, payload, due, created) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(kind, key) DO UPDATE SET payload = excluded.payload, due = excluded.due,
+           attempts = CASE WHEN attempts >= ?6 THEN 0 ELSE attempts END,
+           last_error = CASE WHEN attempts >= ?6 THEN NULL ELSE last_error END",
+        params![
+            kind,
+            key,
+            payload.to_string(),
+            due,
+            unix_now(),
+            EFFECT_MAX_ATTEMPTS
+        ],
+    )?;
+    Ok(())
+}
+
+fn effect_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Effect> {
+    let raw: String = row.get(2)?;
+    Ok(Effect {
+        kind: row.get(0)?,
+        key: row.get(1)?,
+        payload: serde_json::from_str(&raw).unwrap_or(Value::Null),
+        raw,
+        due: row.get(3)?,
+        attempts: row.get(4)?,
+        last_error: row.get(5)?,
+    })
+}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -152,11 +210,22 @@ impl Store {
 
     // --- Runs ---------------------------------------------------------------------
 
-    pub fn start_run(&self, id: &str, request: &str, by: Option<&str>, model: &str) -> Result<()> {
+    /// A task starts, under the rules in `policy_version` (policy.rs);
+    /// `schedule` is set for a scheduled run.
+    pub fn start_run(
+        &self,
+        id: &str,
+        request: &str,
+        by: Option<&str>,
+        model: &str,
+        policy_version: &str,
+        schedule: Option<i64>,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO runs (id, status, request, by_user, model) VALUES (?1, 'running', ?2, ?3, ?4)",
-            params![id, request, by, model],
+            "INSERT INTO runs (id, status, request, by_user, model, policy_version, schedule)
+             VALUES (?1, 'running', ?2, ?3, ?4, ?5, ?6)",
+            params![id, request, by, model, policy_version, schedule],
         )?;
         Ok(())
     }
@@ -350,14 +419,141 @@ impl Store {
         Ok(())
     }
 
+    // --- Effects: side effects stored first, done afterwards (effects.rs) ----------
+
+    /// Adds an effect, or replaces the payload and due time of the waiting one
+    /// with that kind and key (its attempts carry over, unless it had given up:
+    /// then it starts over).
+    pub fn enqueue_effect(&self, kind: &str, key: &str, payload: &Value, due: i64) -> Result<()> {
+        enqueue_effect(&self.conn.lock().unwrap(), kind, key, payload, due)
+    }
+
+    /// Adds an effect unless one with that kind and key is already there.
+    pub fn ensure_effect(&self, kind: &str, key: &str, payload: &Value, due: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO effects (kind, key, payload, due, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![kind, key, payload.to_string(), due, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    /// Effects due by `now` that haven't given up, oldest first.
+    pub fn due_effects(&self, now: i64, limit: i64) -> Result<Vec<Effect>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, key, payload, due, attempts, last_error FROM effects
+             WHERE due <= ?1 AND attempts < ?2 ORDER BY due, created LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![now, EFFECT_MAX_ATTEMPTS, limit], effect_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// When the next effect that hasn't given up is due.
+    pub fn next_effect_due(&self) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT MIN(due) FROM effects WHERE attempts < ?1",
+            params![EFFECT_MAX_ATTEMPTS],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Done: removes the effect, unless it was enqueued again while it ran (a
+    /// new payload or due time), which then runs too.
+    pub fn effect_done(&self, effect: &Effect) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM effects WHERE kind = ?1 AND key = ?2 AND payload = ?3 AND due = ?4",
+            params![effect.kind, effect.key, effect.raw, effect.due],
+        )?;
+        Ok(())
+    }
+
+    /// Runs the effect again at `due`; a failure counts toward giving up.
+    pub fn effect_again(&self, effect: &Effect, due: i64, error: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE effects SET due = ?5, attempts = attempts + ?6, last_error = COALESCE(?7, last_error)
+             WHERE kind = ?1 AND key = ?2 AND payload = ?3 AND due = ?4",
+            params![
+                effect.kind,
+                effect.key,
+                effect.raw,
+                effect.due,
+                due,
+                i64::from(error.is_some()),
+                error
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// How many effects are waiting, and the ones that gave up.
+    pub fn effects_health(&self) -> Result<(i64, Vec<Effect>)> {
+        let conn = self.conn.lock().unwrap();
+        let waiting: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM effects WHERE attempts < ?1",
+            params![EFFECT_MAX_ATTEMPTS],
+            |row| row.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT kind, key, payload, due, attempts, last_error FROM effects
+             WHERE attempts >= ?1 ORDER BY kind, key",
+        )?;
+        let failing = stmt
+            .query_map(params![EFFECT_MAX_ATTEMPTS], effect_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((waiting, failing))
+    }
+
+    /// Hard-deletes memories deleted before `cutoff` (unix seconds): their
+    /// rows, their full-text entries, and the text in their history.
+    pub fn purge_deleted_memories(&self, cutoff: i64) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let gone = "SELECT id FROM memory WHERE status = 'deleted' AND COALESCE(updated, 0) < ?1";
+        tx.execute(
+            &format!("UPDATE memory_events SET before = NULL, after = NULL WHERE memory_id IN ({gone})"),
+            params![cutoff],
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT INTO memory_events (memory_id, actor, action, created)
+                 SELECT id, 'system', 'purge', ?2 FROM ({gone})"
+            ),
+            params![cutoff, unix_now()],
+        )?;
+        let purged = tx.execute(
+            "DELETE FROM memory WHERE status = 'deleted' AND COALESCE(updated, 0) < ?1",
+            params![cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_fts WHERE id NOT IN (SELECT id FROM memory)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(purged)
+    }
+
     // --- What the user is asked ---------------------------------------------------
 
     /// Parks a run on an approval: the card the user sees and the run's state.
-    pub fn park(&self, id: &str, run: &str, card: &Value, checkpoint: &str) -> Result<()> {
+    /// Parks a run on an approval, under the rules in `policy_version`, which
+    /// are checked again before it resumes.
+    pub fn park(
+        &self,
+        id: &str,
+        run: &str,
+        card: &Value,
+        checkpoint: &str,
+        policy_version: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO pending (id, kind, run, card, checkpoint) VALUES (?1, 'approval', ?2, ?3, ?4)",
-            params![id, run, card.to_string(), checkpoint],
+            "INSERT INTO pending (id, kind, run, card, checkpoint, policy_version)
+             VALUES (?1, 'approval', ?2, ?3, ?4, ?5)",
+            params![id, run, card.to_string(), checkpoint, policy_version],
         )?;
         Ok(())
     }
@@ -531,6 +727,8 @@ fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
 }
 
 /// Schema changes to databases made by earlier versions (PRAGMA user_version).
+/// Every change is additive, so an older agentd still reads and writes a
+/// newer database (it ignores versions above its own).
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 {
@@ -540,12 +738,101 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
         conn.execute_batch("PRAGMA user_version = 1")?;
     }
+    if version < 2 {
+        // One transaction: a failed step leaves the database at version 1.
+        conn.execute_batch(&format!("BEGIN; {MIGRATION_2} COMMIT;"))?;
+    }
     Ok(())
 }
+
+/// Memory v2 (kinds, trust, status, history, full-text search), the effects
+/// queue, and policy versions on parked work (docs/memory-v2.md §4).
+///
+/// Ids keep the types the tables already have: memory and schedule ids are
+/// integers, run ids text. `created` on memory is an ISO timestamp; the new
+/// time columns are unix seconds.
+///
+/// `trusted` stays, derived from `trust` and `status`, so 0.14.0 can still read
+/// the table after a rollback; the `memory_legacy_*` triggers keep `trust` in
+/// step when code that only knows `trusted` writes (0.14.0, or the v1 path
+/// with MEMORY_V2 off).
+const MIGRATION_2: &str = "
+    ALTER TABLE memory ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact';
+    ALTER TABLE memory ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+    ALTER TABLE memory ADD COLUMN trust TEXT NOT NULL DEFAULT 'agent_inferred';
+    ALTER TABLE memory ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;
+    ALTER TABLE memory ADD COLUMN source_run TEXT;
+    ALTER TABLE memory ADD COLUMN source_seq INTEGER;
+    ALTER TABLE memory ADD COLUMN source_schedule INTEGER;
+    ALTER TABLE memory ADD COLUMN valid_until INTEGER;
+    ALTER TABLE memory ADD COLUMN superseded_by INTEGER;
+    ALTER TABLE memory ADD COLUMN pending_reason TEXT;
+    ALTER TABLE memory ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE memory ADD COLUMN updated INTEGER;
+    ALTER TABLE memory ADD COLUMN last_recalled INTEGER;
+    ALTER TABLE memory ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0;
+    UPDATE memory SET trust = CASE WHEN trusted = 1 THEN 'user_stated' ELSE 'agent_inferred' END,
+                      updated = CAST(strftime('%s', created) AS INTEGER);
+    CREATE INDEX IF NOT EXISTS memory_lookup ON memory(agent, kind, status);
+    CREATE INDEX IF NOT EXISTS memory_expiry ON memory(valid_until) WHERE valid_until IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS memory_worklog_run ON memory(source_run) WHERE kind = 'work_log';
+
+    CREATE TRIGGER IF NOT EXISTS memory_legacy_insert AFTER INSERT ON memory
+      WHEN new.trusted = 1 AND new.trust <> 'user_stated' BEGIN
+        UPDATE memory SET trust = 'user_stated' WHERE id = new.id; END;
+    CREATE TRIGGER IF NOT EXISTS memory_legacy_confirm AFTER UPDATE OF trusted ON memory
+      WHEN new.trusted = 1 AND old.trusted = 0 BEGIN
+        UPDATE memory SET trust = 'user_stated', status = 'active' WHERE id = new.id; END;
+    CREATE TRIGGER IF NOT EXISTS memory_trusted AFTER UPDATE OF trust, status ON memory BEGIN
+        UPDATE memory SET trusted = (new.trust = 'user_stated' AND new.status = 'active')
+        WHERE id = new.id AND trusted <> (new.trust = 'user_stated' AND new.status = 'active'); END;
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED, text, tokenize = 'porter unicode61');
+    CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN
+      INSERT INTO memory_fts(id, text) VALUES (new.id, new.text); END;
+    CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE OF text ON memory BEGIN
+      DELETE FROM memory_fts WHERE id = old.id; INSERT INTO memory_fts(id, text) VALUES (new.id, new.text); END;
+    CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory BEGIN
+      DELETE FROM memory_fts WHERE id = old.id; END;
+    INSERT INTO memory_fts(id, text) SELECT id, text FROM memory;
+
+    CREATE TABLE IF NOT EXISTS memory_events (
+      seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+      memory_id  INTEGER NOT NULL,
+      actor      TEXT NOT NULL,
+      action     TEXT NOT NULL,
+      by_user    TEXT,
+      run        TEXT,
+      before     TEXT,
+      after      TEXT,
+      created    INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS memory_events_memory ON memory_events(memory_id, seq);
+
+    CREATE TABLE IF NOT EXISTS effects (
+      kind       TEXT NOT NULL,
+      key        TEXT NOT NULL,
+      payload    TEXT NOT NULL,
+      due        INTEGER NOT NULL,
+      attempts   INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created    INTEGER NOT NULL,
+      PRIMARY KEY (kind, key));
+    CREATE INDEX IF NOT EXISTS effects_due ON effects(due);
+
+    ALTER TABLE pending   ADD COLUMN policy_version TEXT;
+    ALTER TABLE schedules ADD COLUMN policy_version TEXT;
+    ALTER TABLE schedules ADD COLUMN created_from TEXT NOT NULL DEFAULT 'user';
+    ALTER TABLE runs      ADD COLUMN kind TEXT NOT NULL DEFAULT 'task';
+    ALTER TABLE runs      ADD COLUMN policy_version TEXT;
+    ALTER TABLE runs      ADD COLUMN schedule INTEGER;
+
+    PRAGMA user_version = 2;
+";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn events_history_and_settings() {
@@ -574,11 +861,20 @@ mod tests {
     fn runs_park_and_resume() {
         let store = Store::open(Path::new(":memory:")).unwrap();
         store
-            .start_run("r1", "do it", Some("me@example.com"), "m")
+            .start_run(
+                "r1",
+                "do it",
+                Some("me@example.com"),
+                "m",
+                "0123456789abcdef",
+                None,
+            )
             .unwrap();
         assert_eq!(store.runs_with_status("running").unwrap(), ["r1"]);
         let card = serde_json::json!({"kind": "shell", "command": "sudo apt update"});
-        store.park("a1", "r1", &card, "{\"step\":3}").unwrap();
+        store
+            .park("a1", "r1", &card, "{\"step\":3}", "0123456789abcdef")
+            .unwrap();
         store.set_run_status("r1", "waiting").unwrap();
         assert!(store.runs_with_status("running").unwrap().is_empty());
         let parked = store.parked("a1").unwrap().unwrap();
@@ -672,6 +968,241 @@ mod tests {
         assert!(listed[0].last_used.is_some());
         assert!(store.delete_secret("GITHUB_TOKEN").unwrap());
         assert!(!store.delete_secret("GITHUB_TOKEN").unwrap());
+    }
+
+    /// agentd 0.14.0's database (schema version 1), opened by this version.
+    fn migrated_v1() -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("agentd-v1-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agentd.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(include_str!("../testdata/agentd-v1.sql"))
+            .unwrap();
+        (Store::open(&path).unwrap(), dir)
+    }
+
+    fn memory_rows(store: &Store) -> Vec<(i64, String, bool, String, String, String)> {
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, text, trusted, trust, status, kind FROM memory ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn fts(store: &Store, query: &str) -> Vec<i64> {
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM memory_fts WHERE memory_fts MATCH ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map(params![query], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn migrates_a_v1_database_to_v2() {
+        let (store, dir) = migrated_v1();
+        {
+            let conn = store.conn.lock().unwrap();
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(version, 2);
+            // Every existing memory is an active fact; trust follows `trusted`.
+            let updated: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory WHERE updated > 1700000000",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(updated, 3);
+            // Parked work and schedules from before have no policy version yet.
+            let (policy, kind): (Option<String>, String) = conn
+                .query_row(
+                    "SELECT p.policy_version, r.kind FROM pending p JOIN runs r ON r.id = p.run",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((policy, kind.as_str()), (None, "task"));
+            let from: String = conn
+                .query_row("SELECT created_from FROM schedules", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(from, "user");
+        }
+        let rows = memory_rows(&store);
+        let summary: Vec<(bool, &str, &str, &str)> = rows
+            .iter()
+            .map(|r| (r.2, r.3.as_str(), r.4.as_str(), r.5.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (true, "user_stated", "active", "fact"),
+                (false, "agent_inferred", "active", "fact"),
+                (true, "user_stated", "active", "fact"),
+            ]
+        );
+        // The full-text index holds the existing memories.
+        assert_eq!(fts(&store, "notion"), [2]);
+        assert_eq!(fts(&store, "summaries"), [1]);
+        // 0.14.0's reads still work, and opening again doesn't migrate again.
+        assert_eq!(store.memories(60).unwrap().len(), 3);
+        assert_eq!(store.runs_with_status("waiting").unwrap(), ["b2c3d4e5f6a1"]);
+        assert!(store.parked("c3d4e5f6a1b2").unwrap().is_some());
+        assert_eq!(store.schedules().unwrap().len(), 1);
+        drop(store);
+        let reopened = Store::open(&dir.join("agentd.db")).unwrap();
+        assert_eq!(memory_rows(&reopened).len(), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn trusted_and_trust_stay_in_step_for_old_and_new_writers() {
+        let (store, dir) = migrated_v1();
+        // 0.14.0's statements (also the v1 path with MEMORY_V2 off).
+        let trusted = store.remember("Reply in English", true).unwrap();
+        let hint = store.remember("The office is on floor 3", false).unwrap();
+        let rows = memory_rows(&store);
+        let row = |id: i64| rows.iter().find(|r| r.0 == id).unwrap().clone();
+        assert_eq!(row(trusted.id).3, "user_stated");
+        assert_eq!(row(hint.id).3, "agent_inferred");
+        store.confirm_memory(hint.id).unwrap();
+        let confirmed = memory_rows(&store).into_iter().find(|r| r.0 == hint.id).unwrap();
+        assert_eq!((confirmed.2, confirmed.3.as_str()), (true, "user_stated"));
+        // v2 writers set trust and status; `trusted` follows for 0.14.0.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE memory SET status = 'deleted' WHERE id = ?1",
+                params![trusted.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memory SET status = 'pending', trust = 'agent_inferred' WHERE id = ?1",
+                params![hint.id],
+            )
+            .unwrap();
+        }
+        let after: Vec<(i64, bool)> = memory_rows(&store).iter().map(|r| (r.0, r.2)).collect();
+        assert!(after.contains(&(trusted.id, false)) && after.contains(&(hint.id, false)));
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE memory SET status = 'active', trust = 'user_stated' WHERE id = ?1",
+                params![hint.id],
+            )
+            .unwrap();
+        }
+        assert!(memory_rows(&store).iter().any(|r| r.0 == hint.id && r.2));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn full_text_search_follows_the_memory_table() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let a = store
+            .remember("Invoices go to billing@example.com", true)
+            .unwrap();
+        let b = store
+            .remember("The staging server is called kestrel", false)
+            .unwrap();
+        assert_eq!(fts(&store, "invoice"), [a.id]); // porter stemming
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE memory SET text = 'The staging server is called osprey' WHERE id = ?1",
+                params![b.id],
+            )
+            .unwrap();
+        }
+        assert!(fts(&store, "kestrel").is_empty());
+        assert_eq!(fts(&store, "osprey"), [b.id]);
+        store.forget(a.id).unwrap();
+        assert!(fts(&store, "invoice").is_empty());
+    }
+
+    #[test]
+    fn effects_are_replaced_by_key_and_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("agentd-fx-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agentd.db");
+        let store = Store::open(&path).unwrap();
+        store
+            .enqueue_effect("consolidate", "main", &json!({"since": "r1"}), 100)
+            .unwrap();
+        let first = store.due_effects(1_000, 10).unwrap().remove(0);
+        store
+            .effect_again(&first, 150, Some("gateway answered 503"))
+            .unwrap();
+        // A later trigger replaces payload and due, and keeps the attempts.
+        store
+            .enqueue_effect("consolidate", "main", &json!({"since": "r2"}), 500)
+            .unwrap();
+        let replaced = store.due_effects(1_000, 10).unwrap();
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(
+            (replaced[0].payload.clone(), replaced[0].due, replaced[0].attempts),
+            (json!({"since": "r2"}), 500, 1)
+        );
+        assert!(store.due_effects(499, 10).unwrap().is_empty());
+        assert_eq!(store.next_effect_due().unwrap(), Some(500));
+        // Finishing the old run doesn't remove the new trigger.
+        store.effect_done(&first).unwrap();
+        assert_eq!(store.due_effects(1_000, 10).unwrap().len(), 1);
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let after = reopened.due_effects(1_000, 10).unwrap();
+        assert_eq!(after, replaced);
+        reopened.effect_done(&after[0]).unwrap();
+        assert_eq!(reopened.effects_health().unwrap(), (0, vec![]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_purge_removes_only_long_deleted_memories() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let old = store.remember("Old and deleted", true).unwrap();
+        let recent = store.remember("Recently deleted", true).unwrap();
+        let kept = store.remember("Still active", true).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE memory SET status = 'deleted', updated = 1000 WHERE id = ?1",
+                params![old.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memory SET status = 'deleted', updated = 5000 WHERE id = ?1",
+                params![recent.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memory_events (memory_id, actor, action, before, after, created)
+                 VALUES (?1, 'user', 'forget', 'Old and deleted', NULL, 1000)",
+                params![old.id],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.purge_deleted_memories(2000).unwrap(), 1);
+        let ids: Vec<i64> = memory_rows(&store).iter().map(|r| r.0).collect();
+        assert_eq!(ids, [recent.id, kept.id]);
+        assert!(fts(&store, "old").is_empty());
+        let conn = store.conn.lock().unwrap();
+        let history: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT action, before FROM memory_events WHERE memory_id = ?1 ORDER BY seq")
+            .unwrap()
+            .query_map(params![old.id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(history, [("forget".into(), None), ("purge".into(), None)]);
     }
 
     #[test]

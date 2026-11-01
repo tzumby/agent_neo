@@ -1,6 +1,6 @@
 # Architecture
 
-*Status: describes what's built and in the working tree on 2026-11-01. It covers agentd 0.14.0 (the dev desktop still runs 0.12.0 until the next deploy), gatewayd, the push relay, tailnet-proxy, the iPhone app, the Terraform `dev` environment and the Ansible roles. Plans that aren't built yet are marked **(planned)**. For why things are the way they are, see the design docs: [PLAN.MD](../PLAN.MD) (the original build plan), [native-app-plan.md](native-app-plan.md), [operator-isolation.md](operator-isolation.md), [agents-and-bots.md](agents-and-bots.md) and [agent-control.md](agent-control.md).*
+*Status: describes what's built and in the working tree on 2026-11-01. It covers agentd 0.15.0 (memory v2 phase 0 of [memory-v2.md](memory-v2.md); the dev desktop still runs 0.12.0 until the next deploy), gatewayd, the push relay, tailnet-proxy, the iPhone app, the Terraform `dev` environment and the Ansible roles. Plans that aren't built yet are marked **(planned)**. For why things are the way they are, see the design docs: [PLAN.MD](../PLAN.MD) (the original build plan), [native-app-plan.md](native-app-plan.md), [operator-isolation.md](operator-isolation.md), [agents-and-bots.md](agents-and-bots.md) and [agent-control.md](agent-control.md).*
 
 ## Contents
 
@@ -422,7 +422,7 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 
 ## 6. agentd: the agent on each desktop
 
-`services/agentd` is a single static Rust binary (edition 2024, tokio, axum 0.8, rusqlite with bundled SQLite, reqwest with rustls, regex, croner and jiff). It's built with `cargo zigbuild` for `x86_64-unknown-linux-musl` (or aarch64), about 11.5 MB. It runs the model loop, owns the browser and the shell launcher, keeps all of the user's agent state, and serves the API the apps use. Version 0.14.0 at the time of writing.
+`services/agentd` is a single static Rust binary (edition 2024, tokio, axum 0.8, rusqlite with bundled SQLite, reqwest with rustls, regex, croner and jiff). It's built with `cargo zigbuild` for `x86_64-unknown-linux-musl` (or aarch64), about 11.5 MB. It runs the model loop, owns the browser and the shell launcher, keeps all of the user's agent state, and serves the API the apps use. Version 0.15.0 at the time of writing.
 
 ### 6.1 Process, configuration and startup
 
@@ -451,6 +451,7 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 | `SHELL_TOOL` | `on` | Whether the agent has a shell at all |
 | `DESKTOP_NAME` | `cloud-desktop` | Shown in the app and in notification titles |
 | `PUSH_RELAY_URL` | (empty) | The push relay's function URL; push is off without it |
+| `MEMORY_V2` | `off` | Memory v2 ([memory-v2.md](memory-v2.md)). Off: the v1 memory path, on the v2 schema (always migrated) |
 
 - **Startup order:**
   1. Load the configuration.
@@ -459,7 +460,7 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
   4. Load the policy, the skills and the saved keys (`STATE_DIR/secrets`, created with mode 0700).
   5. Recover tasks a restart cut off (§6.6).
   6. Bind the socket, refusing if another agentd already answers on it, and set it to mode 0660.
-  7. Only then start the scheduler, so two agentd processes never both schedule.
+  7. Only then start the scheduler and the effects runner (§6.19), so two agentd processes never both run them.
   8. On SIGTERM, give open requests 3 seconds. The apps' event streams never end on their own, and without that limit systemd would wait 90 s.
 - **Other entry points:** `agentd --version`, and `agentd --check-gateway`, which checks the gateway the way a model call would but without sending a prompt.
 
@@ -480,6 +481,7 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 | `guard.rs` | Untrusted-content labels, the context budget, loop detection, refusals (sleep, `curl \| sh`, shell scheduling, `date`), URL checks |
 | `store.rs` | SQLite: events, history, runs, pending approvals, memory, schedules, key metadata, settings (§6.3) |
 | `schedule.rs` | Cron and one-time planning, the scheduler loop (§6.14) |
+| `effects.rs` | The effects queue's runner: side effects stored first, done afterwards (§6.19) |
 | `secrets.rs` | Saved keys: files, names, redaction (§6.15) |
 | `skills.rs` | Loads `SKILLS_DIR/*.md` (§6.16) |
 | `push.rs` | Notifications through the push relay (§6.17) |
@@ -489,21 +491,29 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 
 Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). It's on the root volume, which is encrypted with the user's own KMS key. Nothing else on the desktop can read it: the shell user and the desktop user are different Unix users.
 
-- **`agentd.db`** (SQLite, WAL mode). Migrations use `PRAGMA user_version`; version 1 added `history.agent`.
+- **`agentd.db`** (SQLite, WAL mode). Migrations use `PRAGMA user_version`:
+  - version 1 added `history.agent`;
+  - version 2 (0.15.0, one transaction) added memory v2's columns and tables, the effects queue, and policy versions (below).
+
+  Every change is additive, so an older agentd still reads and writes a newer database. 0.14.0 was tested on a v2 database.
 
 | Table | Columns | Purpose |
 |---|---|---|
 | `events` | `seq` (autoincrement), `ts`, `kind`, `data` (JSON) | The append-only event log the apps stream and replay (§6.5) |
 | `history` | `id`, `ts`, `role`, `content`, `agent` | What the model sees as the conversation: user messages and final answers only. The last 20 entries go into each new task |
 | `settings` | `key`, `value` | `model`, `allow_actions`, `tab_target`, `user_timezone`, `user_utc_offset` |
-| `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer` | One row per task. `status` is `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `max_steps`, `stuck` or `interrupted` |
-| `pending` | `id`, `kind` (`approval` or `action`), `run`, `card` (JSON), `checkpoint` (the task's serialized `RunState`), `created` (unix seconds) | What the user is being asked: parked approvals and Action needed cards |
-| `memory` | `id`, `agent`, `text`, `trusted`, `created` | Long-term facts (§6.13) |
-| `schedules` | `id`, `agent`, `name`, `prompt`, `cron`, `timezone`, `next_run`, `last_run`, `paused`, `created` | Scheduled tasks (§6.14) |
+| `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule` | One row per task. `status` is `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `max_steps`, `stuck` or `interrupted` |
+| `pending` | `id`, `kind` (`approval` or `action`), `run`, `card` (JSON), `checkpoint` (the task's serialized `RunState`), `created` (unix seconds); v2: `policy_version` | What the user is being asked: parked approvals and Action needed cards |
+| `memory` | `id`, `agent`, `text`, `trusted`, `created`; v2: `kind` (rule, preference, fact, work_log), `status` (active, pending, superseded, expired, deleted), `trust` (user_stated, agent_inferred, imported), `importance`, `source_run`, `source_seq`, `source_schedule`, `valid_until`, `superseded_by`, `pending_reason`, `version`, `updated`, `last_recalled`, `recall_count` | Long-term memory (§6.13). `trusted` is kept in step with `trust` and `status` by triggers, for 0.14.0 and the v1 path |
+| `memory_fts` | FTS5 (`id`, `text`; porter stemming) | Full-text index over `memory`, kept in step by triggers |
+| `memory_events` | `seq`, `memory_id`, `actor`, `action`, `by_user`, `run`, `before`, `after`, `created` | History of every memory change; `before` and `after` are cleared when a memory is purged |
+| `effects` | `kind`, `key` (primary key together), `payload`, `due`, `attempts`, `last_error`, `created` | Side effects waiting to be done (§6.19) |
+| `schedules` | `id`, `agent`, `name`, `prompt`, `cron`, `timezone`, `next_run`, `last_run`, `paused`, `created`; v2: `policy_version`, `created_from` | Scheduled tasks (§6.14) |
 | `secrets` | `name`, `agent`, `label`, `created`, `updated`, `last_used` | Saved keys' names and labels, never their values (§6.15) |
 
 - **`images/<32 hex>.jpg`**: screenshots shown in the chat (`show_screenshot`, Action needed cards), served at `/api/v1/images/{id}`.
 - **`secrets/<NAME>`**: one file per saved key (mode 0600), written atomically through `.<NAME>.new` and a rename.
+- **`agentd.db.pre-<version>`**: a copy of the database made by the Ansible role before a new agentd version starts (SQLite online backup, as `agentd`). The last 3 are kept, for a rollback.
 - **The `agent` column** on history, runs, memory, schedules and key metadata is `main` everywhere for now. It's there for the bots design (`docs/agents-and-bots.md`), and every event carries `"agent": "main"`.
 
 ### 6.4 HTTP API
@@ -513,7 +523,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 
 | Method | Path | What it does |
 |---|---|---|
-| GET | `/api/v1/status` | Desktop name, `busy`, `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version |
+| GET | `/api/v1/status` | Desktop name, `busy`, `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2` |
 | GET | `/api/v1/messages?limit=` | The chat history (default 50, at most 500), with saved keys redacted |
 | POST | `/api/v1/messages` | `{text, timezone, utc_offset}` starts a task. 202 `{task}`, or 409 while one runs. The time zone is remembered for later tasks and schedules |
 | GET | `/api/v1/events?after=` | Server-Sent Events: up to 5,000 logged events after `after`, then live ones. Each SSE message has `id: seq`, `event: kind` and the JSON event. Keep-alive comments every 15 s. Subscribes to the live bus before reading the backlog, so nothing falls between them |
@@ -777,6 +787,15 @@ These patterns are a speed bump against mistakes and injected instructions, not 
 
 Each answer records who gave it (`by`, from `X-Tailscale-User`).
 
+**Policy version.** `Policy::version` is the first 16 hex characters of a SHA-256 over:
+- the approval patterns, sorted;
+- Browser actions on or off;
+- `SHELL_TOOL`;
+- `RUN_AS`;
+- the allowed models, sorted.
+
+Every run and every parked card records it, and `/status` shows it. From memory v2 phase 4, work parked under other rules is checked again before it resumes. Memory never takes part.
+
 ### 6.12 Untrusted content
 
 Web pages, emails and command output can carry injected instructions. The defences, in layers:
@@ -898,6 +917,22 @@ The model therefore never sees a value, even if a command prints one or the user
 - The app sends its IANA time zone and UTC offset with each message. agentd validates them and keeps them in settings.
 - The model sees "Saturday 2026-10-31 10:01 (America/Toronto, UTC-04:00)", so "yesterday" means the user's yesterday.
 - Schedules use the IANA zone with full DST rules (jiff and the system tzdata).
+
+### 6.19 The effects queue
+
+Side effects are stored first and done afterwards. Each is a row in `effects`, which `effects.rs` runs with retries, so a failure isn't lost and a restart doesn't drop work.
+
+- **Enqueuing:** one row per `(kind, key)`. Enqueuing a waiting key replaces its payload and due time and keeps its attempts, so a burst of triggers does the work once. Enqueuing a key that had given up starts it over.
+- **The runner:**
+  - starts with the scheduler, once the socket is bound;
+  - wakes every 2 s, or at once when something is enqueued;
+  - runs due rows oldest first, at most one at a time per kind.
+- **Outcomes:**
+  - **Done:** the row is removed, unless it was enqueued again meanwhile.
+  - **Later(d):** due again without counting a failure.
+  - **Failed:** backs off, doubling from 2 s to 60 s (5 s to 300 s for push).
+- **Giving up:** after 10 failures the row stays, given up. `/status` lists it, and the journal names its kind and key only, since payloads can hold user content.
+- **Kinds today:** `purge`, daily: hard-deletes memories deleted more than 30 days ago, with their search entries and the text in their history. Consolidation and push notifications move onto the queue in memory v2 phases 3 and 4.
 
 ## 7. The attested model gateway
 
@@ -1388,7 +1423,8 @@ Live tests run only with `AGENTD_URL` (a real agentd) or `VNC_ADDR` (a real VNC 
 | `bootstrap`, `init`, `plan`, `apply`, `destroy`, `fmt`, `lint` | Terraform (state bucket; `plan` writes `tfplan`, `apply` applies it). `lint` adds Ansible syntax checks |
 | `galaxy` | Ansible collections (`amazon.aws` 11.x, `community.general` ≥ 12) |
 | `desktop` | `common` + `desktop` roles on running desktops |
-| `agentd-test`, `agentd-build`, `agentd-deploy`, `agentd-logs` | agentd: fmt/clippy/tests; static build for `DESKTOP_ARCH`; deploy; `journalctl -u agentd` over SSM |
+| `agentd-test`, `agentd-build`, `agentd-deploy`, `agentd-logs` | agentd: fmt/clippy/tests; static build for `DESKTOP_ARCH`; deploy (copies the database first when the version changes); `journalctl -u agentd` over SSM |
+| `agentd-evals` | Memory evals on the Mac: a local agentd against Together, headless Chrome, shell tool off, scripted conversations with assertions (`services/agentd/evals`). Costs cents per scenario; `MEMORY_V2=on\|off`, `SCENARIO=name` |
 | `gatewayd-test`, `gatewayd-build`, `gateway-image` | gatewayd tests; static arm64 build; build an attestable AMI and publish its measurements |
 | `tailnet-build`, `tailnet-deploy` | tailnet-proxy |
 | `llm-keys`, `tailscale-key`, `apns-key` | Store secrets in SSM from hidden input or a file |
@@ -1442,7 +1478,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 51 unit tests: approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
+| agentd | 60 unit tests: the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
 | DesktopKit | 21 tests (§10.8) |
@@ -1486,7 +1522,6 @@ Found while writing this document. None of them is a known exploit; most are dri
 - `docs/operator-isolation.md` says "Nothing here is built yet" while describing the built gateway, mentions t4g where the gateway is c7g.medium, and its §2 still describes the Lambda gateway.
 - A gatewayd comment says KMS releases the provider key only to the image. It's plain SSM (by design, per operator-isolation.md).
 - agentd's `aws.rs` header still mentions a gateway function URL. `desktop_identity`'s header says the gateway module grants desktops a permission; it doesn't.
-- The agentd role's header says commands run as the desktop user; they run as `worker`.
 - `edit_boot_install.sh` mentions PCR7; PCR4 and PCR12 are what's published.
 - Unused or hard-coded values:
   - the `iam` module's `ssm_transfer_bucket_arn` is unused;

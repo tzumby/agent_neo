@@ -55,6 +55,9 @@ agentd_skills_dir: "{{ playbook_dir }}/../../services/agentd/skills/"
 agentd_model: zai-org/GLM-5.3
 agentd_max_steps: 40
 agentd_shell_tool: "on"
+# Memory v2 (kinds, trust, retrieval, consolidation): "off" until it has been
+# tried on the dev desktop (docs/memory-v2.md §17).
+agentd_memory_v2: "off"
 agentd_desktop_name: cloud-desktop-dev
 
 # Overrides the approval rules built into agentd (list of {pattern, reason};

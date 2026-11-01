@@ -1,0 +1,13 @@
+[
+  {
+    "name": "explicit-remember-recalled",
+    "about": "Something the user asks to remember is used in a later conversation (memory only: the chat history is cleared in between).",
+    "steps": [
+      {"say": "Please remember that my favourite colour is teal."},
+      {"expect_memory": "teal"},
+      {"new_conversation": true},
+      {"say": "What is my favourite colour? Answer with one word."},
+      {"expect_answer": ["teal"]}
+    ]
+  }
+]

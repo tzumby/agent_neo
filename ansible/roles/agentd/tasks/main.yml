@@ -1,6 +1,7 @@
 # agentd: the agent on this desktop (services/agentd). It runs as its own
-# user, holds the model key, and runs the agent's shell commands as the
-# desktop user, which can't read agentd's secrets, state or socket.
+# user and runs the agent's shell commands as the shell user (worker), which
+# can't read agentd's state, saved keys or socket, nor reach the desktop
+# session. Model calls go through the attested gateway, which holds the key.
 
 - name: Remove the retired Telegram bot
   ansible.builtin.import_tasks: retire-telegram.yml
@@ -102,7 +103,50 @@
     owner: root
     group: root
     mode: "0755"
+  register: agentd_binary_install
   notify: Restart agentd
+
+# A new version may migrate the database when it starts: keep a copy of it as
+# it was (the last 3), for a rollback. SQLite's online backup, as the agentd
+# user, so the copy is consistent while the old version still runs and no
+# root-owned journal files appear next to the database.
+- name: Find agentd's database
+  ansible.builtin.stat:
+    path: /var/lib/agentd/agentd.db
+  register: agentd_db
+  when: agentd_binary_install.changed
+
+- name: Read the new agentd's version
+  ansible.builtin.command: /usr/local/bin/agentd --version
+  register: agentd_new_version
+  changed_when: false
+  when: agentd_binary_install.changed and agentd_db.stat.exists
+
+- name: Copy agentd's database before the new version starts
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - agentd
+      - --
+      - /usr/bin/python3
+      - -c
+      - |
+        import sqlite3, sys
+        source = sqlite3.connect("/var/lib/agentd/agentd.db")
+        copy = sqlite3.connect(sys.argv[1])
+        source.backup(copy)
+        copy.close()
+        source.close()
+      - "/var/lib/agentd/agentd.db.pre-{{ agentd_new_version.stdout.split() | last }}"
+  when: agentd_binary_install.changed and agentd_db.stat.exists
+
+- name: Keep the last 3 database copies
+  ansible.builtin.shell: >-
+    find /var/lib/agentd -maxdepth 1 -name 'agentd.db.pre-*' -printf '%T@ %p\n'
+    | sort -rn | tail -n +4 | cut -d' ' -f2- | xargs -r rm -f --
+  changed_when: false
+  when: agentd_binary_install.changed and agentd_db.stat.exists
 
 # The attested gateway, once it exists: where it is, the images to accept
 # and the audience to sign identity proofs for (none of them secret).

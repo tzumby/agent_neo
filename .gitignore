@@ -35,3 +35,4 @@ terraform/envs/*/.build/
 xcuserdata/
 DerivedData/
 *.xcuserstate
+services/agentd/evals/results/

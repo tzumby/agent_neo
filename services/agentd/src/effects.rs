@@ -35,8 +35,6 @@ const DAY: Duration = Duration::from_secs(86_400);
 /// What a handler did.
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
-    /// For one-off effects (push, consolidation: memory v2 phases 3–4).
-    #[allow(dead_code)]
     Done,
     Later(Duration),
     Failed(String),
@@ -127,6 +125,7 @@ fn settle(store: &Store, effect: &Effect, outcome: Outcome) {
 async fn handle(agent: &Agent, effect: &Effect) -> Outcome {
     match effect.kind.as_str() {
         "purge" => purge(&agent.store),
+        "consolidate" => crate::consolidate::run(agent).await,
         // From a newer agentd (after a rollback): keep it for that version.
         other => Outcome::Failed(format!("unknown effect kind {other}")),
     }

@@ -532,10 +532,11 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | POST | `/api/v1/stop` | Stops the running task, or gives up on a parked one |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
 | GET | `/api/v1/screenshot` | A live screenshot of the current tab (JPEG). Exists, but the app doesn't use it |
-| GET, PUT | `/api/v1/settings` | `{model, allow_actions}` |
+| GET, PUT | `/api/v1/settings` | `{model, allow_actions, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}` |
 | POST | `/api/v1/devices` | `{token, name}`: registers an iPhone's APNs token with the push relay (503 if push isn't configured) |
 | GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active and pending by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older apps still read it |
 | GET | `/api/v1/memory/search?q=&kinds=&limit=` | Memory v2: active memories ranked as the agent's notes are, each with its score (what `search_memory` sees) |
+| POST | `/api/v1/memory/consolidate` | Memory v2: consolidate now (`{ok, tasks, mode}`); it still waits for a running task |
 | DELETE | `/api/v1/memory/{id}` | Forget. Memory v2: status `deleted` (purged after 30 days) |
 | POST | `/api/v1/memory/{id}/confirm` | Vouch for an unverified memory. Memory v2: same as `/approve` |
 | POST | `/api/v1/memory/{id}/approve` | Memory v2: a pending or inferred memory becomes active and user-stated, and replaces what it was proposed to replace |
@@ -574,6 +575,7 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 | `action.resolved` | `id`, `choice`, `by` | "I'm done" or "Skip" |
 | `image` | `task`, `id`, `url`, `caption` | `show_screenshot` |
 | `memory.saved` / `memory.forgotten` / `memory.confirmed` | `id`, `text`, `trusted`, `by`; v2 adds `kind`, `trust`, `status` | Memory changes |
+| `memory.consolidated` | `runs`, `saved`, `proposed`, `merged`, `expired`, `cost`, `mode` | Memory v2: a consolidation finished |
 | `memory.pending` / `memory.superseded` / `memory.updated` | `id`, `text`, `kind`, `reason` / `id`, `by_id` / `id`, `version`; with `by` (`agent`, `user:<login>`) | Memory v2: a save waiting for the user; a memory replaced by a newer one; a user's edit |
 | `schedule.created` / `schedule.updated` / `schedule.deleted` | The schedule (`schedule::json`), `task`, `by`, `done` | Schedule changes. `done` marks a one-time schedule that has run |
 | `secret.saved` / `secret.deleted` | `name`, `label`, `by` | Key changes (never values) |
@@ -879,6 +881,27 @@ Web pages, emails and command output can carry injected instructions. The defenc
 
 **Search.** `search_memory` uses the same ranking as the notes. On the evals, it rescues paraphrases that full-text matching misses.
 
+**Consolidation** (phase 3, `consolidate.rs`).
+- **When:** 10 minutes after the last finished task (a burst consolidates once), or at once when 20 tasks wait. It's a `consolidate` effect (§6.19), never alongside a task.
+- **What it does:** it sends the batch of finished tasks (request, answer, status, schedule) and the current memories to `memory_consolidation_model` (GLM-5.3-Flash by default) through the gateway. The reply is a JSON object with `work_log`, `facts`, `merges` and `expire`, checked here before anything is written:
+  - ids must be real and active;
+  - texts pass the length and secret checks;
+  - one work-log entry per task;
+  - never a rule;
+  - nothing replaces, merges away or expires what the user stated without their approval.
+- **Modes (`memory_consolidation`):**
+  - `observe` (the default): writes the work log and proposes everything else as pending items;
+  - `auto`: applies facts (inferred), merges and expiries, and still proposes preferences;
+  - `off`: does nothing.
+- **Decay:**
+  - facts not recalled for 60 days lose 10% importance per run;
+  - unimportant ones not recalled for 180 days expire;
+  - work-log entries expire after a year;
+  - so does anything past `valid_until`.
+- **Accounting:** each run is a `runs` row (`kind = consolidation`) with its cost, under a daily cap (`memory_consolidation_daily_cap_usd`, $0.50), and emits `memory.consolidated`.
+- **Cost:** about $0.0006 a run on Flash.
+- **Trigger it now:** `POST /api/v1/memory/consolidate`.
+
 **Never a permission.** Memory never grants anything: `policy.rs` and the browser gates never read it.
 
 ### 6.14 Scheduled tasks
@@ -992,7 +1015,11 @@ Side effects are stored first and done afterwards. Each is a row in `effects`, w
   - **Later(d):** due again without counting a failure.
   - **Failed:** backs off, doubling from 2 s to 60 s (5 s to 300 s for push).
 - **Giving up:** after 10 failures the row stays, given up. `/status` lists it, and the journal names its kind and key only, since payloads can hold user content.
-- **Kinds today:** `purge`, daily: hard-deletes memories deleted more than 30 days ago, with their search entries and the text in their history. Consolidation and push notifications move onto the queue in memory v2 phases 3 and 4.
+- **Kinds today:**
+  - `purge`, daily: hard-deletes memories deleted more than 30 days ago, with their search entries and the text in their history;
+  - `consolidate` (key `main`): memory consolidation (§6.13). It's re-enqueued by each finished task, waits while a task runs, and fails over to retries if the model's answer is invalid twice.
+
+  Push notifications move onto the queue in memory v2 phase 4.
 
 ## 7. The attested model gateway
 
@@ -1484,7 +1511,7 @@ Live tests run only with `AGENTD_URL` (a real agentd) or `VNC_ADDR` (a real VNC 
 | `galaxy` | Ansible collections (`amazon.aws` 11.x, `community.general` ≥ 12) |
 | `desktop` | `common` + `desktop` roles on running desktops |
 | `agentd-test`, `agentd-build`, `agentd-deploy`, `agentd-logs` | agentd: fmt/clippy/tests; static build for `DESKTOP_ARCH`; deploy (copies the database first when the version changes); `journalctl -u agentd` over SSM |
-| `agentd-evals` | Memory evals on the Mac: a local agentd against Together, headless Chrome, shell tool off, 20 scripted conversations with assertions (`services/agentd/evals`; results in [memory-v2.md](memory-v2.md) §19). About $0.12 a run; `MEMORY_V2=on\|off`, `SCENARIO=name` |
+| `agentd-evals` | Memory evals on the Mac: a local agentd against Together, headless Chrome, shell tool off, 21 scripted conversations with assertions (one runs a real consolidation) (`services/agentd/evals`; results in [memory-v2.md](memory-v2.md) §19). About $0.12 a run; `MEMORY_V2=on\|off`, `SCENARIO=name` |
 | `gatewayd-test`, `gatewayd-build`, `gateway-image` | gatewayd tests; static arm64 build; build an attestable AMI and publish its measurements |
 | `tailnet-build`, `tailnet-deploy` | tailnet-proxy |
 | `llm-keys`, `tailscale-key`, `apns-key` | Store secrets in SSM from hidden input or a file |
@@ -1538,7 +1565,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 80 unit tests (plus a 5,000-memory speed test run on demand): memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
+| agentd | 87 unit tests (plus a 5,000-memory speed test run on demand): memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
 | DesktopKit | 21 tests (§10.8) |

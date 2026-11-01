@@ -9,6 +9,7 @@ mod browser;
 mod cdp;
 mod clock;
 mod config;
+mod consolidate;
 mod effects;
 mod gateway;
 mod guard;

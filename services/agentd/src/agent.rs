@@ -59,6 +59,10 @@ static ASKS_TO_REMEMBER: LazyLock<regex::Regex> = LazyLock::new(|| {
 pub struct Settings {
     pub model: String,
     pub allow_actions: bool,
+    /// Memory v2's consolidation: off, observe or auto (consolidate.rs).
+    pub memory_consolidation: String,
+    pub memory_consolidation_model: String,
+    pub memory_consolidation_daily_cap_usd: f64,
 }
 
 pub enum StartError {
@@ -325,6 +329,9 @@ impl Agent {
             model: get("model").unwrap_or_else(|| self.cfg.model.clone()),
             // On by default: writing and sending in the browser ask first.
             allow_actions: get("allow_actions").as_deref() != Some("false"),
+            memory_consolidation: crate::consolidate::mode(&self.store).name().to_string(),
+            memory_consolidation_model: crate::consolidate::model(&self.store),
+            memory_consolidation_daily_cap_usd: crate::consolidate::daily_cap(&self.store),
         }
     }
 
@@ -339,6 +346,48 @@ impl Agent {
         let settings = self.settings();
         self.emit("settings", json!(settings));
         Ok(settings)
+    }
+
+    /// Memory v2's consolidation settings; Err says what's wrong with a value.
+    pub fn update_memory_settings(
+        &self,
+        mode: Option<&str>,
+        model: Option<&str>,
+        daily_cap_usd: Option<f64>,
+    ) -> Result<Result<Settings, String>> {
+        if let Some(mode) = mode {
+            if crate::consolidate::Mode::parse(mode).is_none() {
+                return Ok(Err("memory_consolidation must be off, observe or auto".into()));
+            }
+            self.store.set_setting("memory_consolidation", mode)?;
+        }
+        if let Some(model) = model {
+            if !llm::KNOWN_MODELS.contains(&model) {
+                return Ok(Err(format!(
+                    "memory_consolidation_model must be one of {}",
+                    llm::KNOWN_MODELS.join(", ")
+                )));
+            }
+            self.store.set_setting("memory_consolidation_model", model)?;
+        }
+        if let Some(cap) = daily_cap_usd {
+            if !(0.0..=10.0).contains(&cap) {
+                return Ok(Err(
+                    "memory_consolidation_daily_cap_usd must be between 0 and 10".into()
+                ));
+            }
+            self.store
+                .set_setting("memory_consolidation_daily_cap_usd", &cap.to_string())?;
+        }
+        let settings = self.settings();
+        self.emit("settings", json!(settings));
+        Ok(Ok(settings))
+    }
+
+    /// One model call outside a task (consolidation), through the same
+    /// backend: the attested gateway on desktops.
+    pub async fn complete(&self, request: &Value) -> Result<Value> {
+        self.llm.chat(request).await
     }
 
     pub fn is_busy(&self) -> bool {
@@ -357,8 +406,6 @@ impl Agent {
     }
 
     /// Stores a side effect to be done by the effects runner, and wakes it.
-    /// (Consolidation and push notifications use it from memory v2 phases 3–4.)
-    #[allow(dead_code)]
     pub fn enqueue(&self, kind: &str, key: &str, payload: &Value, due: i64) -> Result<()> {
         self.store.enqueue_effect(kind, key, payload, due)?;
         self.effects_changed.notify_one();
@@ -734,6 +781,8 @@ impl Agent {
         if let Err(err) = self.store.finish_run(task_id, status, state.step, cost, answer) {
             tracing::error!(%err, "couldn't store the run's end");
         }
+        // Memory v2: fold the finished task into memory, later.
+        crate::consolidate::trigger(self);
         tracing::info!(task = %task_id, status, steps = state.step, seconds, "task finished");
         // needs_user already pushed its Action needed; a stop came from the user.
         if !matches!(status, "needs_user" | "cancelled") {

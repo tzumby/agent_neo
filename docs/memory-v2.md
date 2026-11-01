@@ -578,6 +578,25 @@ Phase 2 (built; behind `MEMORY_V2`):
 
 The first v2 run had 19/20: "expired-not-used" didn't say to answer from memory, so the model went to look in Gmail and stopped at the sign-in. The scenario now says "without looking anything up".
 
+Phase 3 (built; behind `MEMORY_V2`, mode `observe` by default):
+
+- **Which tasks a consolidation takes.**
+  - The watermark is the last consolidated run's `rowid`, since run ids are random (see phase 0).
+  - A batch is the finished tasks after it, in order, at most 20. It stops at the first one still running or waiting for an approval, so none is passed over.
+  - Stopped (`cancelled`) tasks are skipped, but the watermark moves past them.
+- **Decay and date-based expiry run in `observe` too.** They need no model and only follow dates the user set or recall the user's tasks caused; `observe` only holds back what the model proposes.
+- **How proposals are shown:**
+  - In `observe`, new facts and preferences are pending items (`proposed`).
+  - A merge proposal is a pending item whose approval supersedes every merged memory: `/approve` now takes several `replaces` ids from the proposal's history.
+  - An expiry proposal is a `propose` event on the memory, with no pending row, since there's nothing new to approve.
+  - In `auto`, replacing, merging away or expiring a user-stated memory becomes a pending `conflict` (or an expiry proposal) instead.
+- **Near-duplicates.** The duplicate check (FTS top hit, word-set Jaccard ≥ 0.8) treats a near-identical new fact as already known: nothing is written, and it counts as `merged`.
+- **The model's answer.** No `response_format` is sent (it isn't certain every Together model accepts it through the gateway). The reply is parsed leniently: the JSON object inside it, code fences tolerated, unknown fields refused. An invalid reply gets one retry with the error, then the effect fails.
+- **Accounting.** Each consolidation is a `runs` row (`kind = consolidation`) with its model, cost and the counts as JSON in `answer`. The daily cap is checked against today's (UTC) total.
+- **`POST /api/v1/memory/consolidate`** (not in §13) runs a consolidation now instead of 10 minutes after the last task. It's for testing, and for a future "Tidy up now" in the app.
+- **Settings.** `GET/PUT /settings` take `memory_consolidation` (off, observe, auto), `memory_consolidation_model` (one of the known models) and `memory_consolidation_daily_cap_usd` (0–10).
+- **First real run** (eval `consolidation-work-log`, GLM-5.3-Flash, $0.0006): it logged the one task worth remembering ("Drafted (but did not send) a two-line email to Dana…") and skipped a sum and a remember that was already saved. The entry added a small detail that may not have been in the draft, so the instructions may need to say "only what the answer shows".
+
 
 ## 20. File map
 

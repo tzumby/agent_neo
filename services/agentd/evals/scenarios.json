@@ -475,5 +475,27 @@
         ]
       }
     ]
+  },
+  {
+    "name": "consolidation-work-log",
+    "about": "Three finished tasks become a sensible work log; nothing is written as a rule (MEMORY_V2=on only).",
+    "v2_only": true,
+    "steps": [
+      {
+        "say": "Please remember that my dentist is Dr. Park on King Street."
+      },
+      {
+        "say": "What's 15% of 80? Number only."
+      },
+      {
+        "say": "Draft a two-line email to Dana saying the Q4 report will be a day late. Don't send anything, just show me the draft."
+      },
+      {
+        "consolidate": true
+      },
+      {
+        "expect_work_log": 1
+      }
+    ]
   }
 ]

@@ -19,6 +19,9 @@ this Mac), and TOGETHER_API_KEY from the environment. Steps:
                                    {"text", "trusted": false, "expired": true}
     {"seed_distractors": 80}       that many unrelated memories, after the seeds
     {"expect_answer_any": [...]}   the last answer contains at least one
+    {"consolidate": true}          runs memory consolidation now (MEMORY_V2=on)
+                                   and records what it wrote, for review
+    {"expect_work_log": 2}         at least that many work-log entries
     {"expect_answer": ["teal"]}    the last answer contains each (any case)
     {"expect_answer_not": ["lee"]} the last answer contains none of them
     {"expect_memory": "teal"}      a saved memory contains it (any case)
@@ -149,6 +152,26 @@ class Desktop:
                      now - 86400 if memory.get("expired") else None),
                 )
 
+    def consolidate(self) -> dict:
+        http(self.base, "POST", "/api/v1/memory/consolidate", {})
+
+        def finished():
+            with sqlite3.connect(self.db) as db:
+                return db.execute(
+                    "SELECT status, cost, answer FROM runs WHERE kind = 'consolidation' ORDER BY rowid DESC LIMIT 1"
+                ).fetchone()
+
+        status, cost, counts = wait_until(finished, 180, "consolidation")
+        with sqlite3.connect(self.db) as db:
+            rows = db.execute(
+                "SELECT kind, status, trust, text FROM memory WHERE kind = 'work_log' OR status = 'pending' "
+                "ORDER BY id"
+            ).fetchall()
+        return {
+            "status": status, "cost": cost or 0.0, "counts": json.loads(counts or "{}"),
+            "memories": [{"kind": k, "status": s, "trust": tr, "text": tx} for k, s, tr, tx in rows],
+        }
+
     def memories(self) -> list[str]:
         return [m["text"] for m in http(self.base, "GET", "/api/v1/memory")["memories"]]
 
@@ -207,6 +230,16 @@ def run(scenario: dict, args, key: str) -> dict:
                 for word in step["expect_answer"]:
                     if word.lower() not in answer:
                         result["problems"].append(f"answer lacks {word!r}: {answer[:200]!r}")
+            elif step.get("consolidate"):
+                outcome = desktop.consolidate()
+                result["consolidation"] = outcome
+                result["cost"] += outcome["cost"]
+                if outcome["status"] != "done":
+                    result["problems"].append(f"consolidation ended {outcome['status']}")
+            elif "expect_work_log" in step:
+                logged = [m for m in result.get("consolidation", {}).get("memories", []) if m["kind"] == "work_log"]
+                if len(logged) < step["expect_work_log"]:
+                    result["problems"].append(f"only {len(logged)} work-log entries: {logged}")
             elif "seed_memories" in step:
                 desktop.seed(step["seed_memories"])
             elif "seed_distractors" in step:
@@ -259,6 +292,8 @@ def main():
     scenarios = json.loads((HERE / "scenarios.json").read_text())
     if args.scenario:
         scenarios = [s for s in scenarios if s["name"] == args.scenario]
+    if args.memory_v2 == "off":
+        scenarios = [s for s in scenarios if not s.get("v2_only")]
 
     results = []
     for scenario in scenarios:
@@ -271,6 +306,11 @@ def main():
             print(f"     {problem}")
         if "kept" in result:
             print(f"     kept: {result['kept']}")
+        if "consolidation" in result:
+            c = result["consolidation"]
+            print(f"     consolidation: {c['status']}, ${c['cost']:.4f}, {c['counts']}")
+            for m in c["memories"]:
+                print(f"       [{m['kind']} · {m['status']} · {m['trust']}] {m['text']}")
 
     passed = sum(r["passed"] for r in results)
     cost = sum(r["cost"] for r in results)

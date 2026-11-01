@@ -38,6 +38,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/devices", post(register_device))
         .route("/api/v1/memory", get(memories))
         .route("/api/v1/memory/search", get(search_memory))
+        .route("/api/v1/memory/consolidate", post(consolidate_now))
         .route("/api/v1/memory/{id}", delete(forget_memory).patch(edit_memory))
         .route("/api/v1/memory/{id}/confirm", post(confirm_memory))
         .route("/api/v1/memory/{id}/approve", post(confirm_memory))
@@ -309,6 +310,24 @@ async fn search_memory(State(agent): App, Query(query): Query<SearchQuery>) -> R
                 .map(|(item, score)| json!({"memory": item, "score": (score * 1000.0).round() / 1000.0}))
                 .collect();
             Json(json!({"results": results})).into_response()
+        }
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// Memory v2: consolidate now rather than 10 minutes after the last task
+/// (it still waits for a running task to end).
+async fn consolidate_now(State(agent): App, headers: HeaderMap) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let waiting = crate::consolidate::batch(&agent.store).map_or(0, |(runs, _)| runs.len());
+    let now = crate::memory::unix_now();
+    match agent.enqueue("consolidate", "main", &json!({}), now) {
+        Ok(()) => {
+            tracing::info!(by = ?caller(&headers), waiting, "consolidation requested");
+            Json(json!({"ok": true, "tasks": waiting, "mode": crate::consolidate::mode(&agent.store).name()}))
+                .into_response()
         }
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
@@ -597,9 +616,22 @@ async fn settings(State(agent): App) -> Json<Value> {
 struct SettingsUpdate {
     model: Option<String>,
     allow_actions: Option<bool>,
+    memory_consolidation: Option<String>,
+    memory_consolidation_model: Option<String>,
+    memory_consolidation_daily_cap_usd: Option<f64>,
 }
 
 async fn put_settings(State(agent): App, Json(body): Json<SettingsUpdate>) -> Response {
+    let memory = agent.update_memory_settings(
+        body.memory_consolidation.as_deref(),
+        body.memory_consolidation_model.as_deref(),
+        body.memory_consolidation_daily_cap_usd,
+    );
+    match memory {
+        Ok(Err(problem)) => return error(StatusCode::BAD_REQUEST, &problem),
+        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        Ok(Ok(_)) => {}
+    }
     match agent.update_settings(body.model.as_deref(), body.allow_actions) {
         Ok(settings) => Json(json!(settings)).into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),

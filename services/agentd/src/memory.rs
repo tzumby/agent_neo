@@ -41,7 +41,7 @@ const AGENT: &str = "main";
 
 pub const KINDS: [&str; 4] = ["rule", "preference", "fact", "work_log"];
 
-const ITEM_COLUMNS: &str = "id, kind, status, trust, text, importance, source_run, source_seq, source_schedule, \
+pub(crate) const ITEM_COLUMNS: &str = "id, kind, status, trust, text, importance, source_run, source_seq, source_schedule, \
      valid_until, superseded_by, pending_reason, version, created, updated, last_recalled, recall_count, trusted";
 
 /// A memory, as the API and the tools show it.
@@ -70,7 +70,7 @@ pub struct Item {
 }
 
 impl Item {
-    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    pub(crate) fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: row.get(0)?,
             kind: row.get(1)?,
@@ -98,7 +98,7 @@ impl Item {
         self.created.get(..10).unwrap_or(&self.created)
     }
 
-    fn snapshot(&self) -> Value {
+    pub(crate) fn snapshot(&self) -> Value {
         json!({"text": self.text, "kind": self.kind, "status": self.status, "trust": self.trust,
                "importance": self.importance, "valid_until": self.valid_until})
     }
@@ -116,8 +116,7 @@ pub enum Actor<'a> {
     },
     /// The user, in the app (their Tailscale login).
     User { login: Option<&'a str> },
-    /// The background consolidation (memory v2 phase 3).
-    #[allow(dead_code)]
+    /// The background consolidation (consolidate.rs).
     Consolidator { run: &'a str },
 }
 
@@ -153,7 +152,7 @@ impl Actor<'_> {
     }
 }
 
-fn trust_rank(trust: &str) -> u8 {
+pub(crate) fn trust_rank(trust: &str) -> u8 {
     match trust {
         "user_stated" => 2,
         "imported" => 1,
@@ -161,7 +160,7 @@ fn trust_rank(trust: &str) -> u8 {
     }
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -211,7 +210,7 @@ pub fn check_text(text: &str, keys: &secrets::Secrets) -> Result<(), String> {
     Ok(())
 }
 
-fn get(conn: &Connection, id: i64) -> Result<Option<Item>> {
+pub(crate) fn get(conn: &Connection, id: i64) -> Result<Option<Item>> {
     Ok(conn
         .query_row(
             &format!("SELECT {ITEM_COLUMNS} FROM memory WHERE id = ?1 AND agent = ?2"),
@@ -221,7 +220,7 @@ fn get(conn: &Connection, id: i64) -> Result<Option<Item>> {
         .optional()?)
 }
 
-fn record(
+pub(crate) fn record(
     tx: &Transaction,
     memory: i64,
     actor: &Actor,
@@ -247,7 +246,7 @@ fn record(
 }
 
 /// Marks `old` replaced by `new`.
-fn supersede(tx: &Transaction, old: &Item, new: i64, actor: &Actor) -> Result<()> {
+pub(crate) fn supersede(tx: &Transaction, old: &Item, new: i64, actor: &Actor) -> Result<()> {
     tx.execute(
         "UPDATE memory SET status = 'superseded', superseded_by = ?2, version = version + 1, updated = ?3
          WHERE id = ?1",
@@ -416,7 +415,7 @@ pub fn forget_matching(store: &crate::store::Store, actor: Actor, query: &str) -
 }
 
 /// Words that say nothing about which memory is meant.
-const STOP_WORDS: &[&str] = &[
+pub(crate) const STOP_WORDS: &[&str] = &[
     "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at", "for", "with", "by", "from", "about",
     "as", "is", "are", "was", "were", "be", "been", "it", "its", "this", "that", "these", "those", "i", "me",
     "my", "you", "your", "we", "our", "he", "she", "they", "them", "his", "her", "their", "what", "which",
@@ -471,7 +470,12 @@ fn prefixed_columns() -> String {
 
 /// Active, unexpired memories matching `query` by full text, with their bm25
 /// (more negative is more relevant), most relevant first. `kinds` empty: all.
-fn fts_candidates(conn: &Connection, query: &str, kinds: &[&str], limit: i64) -> Result<Vec<(Item, f64)>> {
+pub(crate) fn fts_candidates(
+    conn: &Connection,
+    query: &str,
+    kinds: &[&str],
+    limit: i64,
+) -> Result<Vec<(Item, f64)>> {
     let Some(fts) = fts_query(query) else {
         return Ok(Vec::new());
     };
@@ -570,8 +574,9 @@ pub fn approve(store: &crate::store::Store, actor: Actor, id: i64) -> Result<Opt
             params![id, unix_now()],
         )?;
         record(tx, id, &actor, "approve", Some(item.snapshot()), None)?;
-        // What it was proposed to replace, from its first history entry.
-        let replaces: Option<i64> = tx
+        // What it was proposed to replace (one id, or several for a merge),
+        // from its first history entry.
+        let replaces: Vec<i64> = tx
             .query_row(
                 "SELECT after FROM memory_events WHERE memory_id = ?1 AND action IN ('create', 'propose')
                  ORDER BY seq LIMIT 1",
@@ -581,14 +586,23 @@ pub fn approve(store: &crate::store::Store, actor: Actor, id: i64) -> Result<Opt
             .optional()?
             .flatten()
             .and_then(|after| serde_json::from_str::<Value>(&after).ok())
-            .and_then(|after| after["replaces"].as_i64());
+            .map(|after| match &after["replaces"] {
+                Value::Number(n) => n.as_i64().into_iter().collect(),
+                Value::Array(ids) => ids.iter().filter_map(Value::as_i64).collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
         let mut superseded = None;
-        if pending
-            && let Some(old) = replaces.map(|old| get(tx, old)).transpose()?.flatten()
-            && old.status == "active"
-        {
-            supersede(tx, &old, id, &actor)?;
-            superseded = Some(old.id);
+        if pending {
+            for old in replaces {
+                if let Some(old) = get(tx, old)?
+                    && old.status == "active"
+                    && old.id != id
+                {
+                    supersede(tx, &old, id, &actor)?;
+                    superseded.get_or_insert(old.id);
+                }
+            }
         }
         Ok(get(tx, id)?.map(|item| (item, superseded)))
     })

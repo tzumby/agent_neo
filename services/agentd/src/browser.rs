@@ -2,7 +2,7 @@
 //! Elements are found through the accessibility tree; `ref`s in snapshots
 //! are Chrome's backend DOM node IDs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -202,8 +202,22 @@ impl Browser {
         if let Some(error) = result["errorText"].as_str() {
             bail!("couldn't load {url}: {error}");
         }
-        let settled = self.settle(network, 15_000).await?;
-        Ok(format!("{} ({settled})", self.where_am_i().await?))
+        let settled = self.settle(network, 8_000).await?;
+        Ok(format!(
+            "{} ({settled}){}",
+            self.where_am_i().await?,
+            self.sign_in_hint().await
+        ))
+    }
+
+    /// Added to a result when the page asks for a sign-in, so the model hands
+    /// over at once instead of spending turns looking at it.
+    async fn sign_in_hint(&self) -> &'static str {
+        if self.looks_like_sign_in().await {
+            ". This is a sign-in page: if the user has to sign in, call needs_user now"
+        } else {
+            ""
+        }
     }
 
     pub async fn read_text(&self, max_chars: usize) -> Result<String> {
@@ -254,11 +268,12 @@ impl Browser {
     pub async fn click(&self, element: &Element) -> Result<String> {
         let network = self.watch()?;
         self.click_node(element.node).await?;
-        let settled = self.settle(network, 10_000).await?;
+        let settled = self.settle(network, 5_000).await?;
         Ok(format!(
-            "clicked '{}' ({settled}); now at {}",
+            "clicked '{}' ({settled}); now at {}{}",
             element.label,
-            self.where_am_i().await?
+            self.where_am_i().await?,
+            self.sign_in_hint().await
         ))
     }
 
@@ -270,7 +285,7 @@ impl Browser {
         if submit {
             let network = self.watch()?;
             self.key("Enter").await?;
-            self.settle(network, 10_000).await?;
+            self.settle(network, 5_000).await?;
         }
         Ok(format!(
             "typed into '{}'; now at {}",
@@ -283,7 +298,7 @@ impl Browser {
         // Keys can send, open or scroll in more content.
         let network = self.watch()?;
         self.key(key).await?;
-        let settled = self.settle(network, 6_000).await?;
+        let settled = self.settle(network, 4_000).await?;
         Ok(format!("pressed ({settled})"))
     }
 
@@ -419,12 +434,16 @@ fn key_definition(key: &str) -> Result<(String, String, i64, Option<String>)> {
 // --- Accessibility tree ---------------------------------------------------------
 
 /// Roles that only add structure; their children are shown in their place.
-/// Resolves "quiet" once the document has loaded and the DOM has had no
-/// relevant change for 600 ms with no loading indicator showing, or "busy"
-/// after MAX_MS. On the page's events (DOMContentLoaded, MutationObserver);
-/// the timers only measure quiet.
+/// Resolves "quiet" once the document has loaded and no element has been
+/// added or removed (and no loading or hidden flag changed) for 400 ms with no
+/// loading indicator showing, or "busy" after MAX_MS. Text that keeps ticking
+/// (presence, "1m ago") doesn't count: apps like Slack never stop that. On
+/// the page's events (DOMContentLoaded, MutationObserver); the timers only
+/// measure quiet.
 const DOM_QUIET: &str = r#"(async () => {
-  const started = Date.now(), max = MAX_MS, quietMs = 600;
+  const started = Date.now(), max = MAX_MS, quietMs = 400;
+  const relevant = (records) => records.some((r) => r.type === "attributes"
+    || [...r.addedNodes, ...r.removedNodes].some((n) => n.nodeType === 1));
   if (document.readyState === "loading") {
     await new Promise((done) => document.addEventListener("DOMContentLoaded", done, { once: true }));
   }
@@ -434,10 +453,10 @@ const DOM_QUIET: &str = r#"(async () => {
     const finish = (how) => { observer.disconnect(); clearTimeout(quiet); clearTimeout(cap); resolve(how); };
     // When quiet but a loading indicator shows, wait for the next change.
     const arm = () => { clearTimeout(quiet); quiet = setTimeout(() => { if (!busy()) finish("quiet"); }, quietMs); };
-    const observer = new MutationObserver(arm);
+    const observer = new MutationObserver((records) => { if (relevant(records)) arm(); });
     observer.observe(document.documentElement, {
-      subtree: true, childList: true, characterData: true,
-      attributes: true, attributeFilter: ["aria-busy", "hidden", "aria-hidden", "disabled", "src", "value"],
+      subtree: true, childList: true,
+      attributes: true, attributeFilter: ["aria-busy", "hidden", "aria-hidden", "disabled"],
     });
     const cap = setTimeout(() => finish("busy"), Math.max(0, max - (Date.now() - started)));
     arm();
@@ -445,31 +464,57 @@ const DOM_QUIET: &str = r#"(async () => {
 })()"#;
 
 /// Resolves when TEXT_JSON appears in the page's text (checked when the DOM
-/// changes, at most every 150 ms), or after MAX_MS.
+/// changes, at most every 150 ms); when it's not there and no element has
+/// changed for 3 s (the page has stopped changing: waiting longer won't help);
+/// or after MAX_MS.
 const WAIT_FOR_TEXT: &str = r#"(async () => {
-  const started = Date.now(), text = TEXT_JSON;
+  const started = Date.now(), text = TEXT_JSON, stillMs = 3000;
   const has = () => (document.body?.innerText ?? "").toLowerCase().includes(text);
   if (has()) return "found it right away";
   return await new Promise((resolve) => {
-    let pending = false;
-    const finish = (how) => { observer.disconnect(); clearTimeout(cap); resolve(how); };
-    const observer = new MutationObserver(() => {
+    let pending = false, still;
+    const finish = (how) => { observer.disconnect(); clearTimeout(cap); clearTimeout(still); resolve(how); };
+    const settleWatch = () => {
+      clearTimeout(still);
+      still = setTimeout(() => finish(`not on the page; it stopped changing after ${Date.now() - started - stillMs} ms`), stillMs);
+    };
+    const observer = new MutationObserver((records) => {
+      if (records.some((r) => [...r.addedNodes, ...r.removedNodes].some((n) => n.nodeType === 1))) settleWatch();
       if (pending) return;
       pending = true;
       setTimeout(() => { pending = false; if (has()) finish(`found it after ${Date.now() - started} ms`); }, 150);
     });
     observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
     const cap = setTimeout(() => finish(`not on the page after ${MAX_MS} ms`), MAX_MS);
+    settleWatch();
   });
 })()"#;
 
 /// How long the network must be quiet before a page counts as loaded.
-const NETWORK_QUIET: Duration = Duration::from_millis(500);
+const NETWORK_QUIET: Duration = Duration::from_millis(300);
+/// A request still running after this is a long poll, a stream or a slow
+/// extra (analytics): it doesn't hold the page up.
+const LONG_REQUEST: Duration = Duration::from_secs(2);
+/// Requests a page doesn't wait for: images, fonts and media render on their
+/// own; prefetches and pings don't matter; live connections never finish.
+const IGNORED_REQUESTS: &[&str] = &[
+    "Image",
+    "Font",
+    "Media",
+    "TextTrack",
+    "Prefetch",
+    "Ping",
+    "CSPViolationReport",
+    "Manifest",
+    "EventSource",
+    "WebSocket",
+];
 
 /// Requests in flight on a tab, from its DevTools network events.
 struct NetworkWatch {
     events: broadcast::Receiver<Value>,
-    in_flight: HashSet<String>,
+    /// Request ID → when it started, and its URL (for diagnostics).
+    in_flight: HashMap<String, (Instant, String)>,
     last_activity: Instant,
 }
 
@@ -477,7 +522,7 @@ impl NetworkWatch {
     fn new(events: broadcast::Receiver<Value>) -> Self {
         Self {
             events,
-            in_flight: HashSet::new(),
+            in_flight: HashMap::new(),
             last_activity: Instant::now(),
         }
     }
@@ -487,18 +532,16 @@ impl NetworkWatch {
         let id = params["requestId"].as_str().unwrap_or_default().to_string();
         match event["method"].as_str() {
             Some("Network.requestWillBeSent") => {
-                // Live connections (event streams) never finish; don't wait on them.
-                if !matches!(
-                    params["type"].as_str(),
-                    Some("EventSource" | "WebSocket" | "Ping")
-                ) {
-                    self.in_flight.insert(id);
+                if !IGNORED_REQUESTS.contains(&params["type"].as_str().unwrap_or("Other")) {
+                    let url = params["request"]["url"].as_str().unwrap_or_default();
+                    self.in_flight.insert(id, (Instant::now(), truncate(url, 120)));
+                    self.last_activity = Instant::now();
                 }
-                self.last_activity = Instant::now();
             }
             Some("Network.loadingFinished" | "Network.loadingFailed") => {
-                self.in_flight.remove(&id);
-                self.last_activity = Instant::now();
+                if self.in_flight.remove(&id).is_some() {
+                    self.last_activity = Instant::now();
+                }
             }
             _ => {}
         }
@@ -514,29 +557,47 @@ impl NetworkWatch {
         }
     }
 
-    /// Waits until at most one request is in flight (a long poll, say) and
-    /// nothing has started or finished for NETWORK_QUIET. False at `deadline`.
+    /// Requests that still hold the page up: started less than LONG_REQUEST ago.
+    fn pending(&self, now: Instant) -> impl Iterator<Item = &(Instant, String)> {
+        self.in_flight
+            .values()
+            .filter(move |(started, _)| now.saturating_duration_since(*started) < LONG_REQUEST)
+    }
+
+    /// Waits until at most one request that matters is in flight and nothing
+    /// has started or finished for NETWORK_QUIET. False at `deadline`.
     async fn idle(&mut self, deadline: Instant) -> bool {
         loop {
             self.catch_up();
             let now = Instant::now();
             let quiet_for = now.saturating_duration_since(self.last_activity);
-            let calm = self.in_flight.len() <= 1;
+            let calm = self.pending(now).count() <= 1;
             if calm && quiet_for >= NETWORK_QUIET {
                 return true;
             }
             if now >= deadline {
+                tracing::debug!(
+                    pending = ?self.pending(now).map(|(_, url)| url.as_str()).collect::<Vec<_>>(),
+                    "network still busy"
+                );
                 return false;
             }
+            // Look again when the quiet period ends or the oldest pending
+            // request turns long-running, or on the next network event.
+            let next_change = self
+                .pending(now)
+                .map(|(started, _)| *started + LONG_REQUEST)
+                .min()
+                .unwrap_or(deadline);
             let wait = if calm {
                 NETWORK_QUIET - quiet_for
             } else {
-                deadline - now
+                next_change.saturating_duration_since(now)
             };
             match tokio::time::timeout(wait.min(deadline - now), self.events.recv()).await {
                 Ok(Ok(event)) => self.apply(&event),
                 Ok(Err(broadcast::error::RecvError::Closed)) => return true,
-                // Lagged, or the quiet period ran out: look again.
+                // Lagged, or a timer ran out: look again.
                 _ => {}
             }
         }
@@ -698,6 +759,32 @@ mod tests {
     /// Opens SETTLE_URL in a new tab of a real Chrome (CDP_URL, e.g. through
     /// `make cdp`) and checks that SETTLE_TEXT is on the page as soon as
     /// open_url returns. Prints the tab's id so it can be closed afterwards.
+    #[test]
+    fn only_requests_a_page_needs_hold_it_up() {
+        let (_tx, rx) = broadcast::channel(4);
+        let mut watch = NetworkWatch::new(rx);
+        let sent = |id: &str, kind: &str| {
+            json!({"method": "Network.requestWillBeSent",
+                   "params": {"requestId": id, "type": kind, "request": {"url": format!("https://x.example/{id}")}}})
+        };
+        for (id, kind) in [
+            ("1", "Script"),
+            ("2", "XHR"),
+            ("3", "Image"),
+            ("4", "WebSocket"),
+            ("5", "Ping"),
+        ] {
+            watch.apply(&sent(id, kind));
+        }
+        let now = Instant::now();
+        // Images, live connections and pings don't count.
+        assert_eq!(watch.pending(now).count(), 2);
+        watch.apply(&json!({"method": "Network.loadingFinished", "params": {"requestId": "1"}}));
+        assert_eq!(watch.pending(now).count(), 1);
+        // A request still running after LONG_REQUEST (a long poll) stops counting.
+        assert_eq!(watch.pending(now + LONG_REQUEST).count(), 0);
+    }
+
     #[tokio::test]
     #[ignore = "needs CDP_URL pointing at a Chrome"]
     async fn live_open_url_waits_for_the_page_to_settle() {

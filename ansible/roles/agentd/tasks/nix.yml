@@ -60,7 +60,7 @@
   ansible.builtin.copy:
     dest: "{{ agentd_shell_home }}/.config/nix/nix.conf"
     content: |
-      # {{ ansible_managed }}
+      # Managed by Ansible (agentd role: tasks/nix.yml).
       experimental-features = nix-command flakes
       # Ubuntu blocks unprivileged user namespaces (AppArmor), which Nix's
       # build sandbox needs; builds run as the shell user anyway.

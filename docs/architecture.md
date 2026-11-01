@@ -647,7 +647,10 @@ Each model turn (`run_loop`):
 3. Trim the context. When tool results total more than 120,000 characters, the oldest are replaced by a note; the 2 newest stay whole. Every turn resends the whole context, so this also caps cost.
 4. Call the model: `{model, messages, tools, tool_choice: auto, max_tokens: 8192}`. A Stop cancels the call.
 5. Add the reply to the conversation. For GLM and Kimi, `reasoning_content` is kept and sent back on later turns, since they reason worse without it; it's dropped for other models, which reject it.
-6. No tool calls means the answer is final. Exception: if the open tab looks like a sign-in page and the model hasn't been reminded yet, agentd adds one reminder to call `needs_user` instead and runs another turn.
+6. No tool calls means the answer is final. Exceptions, each at most once per task, each adding one reminder and running another turn:
+   - the reply has no text either: usually the model's thinking used up `max_tokens` (GLM, `finish_reason` "length"). The reminder asks for the answer itself, rather than ending with "(empty answer)";
+   - the open tab looks like a sign-in page: the reminder says to call `needs_user` instead;
+   - memory v2's reminder to `remember` (§6.13).
 
 For each tool call:
 
@@ -902,7 +905,7 @@ Web pages, emails and command output can carry injected instructions. The defenc
   - relevance is FTS5 bm25 relative to the best match (stop words removed);
   - recency halves every 30 days (`memory_fact_half_life_days`).
 
-  A request with nothing searchable gets the most recent notes.
+  With fewer than 8 full-text matches, the most recent facts and work-log entries fill the rest, after the matches; a request with nothing searchable gets only those. Full text misses paraphrases ("works at Acme" against "started a new job at Globex"), and a recent fact is the likeliest to correct an older one.
 - **Format:** each line reads `- #id [kind · date · user said|inferred] text`; a work-log line names its schedule.
 - **Never shown:** pending, deleted, superseded and expired memories (past `valid_until`).
 - **Recall tracking:** what's shown gets its recall recorded (`last_recalled`, `recall_count`). The journal gets the ids, the size and the time taken, never the text. Building the notes from 5,000 memories takes 3.5–12 ms on the dev desktop.
@@ -929,7 +932,8 @@ Web pages, emails and command output can carry injected instructions. The defenc
   - work-log entries expire after a year;
   - so does anything past `valid_until`.
 - **Accounting:** each run is a `runs` row (`kind = consolidation`) with its cost, under a daily cap (`memory_consolidation_daily_cap_usd`, $0.50), and emits `memory.consolidated`.
-- **Cost:** about $0.0006 a run on Flash.
+- **Reply limit:** 16,384 tokens (the gateway's maximum), and the instructions ask for short thinking. GLM thinks before it answers, and with 4,096 tokens a batch of 20 tasks left no room for the JSON (found in the phase 6 soak). A reply without JSON records its `finish_reason` in the effect's error.
+- **Cost:** about $0.0006 a run on Flash for a few tasks, about a cent for a full batch.
 - **Trigger it now:** `POST /api/v1/memory/consolidate`.
 
 **Never a permission.** Memory never grants anything: `policy.rs` and the browser gates never read it.
@@ -1020,7 +1024,7 @@ The model therefore never sees a value, even if a command prints one or the user
   - approval cards, key requests and Action needed;
   - a user's task that finished, with the start of the answer;
   - a task that hit a problem (error, interrupted, stuck, out of steps);
-  - a scheduled run's `report_outcome`: its summary for `result` and `blocked`, nothing for `nothing`. A scheduled run that didn't report pushes its answer, and the journal counts `report_outcome_missing`.
+  - a scheduled run's `report_outcome`: its summary for `result` and `blocked`, nothing for `nothing`. A scheduled run that didn't report pushes its answer, and the journal counts `report_outcome_missing`. The journal's `task finished` line carries the reported `outcome`, which `make agentd-soak` and the evals count.
 
   Never pushed: stopped tasks, Action needed's end (already pushed), pending memories, consolidation.
 - `push.rs` sends `{title, body, category, thread, data}` to the push relay's function URL. The request is signed with SigV4 using the desktop's instance role (§8).
@@ -1563,7 +1567,8 @@ Live tests run only with `AGENTD_URL` (a real agentd) or `VNC_ADDR` (a real VNC 
 | `galaxy` | Ansible collections (`amazon.aws` 11.x, `community.general` ≥ 12) |
 | `desktop` | `common` + `desktop` roles on running desktops |
 | `agentd-test`, `agentd-build`, `agentd-deploy`, `agentd-logs` | agentd: fmt/clippy/tests; static build for `DESKTOP_ARCH`; deploy (copies the database first when the version changes); `journalctl -u agentd` over SSM |
-| `agentd-evals` | Memory evals on the Mac: a local agentd against Together, headless Chrome, shell tool off, 21 scripted conversations with assertions (one runs a real consolidation) (`services/agentd/evals`; results in [memory-v2.md](memory-v2.md) §19). About $0.12 a run; `MEMORY_V2=on\|off`, `SCENARIO=name` |
+| `agentd-evals` | Memory evals on the Mac: a local agentd against Together, headless Chrome, shell tool off, 41 scripted conversations with assertions (scheduled runs, restarts, real consolidations) (`services/agentd/evals`; results in [memory-v2.md](memory-v2.md) §19). Reports recall@8, the false-memory rate, staleness, the `report_outcome` missing rate and cost per scenario; `--compare OLD NEW` lines two result files up. About $0.30 a run; `MEMORY_V2=on\|off`, `SCENARIO=a,b` |
+| `agentd-soak` | Memory v2 soak report for the desktop, read-only over SSM (`scripts/agentd-soak.py`): phase 6's exit criteria (effect failures, consolidation under the daily cap, consolidations that didn't finish, days of soak), then tasks, scheduled runs and costs by day, and counts from the journal. Only counts and costs leave the desktop. `SINCE=YYYY-MM-DD`, the day the soak started |
 | `gatewayd-test`, `gatewayd-build`, `gateway-image` | gatewayd tests; static arm64 build; build an attestable AMI and publish its measurements |
 | `tailnet-build`, `tailnet-deploy` | tailnet-proxy |
 | `llm-keys`, `tailscale-key`, `apns-key` | Store secrets in SSM from hidden input or a file |
@@ -1617,7 +1622,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 100 unit tests (plus a 5,000-memory speed test run on demand): bulk approval by reason, restore, where a memory came from and what a proposal replaces, export and import round trips, consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
+| agentd | 102 unit tests (plus a 5,000-memory speed test run on demand): bulk approval by reason, restore, where a memory came from and what a proposal replaces, export and import round trips, consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
 | DesktopKit | 25 tests (§10.8) |

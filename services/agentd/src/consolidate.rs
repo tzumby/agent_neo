@@ -33,8 +33,21 @@ use crate::store::Store;
 
 /// A burst of tasks consolidates once: each finish pushes the run out again.
 pub const DELAY_SECS: i64 = 600;
-/// …but at the latest once this many tasks wait.
-pub const MAX_BATCH: i64 = 20;
+/// …but at once when a full batch waits. Tasks per model call: on 20 busy
+/// tasks GLM-5.3-Flash thought for over 3 minutes, past the model client's
+/// timeout (phase 6 evals). A full batch that leaves more behind goes on with
+/// the next one (`more_waiting`).
+pub const MAX_BATCH: i64 = 10;
+/// How hard the model thinks, for the models that take `reasoning_effort`.
+/// GLM's default thinking ran to 8,000 tokens and more per batch, sometimes
+/// past the client's 3-minute timeout; "medium" keeps its judgment (phase 6
+/// evals) at a fraction of that.
+fn reasoning_effort(model: &str) -> Option<&'static str> {
+    model.starts_with("zai-org/GLM").then_some("medium")
+}
+
+/// The pause before the next batch.
+const NEXT_BATCH: Duration = Duration::from_secs(5);
 const MEMORY_CONTEXT_CHARS: usize = 12_000;
 const REQUEST_CHARS: usize = 600;
 const ANSWER_CHARS: usize = 1_500;
@@ -47,6 +60,11 @@ const EXPIRE_AFTER_DAYS: i64 = 180;
 const WORK_LOG_DAYS: i64 = 365;
 const AGENT: &str = "main";
 pub const DEFAULT_MODEL: &str = "zai-org/GLM-5.3-Flash";
+/// The reply's limit, thinking included: GLM thinks before it answers, and
+/// thinking about 20 tasks used up 4,096 tokens on the dev desktop, leaving no
+/// JSON. The gateway's maximum (gatewayd `MAX_TOKENS`); at Flash's prices at
+/// most about a cent per call.
+const REPLY_TOKENS: u32 = 16_384;
 pub const DEFAULT_DAILY_CAP_USD: f64 = 0.50;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -168,12 +186,17 @@ pub fn batch(store: &Store) -> Result<(Vec<Run>, i64)> {
     })
 }
 
-/// How many finished tasks wait for consolidation.
+/// How many finished tasks wait for consolidation (at most a batch).
 fn waiting(store: &Store) -> i64 {
     batch(store).map_or(0, |(runs, _)| runs.len() as i64)
 }
 
-/// After a task: consolidate in 10 minutes (or now, if 20 tasks wait). A later
+/// After a batch of `taken` tasks: whether a full one left more behind.
+fn more_waiting(store: &Store, taken: usize) -> bool {
+    taken as i64 >= MAX_BATCH && waiting(store) > 0
+}
+
+/// After a task: consolidate in 10 minutes (or now, if a full batch waits). A later
 /// task pushes it out again, so a burst of tasks consolidates once.
 pub fn trigger(agent: &Agent) {
     if !agent.cfg.memory_v2 || mode(&agent.store) == Mode::Off {
@@ -772,7 +795,10 @@ pub async fn run(agent: &Agent) -> Outcome {
     let mut problem = String::new();
     // An answer that isn't valid gets one more try, with what was wrong.
     for _ in 0..2 {
-        let request = json!({"model": model, "messages": messages, "max_tokens": 4096});
+        let mut request = json!({"model": model, "messages": messages, "max_tokens": REPLY_TOKENS});
+        if let Some(effort) = reasoning_effort(&model) {
+            request["reasoning_effort"] = json!(effort);
+        }
         let reply = match agent.complete(&request).await {
             Ok(reply) => reply,
             Err(err) => return Outcome::Failed(format!("{err:#}")),
@@ -788,7 +814,9 @@ pub async fn run(agent: &Agent) -> Outcome {
                 break;
             }
             Err(why) => {
-                problem = why.clone();
+                // "length": cut off, most likely while thinking.
+                let finish = reply["choices"][0]["finish_reason"].as_str().unwrap_or("?");
+                problem = format!("{why} (finish_reason {finish})");
                 messages.push(json!({"role": "assistant", "content": content}));
                 messages.push(json!({"role": "user", "content": format!(
                     "That wasn't valid: {why}. Reply with only the JSON object, in the format given."
@@ -835,7 +863,11 @@ pub async fn run(agent: &Agent) -> Outcome {
                     "merged": applied.merged, "expired": applied.expired, "cost": cost, "mode": mode.name(),
                 }),
             );
-            Outcome::Done
+            if more_waiting(store, runs.len()) {
+                Outcome::Later(NEXT_BATCH)
+            } else {
+                Outcome::Done
+            }
         }
         Err(err) => Outcome::Failed(format!("{err:#}")),
     }
@@ -936,6 +968,26 @@ mod tests {
         assert_eq!(runs[1].schedule, Some(4));
         let t3_rowid = runs[1].rowid;
         assert_eq!(mark, t3_rowid);
+    }
+
+    #[test]
+    fn a_full_batch_leaves_the_rest_for_the_next_one() {
+        let (store, _keys) = setup();
+        for i in 0..13 {
+            task(&store, &format!("t{i:02}"), "done", None);
+        }
+        let (runs, mark) = batch(&store).unwrap();
+        assert_eq!(runs.len() as i64, MAX_BATCH);
+        assert_eq!(runs.last().unwrap().id, "t09");
+        // Consolidated up to t09: three wait, so the effect runs again soon.
+        store
+            .set_setting("memory_last_consolidated_run", &mark.to_string())
+            .unwrap();
+        assert!(more_waiting(&store, runs.len()));
+        let (rest, _) = batch(&store).unwrap();
+        assert_eq!(rest.len(), 3);
+        // A batch that wasn't full took everything there was.
+        assert!(!more_waiting(&store, rest.len()));
     }
 
     #[test]

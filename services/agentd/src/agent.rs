@@ -53,6 +53,10 @@ const INTERRUPTED: &str =
 /// Memory v2: the one reminder when the user asked to remember something and
 /// the task is ending without a save. Worded so a question ("do you
 /// remember…?") just gets its answer again.
+/// The one reminder after a reply with neither text nor tool calls: usually the
+/// model's thinking used up `max_tokens` (finish_reason "length").
+const EMPTY_REPLY: &str = "(agentd) Your reply was empty: it was probably cut off while you were thinking. \
+     Give your answer now, briefly.";
 const REMEMBER_NUDGE: &str = "(agentd) The user's message asked you to remember something, and you haven't \
      called remember. If they did, call remember with it now, then finish. If they only asked what you remember, \
      give your answer again.";
@@ -130,6 +134,16 @@ struct RunState {
     /// A scheduled run's `report_outcome` (result, nothing or blocked).
     #[serde(default)]
     reported: Option<push::Reported>,
+    /// Asked once for the answer after an empty reply.
+    #[serde(default)]
+    asked_again: bool,
+}
+
+/// A reply with no text to show (null, empty or only whitespace).
+fn is_empty_reply(message: &Value) -> bool {
+    message["content"]
+        .as_str()
+        .is_none_or(|text| text.trim().is_empty())
 }
 
 /// The user approved what the agent typed into a message field (Slack's
@@ -760,6 +774,7 @@ impl Agent {
             nudged: false,
             memory_block,
             reported: None,
+            asked_again: false,
             schedule_id: scheduled.as_ref().map(|s| s.id),
             scheduled: scheduled.map(|s| s.name),
         };
@@ -834,7 +849,8 @@ impl Agent {
         }
         // Memory v2: fold the finished task into memory, later.
         crate::consolidate::trigger(self);
-        tracing::info!(task = %task_id, status, steps = state.step, seconds, "task finished");
+        let outcome = state.reported.as_ref().map(|r| r.outcome.as_str());
+        tracing::info!(task = %task_id, status, steps = state.step, seconds, outcome, "task finished");
         if self.cfg.memory_v2 && state.scheduled.is_some() && status == "done" && state.reported.is_none() {
             // Counted, so the scheduled-run prompt can be tuned.
             tracing::info!(task = %task_id, "report_outcome_missing");
@@ -1090,6 +1106,17 @@ impl Agent {
             state.messages.push(llm::for_history(&message, &state.model));
             let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
             if calls.is_empty() {
+                // No text either: the thinking used up the reply. Ask once
+                // for the answer, rather than ending with "(empty answer)".
+                if is_empty_reply(&message) && !state.asked_again {
+                    state.asked_again = true;
+                    let finish = reply["choices"][0]["finish_reason"].as_str().unwrap_or("");
+                    tracing::info!(task = %task_id, step, finish, "empty reply: asking for the answer");
+                    state
+                        .messages
+                        .push(json!({"role": "user", "content": EMPTY_REPLY}));
+                    continue;
+                }
                 // Models sometimes ask for a sign-in in their answer, which ends the task
                 // with no way for the user to reach the tab. Remind them once.
                 if !state.reminded && browser.looks_like_sign_in().await {
@@ -2214,6 +2241,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_replies_are_spotted() {
+        for message in [json!({"content": null}), json!({}), json!({"content": "  \n"})] {
+            assert!(is_empty_reply(&message), "{message}");
+        }
+        assert!(!is_empty_reply(&json!({"content": "Today: chapter 2"})));
+    }
+
+    #[test]
     fn checkpoints_from_before_memory_v2_still_load() {
         // A task parked by 0.15.0 phase 0 (no memory fields) resumes.
         let old = json!({
@@ -2227,9 +2262,10 @@ mod tests {
                 state.remember_asked,
                 state.remembered,
                 state.nudged,
-                state.schedule_id
+                state.schedule_id,
+                state.asked_again
             ),
-            (false, false, false, None)
+            (false, false, false, None, false)
         );
         assert_eq!(state.scheduled.as_deref(), Some("Morning inbox"));
     }

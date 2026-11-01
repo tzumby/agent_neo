@@ -14,7 +14,7 @@ INSTANCE ?= $(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-logs tailnet-build tailnet-deploy tailscale-key apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-logs tailnet-build tailnet-deploy tailscale-key apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -82,6 +82,9 @@ agentd-evals: ## Memory evals on this Mac against Together (cents per scenario):
 	  --with-decryption --query Parameter.Value --output text)}" \
 	  services/agentd/evals/run.py --agentd services/agentd/target/debug/agentd \
 	  --memory-v2 $(or $(MEMORY_V2),off) $(if $(SCENARIO),--scenario $(SCENARIO))
+
+agentd-soak: ## Memory v2 soak report for the desktop (read-only): SINCE=YYYY-MM-DD, the day the soak started
+	scripts/agentd-soak.py $(INSTANCE) $(if $(SINCE),--since $(SINCE))
 
 agentd-logs: ## Show agentd's recent log
 	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \

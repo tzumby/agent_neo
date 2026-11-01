@@ -179,6 +179,7 @@ make agentd-deploy      # static binary for DESKTOP_ARCH (cargo-zigbuild), user,
 make tailnet-deploy     # tailnet-proxy (deploy agentd first)
 make agentd-logs        # recent log
 make agentd-evals       # memory evals on this Mac against Together (cents per scenario)
+make agentd-soak SINCE=2026-11-01   # memory v2 soak report for the desktop (read-only)
 ```
 
 **Rolling agentd back.** Schema changes are additive, so an older agentd runs on

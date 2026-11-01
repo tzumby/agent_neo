@@ -16,11 +16,15 @@
         "say": "What is my favourite colour? Answer with one word."
       },
       {
+        "expect_recalled": "teal"
+      },
+      {
         "expect_answer": [
           "teal"
         ]
       }
-    ]
+    ],
+    "measures": "recall"
   },
   {
     "name": "forget-honoured",
@@ -49,7 +53,8 @@
           "418"
         ]
       }
-    ]
+    ],
+    "measures": "false_memory"
   },
   {
     "name": "correction-supersedes",
@@ -83,7 +88,8 @@
           "lee"
         ]
       }
-    ]
+    ],
+    "measures": "staleness"
   },
   {
     "name": "no-false-memory",
@@ -106,7 +112,8 @@
           "i don't"
         ]
       }
-    ]
+    ],
+    "measures": "false_memory"
   },
   {
     "name": "preference-applied",
@@ -119,7 +126,7 @@
         "new_conversation": true
       },
       {
-        "say": "It's 77°F outside. Tell me the temperature in my preferred unit: just the number and the unit."
+        "say": "It's 77\u00b0F outside. Tell me the temperature in my preferred unit: just the number and the unit."
       },
       {
         "expect_answer": [
@@ -128,7 +135,7 @@
       },
       {
         "expect_answer_any": [
-          "°c",
+          "\u00b0c",
           "celsius",
           " c"
         ]
@@ -171,11 +178,15 @@
         "say": "Where is my spare house key?"
       },
       {
+        "expect_recalled": "flowerpot"
+      },
+      {
         "expect_answer": [
           "flowerpot"
         ]
       }
-    ]
+    ],
+    "measures": "recall"
   },
   {
     "name": "recall-paraphrase",
@@ -193,11 +204,15 @@
         "say": "Who do I report to at work?"
       },
       {
+        "expect_recalled": "Priya"
+      },
+      {
         "expect_answer": [
           "priya"
         ]
       }
-    ]
+    ],
+    "measures": "recall"
   },
   {
     "name": "expired-not-used",
@@ -219,7 +234,8 @@
           "hilton"
         ]
       }
-    ]
+    ],
+    "measures": "staleness"
   },
   {
     "name": "two-facts-one-message",
@@ -251,7 +267,8 @@
           "alex"
         ]
       }
-    ]
+    ],
+    "measures": "recall"
   },
   {
     "name": "keep-in-mind",
@@ -267,11 +284,15 @@
         "say": "What car do I drive? Short answer."
       },
       {
+        "expect_recalled": "Civic"
+      },
+      {
         "expect_answer": [
           "civic"
         ]
       }
-    ]
+    ],
+    "measures": "recall"
   },
   {
     "name": "call-me",
@@ -291,7 +312,8 @@
           "raz"
         ]
       }
-    ]
+    ],
+    "measures": "recall"
   },
   {
     "name": "forget-one-of-two",
@@ -318,7 +340,8 @@
       {
         "expect_memory": "orange"
       }
-    ]
+    ],
+    "measures": "false_memory"
   },
   {
     "name": "travel-dates",
@@ -334,11 +357,15 @@
         "say": "Where will I be on November 12? Short answer."
       },
       {
+        "expect_recalled": "Lisbon"
+      },
+      {
         "expect_answer": [
           "lisbon"
         ]
       }
-    ]
+    ],
+    "measures": "recall"
   },
   {
     "name": "secret-refused",
@@ -381,7 +408,8 @@
           "100"
         ]
       }
-    ]
+    ],
+    "measures": "staleness"
   },
   {
     "name": "deploy-day",
@@ -397,11 +425,15 @@
         "say": "Which day do we deploy? One word."
       },
       {
+        "expect_recalled": "Thursday"
+      },
+      {
         "expect_answer": [
           "thursday"
         ]
       }
-    ]
+    ],
+    "measures": "recall"
   },
   {
     "name": "survives-an-unrelated-task",
@@ -423,11 +455,15 @@
         "say": "What's my employee number?"
       },
       {
+        "expect_recalled": "5521"
+      },
+      {
         "expect_answer": [
           "5521"
         ]
       }
-    ]
+    ],
+    "measures": "recall"
   },
   {
     "name": "inferred-hint-is-not-an-instruction",
@@ -470,11 +506,15 @@
         "say": "Which gym do I go to? Short answer."
       },
       {
+        "expect_recalled": "FitLife"
+      },
+      {
         "expect_answer": [
           "fitlife"
         ]
       }
-    ]
+    ],
+    "measures": "recall"
   },
   {
     "name": "consolidation-work-log",
@@ -495,6 +535,556 @@
       },
       {
         "expect_work_log": 1
+      }
+    ]
+  },
+  {
+    "name": "scheduled-nothing-new-is-quiet",
+    "about": "A scheduled check with nothing to report ends with outcome=nothing (a quiet row, no push).",
+    "steps": [
+      {
+        "run_schedule": {
+          "name": "Morning reminders",
+          "prompt": "Tell me about any reminder you remember that is due today. If there isn't one, there's nothing new."
+        }
+      },
+      {
+        "expect_outcome": "nothing",
+        "v2": true
+      }
+    ]
+  },
+  {
+    "name": "scheduled-result-found",
+    "about": "A scheduled check that finds something reports outcome=result with it.",
+    "steps": [
+      {
+        "seed_memories": [
+          "The user's passport expires on {date+12}."
+        ]
+      },
+      {
+        "run_schedule": {
+          "name": "Documents check",
+          "prompt": "If any document you remember expires within the next 30 days, tell me which one and when. Otherwise there's nothing new."
+        }
+      },
+      {
+        "expect_answer": [
+          "passport"
+        ]
+      },
+      {
+        "expect_outcome": "result",
+        "v2": true
+      }
+    ]
+  },
+  {
+    "name": "scheduled-blocked-by-sign-in",
+    "about": "A scheduled run that hits a sign-in page stops: outcome=blocked, or Action needed (needs_user), and doesn't try to log in.",
+    "steps": [
+      {
+        "run_schedule": {
+          "name": "Inbox count",
+          "prompt": "Open https://mail.google.com and tell me how many unread emails I have."
+        },
+        "ok_status": [
+          "done",
+          "needs_user"
+        ]
+      },
+      {
+        "expect_answer_any": [
+          "sign in",
+          "signed in",
+          "sign-in",
+          "log in",
+          "logged in",
+          "login",
+          "not signed"
+        ]
+      },
+      {
+        "expect_outcome": [
+          "blocked",
+          "needs_user"
+        ],
+        "v2": true
+      }
+    ]
+  },
+  {
+    "name": "scheduled-run-continues",
+    "about": "A daily schedule picks up where its last run left off (from its own notes or the work log), with a consolidation in between as on a real desktop (MEMORY_V2=on only).",
+    "v2_only": true,
+    "steps": [
+      {
+        "run_schedule": {
+          "name": "Daily reading",
+          "prompt": "Suggest which chapter of Moby-Dick I should read today: the chapter after the one you suggested last time, or chapter 1 if you haven't suggested one yet. Reply in the form 'Today: chapter N'."
+        }
+      },
+      {
+        "expect_answer": [
+          "chapter 1"
+        ]
+      },
+      {
+        "consolidate": true
+      },
+      {
+        "run_schedule": {
+          "name": "Daily reading",
+          "prompt": "unused: the schedule exists"
+        }
+      },
+      {
+        "expect_answer": [
+          "chapter 2"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "scheduled-run-follows-a-rule",
+    "about": "The user's rules apply in scheduled runs too, which start without the chat.",
+    "steps": [
+      {
+        "say": "From now on, whenever you report something to me, start with the word 'Heads-up:'."
+      },
+      {
+        "seed_memories": [
+          "The user's driving licence expires on {date+9}."
+        ]
+      },
+      {
+        "run_schedule": {
+          "name": "Documents check",
+          "prompt": "If any document you remember expires within the next 30 days, tell me which one and when. Otherwise there's nothing new."
+        }
+      },
+      {
+        "expect_answer": [
+          "heads-up",
+          "licence"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "remember-buried-in-a-task",
+    "about": "A request to remember tucked behind another question is still saved (the nudge's case).",
+    "measures": "recall",
+    "steps": [
+      {
+        "say": "What's 12 times 12? Oh, and remember that my gym closes at 9pm on Sundays."
+      },
+      {
+        "new_conversation": true
+      },
+      {
+        "say": "What time does my gym close on Sundays? Short answer."
+      },
+      {
+        "expect_recalled": "Sunday"
+      },
+      {
+        "expect_answer_any": [
+          "9",
+          "nine",
+          "21:00"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "secret-api-key-refused",
+    "about": "An API key the user asks to remember isn't stored.",
+    "steps": [
+      {
+        "say": "Remember my OpenAI key: sk-proj-Xr7Lq2Vt9Nw4Pz8Kc3Hb6Jd1Fs5Gm0Ya"
+      },
+      {
+        "expect_no_memory": "sk-proj"
+      }
+    ]
+  },
+  {
+    "name": "email-address-kept",
+    "about": "An email address isn't mistaken for a secret.",
+    "measures": "recall",
+    "steps": [
+      {
+        "say": "Please remember that my work email is jordan.blake@example.com."
+      },
+      {
+        "expect_memory": "jordan.blake@example.com"
+      },
+      {
+        "new_conversation": true
+      },
+      {
+        "say": "What's my work email address?"
+      },
+      {
+        "expect_recalled": "jordan.blake"
+      },
+      {
+        "expect_answer": [
+          "jordan.blake@example.com"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "recall-hyphenated-word",
+    "about": "\"wifi\" finds a note written \"Wi-Fi\" (full text indexes it as two words).",
+    "measures": "recall",
+    "steps": [
+      {
+        "seed_memories": [
+          "The guest Wi-Fi network at the user's home is called BlueFox."
+        ]
+      },
+      {
+        "seed_distractors": 40
+      },
+      {
+        "say": "What's my guest wifi network called? One word."
+      },
+      {
+        "expect_recalled": "BlueFox"
+      },
+      {
+        "expect_answer": [
+          "bluefox"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "old-fact-still-found",
+    "about": "A relevant fact from a year ago beats newer, unrelated ones.",
+    "measures": "recall",
+    "steps": [
+      {
+        "seed_memories": [
+          {
+            "text": "The user's blood type is O negative.",
+            "age_days": 400
+          }
+        ]
+      },
+      {
+        "seed_distractors": 60
+      },
+      {
+        "say": "What's my blood type? Short answer."
+      },
+      {
+        "expect_recalled": "blood type"
+      },
+      {
+        "expect_answer_any": [
+          "o negative",
+          "o-",
+          "o neg"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "survives-a-restart",
+    "about": "A memory survives agentd restarting (a deploy).",
+    "measures": "recall",
+    "steps": [
+      {
+        "say": "Please remember that my bike lock code is on a sticker under the saddle."
+      },
+      {
+        "restart": true
+      },
+      {
+        "new_conversation": true
+      },
+      {
+        "say": "Where's my bike lock code? Short answer."
+      },
+      {
+        "expect_recalled": "saddle"
+      },
+      {
+        "expect_answer": [
+          "saddle"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "what-do-you-remember",
+    "about": "Asked what it remembers, the agent lists the user's facts.",
+    "measures": "recall",
+    "steps": [
+      {
+        "seed_memories": [
+          "The user's cat is called Miso.",
+          "The user plays cello on Wednesdays.",
+          "The user is allergic to peanuts."
+        ]
+      },
+      {
+        "say": "What do you remember about me? A short list."
+      },
+      {
+        "expect_answer": [
+          "miso",
+          "cello",
+          "peanut"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "fact-used-without-being-asked",
+    "about": "A remembered fact shapes an answer that doesn't ask for it.",
+    "measures": "recall",
+    "steps": [
+      {
+        "seed_memories": [
+          "The user is vegetarian."
+        ]
+      },
+      {
+        "say": "Suggest one dinner I could cook tonight. Just the dish name."
+      },
+      {
+        "expect_recalled": "vegetarian"
+      },
+      {
+        "expect_answer_not": [
+          "chicken",
+          "beef",
+          "pork",
+          "lamb",
+          "salmon",
+          "shrimp",
+          "fish",
+          "steak",
+          "bacon",
+          "tuna",
+          "turkey"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "false-memory-similar-person",
+    "about": "A fact about the user's brother isn't used to answer about their sister.",
+    "measures": "false_memory",
+    "steps": [
+      {
+        "seed_memories": [
+          "The user's brother Sam lives in Vancouver."
+        ]
+      },
+      {
+        "say": "Where does my sister live? If you don't know, just say you don't know."
+      },
+      {
+        "expect_answer_not": [
+          "sister lives in vancouver",
+          "she lives in vancouver",
+          "sister is in vancouver",
+          "she's in vancouver"
+        ]
+      },
+      {
+        "expect_answer_any": [
+          "don't know",
+          "do not know",
+          "not sure",
+          "no record",
+          "haven't",
+          "don't have",
+          "no information",
+          "not aware",
+          "i'm not able",
+          "i don't",
+          "didn't mention",
+          "not mentioned",
+          "only know",
+          "no mention"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "false-memory-missing-detail",
+    "about": "Knowing the user has a dog doesn't make up the dog's name.",
+    "measures": "false_memory",
+    "steps": [
+      {
+        "seed_memories": [
+          "The user has a dog."
+        ]
+      },
+      {
+        "say": "What's my dog's name? If you don't know, just say you don't know."
+      },
+      {
+        "expect_answer_any": [
+          "don't know",
+          "do not know",
+          "not sure",
+          "no record",
+          "haven't",
+          "don't have",
+          "no information",
+          "not aware",
+          "i'm not able",
+          "i don't",
+          "didn't mention",
+          "not mentioned",
+          "only know",
+          "no mention"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "correction-in-the-same-message",
+    "about": "\"Actually, \u2026\" in the same conversation corrects what was just said.",
+    "measures": "staleness",
+    "steps": [
+      {
+        "say": "Please remember that my flight to Berlin is on Tuesday."
+      },
+      {
+        "say": "Sorry, I got that wrong: the flight is on Wednesday, not Tuesday."
+      },
+      {
+        "new_conversation": true
+      },
+      {
+        "say": "What day is my flight to Berlin? One word."
+      },
+      {
+        "expect_answer": [
+          "wednesday"
+        ]
+      },
+      {
+        "expect_answer_not": [
+          "tuesday"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "newer-fact-wins",
+    "about": "Of two facts that disagree, the newer one is used.",
+    "measures": "staleness",
+    "steps": [
+      {
+        "seed_memories": [
+          {
+            "text": "The user works at Acme Corp as an analyst.",
+            "age_days": 200
+          },
+          {
+            "text": "The user started a new job at Globex in September.",
+            "age_days": 40
+          }
+        ]
+      },
+      {
+        "say": "Which company do I work for now? One word."
+      },
+      {
+        "expect_answer": [
+          "globex"
+        ]
+      },
+      {
+        "expect_answer_not": [
+          "acme"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "moved-address-supersedes",
+    "about": "A new address replaces the old one (v2 supersedes it), and the old one isn't used.",
+    "measures": "staleness",
+    "steps": [
+      {
+        "seed_memories": [
+          "The user lives at 5 Oak Avenue."
+        ]
+      },
+      {
+        "say": "I've moved: my new address is 22 Elm Street. Please update what you remember."
+      },
+      {
+        "expect_no_memory": "lives at 5 oak avenue",
+        "v2": true
+      },
+      {
+        "new_conversation": true
+      },
+      {
+        "say": "What's my home address? Short answer."
+      },
+      {
+        "expect_answer": [
+          "elm"
+        ]
+      },
+      {
+        "expect_answer_not": [
+          "address is 5 oak",
+          "live at 5 oak",
+          "lives at 5 oak"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "consolidation-skips-trivia",
+    "about": "Consolidating three trivial tasks writes no work log (MEMORY_V2=on only).",
+    "v2_only": true,
+    "steps": [
+      {
+        "say": "What's 7 times 8? Number only."
+      },
+      {
+        "say": "Spell 'necessary' backwards."
+      },
+      {
+        "say": "What's the capital of Japan? One word."
+      },
+      {
+        "consolidate": true
+      },
+      {
+        "expect_work_log_max": 0
+      }
+    ]
+  },
+  {
+    "name": "consolidation-full-batch",
+    "about": "Consolidating a full batch of 20 busy tasks returns valid JSON and logs most of them (MEMORY_V2=on only). Found in the soak: the model's thinking used up its reply.",
+    "v2_only": true,
+    "steps": [
+      {
+        "seed_runs": 20
+      },
+      {
+        "consolidate": true
+      },
+      {
+        "expect_work_log": 10
       }
     ]
   }

@@ -1110,8 +1110,9 @@ pub struct Recall {
 ///    least important preferences dropped first);
 /// 2. for a scheduled run, its own latest work-log entries (3, ~600 tokens);
 /// 3. the facts and work-log entries most relevant to `request` (top 8,
-///    ~2,000 tokens), ranked by `score`. A request of only stop words gets
-///    the most recent ones.
+///    ~2,000 tokens), ranked by `score`. With fewer than 8 full-text
+///    matches, the most recent ones fill the rest, after the matches (all of
+///    them for a request of only stop words).
 ///
 /// Pending, deleted, superseded and expired memories are never shown. The
 /// recall of each fact and work-log entry shown is recorded.
@@ -1139,18 +1140,26 @@ pub fn recall(store: &crate::store::Store, request: &str, schedule: Option<i64>)
             None => Vec::new(),
         };
         let matched = fts_candidates(conn, request, &["fact", "work_log"], CANDIDATES)?;
-        let candidates: Vec<(Item, Option<f64>)> = if matched.is_empty() {
+        // Fewer matches than notes: the most recent facts and work-log entries
+        // fill the rest, after the matches. Full text misses a paraphrase
+        // ("works at Acme" against "started a new job at Globex"), and a
+        // recent fact is the likeliest to correct an older one.
+        let recent: Vec<Item> = if matched.len() < RECALLED {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status = 'active'
                    AND kind IN ('fact', 'work_log') AND (valid_until IS NULL OR valid_until > ?2)
                  ORDER BY COALESCE(updated, 0) DESC, id DESC LIMIT ?3"
             ))?;
             stmt.query_map(params![AGENT, now, CANDIDATES], Item::from_row)?
-                .map(|row| row.map(|item| (item, None)))
+                .filter(|row| {
+                    row.as_ref()
+                        .map_or(true, |item| matched.iter().all(|(m, _)| m.id != item.id))
+                })
                 .collect::<rusqlite::Result<_>>()?
         } else {
-            matched.into_iter().map(|(item, b)| (item, Some(b))).collect()
+            Vec::new()
         };
+        let candidates = (matched, recent);
         let mut stmt = conn.prepare("SELECT id, name FROM schedules")?;
         let names: Vec<(i64, String)> = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1192,7 +1201,18 @@ pub fn recall(store: &crate::store::Store, request: &str, schedule: Option<i64>)
         recalled.push(item.id);
     }
     let (mut used, mut shown) = (0, 0);
-    for (item, _) in rank(candidates, half_life, now) {
+    let (matched, recent) = candidates;
+    let matched = rank(
+        matched.into_iter().map(|(item, b)| (item, Some(b))).collect(),
+        half_life,
+        now,
+    );
+    let recent = rank(
+        recent.into_iter().map(|item| (item, None)).collect(),
+        half_life,
+        now,
+    );
+    for (item, _) in matched.into_iter().chain(recent) {
         if shown == RECALLED {
             break;
         }
@@ -1728,11 +1748,16 @@ mod tests {
         }
         let recall = recall(&store, "Where is my wifi router?", None).unwrap();
         let shown: Vec<i64> = recall.recalled.clone();
-        // Only matches are recalled, the best first; at most 8.
+        // The three matches first, the best first; recent notes fill the
+        // rest of the 8.
         assert_eq!(shown[0], router, "{}", recall.block);
-        assert!(shown.contains(&inferred) && shown.contains(&old_router));
-        assert!(shown.len() <= 8);
-        assert!(!recall.block.contains("lunch"));
+        let mut first: Vec<i64> = shown[..3].to_vec();
+        first.sort();
+        let mut matches = vec![router, old_router, inferred];
+        matches.sort();
+        assert_eq!(first, matches, "{}", recall.block);
+        assert_eq!(shown.len(), 8);
+        assert_eq!(recall.block.matches("lunch").count(), 5);
         assert!(recall.tokens > 0 && recall.tokens == recall.block.len() / 4);
         let counts: Vec<(i64, i64)> = store
             .read(|conn| {
@@ -1751,6 +1776,47 @@ mod tests {
             .map(|(m, _)| m.id)
             .collect();
         assert_eq!(found[0], router);
+    }
+
+    #[test]
+    fn a_paraphrased_newer_fact_still_reaches_the_notes() {
+        // Found by the evals: "which company do I work for" matches only the
+        // old job; the new one shares no word with the question.
+        let (store, _keys, _dir) = setup();
+        let old = seed(
+            &store,
+            "The user works at Acme Corp as an analyst.",
+            "fact",
+            "user_stated",
+            200,
+            0.5,
+        );
+        let new = seed(
+            &store,
+            "The user started a new job at Globex in September.",
+            "fact",
+            "user_stated",
+            40,
+            0.5,
+        );
+        let notes = recall(&store, "Which company do I work for now?", None).unwrap();
+        assert_eq!(notes.recalled, vec![old, new], "{}", notes.block);
+        // With 8 matches, nothing else is added.
+        let (store, _keys, _dir) = setup();
+        let matches: Vec<i64> = (0..8)
+            .map(|i| seed(&store, &format!("Work note {i}"), "fact", "user_stated", 100, 0.5))
+            .collect();
+        seed(
+            &store,
+            "The user started a new job at Globex.",
+            "fact",
+            "user_stated",
+            1,
+            0.5,
+        );
+        let mut shown = recall(&store, "work", None).unwrap().recalled;
+        shown.sort();
+        assert_eq!(shown, matches);
     }
 
     #[test]

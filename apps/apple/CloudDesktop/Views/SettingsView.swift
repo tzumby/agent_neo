@@ -44,8 +44,10 @@ struct SettingsView: View {
             }
             Section {
                 NavigationLink("Memory") { MemoryView(client: client) }
+                NavigationLink("Schedules") { SchedulesView(client: client) }
+                NavigationLink("Keys & tokens") { SecretsView(client: client) }
             } footer: {
-                Text("What the agent remembers between conversations.")
+                Text("What the agent remembers between conversations, the tasks it runs on its own, and the keys it can use without seeing them.")
             }
             Section("Desktop") {
                 LabeledContent("Name", value: store.status?.desktop ?? "…")

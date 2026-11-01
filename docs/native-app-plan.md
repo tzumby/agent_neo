@@ -20,10 +20,15 @@ the end). Items marked UNVERIFIED need a spike before we rely on them.*
 >   `worker`); skills tell the agent how.
 > - **Desktops** are x86_64 (t3a.medium) in a private subnet behind a fck-nat instance, with no
 >   public IP; disks use each user's own KMS key.
-> - **agentd 0.9 to 0.11:** approvals park the task and survive restarts; a wrap-up at the step
->   limit; memory; skills; one approval per message; Stop interrupts at once.
-> - **The app:** commands are steps in the task's row (only pending approvals are cards), a
->   Memory screen, and Stopping… feedback.
+> - **agentd 0.9 to 0.14:** approvals park the task and survive restarts; a wrap-up at the step
+>   limit; memory; skills; one approval per message; Stop interrupts at once; browsing waits on
+>   page events rather than timers; scheduled tasks (`schedule_task`, run by agentd in the user's
+>   time zone); keys and tokens (`request_secret`: pasted in the app, kept on the desktop, given to
+>   commands through systemd credentials, redacted from everything the model and the apps see).
+> - **The app:** commands are steps in the task's row (only pending approvals are cards), Memory,
+>   Schedules and Keys & tokens screens, key request cards with a secure field, a warning before a
+>   key is sent in the chat, Stopping… feedback, and answers rendered as Markdown (headings,
+>   lists, tables, quotes, code; no remote images or HTML).
 
 ## Decisions so far
 

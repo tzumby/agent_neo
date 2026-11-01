@@ -41,6 +41,10 @@ final class PushCenter: NSObject {
 
     /// Asks for permission (once) and registers for remote notifications.
     func register() async {
+        #if DEBUG
+            // The chat preview talks to a stand-in server, which has no push relay.
+            if ProcessInfo.processInfo.environment["CHAT_PREVIEW_URL"] != nil { return }
+        #endif
         let center = UNUserNotificationCenter.current()
         let granted = (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
         guard granted else { return }

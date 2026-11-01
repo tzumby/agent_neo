@@ -117,6 +117,24 @@ pub const PIPED_INSTALL_REFUSAL: &str = "not run: piping a downloaded script int
      Install with a package manager instead: read the install-software skill (read_skill). If what you need \
      isn't packaged anywhere, tell the user.";
 
+pub const SHELL_SCHEDULE_REFUSAL: &str = "not run: don't schedule with the shell (crontab, at, systemd \
+     timers); those run with no approvals and can't tell the user. Use schedule_task instead.";
+
+/// Scheduling through the shell: `crontab`, `at`/`batch`, or a systemd timer.
+pub fn is_shell_schedule(command: &str) -> bool {
+    use std::sync::LazyLock;
+    static SCHEDULE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?x)
+            (^|[;&|(]|\$\(|`) \s* (sudo\s+(-\S+\s+)*)? (/\S*/)? (crontab|at|batch) (\s|$)
+            | \bsystemd-run\b [^;&|]* --on-(calendar|active|boot|unit-active)
+            | \bsystemctl\b [^;&|]* \b(enable|start)\b [^;&|]* \.timer\b",
+        )
+        .expect("valid regex")
+    });
+    SCHEDULE.is_match(command)
+}
+
 /// A downloaded script piped into a shell: `curl … | sh`, `wget -qO- … | sudo bash`,
 /// `bash <(curl …)`, `sh -c "$(curl …)"`. Packages come from package managers.
 pub fn is_piped_install(command: &str) -> bool {
@@ -260,6 +278,31 @@ mod tests {
             "echo $SHELL",
         ] {
             assert!(!is_piped_install(fine), "{fine}");
+        }
+    }
+
+    #[test]
+    fn spots_scheduling_through_the_shell() {
+        for scheduled in [
+            "crontab -l",
+            "(crontab -l; echo '0 8 * * * ~/x.sh') | crontab -",
+            "echo ~/backup.sh | at 09:00 tomorrow",
+            "sudo crontab -e",
+            "systemd-run --user --on-calendar='*-*-* 08:00' ~/x.sh",
+            "systemctl --user enable --now backup.timer",
+            "cd ~/work && /usr/bin/crontab jobs.txt",
+        ] {
+            assert!(is_shell_schedule(scheduled), "{scheduled}");
+        }
+        for fine in [
+            "grep -r 'at' src",
+            "cat crontab.md",
+            "echo look at this",
+            "git log --format='%h at %ad'",
+            "systemctl status nginx",
+            "batchelor --help",
+        ] {
+            assert!(!is_shell_schedule(fine), "{fine}");
         }
     }
 

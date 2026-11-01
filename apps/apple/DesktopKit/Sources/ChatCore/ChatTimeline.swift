@@ -14,6 +14,7 @@ public struct ChatTimeline: Sendable, Equatable {
     private var workIndex: [String: Int] = [:]  // task → index of its work item
     private var approvalIndex: [String: Int] = [:]
     private var actionIndex: [String: Int] = [:]
+    private var scheduleIndex: [Int: Int] = [:]  // schedule id → index of its note
     private var openRun: [String: Int] = [:]  // task → index of its command step still waiting for output
 
     public init() {}
@@ -22,7 +23,11 @@ public struct ChatTimeline: Sendable, Equatable {
     /// (their outcome is on the command's step).
     public var visibleItems: [ChatItem] {
         items.filter {
-            if case .approval(let approval) = $0, approval.browser == nil, approval.state != .pending { return false }
+            if case .approval(let approval) = $0, approval.browser == nil, approval.secret == nil,
+                approval.state != .pending
+            {
+                return false
+            }
             return true
         }
     }
@@ -39,7 +44,9 @@ public struct ChatTimeline: Sendable, Equatable {
         case "message":
             let text = data["text"]?.string ?? ""
             if data["role"]?.string == "user" {
-                items.append(.user(Message(id: event.seq, text: text)))
+                // A scheduled run's prompt, started by the desktop on its own.
+                let schedule = data["schedule"]?["name"]?.string
+                items.append(.user(Message(id: event.seq, text: text, schedule: schedule)))
             } else {
                 items.append(.assistant(Message(id: event.seq, text: text)))
             }
@@ -67,6 +74,7 @@ public struct ChatTimeline: Sendable, Equatable {
             var step = Work.Step(
                 id: event.seq, tool: "run_shell", detail: data["command"]?.string ?? "",
                 asRoot: data["as_root"]?.bool ?? false)
+            step.secrets = data["secrets"]?.array?.compactMap(\.string) ?? []
             step.run = ShellRun(state: data["needs_approval"]?.bool == true ? .waitingForApproval : .running)
             if let index = workIndex[task], case .work(let work) = items[index] {
                 openRun[task] = work.steps.count
@@ -84,7 +92,17 @@ public struct ChatTimeline: Sendable, Equatable {
             let id = data["id"]?.string ?? ""
             var approval = Approval(
                 id: id, seq: event.seq, command: data["command"]?.string ?? "", reason: data["reason"]?.string ?? "")
-            if data["kind"]?.string == "browser" {
+            if data["kind"]?.string == "secret" {
+                approval.secret = SecretRequest(
+                    name: data["name"]?.string ?? "", label: data["label"]?.string ?? "",
+                    why: data["why"]?.string ?? "", how: data["how"]?.string ?? "",
+                    url: data["url"]?.string.flatMap(URL.init(string:)), host: data["host"]?.string,
+                    replace: data["replace"]?.bool ?? false, tainted: data["tainted"]?.bool ?? false)
+            } else if data["kind"]?.string == "schedule" {
+                approval.schedule = ScheduleProposal(
+                    name: data["name"]?.string ?? "", prompt: data["text"]?.string ?? "",
+                    when: data["when"]?.string ?? "")
+            } else if data["kind"]?.string == "browser" {
                 approval.browser = BrowserAction(
                     action: data["action"]?.string ?? "", target: data["target"]?.string ?? "",
                     text: data["text"]?.string, key: data["key"]?.string, submit: data["submit"]?.bool ?? false,
@@ -96,7 +114,7 @@ public struct ChatTimeline: Sendable, Equatable {
             let id = data["id"]?.string ?? ""
             let approved = data["approved"]?.bool ?? false
             let isCommand = approvalIndex[id].map { index -> Bool in
-                if case .approval(let approval) = items[index] { return approval.browser == nil }
+                if case .approval(let approval) = items[index] { return approval.isCommand }
                 return false
             } ?? false
             if data["expired"]?.bool == true {
@@ -127,6 +145,29 @@ public struct ChatTimeline: Sendable, Equatable {
         case "image":
             if let path = data["url"]?.string {
                 items.append(.image(Picture(id: event.seq, path: path, caption: data["caption"]?.string)))
+            }
+        case "schedule.created":
+            guard let id = data["id"]?.int else { return }
+            scheduleIndex[id] = items.count
+            items.append(
+                .schedule(
+                    ScheduleNote(
+                        id: id, seq: event.seq, name: data["name"]?.string ?? "",
+                        when: data["description"]?.string ?? "", prompt: data["prompt"]?.string ?? "",
+                        nextRun: data["next_run"]?.double.map(Date.init(timeIntervalSince1970:)))))
+        case "schedule.deleted":
+            // Cancelled, or a one-time run that has run ("done").
+            guard let id = data["id"]?.int, data["done"]?.bool != true else { return }
+            update(schedule: id) { $0.cancelled = true }
+        case "secret.saved":
+            // Saved for a request that's still waiting: the desktop was busy.
+            let name = data["name"]?.string ?? ""
+            for index in items.indices {
+                guard case .approval(var approval) = items[index], approval.state == .pending,
+                    approval.secret?.name == name
+                else { continue }
+                approval.secret?.saved = true
+                items[index] = .approval(approval)
             }
         case "task.finished":
             busy = false
@@ -186,6 +227,12 @@ public struct ChatTimeline: Sendable, Equatable {
         items[index] = .approval(approval)
     }
 
+    private mutating func update(schedule id: Int, _ change: (inout ScheduleNote) -> Void) {
+        guard let index = scheduleIndex[id], case .schedule(var note) = items[index] else { return }
+        change(&note)
+        items[index] = .schedule(note)
+    }
+
     private mutating func update(action id: String, _ change: (inout Action) -> Void) {
         guard let index = actionIndex[id], case .action(var action) = items[index] else { return }
         change(&action)
@@ -200,6 +247,7 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
     case approval(Approval)
     case action(Action)
     case image(Picture)
+    case schedule(ScheduleNote)
 
     public var id: String {
         switch self {
@@ -209,6 +257,7 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
         case .approval(let a): "approval-\(a.id)"
         case .action(let a): "action-\(a.id)"
         case .image(let p): "image-\(p.id)"
+        case .schedule(let s): "schedule-\(s.seq)"
         }
     }
 }
@@ -216,6 +265,8 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
 public struct Message: Sendable, Equatable {
     public let id: Int
     public let text: String
+    /// For a scheduled run's prompt: the schedule's name.
+    public var schedule: String? = nil
 }
 
 /// One task's tool calls, collapsed under a single row.
@@ -225,6 +276,8 @@ public struct Work: Sendable, Equatable {
         public let tool: String
         public let detail: String
         public var asRoot = false
+        /// Saved keys the command got (by name).
+        public var secrets: [String] = []
         /// For a command: how it went, shown inside the step.
         public var run: ShellRun?
     }
@@ -275,6 +328,58 @@ public struct Approval: Sendable, Equatable {
     public var state: State = .pending
     /// Set when it's a browser action (typing, a key, a click) rather than a command.
     public var browser: BrowserAction?
+    /// Set when it's a schedule the agent wants to set up.
+    public var schedule: ScheduleProposal?
+    /// Set when the agent asks for a key or token.
+    public var secret: SecretRequest?
+
+    /// A shell command (shown in its step once answered).
+    public var isCommand: Bool { browser == nil && schedule == nil && secret == nil }
+}
+
+/// The agent asks for a key or token (a GitHub token, an API key): the user
+/// pastes it into a secure field, it's saved on the desktop, and the agent
+/// carries on knowing only its name.
+public struct SecretRequest: Sendable, Equatable {
+    /// The environment variable it becomes, e.g. GITHUB_TOKEN.
+    public let name: String
+    /// "GitHub token".
+    public let label: String
+    /// What the agent needs it for.
+    public let why: String
+    /// Markdown steps for creating it.
+    public let how: String
+    /// Where it's created, e.g. GitHub's new-token page.
+    public let url: URL?
+    /// That link's site, shown so a look-alike stands out.
+    public let host: String?
+    /// A new value for a key that's saved already (expired, rejected).
+    public let replace: Bool
+    /// Asked for after the agent read outside content.
+    public let tainted: Bool
+    /// Saved, but the task hasn't carried on yet (the desktop was busy).
+    public var saved = false
+}
+
+/// A schedule waiting for the user's OK: asked for after the agent read
+/// outside content, so it could come from that content.
+public struct ScheduleProposal: Sendable, Equatable {
+    public let name: String
+    public let prompt: String
+    /// "Weekdays at 08:00", or "Once, Mon Nov 2 at 09:00".
+    public let when: String
+}
+
+/// "Scheduled": the agent set up a task to run later or on a repeat.
+public struct ScheduleNote: Sendable, Equatable {
+    public let id: Int
+    public let seq: Int
+    public let name: String
+    public let when: String
+    public let prompt: String
+    public let nextRun: Date?
+    /// Cancelled since (in the app or by the agent).
+    public var cancelled = false
 }
 
 /// A change the agent wants to make in the desktop's browser.

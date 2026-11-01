@@ -8,7 +8,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use futures_util::Stream;
 use serde::Deserialize;
@@ -16,9 +16,10 @@ use serde_json::{Value, json};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::agent::{Agent, StartError};
+use crate::agent::{Agent, SecretError, StartError};
 use crate::clock::UserClock;
 use crate::llm::KNOWN_MODELS;
+use crate::schedule;
 
 type App = State<Arc<Agent>>;
 
@@ -37,6 +38,12 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/memory", get(memories))
         .route("/api/v1/memory/{id}", delete(forget_memory))
         .route("/api/v1/memory/{id}/confirm", post(confirm_memory))
+        .route("/api/v1/schedules", get(schedules))
+        .route("/api/v1/schedules/{id}", delete(delete_schedule))
+        .route("/api/v1/schedules/{id}/pause", post(pause_schedule))
+        .route("/api/v1/schedules/{id}/resume", post(resume_schedule))
+        .route("/api/v1/secrets", get(list_secrets))
+        .route("/api/v1/secrets/{name}", put(save_secret).delete(delete_secret))
         .with_state(agent)
 }
 
@@ -72,7 +79,12 @@ struct Limit {
 
 async fn messages(State(agent): App, Query(query): Query<Limit>) -> Response {
     match agent.store.history(query.limit.unwrap_or(50).clamp(1, 500)) {
-        Ok(history) => Json(json!({"messages": history})).into_response(),
+        Ok(mut history) => {
+            for entry in &mut history {
+                entry.text = agent.secrets.redact(&entry.text).into_owned();
+            }
+            Json(json!({"messages": history})).into_response()
+        }
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
@@ -154,7 +166,9 @@ async fn events(
         .unwrap_or_default();
     let last = backlog.last().map_or(query.after.unwrap_or(0), |e| e.seq);
     let live = live.filter_map(move |event| event.ok().filter(|e| e.seq > last));
-    let stream = tokio_stream::iter(backlog).chain(live).map(|event| {
+    // Older events may hold a key pasted into the chat before it was saved.
+    let stream = tokio_stream::iter(backlog).chain(live).map(move |mut event| {
+        agent.secrets.redact_json(&mut event.data);
         Ok(SseEvent::default()
             .id(event.seq.to_string())
             .event(event.kind.clone())
@@ -239,6 +253,116 @@ async fn confirm_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderM
             Json(json!({"ok": true})).into_response()
         }
         Ok(false) => error(StatusCode::NOT_FOUND, "no such memory"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+async fn schedules(State(agent): App) -> Response {
+    match agent.store.schedules() {
+        Ok(schedules) => {
+            let schedules: Vec<Value> = schedules.iter().map(schedule::json).collect();
+            Json(json!({"schedules": schedules})).into_response()
+        }
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+async fn delete_schedule(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
+    match agent.store.delete_schedule(id) {
+        Ok(true) => {
+            agent.emit("schedule.deleted", json!({"id": id, "by": caller(&headers)}));
+            Json(json!({"ok": true})).into_response()
+        }
+        Ok(false) => error(StatusCode::NOT_FOUND, "no such schedule"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+async fn pause_schedule(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
+    set_paused(&agent, id, true, &headers)
+}
+
+/// A resumed schedule picks up from now: runs it missed while paused are skipped.
+async fn resume_schedule(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
+    set_paused(&agent, id, false, &headers)
+}
+
+fn set_paused(agent: &Agent, id: i64, paused: bool, headers: &HeaderMap) -> Response {
+    let schedule = match agent.store.schedule(id) {
+        Ok(Some(schedule)) => schedule,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "no such schedule"),
+        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    };
+    let now = jiff::Timestamp::now();
+    let next_run = match (&schedule.cron, paused) {
+        (Some(cron), false) => schedule::next_run(cron, &schedule.timezone, now),
+        _ => None,
+    };
+    if !paused && schedule.cron.is_none() && schedule.next_run < now.as_second() {
+        return error(StatusCode::CONFLICT, "its time has passed");
+    }
+    match agent.store.set_schedule_paused(id, paused, next_run) {
+        Ok(true) => {
+            agent.schedules_changed.notify_one();
+            let updated = agent.store.schedule(id).ok().flatten();
+            let mut event = updated.as_ref().map_or_else(|| json!({"id": id}), schedule::json);
+            event["by"] = json!(caller(headers));
+            agent.emit("schedule.updated", event.clone());
+            Json(event).into_response()
+        }
+        Ok(false) => error(StatusCode::NOT_FOUND, "no such schedule"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// The saved keys, by name and label. Values never leave the desktop.
+async fn list_secrets(State(agent): App) -> Json<Value> {
+    Json(json!({"secrets": agent.secret_infos()}))
+}
+
+#[derive(Deserialize)]
+struct NewSecret {
+    value: String,
+    #[serde(default)]
+    label: Option<String>,
+    /// The request card it answers: that task resumes.
+    #[serde(default)]
+    approval: Option<String>,
+}
+
+/// Saves a key from the app (typed or pasted into a secure field). The body
+/// is never logged.
+async fn save_secret(
+    State(agent): App,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<NewSecret>,
+) -> Response {
+    let by = caller(&headers);
+    let info = match agent.save_secret(&name, &body.value, body.label.as_deref(), by.clone()) {
+        Ok(info) => info,
+        Err(SecretError::Invalid(problem)) => return error(StatusCode::BAD_REQUEST, &problem),
+        Err(SecretError::Failed(err)) => {
+            tracing::error!(%err, name, "couldn't save a key");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "couldn't save the key");
+        }
+    };
+    // Resumes the task that asked for it; the key stays saved either way.
+    let (resumed, busy) = match body.approval {
+        Some(id) => match agent.answer_secret_request(&id, &name, by) {
+            Ok(()) => (true, false),
+            Err(StartError::Busy) => (false, true),
+            Err(StartError::NotFound) => (false, false),
+        },
+        None => (false, false),
+    };
+    Json(json!({"secret": info, "resumed": resumed, "busy": busy})).into_response()
+}
+
+async fn delete_secret(State(agent): App, Path(name): Path<String>, headers: HeaderMap) -> Response {
+    match agent.delete_secret(&name, caller(&headers)) {
+        Ok(true) => Json(json!({"ok": true})).into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "no such key"),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }

@@ -15,6 +15,9 @@ struct ChatView: View {
     @State private var takeOver: TakeOverRequest?
     @State private var position = ScrollPosition(edge: .bottom)
     @State private var sent = 0
+    /// A key in the message about to be sent: offer to save it instead.
+    @State private var foundKey: KeyDetector.Found?
+    @State private var savingKey: SecretEditor.Target?
     @FocusState private var composing: Bool
     @Environment(PushCenter.self) private var push
 
@@ -65,6 +68,27 @@ struct ChatView: View {
                 VStack(spacing: 16) {
                     ProgressView("Reconnecting to Tailscale…")
                     Button("Close") { takeOver = nil }.buttonStyle(.glass)
+                }
+            }
+        }
+        .confirmationDialog(
+            "This looks like a \(foundKey?.label ?? "key")",
+            isPresented: Binding(get: { foundKey != nil }, set: { if !$0 { foundKey = nil } }),
+            titleVisibility: .visible, presenting: foundKey
+        ) { found in
+            Button("Save it on your desktop") { savingKey = .new(found) }
+            Button("Send it in the chat anyway", role: .destructive) { send(draft, checked: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("Messages go to the AI model and stay in the chat. A key saved on your desktop is given to commands by name, and the agent never sees it.")
+        }
+        .sheet(item: $savingKey) { target in
+            NavigationStack {
+                SecretEditor(client: client, target: target) { name in
+                    // The message keeps its meaning, without the key.
+                    if case .new(let found?) = target {
+                        draft = draft.replacingOccurrences(of: found.value, with: "$\(name)")
+                    }
                 }
             }
         }
@@ -155,9 +179,14 @@ struct ChatView: View {
         }
     }
 
-    private func send(_ text: String) {
+    /// `checked`: the user chose to send a message with a key in it.
+    private func send(_ text: String, checked: Bool = false) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        if !checked, let found = KeyDetector.find(in: text) {
+            foundKey = found
+            return
+        }
         draft = ""
         sent += 1
         withAnimation(.snappy) { position.scrollTo(edge: .bottom) }

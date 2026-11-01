@@ -3,10 +3,11 @@
 Always-on Linux desktops (XFCE + Google Chrome; x86_64 by default, `desktop_arch`) on AWS for AI agents.
 See [PLAN.MD](PLAN.MD) for the full design and milestones.
 
-**Current state: step 1.** One test desktop, configured by Ansible over SSM,
-runs Chrome on a virtual display. You can watch it through noVNC over an SSM
-port forward. No Packer, launch template, data volume, agent daemon or control
-plane yet.
+**Current state:** one test desktop, configured by Ansible over SSM, runs Chrome
+on a virtual display with **agentd** (the agent), an attested model gateway, a
+push relay, and an iPhone app that reaches the desktop over your tailnet. No
+Packer, launch template, data volume or control plane yet. The full picture is in
+[docs/architecture.md](docs/architecture.md).
 
 ## Prerequisites
 
@@ -83,10 +84,37 @@ the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
   `worker`, packages from nixpkgs-unstable through the egress proxy; uv, node,
   gh, jq and ripgrep preinstalled). `curl … | bash` is refused. **Skills**
   (`services/agentd/skills`, deployed to `/etc/agentd/skills`) are how-tos the
-  agent reads on demand: installing software, Python with uv, Node, git;
+  agent reads on demand: installing software, Python with uv, Node, git and
+  GitHub tokens, opencode with Together AI;
 - the agent **remembers** facts across conversations (`remember` / `forget`,
   shown in each task's instructions). Facts saved after it read outside content
   stay unverified until confirmed in the app's Settings → Memory;
+- the agent runs **scheduled tasks**: ask "every weekday at 8, summarize my
+  inbox" or "tomorrow at 9, check PR 12" and it calls `schedule_task` (a
+  five-field cron pattern or a one-time local time, in your time zone with
+  daylight saving; at most every 15 minutes, 25 schedules). agentd starts each
+  run itself as an ordinary task with just the saved prompt, so approvals still
+  apply, and the answer arrives as a notification titled with the schedule's
+  name. A run that's over an hour late (desktop off or busy) is skipped with a
+  note in the chat. Schedules set up after the agent read outside content need
+  your approval; the shell's crontab, `at` and systemd timers are refused.
+  Settings → Schedules lists them, with pause and cancel;
+- **keys and tokens** (a GitHub token, an API key) go to the desktop without
+  passing through the model or the chat. When a job needs one, the agent calls
+  `request_secret`: the app shows a card with why, how to create it (GitHub's
+  token page comes pre-filled) and a secure field with Paste. The value travels
+  over the tailnet to agentd, which keeps it in `/var/lib/agentd/secrets/NAME`
+  (mode 0600; names and labels in SQLite). A command gets a key only when it
+  names it (`$GITHUB_TOKEN`, or run_shell's `secrets`), through systemd
+  `LoadCredential`, never on a command line or in the unit's properties. agentd
+  replaces every saved value with `[secret NAME]` in tool results, the event
+  log, the chat history and notifications, so the model never sees one. The API
+  is write-only (`PUT`/`DELETE /api/v1/secrets/{name}`, `GET` lists names).
+  Settings → Keys & tokens adds, replaces and deletes keys, and a message that
+  looks like it holds a key (`ghp_…`, `sk-…`) offers to save it instead. Names
+  with PASSWORD are refused: sites are still signed in to in the browser.
+  `api.together.ai` and `api.together.xyz` are on the shell's allowlist for
+  tools that use a Together key;
 - a message takes **one approval**: approving what it types into a message
   field (Slack's "Message …", "Reply…") also lets it press Enter or Send right
   after;
@@ -105,6 +133,7 @@ the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
   addresses (the logged-in Chrome would hand over its profile or DevTools);
 - commands starting with `sudo`, risky ones, and (after the agent has read a web
   page or command output) ones that can send data out (`curl`, `scp`, `git push`,
+  `gh` commands that write such as `gh gist create` or `gh api`, `npm publish`,
   ...) wait for approval in the app; approvals record who answered;
 - a task waiting for approval parks: its state is saved in `/var/lib/agentd`,
   the desktop is free, and the answer resumes it, after a restart too (only if
@@ -207,6 +236,9 @@ make destroy               # dev env. The state bucket is protected (prevent_des
 
 ## Notes
 
+- [docs/architecture.md](docs/architecture.md): how everything that's built fits
+  together, in detail (AWS, the desktop VM, agentd, the gateway, the relay,
+  tailnet-proxy, the app, flows, security model, operations, known gaps).
 - Design docs: [PLAN.MD](PLAN.MD) (overall build plan) and
   [docs/agent-control.md](docs/agent-control.md) (how an agent controls a desktop:
   a model-agnostic runner with an optional Claude checker).

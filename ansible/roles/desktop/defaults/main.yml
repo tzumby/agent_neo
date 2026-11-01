@@ -40,6 +40,8 @@ desktop_packages:
   - fonts-noto-cjk
   - fonts-liberation2
   - python3-venv
+  # Time zones for agentd's scheduled tasks (daylight saving included).
+  - tzdata
 
 # Anything that could blank or lock the screen.
 desktop_removed_packages:

@@ -10,17 +10,22 @@ struct ChatRow: View, Equatable {
 
     var body: some View {
         switch item {
-        case .user(let message): UserBubble(text: message.text)
+        case .user(let message): UserBubble(text: message.text, schedule: message.schedule)
         case .assistant(let message): AssistantMessage(text: message.text)
         case .work(let work): WorkRow(work: work)
         case .approval(let approval):
-            if let action = approval.browser {
+            if let request = approval.secret {
+                SecretRequestCard(approval: approval, request: request)
+            } else if let proposal = approval.schedule {
+                ScheduleApprovalCard(approval: approval, proposal: proposal)
+            } else if let action = approval.browser {
                 BrowserApprovalCard(approval: approval, action: action)
             } else {
                 ApprovalCard(approval: approval)
             }
         case .action(let action): ActionCard(action: action)
         case .image(let picture): PictureRow(picture: picture)
+        case .schedule(let note): ScheduleCard(note: note)
         }
     }
 }
@@ -29,43 +34,37 @@ struct ChatRow: View, Equatable {
 
 private struct UserBubble: View {
     let text: String
+    /// Set when the desktop sent this itself: a scheduled task's run.
+    let schedule: String?
 
     var body: some View {
-        Text(text)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 11)
-            .background(Theme.userBubble, in: .rect(cornerRadius: 22))
-            .contextMenu {
-                Button("Copy", systemImage: "doc.on.doc") { UIPasteboard.general.string = text }
+        VStack(alignment: .trailing, spacing: 6) {
+            if let schedule {
+                Label("Scheduled · \(schedule)", systemImage: "clock")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, alignment: .trailing)
-            .padding(.leading, 56)
+            Text(text)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 11)
+                .background(Theme.userBubble, in: .rect(cornerRadius: 22))
+                .contextMenu {
+                    Button("Copy", systemImage: "doc.on.doc") { UIPasteboard.general.string = text }
+                }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.leading, 56)
     }
 }
 
-/// The agent's answer: plain text on the background, as in Grok, with code
-/// blocks as cards.
+/// The agent's answer: Markdown on the background, as in Grok, with code
+/// blocks and tables as cards.
 private struct AssistantMessage: View {
     let text: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ForEach(Array(MarkdownText.blocks(text).enumerated()), id: \.offset) { _, block in
-                switch block {
-                case .text(let attributed):
-                    // No .textSelection here: selectable text skips custom renderers
-                    // (no code chips). Long-press copies instead; code blocks stay selectable.
-                    MarkdownText.text(attributed)
-                        .lineSpacing(3)
-                        .textRenderer(CodeChipRenderer())
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contextMenu {
-                            Button("Copy", systemImage: "doc.on.doc") { UIPasteboard.general.string = text }
-                        }
-                case .code(let language, let code):
-                    CodeBlock(language: language, code: code)
-                }
-            }
+            MarkdownView(text: text)
             CopyButton(text: text).font(.footnote)
         }
     }
@@ -94,152 +93,6 @@ struct CopyButton: View {
         .foregroundStyle(.secondary)
         .accessibilityLabel("Copy")
         .sensoryFeedback(.success, trigger: copied) { _, new in new }
-    }
-}
-
-/// Markdown the way chat answers use it: fenced code blocks become blocks;
-/// the rest is inline Markdown (bold, italics, links, `code` as a chip) with
-/// line breaks kept, headings as bold lines and "-" bullets as "•".
-enum MarkdownText {
-    enum Block {
-        case text(AttributedString)
-        case code(language: String?, code: String)
-    }
-
-    static func blocks(_ text: String) -> [Block] {
-        var blocks: [Block] = []
-        var prose: [Substring] = []
-        var code: [Substring]?
-        var language: String?
-
-        func flushProse() {
-            let joined = prose.joined(separator: "\n").trimmingCharacters(in: .newlines)
-            if !joined.isEmpty { blocks.append(.text(inline(joined))) }
-            prose = []
-        }
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("```") {
-                if let lines = code {
-                    blocks.append(.code(language: language, code: lines.joined(separator: "\n")))
-                    code = nil
-                } else {
-                    flushProse()
-                    let tag = trimmed.dropFirst(3).trimmingCharacters(in: .whitespaces)
-                    language = tag.isEmpty ? nil : tag
-                    code = []
-                }
-            } else if code != nil {
-                code?.append(line)
-            } else {
-                prose.append(line)
-            }
-        }
-        if let lines = code { blocks.append(.code(language: language, code: lines.joined(separator: "\n"))) }
-        flushProse()
-        return blocks
-    }
-
-    private static func inline(_ text: String) -> AttributedString {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
-            let trimmed = line.drop { $0 == " " }
-            if let hashes = trimmed.firstIndex(of: " "), trimmed[..<hashes].allSatisfy({ $0 == "#" }),
-                !trimmed[..<hashes].isEmpty
-            {
-                return "**\(trimmed[trimmed.index(after: hashes)...])**"
-            }
-            if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
-                let indent = String(repeating: " ", count: line.count - trimmed.count)
-                return indent + "• " + trimmed.dropFirst(2)
-            }
-            return String(line)
-        }
-        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        return (try? AttributedString(markdown: lines.joined(separator: "\n"), options: options))
-            ?? AttributedString(text)
-    }
-
-    /// The text with each `code` span as a monospaced run marked for
-    /// `CodeChipRenderer`, which draws a rounded chip behind it.
-    static func text(_ attributed: AttributedString) -> Text {
-        var result = Text(verbatim: "")
-        var prose = AttributedString()
-        for run in attributed.runs {
-            let piece = AttributedString(attributed[run.range])
-            guard run.inlinePresentationIntent?.contains(.code) == true else {
-                prose.append(piece)
-                continue
-            }
-            // Thin spaces give the chip a little room on each side.
-            var code = AttributedString("\u{2009}\(String(piece.characters))\u{2009}")
-            code.font = .system(.callout, design: .monospaced)
-            code.foregroundColor = Color(white: 0.95)
-            result = Text("\(result)\(Text(prose))\(Text(code).customAttribute(InlineCode()))")
-            prose = AttributedString()
-        }
-        return Text("\(result)\(Text(prose))")
-    }
-}
-
-/// Marks inline code in a `Text` for `CodeChipRenderer`.
-struct InlineCode: TextAttribute {}
-
-/// Draws a rounded chip behind runs marked `InlineCode`.
-struct CodeChipRenderer: TextRenderer {
-    var displayPadding: EdgeInsets { EdgeInsets(top: 2, leading: 2, bottom: 2, trailing: 2) }
-
-    func draw(layout: Text.Layout, in context: inout GraphicsContext) {
-        for line in layout {
-            // One code span can be several runs (the padding spaces may use
-            // another font), so neighbouring code runs share one chip.
-            var chips: [CGRect] = []
-            var open: CGRect?
-            for run in line {
-                if run[InlineCode.self] != nil {
-                    open = open?.union(run.typographicBounds.rect) ?? run.typographicBounds.rect
-                } else if let chip = open {
-                    chips.append(chip)
-                    open = nil
-                }
-            }
-            if let chip = open { chips.append(chip) }
-            for chip in chips {
-                context.fill(
-                    Path(roundedRect: chip.insetBy(dx: 0, dy: -1.5), cornerRadius: 6),
-                    with: .color(.white.opacity(0.12)))
-            }
-            for run in line { context.draw(run) }
-        }
-    }
-}
-
-/// A fenced code block: language, copy, and code that scrolls sideways.
-private struct CodeBlock: View {
-    let language: String?
-    let code: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(language ?? "code").font(.caption.weight(.semibold))
-                Spacer()
-                CopyButton(text: code).font(.caption)
-            }
-            .foregroundStyle(.secondary)
-            .padding(.leading, 12)
-            .padding(.trailing, 4)
-            .padding(.vertical, 2)
-            Rectangle().fill(Theme.hairline).frame(height: 0.5)
-            ScrollView(.horizontal) {
-                Text(code)
-                    .font(.system(.footnote, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(12)
-            }
-            .scrollIndicators(.hidden)
-        }
-        .background(Theme.inset, in: .rect(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Theme.hairline, lineWidth: 0.5))
     }
 }
 
@@ -346,6 +199,12 @@ private struct StepRow: View {
                             .padding(.vertical, 2)
                             .background(.orange.opacity(0.15), in: .capsule)
                     }
+                    if !step.secrets.isEmpty {
+                        Image(systemName: "key.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.yellow)
+                            .accessibilityLabel("Uses \(step.secrets.joined(separator: ", "))")
+                    }
                     Spacer(minLength: 4)
                     if let run = step.run {
                         RunStatus(run: run)
@@ -442,6 +301,10 @@ enum StepText {
         case "remember": argument("text", in: step.detail).map { "Remembering “\($0)”" } ?? "Remembering"
         case "forget": "Forgetting something"
         case "read_skill": argument("name", in: step.detail).map { "Reading the \($0) how-to" } ?? "Reading a how-to"
+        case "schedule_task": argument("name", in: step.detail).map { "Scheduling “\($0)”" } ?? "Scheduling a task"
+        case "list_schedules": "Checking the schedules"
+        case "cancel_schedule": "Cancelling a schedule"
+        case "request_secret": argument("label", in: step.detail).map { "Asking for your \($0)" } ?? "Asking for a key"
         default: step.tool
         }
     }
@@ -460,6 +323,8 @@ enum StepText {
         case "needs_user": "hand.raised"
         case "remember", "forget": "brain"
         case "read_skill": "book"
+        case "schedule_task", "list_schedules", "cancel_schedule": "calendar.badge.clock"
+        case "request_secret": "key"
         default: "gearshape"
         }
     }
@@ -681,6 +546,200 @@ private struct Outcome: View {
 
     var body: some View {
         Label(text, systemImage: icon).font(.subheadline.weight(.medium)).foregroundStyle(color)
+    }
+}
+
+// MARK: - Schedules
+
+/// "Scheduled": a task the agent set up to run later or on a repeat.
+private struct ScheduleCard: View {
+    let note: ScheduleNote
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label {
+                Text(note.cancelled ? "Schedule cancelled" : "Scheduled").font(.subheadline.weight(.semibold))
+            } icon: {
+                Image(systemName: note.cancelled ? "calendar.badge.minus" : "calendar.badge.clock")
+                    .foregroundStyle(note.cancelled ? Color.secondary : Color.blue)
+            }
+            Text(note.name).font(.headline)
+            Text(note.when).font(.subheadline)
+            if !note.cancelled, let next = note.nextRun {
+                Text("Next: \(next.formatted(.dateTime.weekday().month().day().hour().minute()))")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Text(note.prompt).font(.footnote).foregroundStyle(.secondary).lineLimit(3)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .opacity(note.cancelled ? 0.6 : 1)
+        .card()
+    }
+}
+
+/// "Schedule this?": asked for after the agent read a page, an email or
+/// command output, so the request could come from that content.
+private struct ScheduleApprovalCard: View {
+    let approval: Approval
+    let proposal: ScheduleProposal
+    @Environment(\.chatStore) private var store
+    @Environment(\.agentClient) private var client
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label {
+                Text("Schedule this?").font(.headline)
+            } icon: {
+                Image(systemName: "calendar.badge.exclamationmark").foregroundStyle(.orange)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(proposal.name).font(.subheadline.weight(.semibold))
+                Text(proposal.when).font(.subheadline)
+                Text(proposal.prompt)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(8)
+                    .textSelection(.enabled)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.inset, in: .rect(cornerRadius: 14))
+            Text("The agent asked for this after reading outside content. Approve only if you asked for it.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            if approval.state == .pending {
+                HStack(spacing: 10) {
+                    Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
+                        .buttonStyle(.glass)
+                    Button { answer(true) } label: {
+                        Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    }
+                    .primaryGlass()
+                }
+                .controlSize(.large)
+            }
+        }
+        .card()
+    }
+
+    private func answer(_ approved: Bool) {
+        guard let store, let client else { return }
+        Task { await store.answer(approval, approved: approved, client: client) }
+    }
+}
+
+// MARK: - Keys and tokens
+
+/// The agent asks for a key or token: why, how to create it, a link, and a
+/// secure field. The value goes to the desktop over the tailnet; the chat and
+/// the model only ever see its name.
+private struct SecretRequestCard: View {
+    let approval: Approval
+    let request: SecretRequest
+    @Environment(\.chatStore) private var store
+    @Environment(\.agentClient) private var client
+    @State private var value = ""
+    @State private var pasted = false
+    @State private var saving = false
+
+    private var ready: Bool { value.trimmingCharacters(in: .whitespacesAndNewlines).count >= 8 && !saving }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label {
+                Text(request.replace ? "A new \(request.label)" : request.label).font(.headline)
+            } icon: {
+                Image(systemName: "key.fill").foregroundStyle(.yellow)
+            }
+            if !request.why.isEmpty {
+                Text(request.why)
+            }
+            switch approval.state {
+            case .pending where request.saved:
+                // Saved while the desktop was busy: carry on when it's free.
+                HStack {
+                    Outcome(text: "Saved on your desktop", icon: "lock.fill", color: .green)
+                    Spacer()
+                    Button("Continue") { answer(true) }.buttonStyle(.glass)
+                }
+            case .pending:
+                form
+            case .approved: Outcome(text: "Saved on your desktop", icon: "lock.fill", color: .green)
+            case .denied: Outcome(text: "Not given", icon: "xmark.circle.fill", color: .secondary)
+            case .expired: Outcome(text: "Expired", icon: "clock", color: .secondary)
+            }
+        }
+        .card()
+        .sensoryFeedback(.success, trigger: approval.state) { _, new in new == .approved }
+    }
+
+    @ViewBuilder private var form: some View {
+        if !request.how.isEmpty {
+            MarkdownView(text: request.how)
+                .font(.subheadline)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.inset, in: .rect(cornerRadius: 14))
+        }
+        if let url = request.url {
+            Link(destination: url) {
+                Label("Open \(request.host ?? url.host() ?? "the page")", systemImage: "arrow.up.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glass)
+            .controlSize(.large)
+        }
+        KeyField(prompt: "Paste your \(request.label)", value: $value, pasted: $pasted)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Theme.inset, in: .rect(cornerRadius: 14))
+        HStack(spacing: 10) {
+            Button { answer(false) } label: { Text("Not now").frame(maxWidth: .infinity) }
+                .buttonStyle(.glass)
+            Button { save() } label: {
+                Group {
+                    if saving { ProgressView().tint(.black) } else { Text("Save") }
+                }
+                .foregroundStyle(.black)
+                .frame(maxWidth: .infinity)
+            }
+            .primaryGlass()
+            .disabled(!ready)
+        }
+        .controlSize(.large)
+        Label(
+            "Kept only on your desktop. The agent uses it by name and never sees it.",
+            systemImage: "lock.fill"
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        if request.tainted {
+            Label(
+                "Asked for after the agent read a page or command output. Only go on if you asked for something that needs this key.",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.orange)
+        }
+    }
+
+    private func save() {
+        guard let store, let client else { return }
+        saving = true
+        Task {
+            if await store.save(secret: value, for: approval, client: client) {
+                value = ""
+                // The clipboard still holds the key: clear it (writing needs no permission).
+                if pasted { UIPasteboard.general.items = [] }
+            }
+            saving = false
+        }
+    }
+
+    private func answer(_ approved: Bool) {
+        guard let store, let client else { return }
+        Task { await store.answer(approval, approved: approved, client: client) }
     }
 }
 

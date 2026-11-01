@@ -1,5 +1,7 @@
 //! SQLite state: the event log the apps stream, the chat history the model
-//! sees, runs (tasks) and what they wait on, the agent's memory, and settings.
+//! sees, runs (tasks) and what they wait on, the agent's memory, schedules,
+//! the saved keys' names and labels (their values are files: secrets.rs), and
+//! settings.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -37,6 +39,35 @@ pub struct Memory {
     pub text: String,
     pub trusted: bool,
     pub created: String,
+}
+
+/// A task the agent starts on its own: repeating (`cron`, in `timezone`) or
+/// once, at `next_run` (unix seconds).
+#[derive(Clone, Debug, Serialize)]
+pub struct Schedule {
+    pub id: i64,
+    pub name: String,
+    pub prompt: String,
+    pub cron: Option<String>,
+    pub timezone: String,
+    pub next_run: i64,
+    pub last_run: Option<i64>,
+    pub paused: bool,
+    pub created: String,
+}
+
+const SCHEDULE_COLUMNS: &str = "id, name, prompt, cron, timezone, next_run, last_run, paused, created";
+
+/// A saved key, as the apps list it: never its value.
+#[derive(Clone, Debug, Serialize)]
+pub struct SecretInfo {
+    /// The environment variable commands get it as, e.g. GITHUB_TOKEN.
+    pub name: String,
+    /// What it is, for people: "GitHub token".
+    pub label: String,
+    pub created: String,
+    pub updated: String,
+    pub last_used: Option<String>,
 }
 
 /// Something the user is asked: an approval a parked task waits on (with the
@@ -93,7 +124,25 @@ impl Store {
                  agent TEXT NOT NULL DEFAULT 'main',
                  text TEXT NOT NULL,
                  trusted INTEGER NOT NULL,
-                 created TEXT NOT NULL DEFAULT ({NOW}));"
+                 created TEXT NOT NULL DEFAULT ({NOW}));
+             CREATE TABLE IF NOT EXISTS schedules (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 agent TEXT NOT NULL DEFAULT 'main',
+                 name TEXT NOT NULL,
+                 prompt TEXT NOT NULL,
+                 cron TEXT,
+                 timezone TEXT NOT NULL,
+                 next_run INTEGER NOT NULL,
+                 last_run INTEGER,
+                 paused INTEGER NOT NULL DEFAULT 0,
+                 created TEXT NOT NULL DEFAULT ({NOW}));
+             CREATE TABLE IF NOT EXISTS secrets (
+                 name TEXT PRIMARY KEY,
+                 agent TEXT NOT NULL DEFAULT 'main',
+                 label TEXT NOT NULL,
+                 created TEXT NOT NULL DEFAULT ({NOW}),
+                 updated TEXT NOT NULL DEFAULT ({NOW}),
+                 last_used TEXT);"
         ))?;
         migrate(&conn)?;
         Ok(Self {
@@ -181,6 +230,126 @@ impl Store {
         Ok(conn.execute("UPDATE memory SET trusted = 1 WHERE id = ?1", params![id])? > 0)
     }
 
+    // --- Schedules ----------------------------------------------------------------
+
+    pub fn add_schedule(
+        &self,
+        name: &str,
+        prompt: &str,
+        cron: Option<&str>,
+        timezone: &str,
+        next_run: i64,
+    ) -> Result<Schedule> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            &format!(
+                "INSERT INTO schedules (name, prompt, cron, timezone, next_run) VALUES (?1, ?2, ?3, ?4, ?5)
+                 RETURNING {SCHEDULE_COLUMNS}"
+            ),
+            params![name, prompt, cron, timezone, next_run],
+            schedule_row,
+        )?)
+    }
+
+    pub fn schedules(&self) -> Result<Vec<Schedule>> {
+        self.schedules_where("1 = 1 ORDER BY id", params![])
+    }
+
+    pub fn schedule(&self, id: i64) -> Result<Option<Schedule>> {
+        Ok(self.schedules_where("id = ?1", params![id])?.pop())
+    }
+
+    /// Schedules whose run is due, oldest first (paused ones aren't).
+    pub fn due_schedules(&self, now: i64) -> Result<Vec<Schedule>> {
+        self.schedules_where("paused = 0 AND next_run <= ?1 ORDER BY next_run", params![now])
+    }
+
+    /// When the next run is due.
+    pub fn next_due(&self) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT MIN(next_run) FROM schedules WHERE paused = 0",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// A run started (`ran`) or was skipped; `next_run` is the one after.
+    pub fn schedule_ran(&self, id: i64, ran: Option<i64>, next_run: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE schedules SET next_run = ?2, last_run = COALESCE(?3, last_run) WHERE id = ?1",
+            params![id, next_run, ran],
+        )?;
+        Ok(())
+    }
+
+    /// Pauses or resumes; a resumed schedule runs next at `next_run`.
+    pub fn set_schedule_paused(&self, id: i64, paused: bool, next_run: Option<i64>) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE schedules SET paused = ?2, next_run = COALESCE(?3, next_run) WHERE id = ?1",
+            params![id, paused, next_run],
+        )? > 0)
+    }
+
+    pub fn delete_schedule(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM schedules WHERE id = ?1", params![id])? > 0)
+    }
+
+    fn schedules_where(&self, condition: &str, args: impl rusqlite::Params) -> Result<Vec<Schedule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE {condition}"
+        ))?;
+        let rows = stmt.query_map(args, schedule_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // --- Saved keys (names and labels; the values are files) -----------------------
+
+    /// Records a key saved or replaced; a replacement keeps its first date.
+    pub fn save_secret(&self, name: &str, label: &str) -> Result<SecretInfo> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO secrets (name, label) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET label = excluded.label, updated = {NOW}"
+            ),
+            params![name, label],
+        )?;
+        Ok(conn.query_row(
+            "SELECT name, label, created, updated, last_used FROM secrets WHERE name = ?1",
+            params![name],
+            secret_row,
+        )?)
+    }
+
+    pub fn secrets(&self) -> Result<Vec<SecretInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT name, label, created, updated, last_used FROM secrets ORDER BY name")?;
+        let rows = stmt.query_map([], secret_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_secret(&self, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM secrets WHERE name = ?1", params![name])? > 0)
+    }
+
+    pub fn secrets_used(&self, names: &[String]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        for name in names {
+            conn.execute(
+                &format!("UPDATE secrets SET last_used = {NOW} WHERE name = ?1"),
+                params![name],
+            )?;
+        }
+        Ok(())
+    }
+
     // --- What the user is asked ---------------------------------------------------
 
     /// Parks a run on an approval: the card the user sees and the run's state.
@@ -198,7 +367,8 @@ impl Store {
         self.pending_where("kind = 'approval' AND id = ?1", Some(id))
     }
 
-    /// Any parked approval (there is at most one: one task at a time).
+    /// The latest parked approval. There can be more than one: a scheduled run
+    /// may park while the user's task waits on an approval.
     pub fn any_parked(&self) -> Result<Option<Pending>> {
         self.pending_where("kind = 'approval'", None)
     }
@@ -327,6 +497,30 @@ impl Store {
     }
 }
 
+fn schedule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
+    Ok(Schedule {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        prompt: row.get(2)?,
+        cron: row.get(3)?,
+        timezone: row.get(4)?,
+        next_run: row.get(5)?,
+        last_run: row.get(6)?,
+        paused: row.get(7)?,
+        created: row.get(8)?,
+    })
+}
+
+fn secret_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretInfo> {
+    Ok(SecretInfo {
+        name: row.get(0)?,
+        label: row.get(1)?,
+        created: row.get(2)?,
+        updated: row.get(3)?,
+        last_used: row.get(4)?,
+    })
+}
+
 fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
     Ok(Memory {
         id: row.get(0)?,
@@ -405,6 +599,40 @@ mod tests {
     }
 
     #[test]
+    fn schedules_come_due_move_on_and_pause() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let daily = store
+            .add_schedule(
+                "Digest",
+                "Summarize my inbox",
+                Some("0 8 * * *"),
+                "America/Toronto",
+                1_000,
+            )
+            .unwrap();
+        let once = store
+            .add_schedule("Check PR", "Check PR 12", None, "America/Toronto", 2_000)
+            .unwrap();
+        assert_eq!((daily.cron.as_deref(), daily.paused), (Some("0 8 * * *"), false));
+        assert_eq!(store.next_due().unwrap(), Some(1_000));
+        assert!(store.due_schedules(999).unwrap().is_empty());
+        let due: Vec<i64> = store.due_schedules(5_000).unwrap().iter().map(|s| s.id).collect();
+        assert_eq!(due, [daily.id, once.id]); // oldest first
+        store.schedule_ran(daily.id, Some(1_001), 90_000).unwrap();
+        let moved = store.schedule(daily.id).unwrap().unwrap();
+        assert_eq!((moved.next_run, moved.last_run), (90_000, Some(1_001)));
+        // Skipped (not run): last_run stays.
+        store.schedule_ran(daily.id, None, 180_000).unwrap();
+        assert_eq!(store.schedule(daily.id).unwrap().unwrap().last_run, Some(1_001));
+        assert!(store.set_schedule_paused(once.id, true, None).unwrap());
+        assert!(store.due_schedules(5_000).unwrap().is_empty());
+        assert_eq!(store.next_due().unwrap(), Some(180_000));
+        assert!(store.delete_schedule(once.id).unwrap());
+        assert!(!store.delete_schedule(once.id).unwrap());
+        assert_eq!(store.schedules().unwrap().len(), 1);
+    }
+
+    #[test]
     fn remembers_forgets_and_confirms() {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let a = store.remember("The user's manager is Lawrence", true).unwrap();
@@ -426,6 +654,24 @@ mod tests {
         assert!(store.forget(a.id).unwrap());
         assert!(!store.forget(a.id).unwrap());
         assert_eq!(store.memories(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn saved_keys_keep_their_first_date_and_record_use() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let first = store.save_secret("GITHUB_TOKEN", "GitHub token").unwrap();
+        assert_eq!(first.last_used, None);
+        let replaced = store.save_secret("GITHUB_TOKEN", "GitHub token (acme)").unwrap();
+        assert_eq!(
+            (replaced.label.as_str(), &replaced.created),
+            ("GitHub token (acme)", &first.created)
+        );
+        store.secrets_used(&["GITHUB_TOKEN".into()]).unwrap();
+        let listed = store.secrets().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].last_used.is_some());
+        assert!(store.delete_secret("GITHUB_TOKEN").unwrap());
+        assert!(!store.delete_secret("GITHUB_TOKEN").unwrap());
     }
 
     #[test]

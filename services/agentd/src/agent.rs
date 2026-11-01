@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Notify, broadcast, watch};
 
 use crate::browser::Browser;
 use crate::cdp::Cdp;
@@ -22,15 +22,20 @@ use crate::llm::{self, Together, Usage, truncate};
 use crate::policy::Gate;
 use crate::policy::Policy;
 use crate::push::{self, Push, Relay};
-use crate::shell::{Shell, split_sudo};
+use crate::schedule;
+use crate::secrets::{self, Secrets};
+use crate::shell::{KeyFile, Shell, split_sudo};
 use crate::skills::Skills;
-use crate::store::{Event, Pending, Store};
+use crate::store::{Event, Pending, Schedule, SecretInfo, Store};
 use crate::tools;
 
 const HISTORY_LIMIT: i64 = 20;
 /// Memories shown to the model at the start of each task (the latest ones).
 const MEMORY_LIMIT: i64 = 60;
 const MEMORY_MAX_CHARS: usize = 500;
+const SCHEDULE_PROMPT_MAX_CHARS: usize = 2000;
+const SCHEDULE_NAME_MAX_CHARS: usize = 60;
+const SECRET_LABEL_MAX_CHARS: usize = 60;
 /// An approval answered later than this doesn't resume its task: the context
 /// is stale.
 const APPROVAL_TTL_SECS: i64 = 24 * 3600;
@@ -48,6 +53,13 @@ pub struct Settings {
 pub enum StartError {
     Busy,
     NotFound,
+}
+
+/// Why a key from the app wasn't saved.
+pub enum SecretError {
+    /// Bad name or value, or too many keys: tell the user.
+    Invalid(String),
+    Failed(anyhow::Error),
 }
 
 /// A task's state between model turns: all it needs to carry on after parking
@@ -75,6 +87,9 @@ struct RunState {
     /// second approval.
     #[serde(default)]
     armed: Option<ArmedSend>,
+    /// The schedule's name, when the task is a scheduled run.
+    #[serde(default)]
+    scheduled: Option<String>,
 }
 
 /// The user approved what the agent typed into a message field (Slack's
@@ -139,6 +154,11 @@ pub struct Agent {
     cancel: watch::Sender<bool>,
     /// Push notifications through the relay; None when it isn't configured.
     pub push: Option<Arc<Relay>>,
+    /// Wakes the scheduler when schedules are added or resumed.
+    pub schedules_changed: Notify,
+    /// Keys and tokens the user saved; their values are redacted from
+    /// everything the model, the apps and notifications see.
+    pub secrets: Secrets,
 }
 
 fn short_id() -> String {
@@ -155,7 +175,8 @@ fn unix_now() -> i64 {
 /// user approved: same kind, element, text, key, site or command.
 fn same_request(approved: &Value, now: &Value) -> bool {
     [
-        "kind", "action", "role", "target", "text", "key", "submit", "site", "command",
+        "kind", "action", "role", "target", "text", "key", "submit", "site", "command", "when", "name",
+        "secrets",
     ]
     .iter()
     .all(|key| approved[key] == now[key])
@@ -170,8 +191,10 @@ impl Agent {
         if push.is_some() {
             tracing::info!("push notifications on (relay)");
         }
+        let secrets = Secrets::open(&cfg.state_dir.join("secrets")).context("opening the saved keys")?;
         let agent = Self {
             push,
+            secrets,
             llm: Together::new(&cfg)?,
             cdp: Cdp::new(&cfg.cdp_url)?,
             shell: Shell {
@@ -188,6 +211,7 @@ impl Agent {
             bus,
             busy: AtomicBool::new(false),
             cancel: watch::channel(false).0,
+            schedules_changed: Notify::new(),
             cfg,
         };
         agent.recover();
@@ -214,6 +238,8 @@ impl Agent {
         if let Some(object) = data.as_object_mut() {
             object.entry("agent").or_insert_with(|| json!("main"));
         }
+        // No saved key's value reaches the log or the apps.
+        self.secrets.redact_json(&mut data);
         match self.store.append_event(kind, &data) {
             Ok(event) => {
                 let _ = self.bus.send(event);
@@ -257,19 +283,52 @@ impl Agent {
         if self.busy.swap(true, Ordering::SeqCst) {
             return Err(StartError::Busy);
         }
-        // A new request replaces a task that's waiting for an approval.
-        if let Ok(Some(parked)) = self.store.any_parked() {
-            self.abandon(
-                parked,
-                "I stopped waiting for your approval because you sent a new message.",
-            );
+        // A new request replaces tasks waiting for an approval.
+        self.abandon_parked("I stopped waiting for your approval because you sent a new message.");
+        self.cancel.send_replace(false);
+        let task_id = short_id();
+        let agent = self.clone();
+        let id = task_id.clone();
+        tokio::spawn(async move { agent.run(id, text, by, None).await });
+        Ok(task_id)
+    }
+
+    /// Starts a schedule's run. Unlike a message from the user, it leaves a task
+    /// that's waiting for an approval alone: the user may still answer it.
+    pub fn start_scheduled(self: &Arc<Self>, schedule: &Schedule) -> Result<String, StartError> {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return Err(StartError::Busy);
         }
         self.cancel.send_replace(false);
         let task_id = short_id();
         let agent = self.clone();
         let id = task_id.clone();
-        tokio::spawn(async move { agent.run(id, text, by).await });
+        let schedule = schedule.clone();
+        tokio::spawn(async move {
+            let prompt = schedule.prompt.clone();
+            agent.run(id, prompt, None, Some(schedule)).await
+        });
         Ok(task_id)
+    }
+
+    /// A note from the agent in the chat, outside any task.
+    pub fn say(&self, text: &str) {
+        let _ = self.store.add_history("assistant", text);
+        self.emit("message", json!({"role": "assistant", "text": text}));
+    }
+
+    /// Gives up on every task waiting for an approval.
+    fn abandon_parked(&self, answer: &str) -> bool {
+        let mut any = false;
+        // Bounded: abandon() removes each one (unless answered meanwhile).
+        for _ in 0..16 {
+            let Ok(Some(parked)) = self.store.any_parked() else {
+                break;
+            };
+            self.abandon(parked, answer);
+            any = true;
+        }
+        any
     }
 
     pub fn stop(&self) -> bool {
@@ -281,13 +340,7 @@ impl Agent {
             return true;
         }
         // Waiting for an approval: stopping it means giving up on it.
-        let stopped = match self.store.any_parked() {
-            Ok(Some(parked)) => {
-                self.abandon(parked, "Stopped.");
-                true
-            }
-            _ => false,
-        };
+        let stopped = self.abandon_parked("Stopped.");
         self.busy.store(false, Ordering::SeqCst);
         stopped
     }
@@ -425,29 +478,61 @@ impl Agent {
 
     // --- A task ------------------------------------------------------------------
 
-    async fn run(self: Arc<Self>, task_id: String, text: String, by: Option<String>) {
+    async fn run(
+        self: Arc<Self>,
+        task_id: String,
+        text: String,
+        by: Option<String>,
+        scheduled: Option<Schedule>,
+    ) {
         let settings = self.settings();
-        let history = self.store.history(HISTORY_LIMIT).unwrap_or_default();
-        if let Err(err) = self.store.add_history("user", &text) {
+        // A key the user pasted into the chat after all: the model sees its name only.
+        let text = self.secrets.redact(&text).into_owned();
+        // A scheduled run stands on its own: its prompt, without the chat.
+        let history = match scheduled {
+            Some(_) => Vec::new(),
+            None => self.store.history(HISTORY_LIMIT).unwrap_or_default(),
+        };
+        let (for_history, for_model) = match &scheduled {
+            Some(schedule) => (
+                format!("[Scheduled task “{}”] {text}", schedule.name),
+                format!(
+                    "(agentd) This is the scheduled task “{}” the user set up earlier ({}). They aren't \
+                     watching, so do it and end with a short report they can read in a notification.\n\n{text}",
+                    schedule.name,
+                    schedule::describe(schedule.cron.as_deref(), schedule.next_run, &schedule.timezone),
+                ),
+            ),
+            None => (text.clone(), text.clone()),
+        };
+        if let Err(err) = self.store.add_history("user", &for_history) {
             tracing::error!(%err, "couldn't store the message");
         }
+        let by_label = by
+            .clone()
+            .or_else(|| scheduled.as_ref().map(|_| "schedule".to_string()));
         if let Err(err) = self
             .store
-            .start_run(&task_id, &text, by.as_deref(), &settings.model)
+            .start_run(&task_id, &text, by_label.as_deref(), &settings.model)
         {
             tracing::error!(%err, "couldn't store the run");
         }
+        let schedule_info = scheduled.as_ref().map(|s| json!({"id": s.id, "name": s.name}));
         self.emit(
             "message",
-            json!({"role": "user", "text": text, "task": task_id, "by": by}),
+            json!({"role": "user", "text": text, "task": task_id, "by": by, "schedule": schedule_info}),
         );
         self.emit("task.started", json!({"task": task_id, "model": settings.model}));
-        tracing::info!(task = %task_id, model = %settings.model, by = ?by, "task started");
+        tracing::info!(task = %task_id, model = %settings.model, by = ?by_label, "task started");
 
         // The system prompt is written at each (re)start of the loop.
         let mut messages = vec![json!({"role": "system", "content": ""})];
-        messages.extend(history.iter().map(|h| json!({"role": h.role, "content": h.text})));
-        messages.push(json!({"role": "user", "content": text}));
+        messages.extend(
+            history
+                .iter()
+                .map(|h| json!({"role": h.role, "content": self.secrets.redact(&h.text)})),
+        );
+        messages.push(json!({"role": "user", "content": for_model}));
         let state = RunState {
             task: task_id,
             model: settings.model,
@@ -461,6 +546,7 @@ impl Agent {
             usage: Usage::default(),
             seconds: 0.0,
             armed: None,
+            scheduled: scheduled.map(|s| s.name),
         };
         self.drive(state, None).await;
     }
@@ -527,10 +613,11 @@ impl Agent {
         // needs_user already pushed its Action needed; a stop came from the user.
         if !matches!(status, "needs_user" | "cancelled") {
             self.notify(Push {
-                title: if status == "done" {
-                    self.cfg.desktop_name.clone()
-                } else {
-                    "Your desktop hit a problem".into()
+                title: match (&state.scheduled, status) {
+                    (Some(name), "done") => name.clone(),
+                    (Some(name), _) => format!("{name}: a problem"),
+                    (None, "done") => self.cfg.desktop_name.clone(),
+                    (None, _) => "Your desktop hit a problem".into(),
                 },
                 body: push::clip(answer, 180),
                 category: None,
@@ -548,6 +635,7 @@ impl Agent {
             &now,
             &self.memory_prompt(),
             &self.skills.listing(),
+            &self.keys_prompt(),
         );
         state.messages[0] = json!({"role": "system", "content": prompt});
         let mut browser = Browser::new(self.cdp.clone(), state.allow_actions, self.policy.clone());
@@ -586,6 +674,9 @@ impl Agent {
                     }
                     Some(command) if name == "run_shell" && guard::is_piped_install(command) => {
                         Some(guard::PIPED_INSTALL_REFUSAL.to_string())
+                    }
+                    Some(command) if name == "run_shell" && guard::is_shell_schedule(command) => {
+                        Some(guard::SHELL_SCHEDULE_REFUSAL.to_string())
                     }
                     Some(command) if name == "run_shell" && guard::is_bare_date(command) => Some(format!(
                         "not run: you don't need the shell for the date. It's now {now} for the user; \
@@ -627,6 +718,7 @@ impl Agent {
                         &name,
                         &args,
                         state.tainted,
+                        state.scheduled.is_some(),
                         resumed,
                         &mut state.armed,
                         &mut cancel,
@@ -653,6 +745,8 @@ impl Agent {
                 } else {
                     "error: arguments must be a JSON object".to_string()
                 };
+                // A saved key's value never reaches the model.
+                let result = self.secrets.redact(&result).into_owned();
                 state.queue.remove(0);
                 let repeat = state.loops.record(&name, &raw, &result);
                 if guard::carries_outside_content(&name) {
@@ -768,6 +862,7 @@ impl Agent {
         name: &str,
         args: &Value,
         tainted: bool,
+        scheduled: bool,
         resumed: Option<Answer>,
         armed: &mut Option<ArmedSend>,
         cancel: &mut watch::Receiver<bool>,
@@ -908,6 +1003,45 @@ impl Agent {
                     Ok(format!("there's no memory #{id}"))
                 }
             }
+            "schedule_task" => {
+                if scheduled {
+                    return Ok(
+                        "not scheduled: a scheduled run can't set up schedules; tell the user to ask \
+                               for it in the chat"
+                            .into(),
+                    );
+                }
+                self.schedule_task(task_id, args, tainted, resumed)
+            }
+            "list_schedules" => {
+                let schedules = self.store.schedules()?;
+                if schedules.is_empty() {
+                    return Ok("no schedules".into());
+                }
+                Ok(schedules
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "#{} “{}”: {}{}; next run {}. Prompt: {}\n",
+                            s.id,
+                            s.name,
+                            schedule::describe(s.cron.as_deref(), s.next_run, &s.timezone),
+                            if s.paused { " (paused)" } else { "" },
+                            schedule::local(s.next_run, &s.timezone),
+                            s.prompt,
+                        )
+                    })
+                    .collect())
+            }
+            "cancel_schedule" => {
+                let id = number("id").ok_or_else(|| anyhow!("id is required"))?;
+                if self.store.delete_schedule(id)? {
+                    self.emit("schedule.deleted", json!({"task": task_id, "id": id}));
+                    Ok(format!("cancelled schedule #{id}"))
+                } else {
+                    Ok(format!("there's no schedule #{id}"))
+                }
+            }
             "read_skill" => {
                 let skill = required("name")?;
                 Ok(self.skills.read(skill).map(String::from).unwrap_or_else(|| {
@@ -928,22 +1062,180 @@ impl Agent {
             }
             "run_shell" if self.cfg.shell_tool => {
                 let timeout = number("timeout").map_or(120, |n| n.max(1) as u64);
-                self.run_shell(task_id, required("command")?, timeout, tainted, resumed, cancel)
-                    .await
+                let asked: Vec<String> = match &args["secrets"] {
+                    Value::Array(names) => names.iter().filter_map(Value::as_str).map(String::from).collect(),
+                    Value::String(name) => vec![name.clone()],
+                    _ => Vec::new(),
+                };
+                self.run_shell(
+                    task_id,
+                    required("command")?,
+                    &asked,
+                    timeout,
+                    tainted,
+                    resumed,
+                    cancel,
+                )
+                .await
             }
+            "request_secret" if self.cfg.shell_tool => self.request_secret(task_id, args, tainted, resumed),
             _ => Ok(format!("error: unknown tool {name}")),
         }
     }
 
+    /// Sets up a scheduled task. After outside content, the request may come
+    /// from injected text, so the user approves it first.
+    fn schedule_task(
+        &self,
+        task_id: &str,
+        args: &Value,
+        tainted: bool,
+        resumed: Option<Answer>,
+    ) -> Result<String> {
+        let text = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty());
+        let Some(prompt) = text("prompt") else {
+            return Ok("error: prompt is required".into());
+        };
+        let prompt: String = prompt.chars().take(SCHEDULE_PROMPT_MAX_CHARS).collect();
+        let name: String = text("name")
+            .unwrap_or(&prompt)
+            .chars()
+            .take(SCHEDULE_NAME_MAX_CHARS)
+            .collect();
+        if self.store.schedules()?.len() >= schedule::MAX_SCHEDULES {
+            return Ok(format!(
+                "not scheduled: there are already {} schedules; ask the user which to cancel",
+                schedule::MAX_SCHEDULES
+            ));
+        }
+        let timezone = self.user_clock().timezone;
+        let timing = match schedule::plan(text("cron"), text("at"), &timezone, jiff::Timestamp::now()) {
+            Ok(timing) => timing,
+            Err(problem) => return Ok(format!("not scheduled: {problem}")),
+        };
+        let when = schedule::describe(timing.cron.as_deref(), timing.next_run, &timezone);
+        if tainted {
+            let card = json!({
+                "kind": "schedule", "name": name, "text": prompt, "when": when, "next_run": timing.next_run,
+                "reason": "was asked for after reading outside content (a page, an email or command output)",
+            });
+            if !matches!(self.approve(task_id, card, resumed)?, Decision::Approved) {
+                return Ok("denied: the user did not approve this schedule. Don't try another way.".into());
+            }
+        }
+        let saved =
+            self.store
+                .add_schedule(&name, &prompt, timing.cron.as_deref(), &timezone, timing.next_run)?;
+        self.schedules_changed.notify_one();
+        let mut event = schedule::json(&saved);
+        event["task"] = json!(task_id);
+        self.emit("schedule.created", event);
+        tracing::info!(task = %task_id, schedule = saved.id, "schedule created");
+        Ok(format!(
+            "scheduled #{} “{name}”: {when}; first run {}. Each run is a new task with just this prompt \
+             (not this conversation). The user can see and cancel it in the app.",
+            saved.id,
+            schedule::local(timing.next_run, &timezone),
+        ))
+    }
+
+    /// Asks the user for a key or token: the task parks while they paste it
+    /// into the app (or decline), and resumes knowing only its name.
+    fn request_secret(
+        &self,
+        task_id: &str,
+        args: &Value,
+        tainted: bool,
+        resumed: Option<Answer>,
+    ) -> Result<String> {
+        let text = |key: &str, max: usize| -> String {
+            args[key]
+                .as_str()
+                .map(str::trim)
+                .unwrap_or_default()
+                .chars()
+                .take(max)
+                .collect()
+        };
+        let name = text("name", 64);
+        if let Err(problem) = secrets::check_name(&name) {
+            return Ok(format!("not asked: {problem}"));
+        }
+        let label = Some(text("label", SECRET_LABEL_MAX_CHARS))
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| name.clone());
+        let url = text("url", 2000);
+        // The card shows the link's site, so a look-alike stands out.
+        let host = match url::Url::parse(&url) {
+            _ if url.is_empty() => None,
+            Ok(link) if link.scheme() == "https" && link.host_str().is_some() => {
+                link.host_str().map(String::from)
+            }
+            _ => {
+                return Ok(
+                    "not asked: url must be an https link to the page where the user creates the key".into(),
+                );
+            }
+        };
+        let replace = args["replace"].as_bool().unwrap_or(false);
+        if resumed.is_none() {
+            if self.secrets.has(&name) && !replace {
+                return Ok(format!(
+                    "{name} is already saved: use it in run_shell as ${name}. If it was rejected or has expired, \
+                     ask again with replace set."
+                ));
+            }
+            if !self.secrets.has(&name) && self.secrets.names().len() >= secrets::MAX_SECRETS {
+                return Ok(
+                    "not asked: there are too many saved keys; ask the user to delete some in Settings"
+                        .into(),
+                );
+            }
+        }
+        let card = json!({
+            "kind": "secret", "name": name, "label": label, "why": text("why", 400), "how": text("how", 3000),
+            "url": (!url.is_empty()).then_some(&url), "host": host, "replace": replace, "tainted": tainted,
+        });
+        Ok(match self.approve(task_id, card, resumed)? {
+            Decision::Approved if self.secrets.has(&name) => format!(
+                "saved: the user gave their {label} as {name}. Commands get it as an environment variable when \
+                 they name it (${name}) or list it in secrets. You can't see its value; output shows it as \
+                 [secret {name}]. Pass it per command rather than writing it into files."
+            ),
+            Decision::Approved => {
+                format!("{name} wasn't saved. Tell the user what you couldn't do without it.")
+            }
+            _ => format!(
+                "the user didn't give {name}. Don't ask for it in the chat; tell them what you couldn't do \
+                 without it."
+            ),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn run_shell(
         &self,
         task_id: &str,
         command: &str,
+        asked: &[String],
         timeout: u64,
         tainted: bool,
         resumed: Option<Answer>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<String> {
+        let (keys, unknown) = self.secrets.used_by(command, asked);
+        if !unknown.is_empty() {
+            let saved = self.secrets.names();
+            return Ok(format!(
+                "not run: no saved key named {}. Saved keys: {}. Use request_secret to ask the user for one.",
+                unknown.join(", "),
+                if saved.is_empty() {
+                    "none".into()
+                } else {
+                    saved.join(", ")
+                },
+            ));
+        }
         let (as_root, inner) = split_sudo(command);
         let reason = if as_root {
             Some("runs as root")
@@ -951,7 +1243,11 @@ impl Agent {
             Some(reason)
         } else if tainted && self.policy.sends_data(inner) {
             // Injected instructions in a page could try to send data out.
-            Some("could send data off the desktop, after reading outside content")
+            Some(if keys.is_empty() {
+                "could send data off the desktop, after reading outside content"
+            } else {
+                "could send data off the desktop with your saved key, after reading outside content"
+            })
         } else {
             None
         };
@@ -959,11 +1255,14 @@ impl Agent {
         if resumed.is_none() {
             self.emit(
                 "shell",
-                json!({"task": task_id, "command": command, "as_root": as_root, "needs_approval": reason.is_some()}),
+                json!({
+                    "task": task_id, "command": command, "as_root": as_root, "needs_approval": reason.is_some(),
+                    "secrets": keys,
+                }),
             );
         }
         if let Some(reason) = reason {
-            let card = json!({"kind": "shell", "command": command, "reason": reason});
+            let card = json!({"kind": "shell", "command": command, "reason": reason, "secrets": keys});
             if !matches!(self.approve(task_id, card, resumed)?, Decision::Approved) {
                 return Ok(format!(
                     "denied: the user did not approve this command (it {reason})"
@@ -971,7 +1270,19 @@ impl Agent {
             }
         }
         let started = std::time::Instant::now();
-        let output = self.shell.run(inner, as_root, timeout, cancel).await?;
+        let files: Vec<KeyFile> = keys
+            .iter()
+            .map(|name| KeyFile {
+                name: name.clone(),
+                path: self.secrets.path(name),
+            })
+            .collect();
+        let mut output = self.shell.run(inner, as_root, timeout, &files, cancel).await?;
+        if !keys.is_empty() {
+            let _ = self.store.secrets_used(&keys);
+        }
+        // Before it's cut to size, so no part of a value is left at the cut.
+        output.text = self.secrets.redact(&output.text).into_owned();
         // The app shows each command as a terminal card with its output.
         self.emit(
             "shell.output",
@@ -1054,6 +1365,112 @@ impl Agent {
         });
     }
 
+    /// The saved keys, by name, for the system prompt.
+    fn keys_prompt(&self) -> String {
+        self.secret_infos()
+            .iter()
+            .map(|info| format!("- {}: {}\n", info.name, info.label))
+            .collect()
+    }
+
+    /// The saved keys (never their values), for the model and the apps.
+    pub fn secret_infos(&self) -> Vec<SecretInfo> {
+        let infos = self.store.secrets().unwrap_or_default();
+        self.secrets
+            .names()
+            .into_iter()
+            .map(|name| {
+                infos
+                    .iter()
+                    .find(|i| i.name == name)
+                    .cloned()
+                    .unwrap_or(SecretInfo {
+                        label: name.clone(),
+                        name,
+                        created: String::new(),
+                        updated: String::new(),
+                        last_used: None,
+                    })
+            })
+            .collect()
+    }
+
+    /// Saves a key the user typed or pasted in the app. Only its name and
+    /// label are logged or shown again.
+    pub fn save_secret(
+        &self,
+        name: &str,
+        value: &str,
+        label: Option<&str>,
+        by: Option<String>,
+    ) -> Result<SecretInfo, SecretError> {
+        secrets::check_name(name).map_err(SecretError::Invalid)?;
+        secrets::check_value(value).map_err(SecretError::Invalid)?;
+        if !self.secrets.has(name) && self.secrets.names().len() >= secrets::MAX_SECRETS {
+            return Err(SecretError::Invalid(format!(
+                "there are already {} saved keys; delete some first",
+                secrets::MAX_SECRETS
+            )));
+        }
+        // The label the user gave, else the one it had, else the one asked with.
+        let current = self
+            .secret_infos()
+            .into_iter()
+            .find(|i| i.name == name)
+            .map(|i| i.label);
+        let asked = self
+            .store
+            .any_parked()
+            .ok()
+            .flatten()
+            .filter(|p| p.card["kind"] == "secret" && p.card["name"] == name)
+            .and_then(|p| p.card["label"].as_str().map(String::from));
+        let label: String = label
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .or(current)
+            .or(asked)
+            .unwrap_or_else(|| name.to_string())
+            .chars()
+            .take(SECRET_LABEL_MAX_CHARS)
+            .collect();
+        self.secrets.put(name, value).map_err(SecretError::Failed)?;
+        let info = self
+            .store
+            .save_secret(name, &label)
+            .map_err(SecretError::Failed)?;
+        tracing::info!(name, by = ?by, "key saved");
+        self.emit("secret.saved", json!({"name": name, "label": label, "by": by}));
+        Ok(info)
+    }
+
+    pub fn delete_secret(&self, name: &str, by: Option<String>) -> Result<bool> {
+        let removed = self.secrets.remove(name)?;
+        let recorded = self.store.delete_secret(name)?;
+        if removed || recorded {
+            tracing::info!(name, by = ?by, "key deleted");
+            self.emit("secret.deleted", json!({"name": name, "by": by}));
+        }
+        Ok(removed || recorded)
+    }
+
+    /// Resumes the task that asked for this key, now that it's saved. Only a
+    /// request for this very key: never another kind of approval.
+    pub fn answer_secret_request(
+        self: &Arc<Self>,
+        id: &str,
+        name: &str,
+        by: Option<String>,
+    ) -> Result<(), StartError> {
+        match self.store.parked(id) {
+            Ok(Some(parked)) if parked.card["kind"] == "secret" && parked.card["name"] == name => {
+                self.answer_approval(id, true, by)
+            }
+            _ => Err(StartError::NotFound),
+        }
+    }
+
     /// What the model is told it remembers, at the start of each task.
     fn memory_prompt(&self) -> String {
         let memories = self.store.memories(MEMORY_LIMIT).unwrap_or_default();
@@ -1075,8 +1492,10 @@ impl Agent {
     }
 
     /// Notifies the user's devices through the relay, in the background.
-    fn notify(&self, notification: Push) {
+    fn notify(&self, mut notification: Push) {
         let Some(relay) = self.push.clone() else { return };
+        notification.title = self.secrets.redact(&notification.title).into_owned();
+        notification.body = self.secrets.redact(&notification.body).into_owned();
         tokio::spawn(async move {
             if let Err(err) = relay.notify(&notification).await {
                 tracing::warn!(%err, "push failed");
@@ -1090,6 +1509,20 @@ fn approval_push(task_id: &str, id: &str, details: &Value) -> Push {
     let text = |key: &str| details[key].as_str().unwrap_or_default().to_string();
     let site = text("site");
     let (title, body) = match (details["kind"].as_str(), details["action"].as_str()) {
+        // Opens the app, where the key is pasted: no Approve button here.
+        (Some("secret"), _) => {
+            return Push {
+                title: format!("{} needed", text("label")),
+                body: push::clip(&text("why"), 180),
+                category: None,
+                thread: task_id.to_string(),
+                data: json!({"task": task_id, "approval": id}),
+            };
+        }
+        (Some("schedule"), _) => (
+            "Schedule this?".to_string(),
+            format!("{}: {}", text("when"), text("text")),
+        ),
         (Some("browser"), Some("type")) => (
             format!("Write this on {site}?"),
             format!("In “{}”: {}", text("target"), text("text")),

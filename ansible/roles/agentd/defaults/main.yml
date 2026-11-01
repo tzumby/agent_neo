@@ -36,6 +36,9 @@ agentd_shell_allowed_domains:
   - nodejs.org
   - .anthropic.com
   - claude.ai
+  # Together AI, for tools the user gives a key (opencode calls api.together.xyz).
+  - api.together.ai
+  - api.together.xyz
   # Nix: the binary cache, the flake registry, source tarballs.
   - .nixos.org
 # Nix for the shell user (tasks/nix.yml): the release, its published SHA-256

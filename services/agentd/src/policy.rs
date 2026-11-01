@@ -85,7 +85,15 @@ const RISKY_LABEL: &str = r"(?i)\b(send|delete|trash|archive|spam|move to|mark a
 /// Commands that can send data off the desktop. Once a task has read outside
 /// content (which may carry injected instructions), these ask first. A speed
 /// bump like the rest: the firewall and approvals for root are the walls.
-const SENDS_DATA: &str = r"\b(curl|wget|nc|ncat|netcat|socat|telnet|ssh|scp|sftp|rsync|ftp|mail|sendmail)\b|\bgit\s+(push|send-email)\b";
+/// With a saved GitHub token, gh can write to GitHub too (issues, gists, the
+/// API); reading with it (gh repo clone, gh pr view) doesn't ask.
+const SENDS_DATA: &str = concat!(
+    r"\b(curl|wget|nc|ncat|netcat|socat|telnet|ssh|scp|sftp|rsync|ftp|mail|sendmail)\b",
+    r"|\bgit\s+(push|send-email)\b",
+    r"|\bgh\s+(api\b|gist\s+(create|edit)|(issue|pr)\s+(create|comment|edit|close|reopen|merge|review)",
+    r"|release\s+(create|upload|edit)|repo\s+(create|fork|edit|rename|delete|sync))\b",
+    r"|\b(npm|pnpm|yarn)\s+publish\b|\bcargo\s+publish\b|\btwine\s+upload\b",
+);
 
 /// Typing into these needs no approval: it only looks things up.
 const SEARCH_LABEL: &str = r"(?i)\b(search|find|filter|jump to)\b";
@@ -288,6 +296,12 @@ mod tests {
             "git push origin main",
             "scp a host:",
             "nc -q1 h 80 < f",
+            "gh gist create --public notes.txt",
+            "gh issue comment 12 --body hi",
+            "gh pr create --fill",
+            "gh api -X POST repos/a/b/issues",
+            "gh repo create leak --public",
+            "npm publish",
         ] {
             assert!(policy.sends_data(cmd), "{cmd}");
         }
@@ -297,6 +311,9 @@ mod tests {
             "npm install",
             "git status",
             "python3 build.py",
+            "gh repo clone acme/api",
+            "gh pr view 3",
+            "gh auth status",
         ] {
             assert!(!policy.sends_data(cmd), "{cmd}");
         }

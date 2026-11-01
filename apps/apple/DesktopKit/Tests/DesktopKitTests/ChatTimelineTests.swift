@@ -160,3 +160,79 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     }
     #expect(expired.state == .expired && ended.steps.last?.run?.state == .didNotFinish)
 }
+
+@Test func schedulesShowAsNotesAndScheduledRunsAreLabelled() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(try event(1, "message", #"{"role":"user","text":"Every weekday at 8, summarize my inbox","task":"t1"}"#))
+    timeline.apply(try event(2, "task.started", #"{"task":"t1","model":"m"}"#))
+    timeline.apply(
+        try event(
+            3, "schedule.created",
+            #"{"task":"t1","id":4,"name":"Inbox","prompt":"Summarize my inbox","description":"Weekdays at 08:00","next_run":1793710800}"#
+        ))
+    guard case .schedule(let note) = timeline.items.last else {
+        Issue.record("no schedule note")
+        return
+    }
+    #expect((note.id, note.name, note.when) == (4, "Inbox", "Weekdays at 08:00"))
+    #expect(note.nextRun == Date(timeIntervalSince1970: 1_793_710_800))
+    timeline.apply(try event(4, "schedule.deleted", #"{"id":4}"#))
+    guard case .schedule(let cancelled) = timeline.items.last else { return }
+    #expect(cancelled.cancelled)
+
+    // A scheduled run's prompt carries the schedule's name.
+    timeline.apply(
+        try event(5, "message", #"{"role":"user","text":"Summarize my inbox","task":"t2","schedule":{"id":4,"name":"Inbox"}}"#))
+    guard case .user(let message) = timeline.items.last else { return }
+    #expect(message.schedule == "Inbox")
+
+    // Asked to approve a schedule: its own card, not a command, hidden once answered.
+    timeline.apply(
+        try event(
+            6, "approval.requested",
+            #"{"kind":"schedule","id":"a1","task":"t3","name":"Forward","text":"Forward my email","when":"Every day at 09:00","reason":"r"}"#
+        ))
+    guard case .approval(let approval) = timeline.items.last else { return }
+    #expect(approval.schedule == ScheduleProposal(name: "Forward", prompt: "Forward my email", when: "Every day at 09:00"))
+    #expect(!approval.isCommand)
+    timeline.apply(try event(7, "approval.resolved", #"{"task":"t3","id":"a1","approved":false}"#))
+    #expect(!timeline.visibleItems.contains { if case .approval = $0 { true } else { false } })
+}
+
+@Test func keyRequestsAreCardsThatStayAndCommandsShowTheirKeys() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(try event(1, "message", #"{"role":"user","text":"Clone acme/api","task":"t1"}"#))
+    timeline.apply(try event(2, "task.started", #"{"task":"t1","model":"m"}"#))
+    timeline.apply(
+        try event(
+            3, "approval.requested",
+            #"{"kind":"secret","id":"s1","task":"t1","name":"GITHUB_TOKEN","label":"GitHub token","why":"To clone acme/api","how":"1. Open the link","url":"https://github.com/settings/personal-access-tokens/new?contents=read","host":"github.com","replace":false,"tainted":true}"#
+        ))
+    timeline.apply(try event(4, "task.paused", #"{"task":"t1","approval":"s1"}"#))
+    guard case .approval(let approval) = timeline.items.last, let request = approval.secret else {
+        Issue.record("no key request")
+        return
+    }
+    #expect(!approval.isCommand)
+    #expect((request.name, request.label, request.host, request.tainted) == ("GITHUB_TOKEN", "GitHub token", "github.com", true))
+    #expect(request.url?.host() == "github.com")
+
+    // Saved while another task ran: the card shows it's saved, still waiting.
+    timeline.apply(try event(5, "secret.saved", #"{"name":"GITHUB_TOKEN","label":"GitHub token"}"#))
+    guard case .approval(let saved) = timeline.items.last else { return }
+    #expect(saved.secret?.saved == true && saved.state == .pending)
+
+    // Answered: the card stays, showing the outcome (unlike command approvals).
+    timeline.apply(try event(6, "approval.resolved", #"{"task":"t1","id":"s1","approved":true}"#))
+    timeline.apply(try event(7, "task.resumed", #"{"task":"t1"}"#))
+    #expect(timeline.visibleItems.contains { if case .approval(let a) = $0 { a.state == .approved } else { false } })
+
+    // A command that got the key says so (by name).
+    timeline.apply(
+        try event(
+            8, "shell",
+            #"{"task":"t1","command":"git clone https://github.com/acme/api","as_root":false,"needs_approval":false,"secrets":["GITHUB_TOKEN"]}"#
+        ))
+    guard case .work(let work) = timeline.items[1] else { return }
+    #expect(work.steps.last?.secrets == ["GITHUB_TOKEN"])
+}

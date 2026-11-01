@@ -11,6 +11,77 @@ public struct AgentMemory: Decodable, Sendable, Equatable, Identifiable {
     public let created: String
 }
 
+/// A task the agent runs on its own: on a repeat, or once.
+public struct AgentSchedule: Decodable, Sendable, Equatable, Identifiable {
+    public let id: Int
+    public let name: String
+    public let prompt: String
+    /// Five-field cron pattern; nil for a one-time run.
+    public let cron: String?
+    /// Where its times are read (the user's time zone when it was set up).
+    public let timezone: String
+    /// "Weekdays at 08:00", or "Once, Mon Nov 2 at 09:00".
+    public let description: String
+    public let nextRun: Date
+    public let lastRun: Date?
+    public let paused: Bool
+
+    public var repeats: Bool { cron != nil }
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, prompt, cron, timezone, description, paused
+        case nextRun = "next_run"
+        case lastRun = "last_run"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(Int.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        prompt = try c.decode(String.self, forKey: .prompt)
+        cron = try c.decodeIfPresent(String.self, forKey: .cron)
+        timezone = try c.decode(String.self, forKey: .timezone)
+        description = try c.decode(String.self, forKey: .description)
+        nextRun = Date(timeIntervalSince1970: try c.decode(Double.self, forKey: .nextRun))
+        lastRun = try c.decodeIfPresent(Double.self, forKey: .lastRun).map(Date.init(timeIntervalSince1970:))
+        paused = try c.decode(Bool.self, forKey: .paused)
+    }
+}
+
+/// A key or token saved on the desktop (a GitHub token, an API key). The app
+/// can save, replace and delete one, but never read its value back.
+public struct AgentSecret: Decodable, Sendable, Equatable, Identifiable {
+    /// The environment variable commands get it as, e.g. GITHUB_TOKEN.
+    public let name: String
+    /// What it is: "GitHub token".
+    public let label: String
+    public let created: String
+    public let lastUsed: String?
+
+    public var id: String { name }
+
+    enum CodingKeys: String, CodingKey {
+        case name, label, created
+        case lastUsed = "last_used"
+    }
+
+    public init(name: String, label: String, created: String = "", lastUsed: String? = nil) {
+        self.name = name
+        self.label = label
+        self.created = created
+        self.lastUsed = lastUsed
+    }
+}
+
+/// What saving a key did: whether the task that asked for it carried on.
+public struct SavedSecret: Decodable, Sendable, Equatable {
+    public let secret: AgentSecret
+    /// The task waiting for it resumed.
+    public let resumed: Bool
+    /// That task couldn't resume yet: another one is running.
+    public let busy: Bool
+}
+
 public struct AgentStatus: Decodable, Sendable, Equatable {
     public let desktop: String
     public let busy: Bool
@@ -171,6 +242,43 @@ public struct AgentClient: Sendable {
     /// Vouches for a memory saved after the agent read outside content.
     public func confirm(memory id: Int) async throws {
         let _: [String: Bool] = try await post("/api/v1/memory/\(id)/confirm", body: [String: String]())
+    }
+
+    public func schedules() async throws -> [AgentSchedule] {
+        struct Reply: Decodable { let schedules: [AgentSchedule] }
+        let reply: Reply = try await get("/api/v1/schedules")
+        return reply.schedules
+    }
+
+    public func cancel(schedule id: Int) async throws {
+        let _: [String: Bool] = try await send("DELETE", "/api/v1/schedules/\(id)", body: [String: String]())
+    }
+
+    /// Pauses or resumes a schedule; returns it as it is now.
+    public func setPaused(_ paused: Bool, schedule id: Int) async throws -> AgentSchedule {
+        try await post("/api/v1/schedules/\(id)/\(paused ? "pause" : "resume")", body: [String: String]())
+    }
+
+    public func secrets() async throws -> [AgentSecret] {
+        struct Reply: Decodable { let secrets: [AgentSecret] }
+        let reply: Reply = try await get("/api/v1/secrets")
+        return reply.secrets
+    }
+
+    /// Saves (or replaces) a key on the desktop. With `approval`, the task that
+    /// asked for it carries on. The value travels only over the tailnet.
+    public func saveSecret(name: String, value: String, label: String?, approval: String?) async throws -> SavedSecret {
+        struct Body: Encodable {
+            let value: String
+            let label: String?
+            let approval: String?
+        }
+        return try await send(
+            "PUT", "/api/v1/secrets/\(name)", body: Body(value: value, label: label, approval: approval))
+    }
+
+    public func deleteSecret(name: String) async throws {
+        let _: [String: Bool] = try await send("DELETE", "/api/v1/secrets/\(name)", body: [String: String]())
     }
 
     // MARK: Plumbing

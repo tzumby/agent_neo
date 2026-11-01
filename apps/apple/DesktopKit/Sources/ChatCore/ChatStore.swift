@@ -73,6 +73,27 @@ public final class ChatStore {
         }
     }
 
+    /// Saves the key a request card asked for; the waiting task carries on.
+    /// Returns whether it was saved.
+    @discardableResult
+    public func save(secret value: String, for approval: Approval, client: AgentClient) async -> Bool {
+        guard let request = approval.secret else { return false }
+        do {
+            let saved = try await client.saveSecret(
+                name: request.name, value: value, label: request.label, approval: approval.id)
+            if saved.busy {
+                notice = "Saved. Your desktop is busy with another request; tap Continue when it's done."
+            }
+            return true
+        } catch let error as AgentError where error.statusCode == 400 {
+            if case .http(_, let message) = error { notice = "Couldn't save it: \(message)" }
+            return false
+        } catch {
+            notice = "Couldn't save it: \(error.localizedDescription)"
+            return false
+        }
+    }
+
     public func update(settings: AgentSettings, client: AgentClient) async {
         await attempt { _ = try await client.update(settings: settings) }
         status = try? await client.status()

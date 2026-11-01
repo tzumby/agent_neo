@@ -14,6 +14,8 @@ mod guard;
 mod llm;
 mod policy;
 mod push;
+mod schedule;
+mod secrets;
 mod shell;
 mod skills;
 mod store;
@@ -51,7 +53,7 @@ async fn main() -> Result<()> {
     let cfg = config::Config::load()?;
     std::fs::create_dir_all(cfg.state_dir.join("images")).context("creating the state directory")?;
     let agent = Arc::new(agent::Agent::new(cfg.clone())?);
-    let app = api::router(agent);
+    let app = api::router(agent.clone());
 
     if let Some(path) = cfg.listen.strip_prefix("unix:") {
         // Only agentd and tailnet-proxy (via the socket's group) can connect;
@@ -63,12 +65,15 @@ async fn main() -> Result<()> {
         let listener = tokio::net::UnixListener::bind(path).with_context(|| format!("binding {path}"))?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
         tracing::info!(socket = path, model = %cfg.model, "listening");
+        // Only once this agentd owns the socket: never two schedulers.
+        tokio::spawn(schedule::run(agent));
         serve_until_stopped(axum::serve(listener, app).with_graceful_shutdown(shutdown())).await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&cfg.listen)
             .await
             .with_context(|| format!("binding {}", cfg.listen))?;
         tracing::info!(address = %cfg.listen, model = %cfg.model, "listening");
+        tokio::spawn(schedule::run(agent));
         serve_until_stopped(axum::serve(listener, app).with_graceful_shutdown(shutdown())).await?;
     }
     Ok(())

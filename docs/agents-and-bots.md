@@ -174,7 +174,7 @@ Each phase ends with something working that can be checked.
 | A | **Agents and runs in agentd:** schema migration (the existing chat becomes the main agent's thread), runs table, durable approvals, wrap-up step, `agent`/`run` on events | The app works as today; a restart mid-approval keeps the approval |
 | B | **Main agent memory:** `remember` / `recall` / `forget`, trust tiers, Memory screen | A preference told once is used in a later chat; an injected "remember…" from a web page lands as unverified |
 | C | **Bots:** spec and versions, `propose_bot` with an approval card, `delegate`, filtered tools, site allowlists, per-bot shell users, Bots tab | A bot created from chat summarizes a Slack channel on request and can't open a site outside its list |
-| D | **Triggers:** schedules in the user's time zone, run queue, browser lease, push labeled with the bot | The digest bot runs on schedule with the app closed, and the user gets the push |
+| D | **Triggers** (the main agent's schedules came first, in agentd 0.13: `schedule_task`, a `schedules` table and a scheduler loop; bots reuse them): schedules in the user's time zone, run queue, browser lease, push labeled with the bot | The digest bot runs on schedule with the app closed, and the user gets the push |
 | E | **Evals** (pydantic-evals off the VM): injection tests across bots and memory | The suite runs before each agentd release |
 
 ## 12. Open questions

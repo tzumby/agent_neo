@@ -44,4 +44,8 @@ public enum JSONValue: Decodable, Sendable, Equatable {
     public var bool: Bool? {
         if case .bool(let value) = self { value } else { nil }
     }
+
+    public var array: [JSONValue]? {
+        if case .array(let value) = self { value } else { nil }
+    }
 }

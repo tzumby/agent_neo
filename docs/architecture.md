@@ -513,7 +513,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 
 - **`images/<32 hex>.jpg`**: screenshots shown in the chat (`show_screenshot`, Action needed cards), served at `/api/v1/images/{id}`.
 - **`secrets/<NAME>`**: one file per saved key (mode 0600), written atomically through `.<NAME>.new` and a rename.
-- **`agentd.db.pre-<version>`**: a copy of the database made by the Ansible role before a new agentd version starts (SQLite online backup, as `agentd`). The last 3 are kept, for a rollback.
+- **`agentd.db.pre-<version>-<time>`**: a copy of the database made by the Ansible role before a new agentd version starts (SQLite online backup, as `agentd`). The last 3 are kept, for a rollback.
 - **The `agent` column** on history, runs, memory, schedules and key metadata is `main` everywhere for now. It's there for the bots design (`docs/agents-and-bots.md`), and every event carries `"agent": "main"`.
 
 ### 6.4 HTTP API
@@ -534,7 +534,8 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/screenshot` | A live screenshot of the current tab (JPEG). Exists, but the app doesn't use it |
 | GET, PUT | `/api/v1/settings` | `{model, allow_actions}` |
 | POST | `/api/v1/devices` | `{token, name}`: registers an iPhone's APNs token with the push relay (503 if push isn't configured) |
-| GET | `/api/v1/memory?status=&limit=` | Up to 500 memories. Memory v2: active and pending by default (`status=` takes a comma list), with every v2 field; v1's fields stay, so older apps still read it |
+| GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active and pending by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older apps still read it |
+| GET | `/api/v1/memory/search?q=&kinds=&limit=` | Memory v2: active memories ranked as the agent's notes are, each with its score (what `search_memory` sees) |
 | DELETE | `/api/v1/memory/{id}` | Forget. Memory v2: status `deleted` (purged after 30 days) |
 | POST | `/api/v1/memory/{id}/confirm` | Vouch for an unverified memory. Memory v2: same as `/approve` |
 | POST | `/api/v1/memory/{id}/approve` | Memory v2: a pending or inferred memory becomes active and user-stated, and replaces what it was proposed to replace |
@@ -859,15 +860,24 @@ Web pages, emails and command output can carry injected instructions. The defenc
   - otherwise lists candidates;
   - rules are forgotten by id only.
 
-**The notes in the prompt.** They come at the end of the system prompt, after the skills and the v2 memory instructions:
-- "Your rules and the user's preferences": always shown, within about 1,500 tokens; the least important preferences are dropped first.
-- "Things you remember (dated hints; the live page wins)": in phase 1, the latest 60 facts. Phase 2 retrieves the top 8 by relevance.
-- Each line reads `- #id [kind · date · user said|inferred] text`.
-- Pending, deleted, superseded and expired memories are never shown.
+**The notes in the prompt** (phase 2). They're built once per task and kept in its state, so a resumed task has the same notes. They go at the end of the system prompt, after the skills and the v2 memory instructions:
+- **"Your rules and the user's preferences":** always shown, within about 1,500 tokens; the least important preferences are dropped first.
+- **"Things you remember (dated hints; the live page wins)":**
+  - for a scheduled run, first its own last 3 work-log entries (about 600 tokens);
+  - then the facts and work-log entries most relevant to the request: the top 8, about 2,000 tokens.
+
+  They're ranked by 0.6 × relevance + 0.25 × recency + 0.15 × importance, × 0.8 if inferred:
+  - relevance is FTS5 bm25 relative to the best match (stop words removed);
+  - recency halves every 30 days (`memory_fact_half_life_days`).
+
+  A request with nothing searchable gets the most recent notes.
+- **Format:** each line reads `- #id [kind · date · user said|inferred] text`; a work-log line names its schedule.
+- **Never shown:** pending, deleted, superseded and expired memories (past `valid_until`).
+- **Recall tracking:** what's shown gets its recall recorded (`last_recalled`, `recall_count`). The journal gets the ids, the size and the time taken, never the text. Building the notes from 5,000 memories takes 3.5–12 ms on the dev desktop.
 
 **The reminder.** When the user's message asks to remember something ("remember", "don't forget", "keep in mind", "from now on") and the task ends without a `remember` call, agentd adds one reminder turn.
 
-**Search.** `search_memory` searches over FTS5 with stop words removed.
+**Search.** `search_memory` uses the same ranking as the notes. On the evals, it rescues paraphrases that full-text matching misses.
 
 **Never a permission.** Memory never grants anything: `policy.rs` and the browser gates never read it.
 
@@ -1474,7 +1484,7 @@ Live tests run only with `AGENTD_URL` (a real agentd) or `VNC_ADDR` (a real VNC 
 | `galaxy` | Ansible collections (`amazon.aws` 11.x, `community.general` ≥ 12) |
 | `desktop` | `common` + `desktop` roles on running desktops |
 | `agentd-test`, `agentd-build`, `agentd-deploy`, `agentd-logs` | agentd: fmt/clippy/tests; static build for `DESKTOP_ARCH`; deploy (copies the database first when the version changes); `journalctl -u agentd` over SSM |
-| `agentd-evals` | Memory evals on the Mac: a local agentd against Together, headless Chrome, shell tool off, scripted conversations with assertions (`services/agentd/evals`). Costs cents per scenario; `MEMORY_V2=on\|off`, `SCENARIO=name` |
+| `agentd-evals` | Memory evals on the Mac: a local agentd against Together, headless Chrome, shell tool off, 20 scripted conversations with assertions (`services/agentd/evals`; results in [memory-v2.md](memory-v2.md) §19). About $0.12 a run; `MEMORY_V2=on\|off`, `SCENARIO=name` |
 | `gatewayd-test`, `gatewayd-build`, `gateway-image` | gatewayd tests; static arm64 build; build an attestable AMI and publish its measurements |
 | `tailnet-build`, `tailnet-deploy` | tailnet-proxy |
 | `llm-keys`, `tailscale-key`, `apns-key` | Store secrets in SSM from hidden input or a file |
@@ -1528,7 +1538,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 73 unit tests: memory v2's write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
+| agentd | 80 unit tests (plus a 5,000-memory speed test run on demand): memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
 | DesktopKit | 21 tests (§10.8) |

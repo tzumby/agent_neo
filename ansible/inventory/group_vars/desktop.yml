@@ -1,3 +1,7 @@
 # Step 1: Chrome opens this page on start. Later the agent daemon's
 # /chrome/open replaces this.
 chrome_start_url: "https://www.google.com"
+
+# Memory v2 (docs/memory-v2.md) on the dev desktop, to try it in the app
+# before the phase 6 soak; the role's default stays "off".
+agentd_memory_v2: "on"

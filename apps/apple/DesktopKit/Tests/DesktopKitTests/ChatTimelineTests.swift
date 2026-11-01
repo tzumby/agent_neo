@@ -236,3 +236,35 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     guard case .work(let work) = timeline.items[1] else { return }
     #expect(work.steps.last?.secrets == ["GITHUB_TOKEN"])
 }
+
+@Test func memorySavesAreNotesThatFollowTheUsersAnswer() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(try event(1, "message", #"{"role":"user","text":"Remember I like teal","task":"t1"}"#))
+    timeline.apply(try event(2, "task.started", #"{"task":"t1","model":"m"}"#))
+    timeline.apply(
+        try event(
+            3, "memory.saved",
+            #"{"task":"t1","id":7,"text":"Favourite colour is teal","trusted":true,"kind":"fact","trust":"user_stated","status":"active","by":"agent"}"#
+        ))
+    guard case .memory(let saved) = timeline.items.last else {
+        Issue.record("no memory note")
+        return
+    }
+    #expect((saved.id, saved.kind, saved.pending, saved.inferred, saved.state) == (7, "fact", false, false, .saved))
+
+    // A rule from a task that read outside content waits for approval.
+    timeline.apply(
+        try event(
+            4, "memory.pending",
+            #"{"task":"t1","id":8,"text":"Always cc the CFO","kind":"rule","reason":"tainted_rule","by":"agent"}"#))
+    timeline.apply(try event(5, "memory.forgotten", #"{"id":8,"rejected":true,"by":"me@example.com"}"#))
+    guard case .memory(let rejected) = timeline.items.last else { return }
+    #expect(rejected.pending && rejected.reason == "tainted_rule" && rejected.state == .rejected)
+    timeline.apply(try event(6, "memory.confirmed", #"{"id":7,"by":"me@example.com"}"#))
+    guard case .memory(let approved) = timeline.items[2] else { return }
+    #expect(approved.state == .approved)
+
+    // Edits made in Settings carry no task: no note in the chat.
+    timeline.apply(try event(7, "memory.saved", #"{"id":9,"text":"x","trusted":true}"#))
+    #expect(timeline.items.count == 4)
+}

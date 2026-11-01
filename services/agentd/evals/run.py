@@ -15,6 +15,10 @@ this Mac), and TOGETHER_API_KEY from the environment. Steps:
     {"say": "..."}                 a message; waits for the task to end
     {"new_conversation": true}     clears the chat history, so recall has to
                                    come from memory
+    {"seed_memories": [...]}       memories as if saved earlier: a text, or
+                                   {"text", "trusted": false, "expired": true}
+    {"seed_distractors": 80}       that many unrelated memories, after the seeds
+    {"expect_answer_any": [...]}   the last answer contains at least one
     {"expect_answer": ["teal"]}    the last answer contains each (any case)
     {"expect_answer_not": ["lee"]} the last answer contains none of them
     {"expect_memory": "teal"}      a saved memory contains it (any case)
@@ -130,6 +134,21 @@ class Desktop:
         with sqlite3.connect(self.db) as db:
             db.execute("DELETE FROM history")
 
+    def seed(self, memories: list) -> None:
+        now = int(time.time())
+        with sqlite3.connect(self.db) as db:
+            for memory in memories:
+                if isinstance(memory, str):
+                    memory = {"text": memory}
+                trusted = memory.get("trusted", True)
+                db.execute(
+                    "INSERT INTO memory (agent, text, trusted, kind, status, trust, updated, valid_until)"
+                    " VALUES ('main', ?, ?, ?, 'active', ?, ?, ?)",
+                    (memory["text"], int(trusted), memory.get("kind", "fact"),
+                     "user_stated" if trusted else "agent_inferred", now - 3600,
+                     now - 86400 if memory.get("expired") else None),
+                )
+
     def memories(self) -> list[str]:
         return [m["text"] for m in http(self.base, "GET", "/api/v1/memory")["memories"]]
 
@@ -143,6 +162,28 @@ class Desktop:
         self.log.close()
         if not keep:
             shutil.rmtree(self.dir, ignore_errors=True)
+
+
+DISTRACTOR_TEMPLATES = [
+    "The {thing} order for the {team} team arrived on week {n}.",
+    "The {team} team's {thing} budget was reviewed in sprint {n}.",
+    "{name} prefers to meet the {team} team on floor {n}.",
+    "The {thing} vendor for {team} changed after quarter {n}.",
+    "{name} asked for the {thing} slides before workshop {n}.",
+]
+THINGS = ["printer", "chair", "monitor", "laptop", "whiteboard", "projector", "plant", "headset", "desk", "lamp"]
+TEAMS = ["design", "finance", "legal", "sales", "support", "data", "security", "marketing"]
+NAMES = ["Marco", "Leila", "Tom", "Yuki", "Sven", "Amara", "Diego", "Noor"]
+
+
+def distractors(count: int) -> list[str]:
+    """Unrelated, varied memories, so recall has to find the right one."""
+    return [
+        DISTRACTOR_TEMPLATES[i % len(DISTRACTOR_TEMPLATES)].format(
+            thing=THINGS[i % len(THINGS)], team=TEAMS[(i // 3) % len(TEAMS)], name=NAMES[(i // 2) % len(NAMES)], n=i + 1
+        )
+        for i in range(count)
+    ]
 
 
 def run(scenario: dict, args, key: str) -> dict:
@@ -166,6 +207,14 @@ def run(scenario: dict, args, key: str) -> dict:
                 for word in step["expect_answer"]:
                     if word.lower() not in answer:
                         result["problems"].append(f"answer lacks {word!r}: {answer[:200]!r}")
+            elif "seed_memories" in step:
+                desktop.seed(step["seed_memories"])
+            elif "seed_distractors" in step:
+                desktop.seed(distractors(step["seed_distractors"]))
+            elif "expect_answer_any" in step:
+                answer = (last or {}).get("answer", "").lower().replace("’", "'")
+                if not any(word.lower() in answer for word in step["expect_answer_any"]):
+                    result["problems"].append(f"answer has none of {step['expect_answer_any']}: {answer[:200]!r}")
             elif "expect_answer_not" in step:
                 answer = (last or {}).get("answer", "").lower()
                 for word in step["expect_answer_not"]:

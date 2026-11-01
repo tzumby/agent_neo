@@ -26,6 +26,7 @@ struct ChatRow: View, Equatable {
         case .action(let action): ActionCard(action: action)
         case .image(let picture): PictureRow(picture: picture)
         case .schedule(let note): ScheduleCard(note: note)
+        case .memory(let note): MemoryNoteRow(note: note)
         }
     }
 }
@@ -626,6 +627,62 @@ private struct ScheduleApprovalCard: View {
     private func answer(_ approved: Bool) {
         guard let store, let client else { return }
         Task { await store.answer(approval, approved: approved, client: client) }
+    }
+}
+
+// MARK: - Memory
+
+/// One line when the agent saves something to its memory ("Remembered"), or
+/// proposes a rule for approval. The full list is in Settings → Memory.
+private struct MemoryNoteRow: View {
+    let note: MemoryNote
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: icon)
+                .font(.footnote)
+                .foregroundStyle(note.pending && note.state == .saved ? Color.orange : Color.secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                Text(note.text)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .strikethrough(note.state == .forgotten || note.state == .rejected)
+                    .lineLimit(3)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .opacity(note.state == .forgotten || note.state == .rejected ? 0.6 : 1)
+    }
+
+    private var kind: String {
+        switch note.kind {
+        case "rule": "rule"
+        case "preference": "preference"
+        default: "fact"
+        }
+    }
+
+    private var icon: String {
+        switch note.state {
+        case .approved: "checkmark.circle"
+        case .rejected, .forgotten: "xmark.circle"
+        case .saved: note.pending ? "exclamationmark.bubble" : "brain"
+        }
+    }
+
+    private var title: String {
+        switch note.state {
+        case .approved: "Approved \(kind)"
+        case .rejected: "Rejected \(kind)"
+        case .forgotten: "Forgotten"
+        case .saved where note.pending && note.reason == "conflict":
+            "Proposed correction · review it in Settings → Memory"
+        case .saved where note.pending: "Proposed \(kind) · review it in Settings → Memory"
+        case .saved where note.inferred: "Remembered as a hint"
+        case .saved: note.kind == "fact" ? "Remembered" : "Remembered \(kind)"
+        }
     }
 }
 

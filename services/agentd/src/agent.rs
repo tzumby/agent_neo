@@ -113,6 +113,10 @@ struct RunState {
     /// …or the model was reminded once.
     #[serde(default)]
     nudged: bool,
+    /// Memory v2: the notes this task started with, built once (a resumed
+    /// task keeps them, and the prompt's prefix stays the same).
+    #[serde(default)]
+    memory_block: Option<String>,
 }
 
 /// The user approved what the agent typed into a message field (Slack's
@@ -624,6 +628,22 @@ impl Agent {
                 .map(|h| json!({"role": h.role, "content": self.secrets.redact(&h.text)})),
         );
         messages.push(json!({"role": "user", "content": for_model}));
+        let memory_block = self.cfg.memory_v2.then(|| {
+            // After an Action needed, "I've done what you asked" says
+            // nothing: the request it continues does.
+            let previous = history
+                .iter()
+                .rev()
+                .find(|h| h.role == "user")
+                .map(|h| h.text.as_str());
+            let query = match previous {
+                Some(previous) if text == tools::RESUME_TEXT || text == tools::SKIP_TEXT => {
+                    format!("{previous}\n{text}")
+                }
+                _ => text.clone(),
+            };
+            self.recall(&task_id, &query, scheduled.as_ref().map(|s| s.id))
+        });
         let state = RunState {
             task: task_id,
             model: settings.model,
@@ -644,6 +664,7 @@ impl Agent {
                 && ASKS_TO_REMEMBER.is_match(&text),
             remembered: false,
             nudged: false,
+            memory_block,
             schedule_id: scheduled.as_ref().map(|s| s.id),
             scheduled: scheduled.map(|s| s.name),
         };
@@ -735,10 +756,21 @@ impl Agent {
         let now = self.user_clock().now();
         // The date and time as of now: a parked task may resume much later.
         let memories = if self.cfg.memory_v2 {
-            memory::block(&self.store).unwrap_or_else(|err| {
-                tracing::error!(%err, "couldn't build the memory block");
-                String::new()
-            })
+            // Built when the task started; a task parked before memory v2's
+            // phase 2 gets its notes now.
+            match &state.memory_block {
+                Some(block) => block.clone(),
+                None => {
+                    let request = state
+                        .messages
+                        .last()
+                        .and_then(|m| m["content"].as_str())
+                        .unwrap_or("");
+                    let block = self.recall(&state.task, request, state.schedule_id);
+                    state.memory_block = Some(block.clone());
+                    block
+                }
+            }
         } else {
             self.memory_prompt()
         };
@@ -1364,6 +1396,25 @@ impl Agent {
                     })
                     .collect::<Vec<_>>()
                     .join("\n"))
+            }
+        }
+    }
+
+    /// A task's notes (memory.rs `recall`); the journal gets the ids and the
+    /// size, never the text.
+    fn recall(&self, task: &str, request: &str, schedule: Option<i64>) -> String {
+        let started = Instant::now();
+        match memory::recall(&self.store, request, schedule) {
+            Ok(recall) => {
+                tracing::info!(
+                    task, recalled = ?recall.recalled, tokens = recall.tokens,
+                    ms = started.elapsed().as_millis() as u64, "memory block"
+                );
+                recall.block
+            }
+            Err(err) => {
+                tracing::error!(%err, task, "couldn't build the memory block");
+                String::new()
             }
         }
     }

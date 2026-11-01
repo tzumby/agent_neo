@@ -15,6 +15,7 @@ public struct ChatTimeline: Sendable, Equatable {
     private var approvalIndex: [String: Int] = [:]
     private var actionIndex: [String: Int] = [:]
     private var scheduleIndex: [Int: Int] = [:]  // schedule id → index of its note
+    private var memoryIndex: [Int: Int] = [:]  // memory id → index of its note
     private var openRun: [String: Int] = [:]  // task → index of its command step still waiting for output
 
     public init() {}
@@ -159,6 +160,24 @@ public struct ChatTimeline: Sendable, Equatable {
             // Cancelled, or a one-time run that has run ("done").
             guard let id = data["id"]?.int, data["done"]?.bool != true else { return }
             update(schedule: id) { $0.cancelled = true }
+        case "memory.saved", "memory.pending":
+            // Saves the agent made in a task; edits in Settings carry no task.
+            guard data["task"]?.string != nil, let id = data["id"]?.int else { return }
+            let pending = event.kind == "memory.pending"
+            memoryIndex[id] = items.count
+            items.append(
+                .memory(
+                    MemoryNote(
+                        id: id, seq: event.seq, text: data["text"]?.string ?? "",
+                        kind: data["kind"]?.string ?? "fact", pending: pending, reason: data["reason"]?.string,
+                        inferred: !pending
+                            && (data["trust"]?.string.map { $0 == "agent_inferred" } ?? (data["trusted"]?.bool == false)))))
+        case "memory.confirmed":
+            guard let id = data["id"]?.int else { return }
+            update(memory: id) { $0.state = .approved }
+        case "memory.forgotten":
+            guard let id = data["id"]?.int else { return }
+            update(memory: id) { $0.state = data["rejected"]?.bool == true ? .rejected : .forgotten }
         case "secret.saved":
             // Saved for a request that's still waiting: the desktop was busy.
             let name = data["name"]?.string ?? ""
@@ -233,6 +252,12 @@ public struct ChatTimeline: Sendable, Equatable {
         items[index] = .schedule(note)
     }
 
+    private mutating func update(memory id: Int, _ change: (inout MemoryNote) -> Void) {
+        guard let index = memoryIndex[id], case .memory(var note) = items[index] else { return }
+        change(&note)
+        items[index] = .memory(note)
+    }
+
     private mutating func update(action id: String, _ change: (inout Action) -> Void) {
         guard let index = actionIndex[id], case .action(var action) = items[index] else { return }
         change(&action)
@@ -248,6 +273,7 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
     case action(Action)
     case image(Picture)
     case schedule(ScheduleNote)
+    case memory(MemoryNote)
 
     public var id: String {
         switch self {
@@ -258,6 +284,7 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
         case .action(let a): "action-\(a.id)"
         case .image(let p): "image-\(p.id)"
         case .schedule(let s): "schedule-\(s.seq)"
+        case .memory(let m): "memory-\(m.seq)"
         }
     }
 }
@@ -380,6 +407,23 @@ public struct ScheduleNote: Sendable, Equatable {
     public let nextRun: Date?
     /// Cancelled since (in the app or by the agent).
     public var cancelled = false
+}
+
+/// The agent saved something to its memory, or proposed it for approval.
+public struct MemoryNote: Sendable, Equatable {
+    public enum State: Sendable, Equatable { case saved, approved, rejected, forgotten }
+    public let id: Int
+    public let seq: Int
+    public let text: String
+    /// rule, preference or fact.
+    public let kind: String
+    /// Waits for the user's approval in Settings → Memory.
+    public let pending: Bool
+    /// Why it waits: tainted_rule (saved after outside content) or conflict.
+    public let reason: String?
+    /// Saved after outside content, as a hint.
+    public let inferred: Bool
+    public var state: State = .saved
 }
 
 /// A change the agent wants to make in the desktop's browser.

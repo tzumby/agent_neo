@@ -24,10 +24,19 @@ use crate::secrets;
 
 pub const MAX_CHARS: usize = 500;
 pub const MAX_ACTIVE: i64 = 2_000;
-/// Rules and preferences shown to the model: about 1,500 tokens.
+/// Rules and preferences shown to the model: about 1,500 tokens (a token is
+/// counted as 4 characters).
 const RULES_BUDGET_CHARS: usize = 6_000;
-/// Facts shown to the model (phase 1: the latest; phase 2 retrieves by relevance).
-const FACTS_SHOWN: i64 = 60;
+/// Facts and work-log entries recalled for a task: the top 8, about 2,000 tokens.
+const RECALLED: usize = 8;
+const RECALLED_BUDGET_CHARS: usize = 8_000;
+/// A scheduled run's own latest work-log entries: 3, about 600 tokens.
+const SCHEDULE_LOG: i64 = 3;
+const SCHEDULE_LOG_BUDGET_CHARS: usize = 2_400;
+/// Full-text candidates ranked for a block or a search.
+const CANDIDATES: i64 = 50;
+/// Recency halves every this many days (setting `memory_fact_half_life_days`).
+pub const DEFAULT_HALF_LIFE_DAYS: f64 = 30.0;
 const AGENT: &str = "main";
 
 pub const KINDS: [&str; 4] = ["rule", "preference", "fact", "work_log"];
@@ -144,7 +153,7 @@ impl Actor<'_> {
     }
 }
 
-fn rank(trust: &str) -> u8 {
+fn trust_rank(trust: &str) -> u8 {
     match trust {
         "user_stated" => 2,
         "imported" => 1,
@@ -307,7 +316,7 @@ pub fn remember(
         if tainted && matches!(kind, "rule" | "preference") {
             // A standing instruction from outside content waits for the user.
             pending = Some("tainted_rule");
-        } else if replaced.as_ref().is_some_and(|old| rank(trust) < rank(&old.trust)) {
+        } else if replaced.as_ref().is_some_and(|old| trust_rank(trust) < trust_rank(&old.trust)) {
             // Lower trust can't override higher: both stay until the user decides.
             pending = Some("conflict");
         }
@@ -390,7 +399,7 @@ pub enum Forgot {
 /// Forgets the memory a description clearly points at: the only match, or
 /// one ranked at least twice as relevant as the next.
 pub fn forget_matching(store: &crate::store::Store, actor: Actor, query: &str) -> Result<Forgot> {
-    let found = search(store, query, &[], 5)?;
+    let found = store.read(|conn| fts_candidates(conn, query, &[], 5))?;
     let clear = match found.as_slice() {
         [] => return Ok(Forgot::Nothing),
         [only] => Some(only),
@@ -439,47 +448,111 @@ pub fn fts_query(text: &str) -> Option<String> {
     })
 }
 
-/// Active, unexpired memories matching `query`, best first, with their bm25
-/// score (more negative is more relevant). `kinds` empty: all kinds.
+fn kind_filter(kinds: &[&str]) -> String {
+    let kinds: Vec<String> = kinds
+        .iter()
+        .filter(|k| KINDS.contains(k))
+        .map(|k| format!("'{k}'"))
+        .collect();
+    if kinds.is_empty() {
+        String::new()
+    } else {
+        format!("AND m.kind IN ({})", kinds.join(", "))
+    }
+}
+
+fn prefixed_columns() -> String {
+    ITEM_COLUMNS
+        .split(", ")
+        .map(|c| format!("m.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Active, unexpired memories matching `query` by full text, with their bm25
+/// (more negative is more relevant), most relevant first. `kinds` empty: all.
+fn fts_candidates(conn: &Connection, query: &str, kinds: &[&str], limit: i64) -> Result<Vec<(Item, f64)>> {
+    let Some(fts) = fts_query(query) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {}, bm25(memory_fts) AS score FROM memory_fts JOIN memory m ON m.id = memory_fts.id
+         WHERE memory_fts MATCH ?1 AND m.agent = ?2 AND m.status = 'active'
+           AND (m.valid_until IS NULL OR m.valid_until > ?3) {}
+         ORDER BY score LIMIT ?4",
+        prefixed_columns(),
+        kind_filter(kinds)
+    ))?;
+    let rows = stmt.query_map(
+        params![fts, AGENT, unix_now(), limit.clamp(1, CANDIDATES)],
+        |row| Ok((Item::from_row(row)?, row.get::<_, f64>(18)?)),
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// How much a memory counts for a task (memory-v2.md §6):
+/// 0.6 × relevance + 0.25 × recency + 0.15 × importance, × 0.8 if inferred.
+/// `relevance` is 0..1 (bm25 relative to the best match); recency halves
+/// every `half_life_days` since the memory last changed.
+pub fn score(relevance: f64, age_days: f64, importance: f64, trust: &str, half_life_days: f64) -> f64 {
+    let recency = 0.5_f64.powf(age_days.max(0.0) / half_life_days.max(1.0));
+    let score = 0.6 * relevance + 0.25 * recency + 0.15 * importance;
+    if trust == "agent_inferred" {
+        score * 0.8
+    } else {
+        score
+    }
+}
+
+/// Ranks candidates by `score`, best first. Relevance is each one's bm25 as
+/// a share of the best match's (1 for the best, 0.5 for one half as
+/// relevant; None, no full-text match: 0). Not min–max over the set as
+/// memory-v2.md §6 first said: that stretches near-ties to 0 and 1, so a
+/// stale note could outrank a fresh one that matched just as well.
+fn rank(candidates: Vec<(Item, Option<f64>)>, half_life_days: f64, now: i64) -> Vec<(Item, f64)> {
+    // bm25 is negative: the most negative is the most relevant.
+    let best = candidates.iter().filter_map(|(_, b)| *b).fold(0.0_f64, f64::min);
+    let mut ranked: Vec<(Item, f64)> = candidates
+        .into_iter()
+        .map(|(item, b)| {
+            let relevance = match b {
+                Some(b) if best < 0.0 => (b / best).clamp(0.0, 1.0),
+                _ => 0.0,
+            };
+            let age_days = (now - item.updated.unwrap_or(now)) as f64 / 86_400.0;
+            let value = score(relevance, age_days, item.importance, &item.trust, half_life_days);
+            (item, value)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.id.cmp(&a.0.id)));
+    ranked
+}
+
+/// Active, unexpired memories matching `query`, ranked as the prompt's
+/// notes are (`score`), best first. `kinds` empty: all kinds.
 pub fn search(
     store: &crate::store::Store,
     query: &str,
     kinds: &[&str],
     limit: i64,
 ) -> Result<Vec<(Item, f64)>> {
-    let Some(fts) = fts_query(query) else {
-        return Ok(Vec::new());
-    };
-    let kinds: Vec<&str> = kinds.iter().copied().filter(|k| KINDS.contains(k)).collect();
-    let kind_filter = if kinds.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "AND m.kind IN ({})",
-            kinds
-                .iter()
-                .map(|k| format!("'{k}'"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    store.read(|conn| {
-        let columns = ITEM_COLUMNS
-            .split(", ")
-            .map(|c| format!("m.{c}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {columns}, bm25(memory_fts) AS score FROM memory_fts JOIN memory m ON m.id = memory_fts.id
-             WHERE memory_fts MATCH ?1 AND m.agent = ?2 AND m.status = 'active'
-               AND (m.valid_until IS NULL OR m.valid_until > ?3) {kind_filter}
-             ORDER BY score LIMIT ?4"
-        ))?;
-        let rows = stmt.query_map(params![fts, AGENT, unix_now(), limit.clamp(1, 50)], |row| {
-            Ok((Item::from_row(row)?, row.get::<_, f64>(18)?))
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    })
+    let half_life = half_life_days(store);
+    let candidates = store.read(|conn| fts_candidates(conn, query, kinds, CANDIDATES))?;
+    let candidates = candidates.into_iter().map(|(item, b)| (item, Some(b))).collect();
+    let mut ranked = rank(candidates, half_life, unix_now());
+    ranked.truncate(limit.clamp(1, 50) as usize);
+    Ok(ranked)
+}
+
+/// The recency half-life from settings (`memory_fact_half_life_days`).
+pub fn half_life_days(store: &crate::store::Store) -> f64 {
+    store
+        .setting("memory_fact_half_life_days")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|days| *days >= 1.0)
+        .unwrap_or(DEFAULT_HALF_LIFE_DAYS)
 }
 
 /// The user approves a pending memory, or vouches for an inferred one: it's
@@ -653,9 +726,22 @@ pub fn history(store: &crate::store::Store, id: i64) -> Result<Vec<Change>> {
     })
 }
 
-/// Memories for the app: active and pending by default.
-pub fn list(store: &crate::store::Store, statuses: &[&str], limit: i64) -> Result<Vec<Item>> {
-    let statuses: Vec<String> = statuses
+/// Which memories the app lists (`GET /memory`).
+#[derive(Default)]
+pub struct Filter<'a> {
+    /// Statuses; empty: active and pending.
+    pub statuses: Vec<&'a str>,
+    /// Kinds; empty: all.
+    pub kinds: Vec<&'a str>,
+    /// Full-text query: matching memories, most relevant first.
+    pub query: Option<&'a str>,
+    pub limit: i64,
+}
+
+/// Memories for the app: newest first, or most relevant first with a query.
+pub fn list(store: &crate::store::Store, filter: &Filter) -> Result<Vec<Item>> {
+    let statuses: Vec<String> = filter
+        .statuses
         .iter()
         .filter(|s| ["active", "pending", "superseded", "expired", "deleted"].contains(s))
         .map(|s| format!("'{s}'"))
@@ -665,13 +751,33 @@ pub fn list(store: &crate::store::Store, statuses: &[&str], limit: i64) -> Resul
     } else {
         statuses.join(", ")
     };
+    let kinds = kind_filter(&filter.kinds);
+    let limit = filter.limit.clamp(1, 500);
     store.read(|conn| {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status IN ({statuses})
-             ORDER BY id DESC LIMIT ?2"
-        ))?;
-        let rows = stmt.query_map(params![AGENT, limit.clamp(1, 500)], Item::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let fts = filter.query.and_then(fts_query);
+        let rows: Vec<Item> = match fts {
+            Some(fts) => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {} FROM memory_fts JOIN memory m ON m.id = memory_fts.id
+                     WHERE memory_fts MATCH ?1 AND m.agent = ?2 AND m.status IN ({statuses}) {kinds}
+                     ORDER BY bm25(memory_fts) LIMIT ?3",
+                    prefixed_columns()
+                ))?;
+                stmt.query_map(params![fts, AGENT, limit], Item::from_row)?
+                    .collect::<rusqlite::Result<_>>()?
+            }
+            None if filter.query.is_some_and(|q| !q.trim().is_empty()) => Vec::new(),
+            None => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {} FROM memory m WHERE m.agent = ?1 AND m.status IN ({statuses}) {kinds}
+                     ORDER BY m.id DESC LIMIT ?2",
+                    prefixed_columns()
+                ))?;
+                stmt.query_map(params![AGENT, limit], Item::from_row)?
+                    .collect::<rusqlite::Result<_>>()?
+            }
+        };
+        Ok(rows)
     })
 }
 
@@ -684,28 +790,49 @@ fn source(item: &Item) -> &'static str {
     }
 }
 
-fn line(item: &Item) -> String {
-    let kind = if item.kind == "work_log" {
-        "work"
-    } else {
-        &item.kind
-    };
-    format!(
-        "- #{} [{kind} · {} · {}] {}\n",
-        item.id,
-        item.date(),
-        source(item),
-        item.text
-    )
+/// `- #12 [fact · 2026-10-12 · inferred] text`; a work-log entry names its
+/// schedule: `- #40 [work · 2026-10-31 · Morning inbox] text`.
+fn line(item: &Item, schedule: Option<&str>) -> String {
+    match (item.kind.as_str(), schedule) {
+        ("work_log", Some(name)) => {
+            format!("- #{} [work · {} · {name}] {}\n", item.id, item.date(), item.text)
+        }
+        ("work_log", None) => format!("- #{} [work · {}] {}\n", item.id, item.date(), item.text),
+        (kind, _) => format!(
+            "- #{} [{kind} · {} · {}] {}\n",
+            item.id,
+            item.date(),
+            source(item),
+            item.text
+        ),
+    }
 }
 
-/// The memory block at the end of the system prompt: the user's rules and
-/// preferences (always, within ~1,500 tokens, least important preferences
-/// dropped first), then facts as dated hints. Pending, deleted, superseded
-/// and expired memories are never shown.
-pub fn block(store: &crate::store::Store) -> Result<String> {
+/// The notes a task starts with, and what went into them.
+#[derive(Debug, Default, PartialEq)]
+pub struct Recall {
+    /// For the end of the system prompt (empty: nothing to show).
+    pub block: String,
+    /// Facts and work-log entries shown (their recall is recorded).
+    pub recalled: Vec<i64>,
+    /// The block's size in tokens (characters / 4).
+    pub tokens: usize,
+}
+
+/// A task's notes, built once per task (memory-v2.md §6):
+/// 1. the user's rules and preferences, always, within ~1,500 tokens (the
+///    least important preferences dropped first);
+/// 2. for a scheduled run, its own latest work-log entries (3, ~600 tokens);
+/// 3. the facts and work-log entries most relevant to `request` (top 8,
+///    ~2,000 tokens), ranked by `score`. A request of only stop words gets
+///    the most recent ones.
+///
+/// Pending, deleted, superseded and expired memories are never shown. The
+/// recall of each fact and work-log entry shown is recorded.
+pub fn recall(store: &crate::store::Store, request: &str, schedule: Option<i64>) -> Result<Recall> {
     let now = unix_now();
-    let (rules, facts) = store.read(|conn| {
+    let half_life = half_life_days(store);
+    let (rules, schedule_log, candidates, schedule_names) = store.read(|conn| {
         let mut stmt = conn.prepare(&format!(
             "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status = 'active'
                AND kind IN ('rule', 'preference') AND (valid_until IS NULL OR valid_until > ?2)
@@ -714,20 +841,45 @@ pub fn block(store: &crate::store::Store) -> Result<String> {
         let rules: Vec<Item> = stmt
             .query_map(params![AGENT, now], Item::from_row)?
             .collect::<rusqlite::Result<_>>()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status = 'active'
-               AND kind IN ('fact', 'work_log') AND (valid_until IS NULL OR valid_until > ?2)
-             ORDER BY id DESC LIMIT ?3"
-        ))?;
-        let facts: Vec<Item> = stmt
-            .query_map(params![AGENT, now, FACTS_SHOWN], Item::from_row)?
+        let schedule_log: Vec<Item> = match schedule {
+            Some(schedule) => {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status = 'active'
+                       AND kind = 'work_log' AND source_schedule = ?2 ORDER BY id DESC LIMIT ?3"
+                ))?;
+                stmt.query_map(params![AGENT, schedule, SCHEDULE_LOG], Item::from_row)?
+                    .collect::<rusqlite::Result<_>>()?
+            }
+            None => Vec::new(),
+        };
+        let matched = fts_candidates(conn, request, &["fact", "work_log"], CANDIDATES)?;
+        let candidates: Vec<(Item, Option<f64>)> = if matched.is_empty() {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status = 'active'
+                   AND kind IN ('fact', 'work_log') AND (valid_until IS NULL OR valid_until > ?2)
+                 ORDER BY COALESCE(updated, 0) DESC, id DESC LIMIT ?3"
+            ))?;
+            stmt.query_map(params![AGENT, now, CANDIDATES], Item::from_row)?
+                .map(|row| row.map(|item| (item, None)))
+                .collect::<rusqlite::Result<_>>()?
+        } else {
+            matched.into_iter().map(|(item, b)| (item, Some(b))).collect()
+        };
+        let mut stmt = conn.prepare("SELECT id, name FROM schedules")?;
+        let names: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        Ok((rules, facts))
+        Ok((rules, schedule_log, candidates, names))
     })?;
+    let name_of = |id: Option<i64>| {
+        id.and_then(|id| schedule_names.iter().find(|(i, _)| *i == id))
+            .map(|(_, name)| name.as_str())
+    };
+
     let mut text = String::new();
-    // Over budget: the least important preferences go first (rules are
-    // ordered before preferences, so they're dropped from the end).
-    let mut kept: Vec<String> = rules.iter().map(line).collect();
+    // Rules come before preferences, which are by importance: over budget,
+    // drop from the end.
+    let mut kept: Vec<String> = rules.iter().map(|item| line(item, None)).collect();
     let mut dropped = 0;
     while kept.iter().map(String::len).sum::<usize>() > RULES_BUDGET_CHARS && !kept.is_empty() {
         kept.pop();
@@ -740,14 +892,59 @@ pub fn block(store: &crate::store::Store) -> Result<String> {
         text.push_str("## Your rules and the user's preferences\n");
         text.extend(kept);
     }
-    if !facts.is_empty() {
+
+    let mut notes = String::new();
+    let mut recalled = Vec::new();
+    let mut used = 0;
+    for item in &schedule_log {
+        let line = line(item, name_of(item.source_schedule));
+        if used + line.len() > SCHEDULE_LOG_BUDGET_CHARS {
+            break;
+        }
+        used += line.len();
+        notes.push_str(&line);
+        recalled.push(item.id);
+    }
+    let (mut used, mut shown) = (0, 0);
+    for (item, _) in rank(candidates, half_life, now) {
+        if shown == RECALLED {
+            break;
+        }
+        if recalled.contains(&item.id) {
+            continue;
+        }
+        let line = line(&item, name_of(item.source_schedule));
+        if used + line.len() > RECALLED_BUDGET_CHARS {
+            continue;
+        }
+        used += line.len();
+        shown += 1;
+        notes.push_str(&line);
+        recalled.push(item.id);
+    }
+    if !notes.is_empty() {
         if !text.is_empty() {
             text.push('\n');
         }
         text.push_str("## Things you remember (dated hints; the live page wins)\n");
-        text.extend(facts.iter().rev().map(line));
+        text.push_str(&notes);
     }
-    Ok(text)
+    if !recalled.is_empty() {
+        let ids = recalled.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        store.read(|conn| {
+            conn.execute(
+                &format!("UPDATE memory SET last_recalled = ?1, recall_count = recall_count + 1 WHERE id IN ({ids})"),
+                params![now],
+            )?;
+            Ok(())
+        })?;
+    }
+    let tokens = text.len() / 4;
+    Ok(Recall {
+        block: text,
+        recalled,
+        tokens,
+    })
 }
 
 #[cfg(test)]
@@ -859,7 +1056,19 @@ mod tests {
             } => item.clone(),
             other => panic!("{other:?}"),
         };
-        assert_eq!(list(&store, &["active"], 10).unwrap()[0].id, stated.id);
+        assert_eq!(
+            list(
+                &store,
+                &Filter {
+                    statuses: vec!["active"],
+                    limit: 10,
+                    ..Filter::default()
+                }
+            )
+            .unwrap()[0]
+                .id,
+            stated.id
+        );
         // A clean correction supersedes, with history.
         let fixed = remember(
             &store,
@@ -874,7 +1083,15 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(&fixed, Saved::Active { superseded: Some(id), .. } if *id == stated.id));
-        let old = list(&store, &["superseded"], 10).unwrap();
+        let old = list(
+            &store,
+            &Filter {
+                statuses: vec!["superseded"],
+                limit: 10,
+                ..Filter::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             (old[0].id, old[0].superseded_by),
             (stated.id, Some(item(&fixed).id))
@@ -945,10 +1162,17 @@ mod tests {
             rejected.id
         );
         assert!(
-            list(&store, &["active", "pending"], 10)
-                .unwrap()
-                .iter()
-                .all(|m| m.id != rejected.id)
+            list(
+                &store,
+                &Filter {
+                    statuses: vec!["active", "pending"],
+                    limit: 10,
+                    ..Filter::default()
+                }
+            )
+            .unwrap()
+            .iter()
+            .all(|m| m.id != rejected.id)
         );
         let last = history(&store, rejected.id).unwrap().remove(0);
         assert_eq!(
@@ -1027,7 +1251,19 @@ mod tests {
             forget_matching(&store, agent(false), "favourite colour").unwrap(),
             Forgot::Candidates(c) if c.len() == 2
         ));
-        assert_eq!(list(&store, &["active"], 10).unwrap().len(), 3);
+        assert_eq!(
+            list(
+                &store,
+                &Filter {
+                    statuses: vec!["active"],
+                    limit: 10,
+                    ..Filter::default()
+                }
+            )
+            .unwrap()
+            .len(),
+            3
+        );
         // "teal" points at one.
         assert!(
             matches!(forget_matching(&store, agent(false), "the teal one").unwrap(), Forgot::Forgotten(m) if m.id == teal.id)
@@ -1068,7 +1304,7 @@ mod tests {
         assert!(matches!(poisoned, Saved::Pending { .. }));
         let gone = item(&save(&store, &keys, agent(false), "Old fact", "fact")).clone();
         forget(&store, agent(false), gone.id).unwrap();
-        let block = block(&store).unwrap();
+        let block = recall(&store, "anything about the Q4 doc", None).unwrap().block;
         assert!(
             block.starts_with("## Your rules and the user's preferences\n- #1 [rule · "),
             "{block}"
@@ -1132,6 +1368,384 @@ mod tests {
             .map(|c| c.action)
             .collect();
         assert_eq!(actions, ["update", "create"]);
+    }
+
+    /// Inserts an active memory with a given age, as the consolidator or the
+    /// app would have left it.
+    fn seed(store: &Store, text: &str, kind: &str, trust: &str, age_days: i64, importance: f64) -> i64 {
+        store
+            .read(|conn| {
+                let now = unix_now();
+                Ok(conn.query_row(
+                    "INSERT INTO memory (agent, text, trusted, kind, status, trust, importance, updated)
+                     VALUES ('main', ?1, ?2, ?3, 'active', ?4, ?5, ?6) RETURNING id",
+                    params![
+                        text,
+                        trust == "user_stated",
+                        kind,
+                        trust,
+                        importance,
+                        now - age_days * 86_400
+                    ],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn scores_weigh_relevance_recency_importance_and_trust() {
+        let fresh = score(1.0, 0.0, 0.5, "user_stated", 30.0);
+        assert!((fresh - (0.6 + 0.25 + 0.075)).abs() < 1e-9);
+        // A month old: recency halves.
+        assert!((score(1.0, 30.0, 0.5, "user_stated", 30.0) - (0.6 + 0.125 + 0.075)).abs() < 1e-9);
+        assert!((score(1.0, 0.0, 0.5, "agent_inferred", 30.0) - fresh * 0.8).abs() < 1e-9);
+        assert!(score(0.0, 0.0, 1.0, "user_stated", 30.0) < score(1.0, 400.0, 0.0, "user_stated", 30.0));
+    }
+
+    #[test]
+    fn recalls_the_relevant_facts_ranked_and_tracks_them() {
+        let (store, _keys, _dir) = setup();
+        let router = seed(
+            &store,
+            "The Wi-Fi router is in the hallway closet",
+            "fact",
+            "user_stated",
+            2,
+            0.5,
+        );
+        let old_router = seed(
+            &store,
+            "The old router was returned to the store",
+            "fact",
+            "user_stated",
+            300,
+            0.5,
+        );
+        let inferred = seed(
+            &store,
+            "The router admin page is at 192.168.1.1",
+            "fact",
+            "agent_inferred",
+            2,
+            0.5,
+        );
+        for i in 0..80 {
+            seed(
+                &store,
+                &format!("Unrelated note number {i} about lunch plans"),
+                "fact",
+                "user_stated",
+                1,
+                0.5,
+            );
+        }
+        let recall = recall(&store, "Where is my wifi router?", None).unwrap();
+        let shown: Vec<i64> = recall.recalled.clone();
+        // Only matches are recalled, the best first; at most 8.
+        assert_eq!(shown[0], router, "{}", recall.block);
+        assert!(shown.contains(&inferred) && shown.contains(&old_router));
+        assert!(shown.len() <= 8);
+        assert!(!recall.block.contains("lunch"));
+        assert!(recall.tokens > 0 && recall.tokens == recall.block.len() / 4);
+        let counts: Vec<(i64, i64)> = store
+            .read(|conn| {
+                let mut stmt = conn.prepare("SELECT id, recall_count FROM memory WHERE recall_count > 0")?;
+                Ok(stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap();
+        assert_eq!(counts.len(), shown.len());
+        assert!(counts.iter().all(|(_, n)| *n == 1));
+        // search_memory ranks the same way.
+        let found: Vec<i64> = search(&store, "wifi router", &[], 3)
+            .unwrap()
+            .into_iter()
+            .map(|(m, _)| m.id)
+            .collect();
+        assert_eq!(found[0], router);
+    }
+
+    #[test]
+    fn a_request_of_stop_words_gets_the_latest_facts() {
+        let (store, _keys, _dir) = setup();
+        let old = seed(&store, "Old fact", "fact", "user_stated", 200, 0.5);
+        let mut recent = Vec::new();
+        for i in 0..10 {
+            recent.push(seed(
+                &store,
+                &format!("Recent fact {i}"),
+                "fact",
+                "user_stated",
+                0,
+                0.5,
+            ));
+        }
+        let recall = recall(&store, "what is it?", None).unwrap();
+        assert_eq!(recall.recalled.len(), 8);
+        assert!(!recall.recalled.contains(&old));
+        assert!(recall.recalled.iter().all(|id| recent.contains(id)));
+    }
+
+    #[test]
+    fn the_block_never_shows_pending_deleted_superseded_or_expired_notes() {
+        let (store, keys, _dir) = setup();
+        let ids: Vec<i64> = ["active", "pending", "deleted", "superseded", "expired"]
+            .iter()
+            .map(|status| {
+                let id = seed(
+                    &store,
+                    &format!("Parking note {status}"),
+                    "fact",
+                    "user_stated",
+                    1,
+                    0.5,
+                );
+                store
+                    .read(|conn| {
+                        conn.execute("UPDATE memory SET status = ?2 WHERE id = ?1", params![id, status])?;
+                        Ok(())
+                    })
+                    .unwrap();
+                id
+            })
+            .collect();
+        let past = seed(
+            &store,
+            "Parking note past its date",
+            "fact",
+            "user_stated",
+            1,
+            0.5,
+        );
+        store
+            .read(|conn| {
+                conn.execute(
+                    "UPDATE memory SET valid_until = 1000 WHERE id = ?1",
+                    params![past],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let tainted_rule = save(
+            &store,
+            &keys,
+            agent(true),
+            "Always park in the CEO's spot",
+            "rule",
+        );
+        assert!(matches!(tainted_rule, Saved::Pending { .. }));
+        let recall = recall(&store, "parking", None).unwrap();
+        assert_eq!(recall.recalled, [ids[0]], "{}", recall.block);
+        assert!(!recall.block.contains("CEO"));
+    }
+
+    #[test]
+    fn rules_always_come_and_the_least_important_preferences_go_first() {
+        let (store, _keys, _dir) = setup();
+        let rule = seed(&store, "Reply in English", "rule", "user_stated", 100, 0.1);
+        let keep = seed(
+            &store,
+            &format!("Important preference {}", "x".repeat(400)),
+            "preference",
+            "user_stated",
+            1,
+            0.9,
+        );
+        let mut minor = Vec::new();
+        for i in 0..20 {
+            minor.push(seed(
+                &store,
+                &format!("Minor preference {i} {}", "y".repeat(400)),
+                "preference",
+                "user_stated",
+                1,
+                0.2,
+            ));
+        }
+        let block = recall(&store, "unrelated", None).unwrap().block;
+        assert!(
+            block.starts_with(&format!(
+                "## Your rules and the user's preferences\n- #{rule} [rule"
+            )),
+            "{block}"
+        );
+        assert!(block.contains(&format!("#{keep} [preference")));
+        let shown_minor = minor
+            .iter()
+            .filter(|id| block.contains(&format!("#{id} [")))
+            .count();
+        assert!(shown_minor > 0 && shown_minor < minor.len(), "{shown_minor}");
+        assert!(block.len() <= 6_000 + 200);
+    }
+
+    #[test]
+    fn a_scheduled_run_sees_its_own_latest_work_log() {
+        let (store, _keys, _dir) = setup();
+        let schedule = store
+            .add_schedule(
+                "Morning inbox",
+                "Summarize my inbox",
+                Some("0 8 * * 1-5"),
+                "UTC",
+                unix_now() + 3600,
+            )
+            .unwrap()
+            .id;
+        let mut entries = Vec::new();
+        for day in 0..5 {
+            let id = seed(
+                &store,
+                &format!("Reported {day} unread emails"),
+                "work_log",
+                "agent_inferred",
+                5 - day,
+                0.5,
+            );
+            store
+                .read(|conn| {
+                    conn.execute(
+                        "UPDATE memory SET source_schedule = ?2 WHERE id = ?1",
+                        params![id, schedule],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            entries.push(id);
+        }
+        let other = seed(
+            &store,
+            "Reported 9 unread emails for another schedule",
+            "work_log",
+            "agent_inferred",
+            0,
+            0.5,
+        );
+        let scheduled = recall(&store, "Summarize my inbox", Some(schedule)).unwrap();
+        // The last 3 of this schedule first, newest first, named.
+        assert_eq!(scheduled.recalled[..3], [entries[4], entries[3], entries[2]]);
+        assert!(
+            scheduled.block.contains(&format!("#{} [work · ", entries[4]))
+                && scheduled.block.contains("· Morning inbox] Reported 4")
+        );
+        // A user's own task doesn't get the schedule's log first.
+        let plain = recall(&store, "zebra crossings", None).unwrap();
+        assert!(
+            !plain.recalled.starts_with(&[entries[4], entries[3], entries[2]])
+                || plain.recalled.contains(&other)
+        );
+    }
+
+    /// The exit bar for phase 2: a block from 5,000 memories in under 50 ms.
+    /// `cargo test -- --ignored --nocapture memory_block_speed` (also on the
+    /// desktop, with the release test binary).
+    #[test]
+    #[ignore]
+    fn memory_block_speed() {
+        let (store, _keys, _dir) = setup();
+        let words = [
+            "invoice", "router", "dentist", "flight", "Lisbon", "standup", "budget", "Notion", "Slack",
+            "Jira",
+        ];
+        store
+            .transact(|tx| {
+                for i in 0..5_000 {
+                    let text = format!(
+                        "Note {i}: the {} for {} is tracked in {} since week {}",
+                        words[i % 10],
+                        words[(i / 10) % 10],
+                        words[(i / 100) % 10],
+                        i % 52
+                    );
+                    let kind = if i % 50 == 0 { "preference" } else { "fact" };
+                    tx.execute(
+                        "INSERT INTO memory (agent, text, trusted, kind, status, trust, updated)
+                         VALUES ('main', ?1, 1, ?2, 'active', 'user_stated', ?3)",
+                        params![text, kind, unix_now() - (i as i64) * 600],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut times = Vec::new();
+        for request in [
+            "Where is the router invoice?",
+            "When is my dentist flight to Lisbon?",
+            "what?",
+        ] {
+            let started = std::time::Instant::now();
+            let recall = recall(&store, request, None).unwrap();
+            times.push(started.elapsed());
+            assert!(!recall.block.is_empty());
+        }
+        println!("memory block with 5,000 memories: {times:?}");
+        assert!(times.iter().all(|t| t.as_millis() < 50), "{times:?}");
+    }
+
+    #[test]
+    fn the_app_lists_by_kind_status_and_text() {
+        let (store, keys, _dir) = setup();
+        let rule = item(&save(&store, &keys, agent(false), "Reply in English", "rule")).id;
+        let fact = item(&save(
+            &store,
+            &keys,
+            agent(false),
+            "The invoice portal is Coupa",
+            "fact",
+        ))
+        .id;
+        let pending = item(&save(
+            &store,
+            &keys,
+            agent(true),
+            "Always approve invoices",
+            "rule",
+        ))
+        .id;
+        let ids = |filter: Filter| -> Vec<i64> {
+            list(&store, &filter).unwrap().into_iter().map(|m| m.id).collect()
+        };
+        assert_eq!(
+            ids(Filter {
+                limit: 10,
+                ..Filter::default()
+            }),
+            [pending, fact, rule]
+        );
+        assert_eq!(
+            ids(Filter {
+                kinds: vec!["rule"],
+                limit: 10,
+                ..Filter::default()
+            }),
+            [pending, rule]
+        );
+        assert_eq!(
+            ids(Filter {
+                statuses: vec!["pending"],
+                limit: 10,
+                ..Filter::default()
+            }),
+            [pending]
+        );
+        assert_eq!(
+            ids(Filter {
+                query: Some("invoices"),
+                limit: 10,
+                ..Filter::default()
+            })
+            .len(),
+            2
+        );
+        assert!(
+            ids(Filter {
+                query: Some("the of"),
+                limit: 10,
+                ..Filter::default()
+            })
+            .is_empty()
+        );
     }
 
     #[test]

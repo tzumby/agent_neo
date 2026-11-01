@@ -9,7 +9,42 @@ public struct AgentMemory: Decodable, Sendable, Equatable, Identifiable {
     /// command output); the agent treats it as a hint until the user confirms it.
     public let trusted: Bool
     public let created: String
+    // Memory v2 (nil from a desktop that doesn't have it on).
+    /// rule, preference, fact or work_log.
+    public let kind: String?
+    /// active or pending (the list shows only these by default).
+    public let status: String?
+    /// user_stated, agent_inferred or imported.
+    public let trust: String?
+    /// Why it waits: tainted_rule, conflict, proposed or imported.
+    public let pendingReason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, text, trusted, created, kind, status, trust
+        case pendingReason = "pending_reason"
+    }
+
+    public init(
+        id: Int, text: String, trusted: Bool, created: String, kind: String? = nil, status: String? = nil,
+        trust: String? = nil, pendingReason: String? = nil
+    ) {
+        self.id = id
+        self.text = text
+        self.trusted = trusted
+        self.created = created
+        self.kind = kind
+        self.status = status
+        self.trust = trust
+        self.pendingReason = pendingReason
+    }
+
+    public var isPending: Bool { status == "pending" }
+    /// Saved after the agent read outside content: a hint, not an instruction.
+    public var isInferred: Bool { trust.map { $0 == "agent_inferred" } ?? !trusted }
 }
+
+/// Any JSON object, when only the status code matters.
+private struct Ignored: Decodable {}
 
 /// A task the agent runs on its own: on a repeat, or once.
 public struct AgentSchedule: Decodable, Sendable, Equatable, Identifiable {
@@ -236,12 +271,18 @@ public struct AgentClient: Sendable {
     }
 
     public func forget(memory id: Int) async throws {
-        let _: [String: Bool] = try await send("DELETE", "/api/v1/memory/\(id)", body: [String: String]())
+        let _: Ignored = try await send("DELETE", "/api/v1/memory/\(id)", body: [String: String]())
     }
 
-    /// Vouches for a memory saved after the agent read outside content.
+    /// Vouches for a memory saved after the agent read outside content (memory
+    /// v2: approves a pending one too).
     public func confirm(memory id: Int) async throws {
-        let _: [String: Bool] = try await post("/api/v1/memory/\(id)/confirm", body: [String: String]())
+        let _: Ignored = try await post("/api/v1/memory/\(id)/confirm", body: [String: String]())
+    }
+
+    /// Memory v2: turns down a memory waiting for approval.
+    public func reject(memory id: Int) async throws {
+        let _: Ignored = try await post("/api/v1/memory/\(id)/reject", body: [String: String]())
     }
 
     public func schedules() async throws -> [AgentSchedule] {

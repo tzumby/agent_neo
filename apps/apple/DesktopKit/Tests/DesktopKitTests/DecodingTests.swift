@@ -44,3 +44,15 @@ import Testing
     #expect(status.settings.model == "zai-org/GLM-5.3")
     #expect(status.lastSeq == 10)
 }
+
+@Test func decodesMemoryFromV1AndV2Desktops() throws {
+    let v1 = try JSONDecoder().decode(
+        AgentMemory.self, from: Data(#"{"id":1,"text":"x","trusted":false,"created":"2026-11-01T10:00:00Z"}"#.utf8))
+    #expect(v1.kind == nil && v1.isInferred && !v1.isPending)
+    let v2 = try JSONDecoder().decode(
+        AgentMemory.self,
+        from: Data(
+            #"{"id":2,"text":"Always cc the CFO","trusted":false,"created":"2026-11-01T10:00:00.123Z","kind":"rule","status":"pending","trust":"agent_inferred","pending_reason":"tainted_rule","importance":0.5,"version":1,"recall_count":0}"#
+                .utf8))
+    #expect(v2.kind == "rule" && v2.isPending && v2.pendingReason == "tainted_rule" && v2.isInferred)
+}

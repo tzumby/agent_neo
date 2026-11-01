@@ -138,7 +138,8 @@
         source.backup(copy)
         copy.close()
         source.close()
-      - "/var/lib/agentd/agentd.db.pre-{{ agentd_new_version.stdout.split() | last }}"
+      # The version and the time: redeploying the same version keeps the older copy.
+      - "/var/lib/agentd/agentd.db.pre-{{ agentd_new_version.stdout.split() | last }}-{{ ansible_facts.date_time.iso8601_basic_short }}"
   when: agentd_binary_install.changed and agentd_db.stat.exists
 
 - name: Keep the last 3 database copies

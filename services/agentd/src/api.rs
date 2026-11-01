@@ -37,6 +37,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/settings", get(settings).put(put_settings))
         .route("/api/v1/devices", post(register_device))
         .route("/api/v1/memory", get(memories))
+        .route("/api/v1/memory/search", get(search_memory))
         .route("/api/v1/memory/{id}", delete(forget_memory).patch(edit_memory))
         .route("/api/v1/memory/{id}/confirm", post(confirm_memory))
         .route("/api/v1/memory/{id}/approve", post(confirm_memory))
@@ -243,7 +244,20 @@ async fn stop(State(agent): App) -> Json<Value> {
 struct MemoryQuery {
     /// Memory v2: comma-separated statuses (default `active,pending`).
     status: Option<String>,
+    /// Memory v2: comma-separated kinds (default all).
+    kind: Option<String>,
+    /// Memory v2: full-text query.
+    q: Option<String>,
     limit: Option<i64>,
+}
+
+fn comma_list(text: &Option<String>) -> Vec<&str> {
+    text.as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// What the agent remembers, for the app's Memory screen. Memory v2 lists
@@ -252,20 +266,50 @@ struct MemoryQuery {
 async fn memories(State(agent): App, Query(query): Query<MemoryQuery>) -> Response {
     let limit = query.limit.unwrap_or(500);
     if agent.cfg.memory_v2 {
-        let statuses: Vec<&str> = query
-            .status
-            .as_deref()
-            .unwrap_or("")
-            .split(',')
-            .map(str::trim)
-            .collect();
-        return match memory::list(&agent.store, &statuses, limit) {
+        let filter = memory::Filter {
+            statuses: comma_list(&query.status),
+            kinds: comma_list(&query.kind),
+            query: query.q.as_deref(),
+            limit,
+        };
+        return match memory::list(&agent.store, &filter) {
             Ok(memories) => Json(json!({"memories": memories})).into_response(),
             Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
     }
     match agent.store.memories(limit.clamp(1, 500)) {
         Ok(memories) => Json(json!({"memories": memories})).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+    kinds: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Memory v2: active memories ranked as the agent's notes are (what its
+/// `search_memory` tool sees), each with its score.
+async fn search_memory(State(agent): App, Query(query): Query<SearchQuery>) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let kinds = comma_list(&query.kinds);
+    match memory::search(
+        &agent.store,
+        &query.q,
+        &kinds,
+        query.limit.unwrap_or(8).clamp(1, 50),
+    ) {
+        Ok(found) => {
+            let results: Vec<Value> = found
+                .into_iter()
+                .map(|(item, score)| json!({"memory": item, "score": (score * 1000.0).round() / 1000.0}))
+                .collect();
+            Json(json!({"results": results})).into_response()
+        }
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }

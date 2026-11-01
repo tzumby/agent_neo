@@ -534,6 +534,50 @@ Phase 1 (built; behind `MEMORY_V2`):
 - **`GET /memory`** takes `status=` (comma list) already in phase 1, because v2 needs a default of active and pending. The other filters come in phase 2.
 - **Evals:** 3 scenarios (explicit remember recalled, forget honoured, correction supersedes). All pass with v2 off (v1) and on; v2 costs about 15% more per task for its longer memory instructions. The correction scenario showed the model writing "Dr. Park (previously Dr. Lee…)" when superseding, which is reasonable.
 
+Phase 2 (built; behind `MEMORY_V2`):
+
+- **Relevance is relative to the best match, not min–max** (a change to §6's formula). A candidate's relevance is its bm25 divided by the best candidate's: 1 for the best, 0.5 for one half as relevant.
+
+  Min–max over the candidate set stretches near-ties to 0 and 1. A test caught it: three notes that all matched only "router" got relevance 1, 0.5 and 0. A 300-day-old note then outranked a 2-day-old one, because the 0.6 weight on relevance swamped recency. With the change, near-ties stay near 1 and recency and importance decide among them.
+- **The block is built once per task.** It's stored in the task's state, so a task resumed after an approval keeps the same notes and the same prompt prefix. A task parked by an earlier phase builds its block when it resumes, from its last message.
+- **The query after an Action needed** is the previous request plus "I've done what you asked…", since the resume text alone says nothing.
+- **Recall tracking** covers the facts and work-log entries shown, not the rules and preferences. Those are always shown, and recall counts only feed consolidation's decay of facts (§8).
+- **Work-log lines** in the block name their schedule: `- #40 [work · 2026-10-31 · Morning inbox] …`.
+- **Speed:** a block from 5,000 memories takes 3.5–12 ms on the dev desktop (t3a.medium, release test binary) and 1–3 ms on a Mac, against the 50 ms bar. Test: `memory::tests::memory_block_speed` (ignored by default).
+- **Full-text search's limits seen so far:**
+  - "Wi-Fi" is indexed as "wi" and "fi", so "wifi" doesn't match it;
+  - a paraphrase ("who do I report to" for "manager") doesn't match at all.
+
+  In the paraphrase eval the model fell back to `search_memory("manager")` on its own and answered correctly. No embeddings yet (§19).
+
+**Evals at phase 2:** 20 scenarios, GLM-5.3, 2026-11-01. v1 is `MEMORY_V2=off`, v2 is `on`; each task is around half a cent.
+
+| Scenario | v1 | v2 | Note |
+|---|---|---|---|
+| explicit-remember-recalled | pass | pass | |
+| forget-honoured | pass | pass | |
+| correction-supersedes | pass | pass | v2 supersedes the old note |
+| no-false-memory | pass | pass | |
+| preference-applied | pass | pass | |
+| rule-applied | pass | pass | |
+| recall-among-distractors | **fail** | pass | v1 shows only the latest 60 notes: the key's location was #1 of 81 |
+| recall-paraphrase | **fail** | pass | v2: full text missed, and the model called `search_memory` |
+| expired-not-used | **fail** | pass | v1 ignores `valid_until` |
+| two-facts-one-message | pass | pass | |
+| keep-in-mind | pass | pass | |
+| call-me | pass | pass | |
+| forget-one-of-two | pass | pass | |
+| travel-dates | pass | pass | |
+| secret-refused | pass | pass | v1 by the prompt; v2 by the prompt and the filter |
+| update-preference | pass | pass | |
+| deploy-day | pass | pass | |
+| survives-an-unrelated-task | pass | pass | |
+| inferred-hint-is-not-an-instruction | pass | pass | |
+| dont-forget | pass | pass | |
+| **Total** | **17/20, $0.11** | **20/20, $0.12** | |
+
+The first v2 run had 19/20: "expired-not-used" didn't say to answer from memory, so the model went to look in Gmail and stopped at the sign-in. The scenario now says "without looking anything up".
+
 
 ## 20. File map
 

@@ -16,7 +16,10 @@ this Mac), and TOGETHER_API_KEY from the environment. Steps:
     {"new_conversation": true}     clears the chat history, so recall has to
                                    come from memory
     {"expect_answer": ["teal"]}    the last answer contains each (any case)
+    {"expect_answer_not": ["lee"]} the last answer contains none of them
     {"expect_memory": "teal"}      a saved memory contains it (any case)
+    {"expect_no_memory": "lee"}    no current memory contains it (v2 lists
+                                   active and pending ones only)
 
 Costs real model spend (cents per scenario). Results are tracked, not gated:
 the report lists pass/fail, steps, seconds and cost per scenario.
@@ -163,6 +166,15 @@ def run(scenario: dict, args, key: str) -> dict:
                 for word in step["expect_answer"]:
                     if word.lower() not in answer:
                         result["problems"].append(f"answer lacks {word!r}: {answer[:200]!r}")
+            elif "expect_answer_not" in step:
+                answer = (last or {}).get("answer", "").lower()
+                for word in step["expect_answer_not"]:
+                    if word.lower() in answer:
+                        result["problems"].append(f"answer has {word!r}: {answer[:200]!r}")
+            elif "expect_no_memory" in step:
+                memories = desktop.memories()
+                if any(step["expect_no_memory"].lower() in m.lower() for m in memories):
+                    result["problems"].append(f"still remembers {step['expect_no_memory']!r}: {memories}")
             elif "expect_memory" in step:
                 memories = desktop.memories()
                 if not any(step["expect_memory"].lower() in m.lower() for m in memories):

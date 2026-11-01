@@ -313,7 +313,7 @@ fn advance(agent: &Agent, schedule: &Schedule, now: i64, ran: Option<i64>) {
     match next {
         Some(next) => agent.emit("schedule.updated", json!({"id": schedule.id, "next_run": next})),
         None => agent.emit("schedule.deleted", json!({"id": schedule.id, "done": true})),
-    }
+    };
 }
 
 #[cfg(test)]

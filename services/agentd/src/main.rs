@@ -13,6 +13,7 @@ mod effects;
 mod gateway;
 mod guard;
 mod llm;
+mod memory;
 mod policy;
 mod push;
 mod schedule;

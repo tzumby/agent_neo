@@ -55,6 +55,95 @@ static NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Z][A-Z0-9_]{1,6
 /// `$NAME` or `${NAME}` (also `${NAME:-…}`) in a command.
 static REFERENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{?([A-Z][A-Z0-9_]*)").unwrap());
 
+/// Well-known key and token formats (the app's KeyDetector, ported): each has
+/// a prefix, so ordinary text and hashes don't match.
+static KEY_FORMATS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    [
+        (r"\bgithub_pat_[A-Za-z0-9_]{40,}", "a GitHub token"),
+        (r"\bgh[pousr]_[A-Za-z0-9]{30,}", "a GitHub token"),
+        (r"\bglpat-[A-Za-z0-9_\-]{20,}", "a GitLab token"),
+        (r"\bsk-ant-[A-Za-z0-9_\-]{20,}", "an Anthropic API key"),
+        (r"\btgp_v1_[A-Za-z0-9_\-]{20,}", "a Together AI API key"),
+        (r"\b[sr]k_(live|test)_[A-Za-z0-9]{20,}", "a Stripe API key"),
+        (r"\bsk-[A-Za-z0-9_\-]{20,}", "an OpenAI API key"),
+        (r"\bxox[abposr]-[A-Za-z0-9\-]{10,}", "a Slack token"),
+        (r"\bhf_[A-Za-z0-9]{30,}", "a Hugging Face token"),
+        (r"\bAIza[0-9A-Za-z_\-]{35}", "a Google API key"),
+        (r"\bAKIA[0-9A-Z]{16}\b", "an AWS access key"),
+    ]
+    .into_iter()
+    .map(|(pattern, what)| (Regex::new(pattern).unwrap(), what))
+    .collect()
+});
+/// 13 to 19 digits, maybe in groups: a card number if it passes Luhn.
+static DIGIT_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d(?:[ -]?\d){12,18}\b").unwrap());
+/// A password word, then up to 40 characters to look at.
+static PASSWORD_WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i:\b(?:password|passcode|passwd)\b)|\bPIN\b").unwrap());
+/// A 6–8 digit code near "code", "OTP" or "2FA" (either side, within 20 characters).
+static ONE_TIME_CODE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:code|otp|2fa)\b.{0,20}?\b\d{6,8}\b|\b\d{6,8}\b.{0,20}?\b(?:code|otp|2fa)\b")
+        .unwrap()
+});
+
+fn luhn(digits: &[u32]) -> bool {
+    let sum: u32 = digits
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, &d)| {
+            if i % 2 == 1 {
+                if d * 2 > 9 { d * 2 - 9 } else { d * 2 }
+            } else {
+                d
+            }
+        })
+        .sum();
+    sum.is_multiple_of(10)
+}
+
+/// A token right after a password word that isn't a plain word: digits or
+/// symbols in it ("hunter2", "Tr0ub4dor&3"). "The PIN pad is by the door"
+/// passes.
+fn secret_after_password_word(rest: &str) -> bool {
+    let window: String = rest.chars().take(40).collect();
+    window
+        .split(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | ',' | ';' | '"' | '\'' | '(' | ')'))
+        .filter(|token| token.chars().count() >= 3)
+        .any(|token| {
+            let token = token.trim_end_matches(['.', '!', '?']);
+            token.chars().any(|c| c.is_ascii_digit())
+                || token
+                    .chars()
+                    .any(|c| !(c.is_alphabetic() || c == '-' || c == '\''))
+        })
+}
+
+/// What a memory's text holds that must never be stored, if anything: a key
+/// or token, a card number, a password, a one-time code. Emails, phone
+/// numbers, names and addresses pass: drafting mail needs them.
+pub fn looks_like_secret(text: &str) -> Option<&'static str> {
+    if let Some((_, what)) = KEY_FORMATS.iter().find(|(re, _)| re.is_match(text)) {
+        return Some(what);
+    }
+    for run in DIGIT_RUN.find_iter(text) {
+        let digits: Vec<u32> = run.as_str().chars().filter_map(|c| c.to_digit(10)).collect();
+        if (13..=19).contains(&digits.len()) && luhn(&digits) {
+            return Some("a card number");
+        }
+    }
+    if PASSWORD_WORD
+        .find_iter(text)
+        .any(|word| secret_after_password_word(&text[word.end()..]))
+    {
+        return Some("a password or PIN");
+    }
+    if ONE_TIME_CODE.is_match(text) {
+        return Some("a one-time code");
+    }
+    None
+}
+
 /// Why a name can't be used, if it can't.
 pub fn check_name(name: &str) -> Result<(), String> {
     if !NAME.is_match(name) {
@@ -237,6 +326,11 @@ impl Secrets {
     }
 
     /// Redacts every string in a JSON value.
+    /// Whether the text holds a saved key's value.
+    pub fn holds_a_value(&self, text: &str) -> bool {
+        matches!(self.redact(text), Cow::Owned(_))
+    }
+
     pub fn redact_json(&self, value: &mut Value) {
         if self.values.read().unwrap().is_empty() {
             return;
@@ -282,6 +376,45 @@ mod tests {
         assert_eq!(check_value("  ghp_abcdefghijkl \n"), Ok("ghp_abcdefghijkl"));
         assert!(check_value("short").is_err());
         assert!(check_value("two\nlines-of-key").is_err());
+    }
+
+    #[test]
+    fn spots_secrets_but_lets_contact_details_through() {
+        for text in [
+            "my token is ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab",
+            "github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ",
+            "OpenAI key sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+            "Anthropic sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+            "together tgp_v1_abcdefghijklmnopqrstuvwxyz",
+            "slack xoxb-1234567890-abcdefghij",
+            "AWS AKIAIOSFODNN7EXAMPLE",
+            "AIzaSyA-abcdefghijklmnopqrstuvwxyz012345",
+            "hf_abcdefghijklmnopqrstuvwxyzABCDEF",
+            "stripe sk_live_abcdefghijklmnopqrstu",
+            "gitlab glpat-abcdefghijklmnopqrst",
+            "card 4242 4242 4242 4242 expires 12/29",
+            "the Visa is 4111111111111111",
+            "password: hunter2",
+            "Her wifi passcode is Tr0ub4dor&3",
+            "PIN 4821 for the garage",
+            "the login code is 384912",
+            "OTP 55120933",
+            "812345 is the 2FA code",
+        ] {
+            assert!(looks_like_secret(text).is_some(), "{text}");
+        }
+        for text in [
+            "Email invoices to billing@example.com",
+            "Call Dana at +1 416 555 0199",
+            "The office is at 100 King St W, Toronto, M5X 1A9",
+            "The PIN pad is by the door",
+            "Remember to reset your password every quarter",
+            "Order number 1234567890123 shipped",
+            "Use the code review checklist",
+            "The meeting room code of conduct",
+        ] {
+            assert_eq!(looks_like_secret(text), None, "{text}");
+        }
     }
 
     #[test]

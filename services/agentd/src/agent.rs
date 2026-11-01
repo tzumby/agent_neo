@@ -4,8 +4,8 @@
 //! A task that needs an approval parks: its state is saved, the desktop is free
 //! again, and the user's answer resumes it from there (after a restart too).
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -19,6 +19,7 @@ use crate::clock::UserClock;
 use crate::config::Config;
 use crate::guard;
 use crate::llm::{self, Together, Usage, truncate};
+use crate::memory;
 use crate::policy::Gate;
 use crate::policy::Policy;
 use crate::push::{self, Push, Relay};
@@ -43,6 +44,16 @@ const PAGE_CHANGED: &str = "the page changed after the user approved, so nothing
      again and ask again if it's still needed";
 const INTERRUPTED: &str =
     "I was interrupted: the agent on your desktop restarted. Ask me to continue if you still need this.";
+/// Memory v2: the one reminder when the user asked to remember something and
+/// the task is ending without a save. Worded so a question ("do you
+/// remember…?") just gets its answer again.
+const REMEMBER_NUDGE: &str = "(agentd) The user's message asked you to remember something, and you haven't \
+     called remember. If they did, call remember with it now, then finish. If they only asked what you remember, \
+     give your answer again.";
+/// "remember", "don't forget", "keep in mind", "from now on" (memory v2 §7).
+static ASKS_TO_REMEMBER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(remember|don'?t forget|keep in mind|from now on)\b").expect("valid pattern")
+});
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Settings {
@@ -90,6 +101,18 @@ struct RunState {
     /// The schedule's name, when the task is a scheduled run.
     #[serde(default)]
     scheduled: Option<String>,
+    /// The schedule's id, when the task is a scheduled run.
+    #[serde(default)]
+    schedule_id: Option<i64>,
+    /// Memory v2: the user's message asked to remember something…
+    #[serde(default)]
+    remember_asked: bool,
+    /// …and remember was called…
+    #[serde(default)]
+    remembered: bool,
+    /// …or the model was reminded once.
+    #[serde(default)]
+    nudged: bool,
 }
 
 /// The user approved what the agent typed into a message field (Slack's
@@ -161,6 +184,8 @@ pub struct Agent {
     /// Keys and tokens the user saved; their values are redacted from
     /// everything the model, the apps and notifications see.
     pub secrets: Secrets,
+    /// The event seq of the tool call being run (a memory's source).
+    step_seq: AtomicI64,
 }
 
 fn short_id() -> String {
@@ -215,6 +240,7 @@ impl Agent {
             cancel: watch::channel(false).0,
             schedules_changed: Notify::new(),
             effects_changed: Notify::new(),
+            step_seq: AtomicI64::new(0),
             cfg,
         };
         agent.recover();
@@ -236,7 +262,8 @@ impl Agent {
         }
     }
 
-    pub fn emit(&self, kind: &str, mut data: Value) {
+    /// Logs an event and sends it to the apps; returns its seq.
+    pub fn emit(&self, kind: &str, mut data: Value) -> Option<i64> {
         // Every event names its agent: "main" until there are bots.
         if let Some(object) = data.as_object_mut() {
             object.entry("agent").or_insert_with(|| json!("main"));
@@ -245,9 +272,46 @@ impl Agent {
         self.secrets.redact_json(&mut data);
         match self.store.append_event(kind, &data) {
             Ok(event) => {
+                let seq = event.seq;
                 let _ = self.bus.send(event);
+                Some(seq)
             }
-            Err(err) => tracing::error!(%err, kind, "couldn't store an event"),
+            Err(err) => {
+                tracing::error!(%err, kind, "couldn't store an event");
+                None
+            }
+        }
+    }
+
+    /// Tells the apps about a memory v2 save: `memory.saved` (active, maybe
+    /// replacing one: `memory.superseded`) or `memory.pending`.
+    pub fn announce_saved(&self, saved: &memory::Saved, by: &str, task: Option<&str>) {
+        match saved {
+            memory::Saved::Active { item, superseded } => {
+                self.emit(
+                    "memory.saved",
+                    json!({"task": task, "id": item.id, "text": item.text, "trusted": item.trusted,
+                           "kind": item.kind, "trust": item.trust, "status": item.status, "by": by}),
+                );
+                if let Some(old) = superseded {
+                    self.emit(
+                        "memory.superseded",
+                        json!({"task": task, "id": old, "by_id": item.id, "by": by}),
+                    );
+                }
+            }
+            memory::Saved::Pending { item, reason } => {
+                self.emit(
+                    "memory.pending",
+                    json!({"task": task, "id": item.id, "text": item.text, "kind": item.kind,
+                           "reason": reason, "by": by}),
+                );
+            }
+            memory::Saved::Refused(_) => {}
+        }
+        if let memory::Saved::Active { item, .. } | memory::Saved::Pending { item, .. } = saved {
+            // Metadata only: never memory text in the journal.
+            tracing::info!(memory = item.id, kind = %item.kind, trust = %item.trust, status = %item.status, "memory saved");
         }
     }
 
@@ -573,6 +637,14 @@ impl Agent {
             usage: Usage::default(),
             seconds: 0.0,
             armed: None,
+            remember_asked: self.cfg.memory_v2
+                && scheduled.is_none()
+                && text != tools::RESUME_TEXT
+                && text != tools::SKIP_TEXT
+                && ASKS_TO_REMEMBER.is_match(&text),
+            remembered: false,
+            nudged: false,
+            schedule_id: scheduled.as_ref().map(|s| s.id),
             scheduled: scheduled.map(|s| s.name),
         };
         self.drive(state, None).await;
@@ -662,19 +734,28 @@ impl Agent {
     async fn run_loop(&self, state: &mut RunState, mut answer: Option<Answer>) -> Result<Outcome> {
         let now = self.user_clock().now();
         // The date and time as of now: a parked task may resume much later.
+        let memories = if self.cfg.memory_v2 {
+            memory::block(&self.store).unwrap_or_else(|err| {
+                tracing::error!(%err, "couldn't build the memory block");
+                String::new()
+            })
+        } else {
+            self.memory_prompt()
+        };
         let prompt = tools::system_prompt(
             self.cfg.shell_tool,
             &now,
-            &self.memory_prompt(),
+            &memories,
             &self.skills.listing(),
             &self.keys_prompt(),
+            self.cfg.memory_v2,
         );
         state.messages[0] = json!({"role": "system", "content": prompt});
         let mut browser = Browser::new(self.cdp.clone(), state.allow_actions, self.policy.clone());
         browser
             .attach(self.store.setting("tab_target")?.as_deref())
             .await?;
-        let schemas = tools::schemas(self.cfg.shell_tool, !self.skills.is_empty());
+        let schemas = tools::schemas(self.cfg.shell_tool, !self.skills.is_empty(), self.cfg.memory_v2);
         let mut cancel = self.cancel.subscribe();
         // A second receiver, to interrupt model calls and browser actions.
         let mut stop = self.cancel.subscribe();
@@ -730,10 +811,14 @@ impl Agent {
                 // A resumed call was shown when it was first made.
                 if resumed.is_none() {
                     tracing::info!(task = %task_id, step, tool = %name, "tool call");
-                    self.emit(
+                    let seq = self.emit(
                         "step",
                         json!({"task": task_id, "step": step, "tool": name, "args": truncate(&raw, 300)}),
                     );
+                    self.step_seq.store(seq.unwrap_or(0), Ordering::SeqCst);
+                }
+                if name == "remember" {
+                    state.remembered = true;
                 }
                 if name == "needs_user" {
                     let reason = args["reason"]
@@ -750,7 +835,7 @@ impl Agent {
                         &name,
                         &args,
                         state.tainted,
-                        state.scheduled.is_some(),
+                        state.schedule_id.or(state.scheduled.as_ref().map(|_| 0)),
                         resumed,
                         &mut state.armed,
                         &mut cancel,
@@ -840,6 +925,15 @@ impl Agent {
                         .push(json!({"role": "user", "content": tools::SIGN_IN_REMINDER}));
                     continue;
                 }
+                // Memory v2: asked to remember, and nothing saved: one reminder.
+                if state.remember_asked && !state.remembered && !state.nudged {
+                    state.nudged = true;
+                    tracing::info!(task = %task_id, step, "nudged to remember");
+                    state
+                        .messages
+                        .push(json!({"role": "user", "content": REMEMBER_NUDGE}));
+                    continue;
+                }
                 let answer = message["content"]
                     .as_str()
                     .unwrap_or("(empty answer)")
@@ -894,7 +988,8 @@ impl Agent {
         name: &str,
         args: &Value,
         tainted: bool,
-        scheduled: bool,
+        // Some for a scheduled run (its schedule id; 0 if unknown).
+        schedule: Option<i64>,
         resumed: Option<Answer>,
         armed: &mut Option<ArmedSend>,
         cancel: &mut watch::Receiver<bool>,
@@ -1004,6 +1099,9 @@ impl Agent {
                     Ok(_) => browser.press_key(key).await,
                 }
             }
+            "remember" | "forget" | "search_memory" if self.cfg.memory_v2 => {
+                self.memory_tool(task_id, name, args, tainted, schedule)
+            }
             "remember" => {
                 let note: String = required("text")?.trim().chars().take(MEMORY_MAX_CHARS).collect();
                 if note.is_empty() {
@@ -1036,7 +1134,7 @@ impl Agent {
                 }
             }
             "schedule_task" => {
-                if scheduled {
+                if schedule.is_some() {
                     return Ok(
                         "not scheduled: a scheduled run can't set up schedules; tell the user to ask \
                                for it in the chat"
@@ -1113,6 +1211,170 @@ impl Agent {
             "request_secret" if self.cfg.shell_tool => self.request_secret(task_id, args, tainted, resumed),
             _ => Ok(format!("error: unknown tool {name}")),
         }
+    }
+
+    /// Memory v2's tools. Trust comes from the task's taint at this moment;
+    /// the rules (pending, conflicts, secrets, caps) are memory.rs's.
+    fn memory_tool(
+        &self,
+        task_id: &str,
+        name: &str,
+        args: &Value,
+        tainted: bool,
+        schedule: Option<i64>,
+    ) -> Result<String> {
+        let text = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty());
+        let number = |key: &str| {
+            args[key]
+                .as_i64()
+                .or_else(|| args[key].as_str()?.trim().trim_start_matches('#').parse().ok())
+        };
+        let actor = memory::Actor::Agent {
+            run: task_id,
+            seq: Some(self.step_seq.load(Ordering::SeqCst)).filter(|s| *s > 0),
+            tainted,
+            schedule: schedule.filter(|s| *s > 0),
+        };
+        match name {
+            "remember" => {
+                let Some(note) = text("text") else {
+                    return Ok("error: text is required".into());
+                };
+                let kind = text("kind").unwrap_or("fact");
+                let valid_until = match text("valid_until") {
+                    None => None,
+                    Some(date) => match self.end_of_day(date) {
+                        Some(until) => Some(until),
+                        None => return Ok("not saved: valid_until must be a date, YYYY-MM-DD".into()),
+                    },
+                };
+                let saved = memory::remember(
+                    &self.store,
+                    &self.secrets,
+                    actor,
+                    memory::New {
+                        text: note,
+                        kind,
+                        replaces: number("replaces"),
+                        valid_until,
+                    },
+                )?;
+                self.announce_saved(&saved, &actor.by(), Some(task_id));
+                Ok(match saved {
+                    memory::Saved::Active {
+                        item,
+                        superseded: Some(old),
+                    } => {
+                        format!("remembered (#{}), replacing #{old}", item.id)
+                    }
+                    memory::Saved::Active { item, .. } if item.trust == "user_stated" => {
+                        format!("remembered (#{})", item.id)
+                    }
+                    memory::Saved::Active { item, .. } => format!(
+                        "remembered as a hint (#{}): this task read outside content, so it's marked inferred",
+                        item.id
+                    ),
+                    memory::Saved::Pending {
+                        item,
+                        reason: "tainted_rule",
+                    } => format!(
+                        "saved for the user's approval (#{}): a {} written after reading outside content waits \
+                         until they approve it in the app",
+                        item.id, item.kind
+                    ),
+                    memory::Saved::Pending { item, .. } => format!(
+                        "saved for the user's approval (#{}): it would replace a memory the user stated, so they \
+                         decide in the app",
+                        item.id
+                    ),
+                    memory::Saved::Refused(why) => format!("not saved: {why}"),
+                })
+            }
+            "forget" => {
+                if let Some(id) = number("id") {
+                    return Ok(match memory::forget(&self.store, actor, id)? {
+                        Some(_) => {
+                            self.emit(
+                                "memory.forgotten",
+                                json!({"task": task_id, "id": id, "by": "agent"}),
+                            );
+                            format!("forgot #{id}")
+                        }
+                        None => format!("there's no memory #{id}"),
+                    });
+                }
+                let Some(query) = text("query") else {
+                    return Ok("error: give the id of the memory, or a query describing it".into());
+                };
+                Ok(match memory::forget_matching(&self.store, actor, query)? {
+                    memory::Forgot::Forgotten(item) => {
+                        self.emit(
+                            "memory.forgotten",
+                            json!({"task": task_id, "id": item.id, "by": "agent"}),
+                        );
+                        format!("forgot #{}: {}", item.id, item.text)
+                    }
+                    memory::Forgot::Candidates(items) => format!(
+                        "several memories match, so nothing was forgotten. Call forget with the id of the right \
+                         one:\n{}",
+                        items
+                            .iter()
+                            .map(|m| format!("#{} [{}] {}", m.id, m.kind, m.text))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                    memory::Forgot::RuleNeedsId(item) => format!(
+                        "#{} is a rule: rules are only forgotten by id. If the user wants it gone, call forget with \
+                         id {}: {}",
+                        item.id, item.id, item.text
+                    ),
+                    memory::Forgot::Nothing => "no memory matches that".into(),
+                })
+            }
+            _ => {
+                let Some(query) = text("query") else {
+                    return Ok("error: query is required".into());
+                };
+                let kinds: Vec<&str> = args["kinds"]
+                    .as_array()
+                    .map(|k| k.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let limit = args["limit"].as_i64().unwrap_or(8).clamp(1, 20);
+                let found = memory::search(&self.store, query, &kinds, limit)?;
+                if found.is_empty() {
+                    return Ok("nothing in memory matches that".into());
+                }
+                Ok(found
+                    .iter()
+                    .map(|(m, _)| {
+                        let source = match (&m.source_schedule, &m.source_run) {
+                            (Some(schedule), _) => format!("schedule #{schedule}"),
+                            (None, Some(run)) => format!("task {run}"),
+                            _ => "the app".into(),
+                        };
+                        format!(
+                            "#{} [{} · {} · {} · {}] {}",
+                            m.id,
+                            m.kind,
+                            m.date(),
+                            m.trust,
+                            source,
+                            m.text
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            }
+        }
+    }
+
+    /// The end of a local date (`YYYY-MM-DD`) in the user's time zone, as
+    /// unix seconds.
+    pub fn end_of_day(&self, date: &str) -> Option<i64> {
+        let day: jiff::civil::Date = date.parse().ok()?;
+        let zone = jiff::tz::TimeZone::get(&self.user_clock().timezone).unwrap_or(jiff::tz::TimeZone::UTC);
+        let next = day.tomorrow().ok()?.to_zoned(zone).ok()?;
+        Some(next.timestamp().as_second() - 1)
     }
 
     /// Sets up a scheduled task. After outside content, the request may come
@@ -1584,6 +1846,48 @@ fn approval_push(task_id: &str, id: &str, details: &Value) -> Push {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spots_requests_to_remember() {
+        for text in [
+            "Remember that my favourite colour is teal",
+            "please don't forget I'm vegetarian",
+            "Dont forget the standup moved",
+            "Keep in mind that Dana is on leave",
+            "From now on, reply in French",
+        ] {
+            assert!(ASKS_TO_REMEMBER.is_match(text), "{text}");
+        }
+        for text in [
+            "Summarize my inbox",
+            "Forget it",
+            "the remembrance service",
+            "now on to the next",
+        ] {
+            assert!(!ASKS_TO_REMEMBER.is_match(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn checkpoints_from_before_memory_v2_still_load() {
+        // A task parked by 0.15.0 phase 0 (no memory fields) resumes.
+        let old = json!({
+            "task": "t1", "model": "m", "allow_actions": true, "messages": [], "queue": [], "step": 3,
+            "tainted": false, "reminded": false, "loops": guard::LoopDetector::default(),
+            "usage": Usage::default(), "seconds": 1.0, "scheduled": "Morning inbox",
+        });
+        let state: RunState = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            (
+                state.remember_asked,
+                state.remembered,
+                state.nudged,
+                state.schedule_id
+            ),
+            (false, false, false, None)
+        );
+        assert_eq!(state.scheduled.as_deref(), Some("Morning inbox"));
+    }
 
     #[test]
     fn a_resumed_action_must_match_its_card() {

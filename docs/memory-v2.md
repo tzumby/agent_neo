@@ -522,6 +522,18 @@ Where this plan met different code (Phase 0; the code's behaviour was kept):
 - The `purge` effect is one perpetual row that answers `Later(24 h)` rather than enqueuing a successor.
 - The database copy before an upgrade uses SQLite's online backup (Python's `sqlite3`, as the `agentd` user), so agentd doesn't have to stop first.
 
+Phase 1 (built; behind `MEMORY_V2`):
+
+- **Ids in the notes.** Each note in the prompt carries its id (`- #12 [fact · 2026-10-12 · inferred] …`). §6's format has none, but `replaces` and `forget` need them.
+- **Phase 1's facts.** The "Things you remember" part lists the latest 60 active facts, as v1 did; phase 2 replaces that with FTS retrieval. Rules and preferences already follow §6: always shown, within ~1,500 tokens, least important preferences dropped first.
+- **The reminder's wording.** It's worded so a question ("do you remember…?") just gets its answer again: "The user's message asked you to remember something, and you haven't called remember. If they did, call remember with it now, then finish. If they only asked what you remember, give your answer again." It isn't used in scheduled runs, or for the Action-needed resume and skip messages.
+- **Forget by query.** It follows the open question's default: a clear match that is a rule isn't removed, and the model is told to use `forget(id)`.
+- **Trust order** for supersedes: `user_stated` > `imported` > `agent_inferred`.
+- **Approving a conflict** supersedes the memory it was proposed to replace. The target is recorded in the `propose` event's `after` (`replaces`), with no new column.
+- **User edits** emit `memory.updated` (not in §13's list), so an edit in Settings isn't shown in the chat as a new save.
+- **`GET /memory`** takes `status=` (comma list) already in phase 1, because v2 needs a default of active and pending. The other filters come in phase 2.
+- **Evals:** 3 scenarios (explicit remember recalled, forget honoured, correction supersedes). All pass with v2 off (v1) and on; v2 costs about 15% more per task for its longer memory instructions. The correction scenario showed the model writing "Dr. Park (previously Dr. Lee…)" when superseding, which is reasonable.
+
 
 ## 20. File map
 

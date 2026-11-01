@@ -3,11 +3,86 @@
     "name": "explicit-remember-recalled",
     "about": "Something the user asks to remember is used in a later conversation (memory only: the chat history is cleared in between).",
     "steps": [
-      {"say": "Please remember that my favourite colour is teal."},
-      {"expect_memory": "teal"},
-      {"new_conversation": true},
-      {"say": "What is my favourite colour? Answer with one word."},
-      {"expect_answer": ["teal"]}
+      {
+        "say": "Please remember that my favourite colour is teal."
+      },
+      {
+        "expect_memory": "teal"
+      },
+      {
+        "new_conversation": true
+      },
+      {
+        "say": "What is my favourite colour? Answer with one word."
+      },
+      {
+        "expect_answer": [
+          "teal"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "forget-honoured",
+    "about": "After the user asks to forget something, a later conversation doesn't know it.",
+    "steps": [
+      {
+        "say": "Please remember that my locker number is 418."
+      },
+      {
+        "expect_memory": "418"
+      },
+      {
+        "new_conversation": true
+      },
+      {
+        "say": "Please forget my locker number."
+      },
+      {
+        "new_conversation": true
+      },
+      {
+        "say": "What is my locker number? If you don't know, just say you don't know."
+      },
+      {
+        "expect_answer_not": [
+          "418"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "correction-supersedes",
+    "about": "A corrected fact replaces the old one, and the old one isn't used.",
+    "steps": [
+      {
+        "say": "Please remember that my dentist is Dr. Lee."
+      },
+      {
+        "new_conversation": true
+      },
+      {
+        "say": "My dentist changed: it's Dr. Park now. Please remember that."
+      },
+      {
+        "new_conversation": true
+      },
+      {
+        "expect_no_memory": "dentist is dr. lee"
+      },
+      {
+        "say": "Who is my dentist? Answer with the name only."
+      },
+      {
+        "expect_answer": [
+          "park"
+        ]
+      },
+      {
+        "expect_answer_not": [
+          "lee"
+        ]
+      }
     ]
   }
 ]

@@ -208,6 +208,21 @@ impl Store {
         })
     }
 
+    /// Runs `f` in one transaction: committed if it returns Ok, rolled back
+    /// otherwise.
+    pub fn transact<T>(&self, f: impl FnOnce(&rusqlite::Transaction) -> Result<T>) -> Result<T> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let value = f(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// Runs `f` on the connection (reads).
+    pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        f(&self.conn.lock().unwrap())
+    }
+
     // --- Runs ---------------------------------------------------------------------
 
     /// A task starts, under the rules in `policy_version` (policy.rs);

@@ -19,6 +19,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::agent::{Agent, SecretError, StartError};
 use crate::clock::UserClock;
 use crate::llm::KNOWN_MODELS;
+use crate::memory;
 use crate::schedule;
 
 type App = State<Arc<Agent>>;
@@ -36,8 +37,11 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/settings", get(settings).put(put_settings))
         .route("/api/v1/devices", post(register_device))
         .route("/api/v1/memory", get(memories))
-        .route("/api/v1/memory/{id}", delete(forget_memory))
+        .route("/api/v1/memory/{id}", delete(forget_memory).patch(edit_memory))
         .route("/api/v1/memory/{id}/confirm", post(confirm_memory))
+        .route("/api/v1/memory/{id}/approve", post(confirm_memory))
+        .route("/api/v1/memory/{id}/reject", post(reject_memory))
+        .route("/api/v1/memory/{id}/history", get(memory_history))
         .route("/api/v1/schedules", get(schedules))
         .route("/api/v1/schedules/{id}", delete(delete_schedule))
         .route("/api/v1/schedules/{id}/pause", post(pause_schedule))
@@ -235,18 +239,55 @@ async fn stop(State(agent): App) -> Json<Value> {
     Json(json!({"stopping": agent.stop()}))
 }
 
-/// What the agent remembers, for the app's Memory screen.
-async fn memories(State(agent): App) -> Response {
-    match agent.store.memories(500) {
+#[derive(Deserialize)]
+struct MemoryQuery {
+    /// Memory v2: comma-separated statuses (default `active,pending`).
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+/// What the agent remembers, for the app's Memory screen. Memory v2 lists
+/// active and pending items with all their fields (v1's fields included, so
+/// older apps still read it).
+async fn memories(State(agent): App, Query(query): Query<MemoryQuery>) -> Response {
+    let limit = query.limit.unwrap_or(500);
+    if agent.cfg.memory_v2 {
+        let statuses: Vec<&str> = query
+            .status
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .collect();
+        return match memory::list(&agent.store, &statuses, limit) {
+            Ok(memories) => Json(json!({"memories": memories})).into_response(),
+            Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        };
+    }
+    match agent.store.memories(limit.clamp(1, 500)) {
         Ok(memories) => Json(json!({"memories": memories})).into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
 
+/// Memory v2's endpoints answer this while the flag is off.
+fn v2_off() -> Response {
+    error(
+        StatusCode::CONFLICT,
+        "memory v2 is off on this desktop (MEMORY_V2)",
+    )
+}
+
 async fn forget_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
-    match agent.store.forget(id) {
+    let by = caller(&headers);
+    let forgotten = if agent.cfg.memory_v2 {
+        memory::forget(&agent.store, memory::Actor::User { login: by.as_deref() }, id).map(|m| m.is_some())
+    } else {
+        agent.store.forget(id)
+    };
+    match forgotten {
         Ok(true) => {
-            agent.emit("memory.forgotten", json!({"id": id, "by": caller(&headers)}));
+            agent.emit("memory.forgotten", json!({"id": id, "by": by}));
             Json(json!({"ok": true})).into_response()
         }
         Ok(false) => error(StatusCode::NOT_FOUND, "no such memory"),
@@ -254,14 +295,125 @@ async fn forget_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMa
     }
 }
 
-/// The user vouches for an unverified memory.
+/// The user vouches for an unverified memory, or (memory v2) approves a
+/// pending one, which then replaces what it was proposed to replace.
 async fn confirm_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
-    match agent.store.confirm_memory(id) {
-        Ok(true) => {
-            agent.emit("memory.confirmed", json!({"id": id, "by": caller(&headers)}));
+    let by = caller(&headers);
+    if !agent.cfg.memory_v2 {
+        return match agent.store.confirm_memory(id) {
+            Ok(true) => {
+                agent.emit("memory.confirmed", json!({"id": id, "by": by}));
+                Json(json!({"ok": true})).into_response()
+            }
+            Ok(false) => error(StatusCode::NOT_FOUND, "no such memory"),
+            Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        };
+    }
+    match memory::approve(&agent.store, memory::Actor::User { login: by.as_deref() }, id) {
+        Ok(Some((item, superseded))) => {
+            agent.emit("memory.confirmed", json!({"id": id, "by": by}));
+            if let Some(old) = superseded {
+                agent.emit("memory.superseded", json!({"id": old, "by_id": id, "by": by}));
+            }
+            Json(json!({"ok": true, "memory": item})).into_response()
+        }
+        Ok(None) => error(
+            StatusCode::NOT_FOUND,
+            "no pending or unverified memory with that id",
+        ),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+async fn reject_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let by = caller(&headers);
+    match memory::reject(&agent.store, memory::Actor::User { login: by.as_deref() }, id) {
+        Ok(Some(_)) => {
+            agent.emit("memory.forgotten", json!({"id": id, "by": by, "rejected": true}));
             Json(json!({"ok": true})).into_response()
         }
-        Ok(false) => error(StatusCode::NOT_FOUND, "no such memory"),
+        Ok(None) => error(StatusCode::NOT_FOUND, "no pending memory with that id"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct MemoryEdit {
+    text: Option<String>,
+    kind: Option<String>,
+    /// `YYYY-MM-DD` (end of that day, the user's time), or null to clear.
+    #[serde(default, deserialize_with = "double_option")]
+    valid_until: Option<Option<String>>,
+    importance: Option<f64>,
+    expected_version: i64,
+}
+
+/// Tells a missing field (None) from an explicit null (Some(None)).
+fn double_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
+}
+
+/// A user's edit: 409 with the current memory when it changed meanwhile.
+async fn edit_memory(
+    State(agent): App,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(body): Json<MemoryEdit>,
+) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let valid_until = match body.valid_until {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(date)) => match agent.end_of_day(&date) {
+            Some(until) => Some(Some(until)),
+            None => return error(StatusCode::BAD_REQUEST, "valid_until must be a date, YYYY-MM-DD"),
+        },
+    };
+    let by = caller(&headers);
+    let change = memory::Edit {
+        text: body.text,
+        kind: body.kind,
+        valid_until,
+        importance: body.importance,
+    };
+    let actor = memory::Actor::User { login: by.as_deref() };
+    match memory::edit(
+        &agent.store,
+        &agent.secrets,
+        actor,
+        id,
+        change,
+        body.expected_version,
+    ) {
+        Ok(memory::Edited::Done(item)) => {
+            agent.emit(
+                "memory.updated",
+                json!({"id": id, "version": item.version, "by": by}),
+            );
+            Json(json!({"memory": item})).into_response()
+        }
+        Ok(memory::Edited::Changed(item)) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "it changed meanwhile", "memory": item})),
+        )
+            .into_response(),
+        Ok(memory::Edited::NotFound) => error(StatusCode::NOT_FOUND, "no such memory"),
+        Ok(memory::Edited::Refused(why)) => error(StatusCode::BAD_REQUEST, &why),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+async fn memory_history(State(agent): App, Path(id): Path<i64>) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    match memory::history(&agent.store, id) {
+        Ok(changes) => Json(json!({"history": changes})).into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }

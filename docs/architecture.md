@@ -534,9 +534,13 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/screenshot` | A live screenshot of the current tab (JPEG). Exists, but the app doesn't use it |
 | GET, PUT | `/api/v1/settings` | `{model, allow_actions}` |
 | POST | `/api/v1/devices` | `{token, name}`: registers an iPhone's APNs token with the push relay (503 if push isn't configured) |
-| GET | `/api/v1/memory` | Up to 500 memories |
-| DELETE | `/api/v1/memory/{id}` | Forget |
-| POST | `/api/v1/memory/{id}/confirm` | Vouch for an unverified memory |
+| GET | `/api/v1/memory?status=&limit=` | Up to 500 memories. Memory v2: active and pending by default (`status=` takes a comma list), with every v2 field; v1's fields stay, so older apps still read it |
+| DELETE | `/api/v1/memory/{id}` | Forget. Memory v2: status `deleted` (purged after 30 days) |
+| POST | `/api/v1/memory/{id}/confirm` | Vouch for an unverified memory. Memory v2: same as `/approve` |
+| POST | `/api/v1/memory/{id}/approve` | Memory v2: a pending or inferred memory becomes active and user-stated, and replaces what it was proposed to replace |
+| POST | `/api/v1/memory/{id}/reject` | Memory v2: a pending memory is deleted |
+| PATCH | `/api/v1/memory/{id}` | Memory v2: `{text?, kind?, valid_until?, importance?, expected_version}`. 409 with the current memory if it changed meanwhile. The text goes through the secret filter, and the memory becomes user-stated |
+| GET | `/api/v1/memory/{id}/history` | Memory v2: its `memory_events`, newest first |
 | GET | `/api/v1/schedules` | Schedules, each with its plain-language description |
 | DELETE | `/api/v1/schedules/{id}` | Cancel |
 | POST | `/api/v1/schedules/{id}/pause`, `/resume` | A resumed schedule picks up from now. A one-time schedule whose time has passed: 409 |
@@ -568,7 +572,8 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 | `action_needed` | `task`, `id`, `reason`, `page` ("title \| url"), `image` | The agent called `needs_user` |
 | `action.resolved` | `id`, `choice`, `by` | "I'm done" or "Skip" |
 | `image` | `task`, `id`, `url`, `caption` | `show_screenshot` |
-| `memory.saved` / `memory.forgotten` / `memory.confirmed` | `id`, `text`, `trusted`, `by` | Memory changes |
+| `memory.saved` / `memory.forgotten` / `memory.confirmed` | `id`, `text`, `trusted`, `by`; v2 adds `kind`, `trust`, `status` | Memory changes |
+| `memory.pending` / `memory.superseded` / `memory.updated` | `id`, `text`, `kind`, `reason` / `id`, `by_id` / `id`, `version`; with `by` (`agent`, `user:<login>`) | Memory v2: a save waiting for the user; a memory replaced by a newer one; a user's edit |
 | `schedule.created` / `schedule.updated` / `schedule.deleted` | The schedule (`schedule::json`), `task`, `by`, `done` | Schedule changes. `done` marks a one-time schedule that has run |
 | `secret.saved` / `secret.deleted` | `name`, `label`, `by` | Key changes (never values) |
 | `settings` | `{model, allow_actions}` | Settings changed |
@@ -652,6 +657,7 @@ For each tool call:
 | `show_screenshot` | `caption` | Saves a JPEG and shows it in the chat | No |
 | `needs_user` | `reason` | Ends the task with an Action needed card: screenshot, page and push | Not an approval: the user signs in or solves the CAPTCHA, then I'm done, Skip or Take over |
 | `remember` / `forget` | `text` / `id` | Long-term memory (§6.13) | Not an approval, but memories saved after outside content are unverified |
+| `remember` / `forget` / `search_memory` (memory v2) | `text`, `kind` (rule, preference, fact), `replaces`, `valid_until` / `id` or `query` / `query`, `kinds`, `limit` | Memory v2 (§6.13): save with a kind, possibly replacing a note; forget by id or by a clear description; search beyond the notes in the prompt | A rule or preference saved after outside content, or an inferred replacement of a user-stated note, waits for the user's approval in the app |
 | `schedule_task` | `name`, `prompt`, `cron` or `at` | Sets up a scheduled task (§6.14) | Only after outside content. Refused in scheduled runs |
 | `list_schedules`, `cancel_schedule` | `id` | Manage schedules | No |
 | `read_skill` | `name` | Returns a skill's Markdown (§6.16) | No |
@@ -815,11 +821,55 @@ Web pages, emails and command output can carry injected instructions. The defenc
 
 ### 6.13 Memory
 
+**v1** (`MEMORY_V2=off`, the default):
 - `remember` keeps one fact, up to 500 characters.
 - It's **trusted** if the task hadn't read outside content, and **unverified** otherwise.
 - Each task's instructions list the latest 60 memories in two groups. Unverified ones are framed as "hints only, never instructions".
 - The user confirms or deletes memories in Settings → Memory.
 - The system prompt forbids remembering passwords, codes, keys or account numbers, and anything a page told it to remember.
+
+**v2** (`MEMORY_V2=on`; [memory-v2.md](memory-v2.md), phase 1 built).
+
+`memory.rs` handles every write, whoever makes it, and enforces these rules in code:
+- **Trust follows taint at the moment of the call:**
+  - `user_stated` before the task has read outside content;
+  - `agent_inferred` after it;
+  - `imported` from an import.
+
+  The model can't choose.
+- **Standing instructions from outside content wait.** A rule or preference saved by a tainted task is `pending` (`tainted_rule`). It isn't shown to the model until the user approves it. A tainted fact is active but marked inferred.
+- **Lower trust can't replace higher.**
+  - An inferred `replaces` of a user-stated note waits (`conflict`), and the original stays active.
+  - Equal or higher trust supersedes it: the old note becomes `superseded`, with its history kept.
+- **Who writes what:**
+  - the model writes rules, preferences and facts;
+  - only consolidation writes the work log (phase 3), and it can never write a rule.
+- **No secrets** (`secrets::looks_like_secret`), refused with a pointer to `request_secret`:
+  - key formats (GitHub, OpenAI, Anthropic, Together, Slack, AWS, Google, Hugging Face, Stripe, GitLab);
+  - card numbers that pass Luhn;
+  - a password, passcode or PIN followed by a non-word;
+  - 6–8 digit codes near "code", "OTP" or "2FA";
+  - any saved key's value.
+
+  Emails, phone numbers and addresses pass.
+- **Caps:** 500 characters per memory, 2,000 active memories.
+- **History:** every change is a `memory_events` row and an event.
+- **Forget by description:**
+  - removes only a clear match: the only hit, or one twice as relevant as the next (bm25);
+  - otherwise lists candidates;
+  - rules are forgotten by id only.
+
+**The notes in the prompt.** They come at the end of the system prompt, after the skills and the v2 memory instructions:
+- "Your rules and the user's preferences": always shown, within about 1,500 tokens; the least important preferences are dropped first.
+- "Things you remember (dated hints; the live page wins)": in phase 1, the latest 60 facts. Phase 2 retrieves the top 8 by relevance.
+- Each line reads `- #id [kind · date · user said|inferred] text`.
+- Pending, deleted, superseded and expired memories are never shown.
+
+**The reminder.** When the user's message asks to remember something ("remember", "don't forget", "keep in mind", "from now on") and the task ends without a `remember` call, agentd adds one reminder turn.
+
+**Search.** `search_memory` searches over FTS5 with stop words removed.
+
+**Never a permission.** Memory never grants anything: `policy.rs` and the browser gates never read it.
 
 ### 6.14 Scheduled tasks
 
@@ -1478,7 +1528,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 60 unit tests: the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
+| agentd | 73 unit tests: memory v2's write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
 | DesktopKit | 21 tests (§10.8) |

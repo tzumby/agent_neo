@@ -12,6 +12,7 @@ struct ChatView: View {
 
     @State private var draft = ""
     @State private var showingSettings = false
+    @State private var showingMemory = false
     @State private var takeOver: TakeOverRequest?
     @State private var position = ScrollPosition(edge: .bottom)
     @State private var sent = 0
@@ -28,6 +29,7 @@ struct ChatView: View {
                     ChatRow(item: item).equatable()
                 }
             }
+            .scrollTargetLayout()
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
         }
@@ -41,6 +43,15 @@ struct ChatView: View {
                 EmptyChat(desktopName: desktopName)
             }
         }
+        .safeAreaBar(edge: .top) {
+            if !loading, let banner = StageBanner.for(store.status) {
+                StageBanner(banner: banner) { follow(banner.target) }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy, value: store.status?.stage)
         .safeAreaBar(edge: .bottom) {
             VStack(spacing: 10) {
                 if store.timeline.items.isEmpty, store.connection == .live {
@@ -59,6 +70,12 @@ struct ChatView: View {
         .toolbar { toolbar }
         .sheet(isPresented: $showingSettings) {
             NavigationStack { SettingsView(store: store, client: client) }
+        }
+        .sheet(isPresented: $showingMemory) {
+            NavigationStack {
+                MemoryView(client: client)
+                    .toolbar { Button("Done") { showingMemory = false } }
+            }
         }
         .fullScreenCover(item: $takeOver) { request in
             if let endpoint {
@@ -104,6 +121,7 @@ struct ChatView: View {
         .environment(\.chatStore, store)
         .environment(\.agentClient, client)
         .environment(\.takeOver, endpoint == nil ? nil : TakeOverAction { takeOver = TakeOverRequest(actionID: $0.id) })
+        .environment(\.openTask, OpenTask { task in openConversation(task) })
         // Until the first sync, the splash covers everything (bars included).
         .overlay {
             if loading {
@@ -156,6 +174,40 @@ struct ChatView: View {
             store.notice = "Couldn't send your answer: \(error.localizedDescription)"
         }
         push.pendingAnswer = nil
+    }
+
+    /// Closes Settings and scrolls to a task's conversation.
+    private func openConversation(_ task: String) {
+        showingSettings = false
+        showingMemory = false
+        let target = store.timeline.items.first { item in
+            if case .work(let work) = item { work.task == task } else { false }
+        }
+        Task {
+            try? await Task.sleep(for: .milliseconds(450))  // the sheet closing
+            if let target {
+                withAnimation(.snappy) { position.scrollTo(id: target.id, anchor: .top) }
+            } else {
+                store.notice = "That conversation is older than what the app has loaded."
+            }
+        }
+    }
+
+    /// Where the stage banner leads.
+    private func follow(_ target: StageBanner.Target) {
+        switch target {
+        case .item(let id):
+            withAnimation(.snappy) { position.scrollTo(id: id, anchor: .center) }
+        case .task(let task):
+            openConversation(task)
+        case .lastAction:
+            let action = store.timeline.items.last { if case .action = $0 { true } else { false } }
+            if let action { withAnimation(.snappy) { position.scrollTo(id: action.id, anchor: .center) } }
+        case .memory:
+            showingMemory = true
+        case .none:
+            break
+        }
     }
 
     /// The first sync with the desktop hasn't finished yet.
@@ -385,5 +437,79 @@ private struct Suggestions: View {
             }
         }
         .scrollIndicators(.hidden)
+    }
+}
+
+// MARK: - Stage
+
+/// What the desktop needs from the user, from agentd's `stage`: a slim banner
+/// over the chat that leads to the card, the conversation or the memories.
+/// Nothing shows while it's idle, working or only has a schedule coming.
+private struct StageBanner: View {
+    enum Target: Equatable {
+        case item(String)
+        case task(String)
+        case lastAction
+        case memory
+        case none
+    }
+
+    struct Banner: Equatable {
+        let text: String
+        let icon: String
+        let tint: Color
+        let target: Target
+    }
+
+    let banner: Banner
+    let tap: () -> Void
+
+    var body: some View {
+        Button(action: tap) {
+            HStack(spacing: 8) {
+                Image(systemName: banner.icon).foregroundStyle(banner.tint)
+                Text(banner.text).font(.subheadline.weight(.medium)).lineLimit(1)
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.right").font(.caption.weight(.bold)).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: .capsule)
+    }
+
+    static func `for`(_ status: AgentStatus?) -> Banner? {
+        guard let status, let stage = status.stage else { return nil }
+        let detail = status.stageDetail
+        switch stage {
+        case "needs_you/approval":
+            let what = switch detail?["kind"]?.string {
+            case "browser": "approve a change in the browser"
+            case "schedule": "approve a schedule"
+            default: "approve a command"
+            }
+            return Banner(
+                text: "Needs you: \(what)", icon: "hand.raised.fill", tint: .orange,
+                target: detail?["card"]?.string.map { .item("approval-\($0)") } ?? .none)
+        case "needs_you/secret":
+            return Banner(
+                text: "Needs you: a key or token", icon: "key.fill", tint: .yellow,
+                target: detail?["card"]?.string.map { .item("approval-\($0)") } ?? .none)
+        case "needs_you/action":
+            return Banner(text: "Needs you: action needed on the desktop", icon: "hand.raised.fill", tint: .orange, target: .lastAction)
+        case "problem":
+            if let run = detail?["run"]?.string {
+                return Banner(text: "Something went wrong", icon: "exclamationmark.triangle.fill", tint: .red, target: .task(run))
+            }
+            return Banner(text: "Notifications or memory upkeep are failing", icon: "exclamationmark.triangle.fill", tint: .red, target: .none)
+        case "review":
+            let count = detail?["pending"]?.int ?? 0
+            let items = count == 1 ? "1 memory item" : "\(count) memory items"
+            return Banner(text: "Review \(items)", icon: "brain", tint: .orange, target: .memory)
+        default:
+            return nil
+        }
     }
 }

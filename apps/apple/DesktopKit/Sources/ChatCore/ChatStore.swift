@@ -23,6 +23,13 @@ public final class ChatStore {
 
     public init() {}
 
+    /// Events after which the status (its stage above all) is worth fetching again.
+    static let changesStatus: Set<String> = [
+        "settings", "task.started", "task.paused", "task.resumed", "task.finished", "approval.requested",
+        "approval.resolved", "action_needed", "action.resolved", "secret.saved", "memory.pending",
+        "memory.confirmed", "memory.forgotten", "schedule.created", "schedule.updated", "schedule.deleted",
+    ]
+
     public var busy: Bool { timeline.busy }
     public var stopping: Bool { timeline.stopping }
 
@@ -39,7 +46,7 @@ public final class ChatStore {
                     guard event.seq > lastSeq else { continue }
                     lastSeq = event.seq
                     timeline.apply(event)
-                    if event.kind == "settings" || event.kind == "task.finished" {
+                    if Self.changesStatus.contains(event.kind) {
                         status = try? await client.status()
                     }
                 }

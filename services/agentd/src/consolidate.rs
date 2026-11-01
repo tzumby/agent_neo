@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::Result;
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::agent::Agent;
 use crate::effects::Outcome;
@@ -578,6 +578,42 @@ fn record_run(
         ],
     )?;
     Ok(())
+}
+
+/// For the app's Memory screen: the mode, model and cap, this month's cost,
+/// and the last run (when, how it ended, what it did, its cost).
+pub fn stats(store: &Store) -> Value {
+    let (month_cost, last) = store
+        .read(|conn| {
+            let month_cost: f64 = conn.query_row(
+                "SELECT COALESCE(SUM(cost), 0) FROM runs WHERE kind = 'consolidation'
+                 AND started >= strftime('%Y-%m-01', 'now')",
+                [],
+                |r| r.get(0),
+            )?;
+            let last = conn
+                .query_row(
+                    "SELECT started, status, cost, answer FROM runs WHERE kind = 'consolidation'
+                     ORDER BY rowid DESC LIMIT 1",
+                    [],
+                    |r| {
+                        let counts: Option<String> = r.get(3)?;
+                        Ok(json!({
+                            "at": r.get::<_, String>(0)?, "status": r.get::<_, String>(1)?,
+                            "cost": r.get::<_, Option<f64>>(2)?,
+                            "counts": counts.and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
+                        }))
+                    },
+                )
+                .optional()?;
+            Ok((month_cost, last))
+        })
+        .unwrap_or((0.0, None));
+    json!({
+        "mode": mode(store).name(), "model": model(store), "daily_cap_usd": daily_cap(store),
+        "month_cost": (month_cost * 1e6).round() / 1e6, "last_run": last,
+        "waiting_tasks": batch(store).map_or(0, |(runs, _)| runs.len()),
+    })
 }
 
 /// Today's spend on consolidation, in USD (UTC day).
@@ -1139,6 +1175,27 @@ mod tests {
             })
             .unwrap();
         assert!((importance - 0.45).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stats_show_the_month_and_the_last_run() {
+        let (store, keys) = setup();
+        assert_eq!(stats(&store)["last_run"], Value::Null);
+        task(&store, "t1", "done", None);
+        go(
+            &store,
+            &keys,
+            Mode::Observe,
+            r#"{"work_log": [{"source_run": "t1", "text": "Did a thing"}]}"#,
+        );
+        let stats = stats(&store);
+        assert_eq!(
+            (stats["mode"].as_str(), stats["month_cost"].as_f64()),
+            (Some("observe"), Some(0.002))
+        );
+        assert_eq!(stats["last_run"]["status"], "done");
+        assert_eq!(stats["last_run"]["counts"]["saved"], 1);
+        assert_eq!(stats["waiting_tasks"], 0);
     }
 
     #[test]

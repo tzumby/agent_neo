@@ -537,6 +537,11 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active and pending by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older apps still read it |
 | GET | `/api/v1/memory/search?q=&kinds=&limit=` | Memory v2: active memories ranked as the agent's notes are, each with its score (what `search_memory` sees) |
 | POST | `/api/v1/memory/consolidate` | Memory v2: consolidate now (`{ok, tasks, mode}`); it still waits for a running task |
+| GET | `/api/v1/memory/consolidation` | Memory v2: consolidation's mode, model, daily cap, this month's cost, last run and how many tasks wait |
+| POST | `/api/v1/memory/approve-all`, `/reject-all` | Memory v2: `{pending_reason?}` approves or rejects every pending memory, or those waiting for one reason |
+| POST | `/api/v1/memory/{id}/restore` | Memory v2: brings back an expired or replaced memory (a replaced one replaces its successor in turn) |
+| GET | `/api/v1/memory/export?format=json\|markdown` | Memory v2: JSON is `{version: 1, exported_at, agent, memories}` (all but deleted); Markdown is the active and pending ones by kind |
+| POST | `/api/v1/memory/import` | Memory v2: a JSON export (its active memories) or `[{text, kind?}]`, at most 2,000. Everything lands pending (`imported`) and goes through the content checks. Returns `{imported, rejected: [{text, reason}]}` |
 | DELETE | `/api/v1/memory/{id}` | Forget. Memory v2: status `deleted` (purged after 30 days) |
 | POST | `/api/v1/memory/{id}/confirm` | Vouch for an unverified memory. Memory v2: same as `/approve` |
 | POST | `/api/v1/memory/{id}/approve` | Memory v2: a pending or inferred memory becomes active and user-stated, and replaces what it was proposed to replace |
@@ -1343,7 +1348,14 @@ None of them imports UIKit; the app target holds everything iOS-specific.
     - **Scheduled** notes, and screenshots.
 - **Settings:**
   - model, Browser actions, agentd version;
-  - Memory (confirm or forget);
+  - **Memory** (memory v2; the plan's §14):
+    - "Needs your approval" first, grouped by why (from outside content, corrections to what you said, proposed while tidying up, imported), with Approve/Reject on each and Approve all / Reject all per group. A correction shows what it replaces.
+    - Then the memories by kind (Rules, Preferences, Facts, Work log), searchable (full text), with expired and replaced ones shown on request and restorable.
+    - Tap one to edit it (text, kind, end date). The edit is refused if the memory changed meanwhile ("Changed elsewhere, reloaded"). The sheet also has "Why do you know this?" with *Open that conversation*.
+    - "Tidying up": the consolidation mode (Off, Review first, Automatic), this month's cost, the last run, and *Tidy up now*.
+    - Export (JSON or Markdown, through the share sheet) and import (a JSON file).
+
+    A desktop without memory v2 gets v1's confirm-or-forget list;
   - Schedules (pause, resume, cancel);
   - **Keys & tokens** (add, replace, delete; values never shown);
   - desktop name and address;
@@ -1376,6 +1388,14 @@ None of them imports UIKit; the app target holds everything iOS-specific.
 - `TAKEOVER_SOCKS` / `TAKEOVER_VNC`: the take-over view over any SOCKS5 proxy.
 
 Both are DEBUG-only.
+
+**Stage banner.** A slim banner over the chat comes from agentd's `stage` and leads where you need to go:
+- "Needs you: approve a command" (or a browser change, or a schedule) and "Needs you: a key or token" scroll to the card;
+- "Needs you: action needed on the desktop" scrolls to the Action needed card;
+- "Something went wrong" opens that conversation;
+- "Review N memory items" opens Memory.
+
+Nothing shows while the desktop is idle, working or only has a schedule coming. The status is fetched again after each event that changes the stage.
 
 ### 10.8 Tests
 
@@ -1597,10 +1617,10 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 95 unit tests (plus a 5,000-memory speed test run on demand): the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
+| agentd | 100 unit tests (plus a 5,000-memory speed test run on demand): bulk approval by reason, restore, where a memory came from and what a proposal replaces, export and import round trips, consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
-| DesktopKit | 21 tests (§10.8) |
+| DesktopKit | 25 tests (§10.8) |
 
 ## 14. How this differs from PLAN.MD
 

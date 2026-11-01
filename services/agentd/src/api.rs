@@ -39,6 +39,12 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/memory", get(memories))
         .route("/api/v1/memory/search", get(search_memory))
         .route("/api/v1/memory/consolidate", post(consolidate_now))
+        .route("/api/v1/memory/consolidation", get(consolidation))
+        .route("/api/v1/memory/approve-all", post(approve_all))
+        .route("/api/v1/memory/reject-all", post(reject_all))
+        .route("/api/v1/memory/export", get(export_memory))
+        .route("/api/v1/memory/import", post(import_memory))
+        .route("/api/v1/memory/{id}/restore", post(restore_memory))
         .route("/api/v1/memory/{id}", delete(forget_memory).patch(edit_memory))
         .route("/api/v1/memory/{id}/confirm", post(confirm_memory))
         .route("/api/v1/memory/{id}/approve", post(confirm_memory))
@@ -362,7 +368,7 @@ async fn memories(State(agent): App, Query(query): Query<MemoryQuery>) -> Respon
             query: query.q.as_deref(),
             limit,
         };
-        return match memory::list(&agent.store, &filter) {
+        return match memory::list_detailed(&agent.store, &filter) {
             Ok(memories) => Json(json!({"memories": memories})).into_response(),
             Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
@@ -420,6 +426,138 @@ async fn consolidate_now(State(agent): App, headers: HeaderMap) -> Response {
         }
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
+}
+
+#[derive(Deserialize, Default)]
+struct ByReason {
+    #[serde(default)]
+    pending_reason: Option<String>,
+}
+
+/// Memory v2: approves every pending memory, or those waiting for one reason
+/// ("Approve all" on a group).
+async fn approve_all(State(agent): App, headers: HeaderMap, body: Option<Json<ByReason>>) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let by = caller(&headers);
+    let reason = body.and_then(|Json(b)| b.pending_reason);
+    match memory::approve_all(
+        &agent.store,
+        memory::Actor::User { login: by.as_deref() },
+        reason.as_deref(),
+    ) {
+        Ok(ids) => {
+            for id in &ids {
+                agent.emit("memory.confirmed", json!({"id": id, "by": by}));
+            }
+            Json(json!({"approved": ids})).into_response()
+        }
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// Memory v2: rejects every pending memory, or those waiting for one reason.
+async fn reject_all(State(agent): App, headers: HeaderMap, body: Option<Json<ByReason>>) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let by = caller(&headers);
+    let reason = body.and_then(|Json(b)| b.pending_reason);
+    match memory::reject_all(
+        &agent.store,
+        memory::Actor::User { login: by.as_deref() },
+        reason.as_deref(),
+    ) {
+        Ok(ids) => {
+            for id in &ids {
+                agent.emit("memory.forgotten", json!({"id": id, "by": by, "rejected": true}));
+            }
+            Json(json!({"rejected": ids})).into_response()
+        }
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// Memory v2: brings back an expired or replaced memory.
+async fn restore_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let by = caller(&headers);
+    match memory::restore(&agent.store, memory::Actor::User { login: by.as_deref() }, id) {
+        Ok(Some((item, replaced))) => {
+            agent.emit(
+                "memory.updated",
+                json!({"id": id, "version": item.version, "by": by, "restored": true}),
+            );
+            if let Some(successor) = replaced {
+                agent.emit(
+                    "memory.superseded",
+                    json!({"id": successor, "by_id": id, "by": by}),
+                );
+            }
+            Json(json!({"memory": item})).into_response()
+        }
+        Ok(None) => error(
+            StatusCode::NOT_FOUND,
+            "no expired or replaced memory with that id",
+        ),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+}
+
+/// Memory v2: every memory as JSON (for an import), or the active ones as
+/// Markdown (to read).
+async fn export_memory(State(agent): App, Query(query): Query<ExportQuery>) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    match query.format.as_deref().unwrap_or("json") {
+        "markdown" => match memory::export_markdown(&agent.store) {
+            Ok(text) => ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], text).into_response(),
+            Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        },
+        "json" => match memory::export_json(&agent.store) {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        },
+        _ => error(StatusCode::BAD_REQUEST, "format must be json or markdown"),
+    }
+}
+
+/// Memory v2: imports a JSON export (its active memories) or a list of
+/// `{text, kind?}`. Everything lands pending, for the user to approve.
+async fn import_memory(State(agent): App, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let by = caller(&headers);
+    match memory::import(
+        &agent.store,
+        &agent.secrets,
+        memory::Actor::User { login: by.as_deref() },
+        &body,
+    ) {
+        Ok(done) => {
+            tracing::info!(imported = done.imported, rejected = done.rejected.len(), by = ?by, "memories imported");
+            Json(json!(done)).into_response()
+        }
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// Memory v2: consolidation's settings, this month's cost and its last run.
+async fn consolidation(State(agent): App) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    Json(crate::consolidate::stats(&agent.store)).into_response()
 }
 
 /// Memory v2's endpoints answer this while the flag is off.

@@ -636,3 +636,21 @@ Phase 4 (built):
 | `docs/memory-v2.md` | This plan, exported as Markdown, with decisions kept current |
 
 No new crates are expected: FTS5 comes with rusqlite's bundled SQLite, SHA-256 is already a dependency through the attestation code, JSON through serde. If a crate is needed anyway, add it in the phase PR with one line of justification.
+
+Phase 5 (built; on the device once deployed):
+
+- **The Memory screen stays.** A version without it, with approvals as chat cards and consolidation automatic, was built and dropped the same day (2026-11-01). §14 stands.
+- **API additions beyond §13:**
+  - `POST /memory/reject-all` ("Reject all" per group);
+  - `GET /memory/consolidation` (mode, model, cap, this month's cost, last run, tasks waiting: the screen's "Tidying up" section);
+  - `GET /memory` items gain `origin` (who wrote it first: agent, user or consolidator) and, for a pending memory, `replaces` (`[{id, text}]`, so a correction shows both texts).
+- **Import** takes only the active memories from an export, at most 2,000. Each goes through the content checks and lands `imported`, pending. **Export JSON** has every memory but the deleted ones; **Markdown** has the active ones by kind, then what's pending.
+- **Restore** brings back an expired or replaced memory. A replaced one replaces its successor in turn, if that's still active.
+- **The stage headline is a banner, not a title.** It appears over the chat only when there's something to do (needs you, a problem, memories to review), and leads to the card, the conversation or Memory. Idle, working and scheduled show nothing: the toolbar and the task row already say so.
+- **"Why do you know this?" → "Open that conversation"** scrolls the chat to the task's row (found by `source_run`), not to `source_seq`. The app has no item for a step event. A task older than the loaded chat gets a notice.
+- **Debug:** `PREVIEW_SCREEN=memory` with `CHAT_PREVIEW_URL` opens the Memory screen straight away, for screenshots against a local agentd.
+- **Checked:** a local agentd with memory v2 and seeded memories, through the API and in the Simulator.
+  - Grouped approvals, the conflict showing what it replaces, the kind tabs, the tidying-up section and the "Review 3 memory items" banner all render.
+  - approve-all, edit (a stale version refused with 409, then saved, the date cleared), restore, export (JSON and Markdown) and import (9 imported, a PIN refused) all work.
+  - Not yet on the device.
+

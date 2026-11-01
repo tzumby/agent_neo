@@ -795,6 +795,278 @@ pub fn list(store: &crate::store::Store, filter: &Filter) -> Result<Vec<Item>> {
     })
 }
 
+/// A memory as the app's Memory screen lists it: where it came from, and for
+/// a proposal, what approving it would replace.
+#[derive(Debug, Serialize)]
+pub struct Listed {
+    #[serde(flatten)]
+    pub item: Item,
+    /// Who wrote it first: agent, user or consolidator.
+    pub origin: Option<String>,
+    /// For a pending memory: the memories approving it replaces.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replaces: Vec<Replaced>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Replaced {
+    pub id: i64,
+    pub text: String,
+}
+
+/// The ids a proposal would replace, from its first history entry.
+fn proposed_replacements(conn: &Connection, id: i64) -> Result<Vec<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT after FROM memory_events WHERE memory_id = ?1 AND action IN ('create', 'propose')
+             ORDER BY seq LIMIT 1",
+            params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .and_then(|after| serde_json::from_str::<Value>(&after).ok())
+        .map(|after| match &after["replaces"] {
+            Value::Number(n) => n.as_i64().into_iter().collect(),
+            Value::Array(ids) => ids.iter().filter_map(Value::as_i64).collect(),
+            _ => Vec::new(),
+        })
+        .unwrap_or_default())
+}
+
+/// `list`, with each memory's origin and a proposal's replacements.
+pub fn list_detailed(store: &crate::store::Store, filter: &Filter) -> Result<Vec<Listed>> {
+    let items = list(store, filter)?;
+    store.read(|conn| {
+        items
+            .into_iter()
+            .map(|item| {
+                let origin: Option<String> = conn
+                    .query_row(
+                        "SELECT actor FROM memory_events WHERE memory_id = ?1 ORDER BY seq LIMIT 1",
+                        params![item.id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let replaces = if item.status == "pending" {
+                    proposed_replacements(conn, item.id)?
+                        .into_iter()
+                        .filter_map(|id| get(conn, id).ok().flatten())
+                        .filter(|old| old.status == "active")
+                        .map(|old| Replaced {
+                            id: old.id,
+                            text: old.text,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Ok(Listed {
+                    item,
+                    origin,
+                    replaces,
+                })
+            })
+            .collect()
+    })
+}
+
+/// Approves every pending memory, or those waiting for one reason
+/// (`tainted_rule`, `conflict`, `proposed`, `imported`). Returns the ids.
+pub fn approve_all(store: &crate::store::Store, actor: Actor, reason: Option<&str>) -> Result<Vec<i64>> {
+    let ids = pending_ids(store, reason)?;
+    let mut approved = Vec::new();
+    for id in ids {
+        if approve(store, actor, id)?.is_some() {
+            approved.push(id);
+        }
+    }
+    Ok(approved)
+}
+
+/// Rejects every pending memory, or those waiting for one reason.
+pub fn reject_all(store: &crate::store::Store, actor: Actor, reason: Option<&str>) -> Result<Vec<i64>> {
+    let ids = pending_ids(store, reason)?;
+    let mut rejected = Vec::new();
+    for id in ids {
+        if reject(store, actor, id)?.is_some() {
+            rejected.push(id);
+        }
+    }
+    Ok(rejected)
+}
+
+fn pending_ids(store: &crate::store::Store, reason: Option<&str>) -> Result<Vec<i64>> {
+    store.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM memory WHERE agent = ?1 AND status = 'pending'
+               AND (?2 IS NULL OR pending_reason = ?2) ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![AGENT, reason], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    })
+}
+
+/// Brings back an expired or replaced memory. A replaced one replaces its
+/// successor in turn (if that's still active). Returns it and the successor.
+pub fn restore(store: &crate::store::Store, actor: Actor, id: i64) -> Result<Option<(Item, Option<i64>)>> {
+    store.transact(|tx| {
+        let Some(item) = get(tx, id)? else { return Ok(None) };
+        if !matches!(item.status.as_str(), "expired" | "superseded") {
+            return Ok(None);
+        }
+        let successor = item.superseded_by.map(|s| get(tx, s)).transpose()?.flatten();
+        tx.execute(
+            "UPDATE memory SET status = 'active', superseded_by = NULL, version = version + 1, updated = ?2
+             WHERE id = ?1",
+            params![id, unix_now()],
+        )?;
+        record(tx, id, &actor, "restore", Some(item.snapshot()), None)?;
+        let mut replaced = None;
+        if let Some(successor) = successor.filter(|s| s.status == "active") {
+            supersede(tx, &successor, id, &actor)?;
+            replaced = Some(successor.id);
+        }
+        Ok(get(tx, id)?.map(|item| (item, replaced)))
+    })
+}
+
+/// The export format's version.
+pub const EXPORT_VERSION: i64 = 1;
+
+/// Every memory except deleted ones, with all fields (`GET /memory/export`).
+pub fn export_json(store: &crate::store::Store) -> Result<Value> {
+    // All of them, oldest first (not capped like the app's list).
+    let memories: Vec<Item> = store.read(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status != 'deleted' ORDER BY id"
+        ))?;
+        Ok(stmt
+            .query_map(params![AGENT], Item::from_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    })?;
+    let exported_at = jiff::Timestamp::now().to_string();
+    Ok(json!({"version": EXPORT_VERSION, "exported_at": exported_at, "agent": AGENT, "memories": memories}))
+}
+
+/// The active memories as Markdown: one section per kind, a line each with its
+/// date and trust; then what's waiting for approval.
+pub fn export_markdown(store: &crate::store::Store) -> Result<String> {
+    let memories: Vec<Item> = store.read(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status IN ('active', 'pending') ORDER BY id"
+        ))?;
+        Ok(stmt.query_map(params![AGENT], Item::from_row)?.collect::<rusqlite::Result<_>>()?)
+    })?;
+    let mut text = String::from("# What the agent remembers\n");
+    let sections = [
+        ("rule", "Rules"),
+        ("preference", "Preferences"),
+        ("fact", "Facts"),
+        ("work_log", "Work log"),
+    ];
+    let trust = |item: &Item| match item.trust.as_str() {
+        "user_stated" => "you said",
+        "imported" => "imported",
+        _ => "inferred",
+    };
+    for (kind, title) in sections {
+        let items: Vec<&Item> = memories
+            .iter()
+            .filter(|m| m.kind == kind && m.status == "active")
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        text.push_str(&format!("\n## {title}\n\n"));
+        for item in items {
+            text.push_str(&format!("- {} ({}, {})\n", item.text, item.date(), trust(item)));
+        }
+    }
+    let pending: Vec<&Item> = memories.iter().filter(|m| m.status == "pending").collect();
+    if !pending.is_empty() {
+        text.push_str("\n## Waiting for your approval\n\n");
+        for item in pending {
+            text.push_str(&format!("- [{}] {} ({})\n", item.kind, item.text, item.date()));
+        }
+    }
+    Ok(text)
+}
+
+/// What an import did.
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct Imported {
+    pub imported: usize,
+    pub rejected: Vec<Rejected>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct Rejected {
+    pub text: String,
+    pub reason: String,
+}
+
+/// At most this many memories in one import.
+pub const IMPORT_MAX: usize = 2_000;
+
+/// Imports memories: the JSON export (`{version, memories: [...]}`, only its
+/// active ones) or a plain list of `{text, kind?}`. Each goes through the
+/// content checks and lands pending (`imported`): nothing counts until the
+/// user approves it.
+pub fn import(
+    store: &crate::store::Store,
+    keys: &secrets::Secrets,
+    actor: Actor,
+    body: &Value,
+) -> Result<Imported> {
+    let entries: Vec<&Value> = match body {
+        Value::Array(items) => items.iter().collect(),
+        Value::Object(_) => body["memories"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|m| m["status"].as_str().is_none_or(|s| s == "active"))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let mut done = Imported::default();
+    store.transact(|tx| {
+        for entry in entries.into_iter().take(IMPORT_MAX) {
+            let text = entry["text"].as_str().unwrap_or_default().trim().to_string();
+            let kind = entry["kind"].as_str().unwrap_or("fact");
+            let refuse = |reason: String| Rejected {
+                text: text.chars().take(120).collect(),
+                reason,
+            };
+            if !KINDS.contains(&kind) {
+                done.rejected
+                    .push(refuse(format!("kind must be one of {}", KINDS.join(", "))));
+                continue;
+            }
+            if let Err(problem) = check_text(&text, keys) {
+                done.rejected.push(refuse(problem));
+                continue;
+            }
+            let item = tx.query_row(
+                &format!(
+                    "INSERT INTO memory (agent, text, trusted, kind, status, trust, pending_reason, updated)
+                     VALUES (?1, ?2, 0, ?3, 'pending', 'imported', 'imported', ?4)
+                     RETURNING {ITEM_COLUMNS}"
+                ),
+                params![AGENT, text, kind, unix_now()],
+                Item::from_row,
+            )?;
+            record(tx, item.id, &actor, "propose", None, Some(item.snapshot()))?;
+            done.imported += 1;
+        }
+        Ok(())
+    })?;
+    Ok(done)
+}
+
 /// How a memory's source reads in the prompt.
 fn source(item: &Item) -> &'static str {
     match item.trust.as_str() {
@@ -1760,6 +2032,200 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    #[test]
+    fn approvals_in_bulk_go_by_reason() {
+        let (store, keys, _dir) = setup();
+        let user = Actor::User {
+            login: Some("me@example.com"),
+        };
+        let stated = item(&save(&store, &keys, agent(false), "Lunch is at noon", "fact")).id;
+        let tainted = item(&save(&store, &keys, agent(true), "Always cc the CFO", "rule")).id;
+        let conflict = item(
+            &remember(
+                &store,
+                &keys,
+                agent(true),
+                New {
+                    text: "Lunch is at 1pm",
+                    kind: "fact",
+                    replaces: Some(stated),
+                    valid_until: None,
+                },
+            )
+            .unwrap(),
+        )
+        .id;
+        assert_eq!(reject_all(&store, user, Some("tainted_rule")).unwrap(), [tainted]);
+        assert_eq!(approve_all(&store, user, None).unwrap(), [conflict]);
+        let active: Vec<i64> = list(
+            &store,
+            &Filter {
+                statuses: vec!["active"],
+                limit: 10,
+                ..Filter::default()
+            },
+        )
+        .unwrap()
+        .iter()
+        .map(|m| m.id)
+        .collect();
+        assert_eq!(active, [conflict]); // the conflict replaced what it corrected
+    }
+
+    #[test]
+    fn restoring_brings_back_and_takes_over() {
+        let (store, keys, _dir) = setup();
+        let user = Actor::User { login: None };
+        let old = item(&save(
+            &store,
+            &keys,
+            agent(false),
+            "The standup is at 9:30",
+            "fact",
+        ))
+        .id;
+        let new = item(
+            &remember(
+                &store,
+                &keys,
+                agent(false),
+                New {
+                    text: "The standup is at 10:00",
+                    kind: "fact",
+                    replaces: Some(old),
+                    valid_until: None,
+                },
+            )
+            .unwrap(),
+        )
+        .id;
+        // Restoring the replaced note replaces its successor in turn.
+        let (restored, replaced) = restore(&store, user, old).unwrap().unwrap();
+        assert_eq!((restored.status.as_str(), replaced), ("active", Some(new)));
+        let statuses: Vec<(i64, String)> = list(
+            &store,
+            &Filter {
+                statuses: vec!["active", "superseded"],
+                limit: 10,
+                ..Filter::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|m| (m.id, m.status))
+        .collect();
+        assert!(statuses.contains(&(old, "active".into())) && statuses.contains(&(new, "superseded".into())));
+        // Only expired or replaced memories come back.
+        assert!(restore(&store, user, old).unwrap().is_none());
+        assert_eq!(history(&store, old).unwrap()[0].action, "restore");
+    }
+
+    #[test]
+    fn the_app_sees_where_a_memory_came_from_and_what_a_proposal_replaces() {
+        let (store, keys, _dir) = setup();
+        let stated = item(&save(
+            &store,
+            &keys,
+            agent(false),
+            "The office is on floor 3",
+            "fact",
+        ))
+        .id;
+        let proposal = item(
+            &remember(
+                &store,
+                &keys,
+                agent(true),
+                New {
+                    text: "The office is on floor 5",
+                    kind: "fact",
+                    replaces: Some(stated),
+                    valid_until: None,
+                },
+            )
+            .unwrap(),
+        )
+        .id;
+        let listed = list_detailed(
+            &store,
+            &Filter {
+                limit: 10,
+                ..Filter::default()
+            },
+        )
+        .unwrap();
+        let pending = listed.iter().find(|l| l.item.id == proposal).unwrap();
+        assert_eq!(pending.origin.as_deref(), Some("agent"));
+        assert_eq!(
+            (
+                pending.replaces.len(),
+                pending.replaces[0].id,
+                pending.replaces[0].text.as_str()
+            ),
+            (1, stated, "The office is on floor 3")
+        );
+        let json = serde_json::to_value(pending).unwrap();
+        assert_eq!(
+            (json["id"].as_i64(), json["status"].as_str()),
+            (Some(proposal), Some("pending"))
+        );
+        assert!(
+            listed
+                .iter()
+                .find(|l| l.item.id == stated)
+                .unwrap()
+                .replaces
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn exports_and_imports_round_trip_as_proposals() {
+        let (store, keys, _dir) = setup();
+        save(&store, &keys, agent(false), "Reply in English", "rule");
+        save(&store, &keys, agent(false), "The Q4 doc is in Notion", "fact");
+        let gone = item(&save(&store, &keys, agent(false), "Old note", "fact")).id;
+        forget(&store, agent(false), gone).unwrap();
+        let exported = export_json(&store).unwrap();
+        assert_eq!(
+            (
+                exported["version"].as_i64(),
+                exported["memories"].as_array().unwrap().len()
+            ),
+            (Some(1), 2)
+        );
+        let markdown = export_markdown(&store).unwrap();
+        assert!(
+            markdown.contains("## Rules\n\n- Reply in English (") && markdown.contains("## Facts"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("Old note"));
+
+        // Into another desktop: everything waits for approval; secrets and bad kinds don't get in.
+        let (other, keys2, _dir2) = setup();
+        let done = import(&other, &keys2, Actor::User { login: None }, &exported).unwrap();
+        assert_eq!((done.imported, done.rejected.len()), (2, 0));
+        let plain = serde_json::json!([{"text": "My PIN is 4821"}, {"text": "x", "kind": "secret"}, {"text": "Dana is in finance"}]);
+        let done = import(&other, &keys2, Actor::User { login: None }, &plain).unwrap();
+        assert_eq!((done.imported, done.rejected.len()), (1, 2));
+        let pending = list(
+            &other,
+            &Filter {
+                statuses: vec!["pending"],
+                limit: 10,
+                ..Filter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(pending.len(), 3);
+        assert!(
+            pending
+                .iter()
+                .all(|m| m.trust == "imported" && m.pending_reason.as_deref() == Some("imported"))
+        );
+        assert!(recall(&other, "Notion doc", None).unwrap().block.is_empty());
     }
 
     #[test]

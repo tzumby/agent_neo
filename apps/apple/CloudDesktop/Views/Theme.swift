@@ -35,6 +35,13 @@ struct TakeOverAction: Sendable, Equatable {
     static func == (lhs: TakeOverAction, rhs: TakeOverAction) -> Bool { true }
 }
 
+/// Scrolls the chat to a task's conversation ("Why do you know this?").
+struct OpenTask: Sendable, Equatable {
+    let open: @MainActor @Sendable (String) -> Void
+
+    static func == (lhs: OpenTask, rhs: OpenTask) -> Bool { true }
+}
+
 // Chat rows get the store, client and take-over action from the environment,
 // so each row's only input is its (Equatable) item and SwiftUI redraws a row
 // only when that item changes.
@@ -42,4 +49,5 @@ extension EnvironmentValues {
     @Entry var chatStore: ChatStore? = nil
     @Entry var agentClient: AgentClient? = nil
     @Entry var takeOver: TakeOverAction? = nil
+    @Entry var openTask: OpenTask? = nil
 }

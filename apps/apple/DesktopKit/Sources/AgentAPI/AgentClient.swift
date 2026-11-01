@@ -60,6 +60,9 @@ public struct AgentSchedule: Decodable, Sendable, Equatable, Identifiable {
     public let nextRun: Date
     public let lastRun: Date?
     public let paused: Bool
+    /// `agent_tainted`: approved through a card after the agent read outside
+    /// content (nil from an older desktop).
+    public let createdFrom: String?
 
     public var repeats: Bool { cron != nil }
 
@@ -67,6 +70,7 @@ public struct AgentSchedule: Decodable, Sendable, Equatable, Identifiable {
         case id, name, prompt, cron, timezone, description, paused
         case nextRun = "next_run"
         case lastRun = "last_run"
+        case createdFrom = "created_from"
     }
 
     public init(from decoder: any Decoder) throws {
@@ -80,6 +84,7 @@ public struct AgentSchedule: Decodable, Sendable, Equatable, Identifiable {
         nextRun = Date(timeIntervalSince1970: try c.decode(Double.self, forKey: .nextRun))
         lastRun = try c.decodeIfPresent(Double.self, forKey: .lastRun).map(Date.init(timeIntervalSince1970:))
         paused = try c.decode(Bool.self, forKey: .paused)
+        createdFrom = try c.decodeIfPresent(String.self, forKey: .createdFrom)
     }
 }
 

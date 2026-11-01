@@ -42,6 +42,12 @@ const SECRET_LABEL_MAX_CHARS: usize = 60;
 const APPROVAL_TTL_SECS: i64 = 24 * 3600;
 const PAGE_CHANGED: &str = "the page changed after the user approved, so nothing was done; look at the page \
      again and ask again if it's still needed";
+const POLICY_CHANGED: &str =
+    "The rules changed while this was waiting, so I didn't do it. Ask again if you still want it.";
+/// Added to a scheduled run's framing with memory v2 (docs/memory-v2.md §15).
+const REPORT_OUTCOME_RULE: &str = "End with report_outcome. Use outcome=nothing when there is nothing the user \
+     needs to see, outcome=result with a summary under 180 characters when there is, and outcome=blocked when you \
+     could not finish. The user is not watching; a result they can use is worth a notification, nothing new is not.";
 const INTERRUPTED: &str =
     "I was interrupted: the agent on your desktop restarted. Ask me to continue if you still need this.";
 /// Memory v2: the one reminder when the user asked to remember something and
@@ -121,6 +127,9 @@ struct RunState {
     /// task keeps them, and the prompt's prefix stays the same).
     #[serde(default)]
     memory_block: Option<String>,
+    /// A scheduled run's `report_outcome` (result, nothing or blocked).
+    #[serde(default)]
+    reported: Option<push::Reported>,
 }
 
 /// The user approved what the agent typed into a message field (Slack's
@@ -521,6 +530,22 @@ impl Agent {
             );
             return Err(StartError::NotFound);
         }
+        // Parked under other rules: if today's would refuse it outright, it
+        // expires rather than go ahead (docs/memory-v2.md §10). If they'd
+        // still only ask, the user's answer stands.
+        let current = self.policy_version();
+        if approved && parked.policy_version.as_deref().is_some_and(|v| v != current) {
+            let model = parked
+                .checkpoint
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<RunState>(c).ok())
+                .map(|state| state.model);
+            if let Some(why) = self.refused_now(&parked.card, model.as_deref()) {
+                tracing::info!(approval = id, why, "parked under other rules: expired");
+                self.abandon_because(parked, POLICY_CHANGED, Some("policy_changed"));
+                return Err(StartError::NotFound);
+            }
+        }
         if self.busy.swap(true, Ordering::SeqCst) {
             return Err(StartError::Busy);
         }
@@ -550,14 +575,31 @@ impl Agent {
         Ok(())
     }
 
+    /// Why today's rules would refuse a parked card outright, if they would:
+    /// a browser change with Browser actions off, a command with the shell
+    /// tool off, or a task on a model that's no longer allowed.
+    fn refused_now(&self, card: &Value, model: Option<&str>) -> Option<&'static str> {
+        match card["kind"].as_str() {
+            Some("browser") if !self.settings().allow_actions => Some("browser actions are off"),
+            Some("shell") if !self.cfg.shell_tool => Some("the shell tool is off"),
+            _ if model.is_some_and(|m| !llm::KNOWN_MODELS.contains(&m)) => Some("the model isn't allowed"),
+            _ => None,
+        }
+    }
+
     /// Gives up on a parked task: its approval card expires and the task ends.
     fn abandon(&self, parked: Pending, answer: &str) {
+        self.abandon_because(parked, answer, None);
+    }
+
+    /// `abandon`, saying why on the card (`policy_changed`).
+    fn abandon_because(&self, parked: Pending, answer: &str, reason: Option<&str>) {
         if !self.store.remove_pending(&parked.id).unwrap_or(false) {
             return; // answered meanwhile
         }
         self.emit(
             "approval.resolved",
-            json!({"task": parked.run, "id": parked.id, "approved": false, "expired": true}),
+            json!({"task": parked.run, "id": parked.id, "approved": false, "expired": true, "reason": reason}),
         );
         match parked
             .checkpoint
@@ -636,9 +678,14 @@ impl Agent {
                 format!("[Scheduled task “{}”] {text}", schedule.name),
                 format!(
                     "(agentd) This is the scheduled task “{}” the user set up earlier ({}). They aren't \
-                     watching, so do it and end with a short report they can read in a notification.\n\n{text}",
+                     watching, so do it and end with a short report they can read in a notification.{}\n\n{text}",
                     schedule.name,
                     schedule::describe(schedule.cron.as_deref(), schedule.next_run, &schedule.timezone),
+                    if self.cfg.memory_v2 {
+                        format!(" {REPORT_OUTCOME_RULE}")
+                    } else {
+                        String::new()
+                    },
                 ),
             ),
             None => (text.clone(), text.clone()),
@@ -712,6 +759,7 @@ impl Agent {
             remembered: false,
             nudged: false,
             memory_block,
+            reported: None,
             schedule_id: scheduled.as_ref().map(|s| s.id),
             scheduled: scheduled.map(|s| s.name),
         };
@@ -765,9 +813,11 @@ impl Agent {
         if let Err(err) = self.store.add_history("assistant", answer) {
             tracing::error!(%err, "couldn't store the answer");
         }
+        // A scheduled run that found nothing: a quiet row in the chat.
+        let quiet = state.reported.as_ref().is_some_and(|r| r.outcome == "nothing");
         self.emit(
             "message",
-            json!({"role": "assistant", "text": answer, "task": task_id}),
+            json!({"role": "assistant", "text": answer, "task": task_id, "quiet": quiet.then_some(true)}),
         );
         let cost = state.usage.cost(&state.model);
         let seconds = state.seconds.round();
@@ -776,6 +826,7 @@ impl Agent {
             json!({
                 "task": task_id, "status": status, "steps": state.step, "seconds": seconds,
                 "model": state.model, "usage": state.usage, "cost": cost,
+                "outcome": state.reported.as_ref().map(|r| &r.outcome),
             }),
         );
         if let Err(err) = self.store.finish_run(task_id, status, state.step, cost, answer) {
@@ -784,16 +835,22 @@ impl Agent {
         // Memory v2: fold the finished task into memory, later.
         crate::consolidate::trigger(self);
         tracing::info!(task = %task_id, status, steps = state.step, seconds, "task finished");
-        // needs_user already pushed its Action needed; a stop came from the user.
-        if !matches!(status, "needs_user" | "cancelled") {
+        if self.cfg.memory_v2 && state.scheduled.is_some() && status == "done" && state.reported.is_none() {
+            // Counted, so the scheduled-run prompt can be tuned.
+            tracing::info!(task = %task_id, "report_outcome_missing");
+        }
+        // The attention budget (push.rs): only what the user must act on or
+        // can use.
+        if let Some((title, body)) = push::on_finish(
+            &self.cfg.desktop_name,
+            state.scheduled.as_deref(),
+            status,
+            state.reported.as_ref(),
+            answer,
+        ) {
             self.notify(Push {
-                title: match (&state.scheduled, status) {
-                    (Some(name), "done") => name.clone(),
-                    (Some(name), _) => format!("{name}: a problem"),
-                    (None, "done") => self.cfg.desktop_name.clone(),
-                    (None, _) => "Your desktop hit a problem".into(),
-                },
-                body: push::clip(answer, 180),
+                title,
+                body,
                 category: None,
                 thread: task_id.clone(),
                 data: json!({"task": task_id}),
@@ -836,7 +893,12 @@ impl Agent {
         browser
             .attach(self.store.setting("tab_target")?.as_deref())
             .await?;
-        let schemas = tools::schemas(self.cfg.shell_tool, !self.skills.is_empty(), self.cfg.memory_v2);
+        let schemas = tools::schemas(
+            self.cfg.shell_tool,
+            !self.skills.is_empty(),
+            self.cfg.memory_v2,
+            self.cfg.memory_v2 && state.scheduled.is_some(),
+        );
         let mut cancel = self.cancel.subscribe();
         // A second receiver, to interrupt model calls and browser actions.
         let mut stop = self.cancel.subscribe();
@@ -900,6 +962,38 @@ impl Agent {
                 }
                 if name == "remember" {
                     state.remembered = true;
+                }
+                // A scheduled run's last word (memory v2): ends the task.
+                if name == "report_outcome" && state.scheduled.is_some() && self.cfg.memory_v2 {
+                    let outcome = args["outcome"].as_str().unwrap_or_default();
+                    let summary = args["summary"].as_str().unwrap_or_default().trim();
+                    if matches!(outcome, "result" | "nothing" | "blocked") {
+                        state.reported = Some(push::Reported {
+                            outcome: outcome.to_string(),
+                            summary: push::clip(summary, 180),
+                        });
+                        // The answer stays the model's own text when it wrote one.
+                        let text = state
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| m["role"] == "assistant")
+                            .and_then(|m| m["content"].as_str())
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                            .map(String::from);
+                        let answer = text.unwrap_or_else(|| match outcome {
+                            "nothing" => "Nothing new.".to_string(),
+                            _ => summary.to_string(),
+                        });
+                        break 'task Outcome::Finished(answer, "done");
+                    }
+                    state.queue.remove(0);
+                    state.messages.push(json!({
+                        "role": "tool", "tool_call_id": call["id"],
+                        "content": "error: outcome must be result, nothing or blocked",
+                    }));
+                    continue;
                 }
                 if name == "needs_user" {
                     let reason = args["reason"]
@@ -1520,6 +1614,12 @@ impl Agent {
         let saved =
             self.store
                 .add_schedule(&name, &prompt, timing.cron.as_deref(), &timezone, timing.next_run)?;
+        // The rules it's set up under; "agent_tainted" when it was approved
+        // through a card after outside content.
+        let origin = if tainted { "agent_tainted" } else { "user" };
+        self.store
+            .set_schedule_origin(saved.id, &self.policy_version(), origin)?;
+        let saved = self.store.schedule(saved.id)?.unwrap_or(saved);
         self.schedules_changed.notify_one();
         let mut event = schedule::json(&saved);
         event["task"] = json!(task_id);
@@ -1885,16 +1985,22 @@ impl Agent {
         text
     }
 
-    /// Notifies the user's devices through the relay, in the background.
+    /// Notifies the user's devices through the relay: stored as a `push`
+    /// effect first, then sent with retries (effects.rs).
     fn notify(&self, mut notification: Push) {
-        let Some(relay) = self.push.clone() else { return };
+        if self.push.is_none() {
+            return;
+        }
         notification.title = self.secrets.redact(&notification.title).into_owned();
         notification.body = self.secrets.redact(&notification.body).into_owned();
-        tokio::spawn(async move {
-            if let Err(err) = relay.notify(&notification).await {
-                tracing::warn!(%err, "push failed");
-            }
-        });
+        if let Err(err) = self.enqueue(
+            "push",
+            &notification.effect_key(),
+            &notification.payload(),
+            unix_now(),
+        ) {
+            tracing::error!(%err, "couldn't queue a notification");
+        }
     }
 }
 
@@ -1944,8 +2050,147 @@ fn approval_push(task_id: &str, id: &str, details: &Value) -> Push {
 }
 
 #[cfg(test)]
+/// An agent on a scratch state directory: no Chrome, no relay, no model
+/// calls unless a task runs.
+pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("agentd-agent-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(dir.join("images")).unwrap();
+    let cfg = Config {
+        listen: "127.0.0.1:0".into(),
+        together_api_key: Some("test-key-not-used".to_string().into()),
+        gateway_url: String::new(),
+        gateway_measurements: Vec::new(),
+        gateway_audience: String::new(),
+        aws_region: "ca-central-1".into(),
+        model: "zai-org/GLM-5.3".into(),
+        cdp_url: "http://127.0.0.1:1".into(),
+        state_dir: dir.clone(),
+        workdir: dir.clone(),
+        run_as: String::new(),
+        shell_memory_max: "1G".into(),
+        shell_tasks_max: "64".into(),
+        shell_cpu_quota: "100%".into(),
+        shell_proxy: String::new(),
+        policy_path: dir.join("no-policy.toml"),
+        skills_dir: dir.join("no-skills"),
+        max_steps: 5,
+        shell_tool: true,
+        desktop_name: "test-desktop".into(),
+        push_relay_url: String::new(),
+        memory_v2: true,
+    };
+    (Arc::new(Agent::new(cfg).unwrap()), dir)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::test_agent;
+
+    /// Parks a task on a card, as `drive` would, under `policy_version`.
+    fn park(agent: &Agent, task: &str, card: Value, policy_version: &str) -> String {
+        agent
+            .store
+            .start_run(task, "do it", None, "zai-org/GLM-5.3", policy_version, None)
+            .unwrap();
+        let state = json!({
+            "task": task, "model": "zai-org/GLM-5.3", "allow_actions": true, "messages": [], "queue": [],
+            "step": 2, "tainted": true, "reminded": false, "loops": guard::LoopDetector::default(),
+            "usage": Usage::default(), "seconds": 1.0,
+        });
+        let id = format!("card-{task}");
+        agent
+            .store
+            .park(&id, task, &card, &state.to_string(), policy_version)
+            .unwrap();
+        id
+    }
+
+    fn events(agent: &Agent, kind: &str) -> Vec<Value> {
+        agent
+            .store
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.data)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_parked_browser_change_expires_when_browser_actions_are_turned_off() {
+        let (agent, dir) = test_agent();
+        let card = json!({"kind": "browser", "action": "type", "target": "Message #eng", "text": "hi", "site": "app.slack.com"});
+        let id = park(&agent, "t1", card, &agent.policy_version());
+        agent.update_settings(None, Some(false)).unwrap();
+        assert!(matches!(
+            agent.answer_approval(&id, true, Some("me".into())),
+            Err(StartError::NotFound)
+        ));
+        let resolved = events(&agent, "approval.resolved");
+        assert_eq!(resolved[0]["reason"], "policy_changed");
+        assert_eq!(resolved[0]["expired"], true);
+        let finished = events(&agent, "task.finished");
+        assert_eq!(finished[0]["status"], "cancelled");
+        assert!(
+            events(&agent, "message")
+                .iter()
+                .any(|m| m["text"] == POLICY_CHANGED)
+        );
+        assert!(agent.store.parked(&id).unwrap().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_parked_command_resumes_when_the_rules_still_only_ask() {
+        let (agent, dir) = test_agent();
+        let card = json!({"kind": "shell", "command": "sudo apt install jq", "reason": "runs as root"});
+        // Under other rules (an older version), but today's would still only ask.
+        let id = park(&agent, "t2", card, "0000000000000000");
+        assert!(agent.answer_approval(&id, true, Some("me".into())).is_ok());
+        assert_eq!(events(&agent, "approval.resolved")[0]["approved"], true);
+        assert_eq!(events(&agent, "task.resumed").len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_with_nothing_new_is_a_quiet_row() {
+        let (agent, dir) = test_agent();
+        agent
+            .store
+            .start_run("t3", "Summarize my inbox", None, "zai-org/GLM-5.3", "x", Some(4))
+            .unwrap();
+        let mut state: RunState = serde_json::from_value(json!({
+            "task": "t3", "model": "zai-org/GLM-5.3", "allow_actions": true, "messages": [], "queue": [],
+            "step": 3, "tainted": true, "reminded": false, "loops": guard::LoopDetector::default(),
+            "usage": Usage::default(), "seconds": 4.0, "scheduled": "Morning inbox", "schedule_id": 4,
+        }))
+        .unwrap();
+        state.reported = Some(push::Reported {
+            outcome: "nothing".into(),
+            summary: "Inbox is clear".into(),
+        });
+        agent.finish(&state, "Nothing new.", "done");
+        let message = events(&agent, "message").pop().unwrap();
+        assert_eq!(
+            (message["text"].as_str(), message["quiet"].as_bool()),
+            (Some("Nothing new."), Some(true))
+        );
+        assert_eq!(events(&agent, "task.finished")[0]["outcome"], "nothing");
+        // And the attention rules keep the phone quiet for it (push.rs).
+        assert_eq!(
+            push::on_finish(
+                "d",
+                Some("Morning inbox"),
+                "done",
+                state.reported.as_ref(),
+                "Nothing new."
+            ),
+            None
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn spots_requests_to_remember() {

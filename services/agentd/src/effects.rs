@@ -14,8 +14,8 @@
 //!   `EFFECT_MAX_ATTEMPTS` failures the row stays, given up, and `/status`
 //!   reports it; enqueuing the same key again starts it over.
 //!
-//! Kinds: `purge` (daily, below). Memory consolidation and push notifications
-//! join in later phases.
+//! Kinds: `purge` (daily), `consolidate` (consolidate.rs) and `push` (a
+//! notification through the relay).
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -126,8 +126,24 @@ async fn handle(agent: &Agent, effect: &Effect) -> Outcome {
     match effect.kind.as_str() {
         "purge" => purge(&agent.store),
         "consolidate" => crate::consolidate::run(agent).await,
+        "push" => push(agent, effect).await,
         // From a newer agentd (after a rollback): keep it for that version.
         other => Outcome::Failed(format!("unknown effect kind {other}")),
+    }
+}
+
+/// Sends a notification through the push relay. With no relay configured
+/// (any more), there's nothing to do.
+async fn push(agent: &Agent, effect: &Effect) -> Outcome {
+    let Some(relay) = agent.push.clone() else {
+        return Outcome::Done;
+    };
+    let Some(notification) = crate::push::Push::from_payload(&effect.payload) else {
+        return Outcome::Done; // malformed: retrying wouldn't help
+    };
+    match relay.notify(&notification).await {
+        Ok(()) => Outcome::Done,
+        Err(err) => Outcome::Failed(format!("{err:#}")),
     }
 }
 

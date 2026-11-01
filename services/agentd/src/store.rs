@@ -54,9 +54,15 @@ pub struct Schedule {
     pub last_run: Option<i64>,
     pub paused: bool,
     pub created: String,
+    /// The rules it was set up under (policy.rs); None from before 0.15.
+    pub policy_version: Option<String>,
+    /// `user` (asked for in a clean task), `agent_clean`, or `agent_tainted`
+    /// (approved through a card after outside content).
+    pub created_from: String,
 }
 
-const SCHEDULE_COLUMNS: &str = "id, name, prompt, cron, timezone, next_run, last_run, paused, created";
+const SCHEDULE_COLUMNS: &str =
+    "id, name, prompt, cron, timezone, next_run, last_run, paused, created, policy_version, created_from";
 
 /// A saved key, as the apps list it: never its value.
 #[derive(Clone, Debug, Serialize)]
@@ -80,6 +86,8 @@ pub struct Pending {
     pub checkpoint: Option<String>,
     /// Unix seconds.
     pub created: i64,
+    /// The rules in force when it parked (policy.rs); None from before 0.15.
+    pub policy_version: Option<String>,
 }
 
 /// A side effect waiting to be done (effects.rs).
@@ -335,6 +343,26 @@ impl Store {
         )?)
     }
 
+    /// Where a new schedule came from, and the rules it was set up under.
+    pub fn set_schedule_origin(&self, id: i64, policy_version: &str, created_from: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE schedules SET policy_version = ?2, created_from = ?3 WHERE id = ?1",
+            params![id, policy_version, created_from],
+        )?;
+        Ok(())
+    }
+
+    /// A schedule runs under today's rules from now on.
+    pub fn set_schedule_policy(&self, id: i64, policy_version: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE schedules SET policy_version = ?2 WHERE id = ?1",
+            params![id, policy_version],
+        )?;
+        Ok(())
+    }
+
     pub fn schedules(&self) -> Result<Vec<Schedule>> {
         self.schedules_where("1 = 1 ORDER BY id", params![])
     }
@@ -573,6 +601,40 @@ impl Store {
         Ok(())
     }
 
+    /// Every parked approval: (id, card kind), newest first.
+    pub fn parked_cards(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, COALESCE(json_extract(card, '$.kind'), 'shell') FROM pending
+             WHERE kind = 'approval' ORDER BY created DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The latest task (not a consolidation): (id, status).
+    pub fn latest_task(&self) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT id, status FROM runs WHERE kind = 'task' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Memory counts: (active, pending).
+    pub fn memory_counts(&self) -> Result<(i64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FILTER (WHERE status = 'active'), COUNT(*) FILTER (WHERE status = 'pending')
+             FROM memory WHERE agent = 'main'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
     /// The parked approval with this ID.
     pub fn parked(&self, id: &str) -> Result<Option<Pending>> {
         self.pending_where("kind = 'approval' AND id = ?1", Some(id))
@@ -610,7 +672,8 @@ impl Store {
         Ok(conn
             .query_row(
                 &format!(
-                    "SELECT id, run, card, checkpoint, created FROM pending WHERE {condition} ORDER BY created DESC LIMIT 1"
+                    "SELECT id, run, card, checkpoint, created, policy_version FROM pending WHERE {condition}
+                     ORDER BY created DESC LIMIT 1"
                 ),
                 rusqlite::params_from_iter(id),
                 |row| {
@@ -621,6 +684,7 @@ impl Store {
                         card: serde_json::from_str(&card).unwrap_or(Value::Null),
                         checkpoint: row.get(3)?,
                         created: row.get(4)?,
+                        policy_version: row.get(5)?,
                     })
                 },
             )
@@ -719,6 +783,8 @@ fn schedule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
         last_run: row.get(6)?,
         paused: row.get(7)?,
         created: row.get(8)?,
+        policy_version: row.get(9)?,
+        created_from: row.get(10)?,
     })
 }
 

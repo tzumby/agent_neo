@@ -254,9 +254,10 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   (replaced the earlier Python agent and Telegram bot).
 - [docs/memory-v2.md](docs/memory-v2.md): the plan for agentd's memory v2 (kinds,
   trust, retrieval, consolidation) and the effects queue, policy versions,
-  attention budget and stage; phases 0–3 are built (agentd 0.15.0, `MEMORY_V2=off`
+  attention budget and stage; phases 0–4 are built (agentd 0.15.0, `MEMORY_V2=off`
   by default, on for the dev desktop; v2 passes 20/20 memory evals, v1 17/20;
-  consolidation runs in review-first `observe` mode).
+  consolidation runs in review-first `observe` mode; notifications go through the
+  effects queue and follow the attention rules).
 - [docs/agents-and-bots.md](docs/agents-and-bots.md): design for a main agent with
   its own memory, and user-created bots it manages (draft, not built yet).
 - [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'

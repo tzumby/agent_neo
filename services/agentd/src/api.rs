@@ -64,8 +64,93 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error": message}))).into_response()
 }
 
+/// What `stage` is worked out from.
+#[derive(Default)]
+pub struct StageFacts {
+    /// Parked approvals: (id, card kind).
+    pub cards: Vec<(String, String)>,
+    /// The latest task: (id, status).
+    pub latest: Option<(String, String)>,
+    pub busy: bool,
+    pub failing_effects: usize,
+    pub pending_memories: i64,
+    /// The next schedule due within a day: (id, name, next_run).
+    pub next_schedule: Option<(i64, String, i64)>,
+}
+
+/// One word for what the desktop needs, from the first matching row
+/// (docs/memory-v2.md §12), and the ids behind it so the app can deep-link.
+pub fn stage_of(facts: &StageFacts) -> (&'static str, Value) {
+    let card = |kinds: &[&str]| {
+        facts
+            .cards
+            .iter()
+            .find(|(_, kind)| kinds.contains(&kind.as_str()))
+    };
+    let latest_is = |statuses: &[&str]| {
+        facts
+            .latest
+            .as_ref()
+            .filter(|(_, status)| statuses.contains(&status.as_str()))
+    };
+    if let Some((id, kind)) = card(&["shell", "browser", "schedule"]) {
+        return ("needs_you/approval", json!({"card": id, "kind": kind}));
+    }
+    if let Some((id, _)) = card(&["secret"]) {
+        return ("needs_you/secret", json!({"card": id}));
+    }
+    if let Some((run, _)) = latest_is(&["needs_user"]) {
+        return ("needs_you/action", json!({"run": run}));
+    }
+    if facts.busy {
+        return ("working", json!({"run": facts.latest.as_ref().map(|(id, _)| id)}));
+    }
+    if let Some((run, status)) = latest_is(&["error", "interrupted", "stuck", "max_steps"]) {
+        return ("problem", json!({"run": run, "status": status}));
+    }
+    if facts.failing_effects > 0 {
+        return ("problem", json!({"failing_effects": facts.failing_effects}));
+    }
+    if facts.pending_memories > 0 {
+        return ("review", json!({"pending": facts.pending_memories}));
+    }
+    if let Some((id, name, next_run)) = &facts.next_schedule {
+        return (
+            "scheduled",
+            json!({"schedule": id, "name": name, "next_run": next_run}),
+        );
+    }
+    ("idle", json!({}))
+}
+
+fn stage(agent: &Agent, failing_effects: usize, pending_memories: i64) -> (&'static str, Value) {
+    let now = crate::memory::unix_now();
+    let next_schedule = agent
+        .store
+        .schedules()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| !s.paused && s.next_run <= now + 86_400)
+        .min_by_key(|s| s.next_run)
+        .map(|s| (s.id, s.name, s.next_run));
+    stage_of(&StageFacts {
+        cards: agent.store.parked_cards().unwrap_or_default(),
+        latest: agent.store.latest_task().ok().flatten(),
+        busy: agent.is_busy(),
+        failing_effects,
+        pending_memories,
+        next_schedule,
+    })
+}
+
 async fn status(State(agent): App) -> Json<Value> {
     let (waiting, failing) = agent.store.effects_health().unwrap_or_default();
+    let (active_memories, pending_memories) = agent.store.memory_counts().unwrap_or_default();
+    let (stage, stage_detail) = stage(
+        &agent,
+        failing.len(),
+        if agent.cfg.memory_v2 { pending_memories } else { 0 },
+    );
     let failing: Vec<Value> = failing
         .iter()
         .map(|e| json!({"kind": e.kind, "key": e.key, "attempts": e.attempts, "last_error": e.last_error}))
@@ -84,6 +169,10 @@ async fn status(State(agent): App) -> Json<Value> {
         "policy_version": agent.policy_version(),
         "effects": {"pending": waiting, "failing": failing},
         "memory_v2": agent.cfg.memory_v2,
+        "memory": {"active": active_memories, "pending": pending_memories},
+        // One word for the app's headline, and what's behind it.
+        "stage": stage,
+        "stage_detail": stage_detail,
     }))
 }
 
@@ -635,5 +724,80 @@ async fn put_settings(State(agent): App, Json(body): Json<SettingsUpdate>) -> Re
     match agent.update_settings(body.model.as_deref(), body.allow_actions) {
         Ok(settings) => Json(json!(settings)).into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with(change: impl FnOnce(&mut StageFacts)) -> &'static str {
+        let mut facts = StageFacts::default();
+        change(&mut facts);
+        stage_of(&facts).0
+    }
+
+    #[test]
+    fn the_stage_is_the_first_row_that_matches() {
+        assert_eq!(with(|_| {}), "idle");
+        assert_eq!(
+            with(|f| f.next_schedule = Some((4, "Morning inbox".into(), 100))),
+            "scheduled"
+        );
+        assert_eq!(with(|f| f.pending_memories = 2), "review");
+        assert_eq!(with(|f| f.failing_effects = 1), "problem");
+        for status in ["error", "interrupted", "stuck", "max_steps"] {
+            assert_eq!(
+                with(|f| f.latest = Some(("t1".into(), status.into()))),
+                "problem",
+                "{status}"
+            );
+        }
+        assert_eq!(with(|f| f.latest = Some(("t1".into(), "done".into()))), "idle");
+        assert_eq!(with(|f| f.busy = true), "working");
+        assert_eq!(
+            with(|f| f.latest = Some(("t1".into(), "needs_user".into()))),
+            "needs_you/action"
+        );
+        assert_eq!(
+            with(|f| f.cards = vec![("s1".into(), "secret".into())]),
+            "needs_you/secret"
+        );
+        for kind in ["shell", "browser", "schedule"] {
+            assert_eq!(
+                with(|f| f.cards = vec![("a1".into(), kind.into())]),
+                "needs_you/approval"
+            );
+        }
+    }
+
+    #[test]
+    fn what_needs_the_user_comes_first() {
+        let everything = StageFacts {
+            cards: vec![("s1".into(), "secret".into()), ("a1".into(), "browser".into())],
+            latest: Some(("t9".into(), "needs_user".into())),
+            busy: true,
+            failing_effects: 3,
+            pending_memories: 5,
+            next_schedule: Some((4, "Morning inbox".into(), 100)),
+        };
+        assert_eq!(
+            stage_of(&everything),
+            ("needs_you/approval", json!({"card": "a1", "kind": "browser"}))
+        );
+        let working = StageFacts {
+            cards: vec![],
+            latest: Some(("t9".into(), "error".into())),
+            ..everything
+        };
+        assert_eq!(stage_of(&working).0, "working");
+        let problem = StageFacts {
+            busy: false,
+            ..working
+        };
+        assert_eq!(
+            stage_of(&problem),
+            ("problem", json!({"run": "t9", "status": "error"}))
+        );
     }
 }

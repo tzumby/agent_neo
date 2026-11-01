@@ -11,7 +11,8 @@ struct ChatRow: View, Equatable {
     var body: some View {
         switch item {
         case .user(let message): UserBubble(text: message.text, schedule: message.schedule)
-        case .assistant(let message): AssistantMessage(text: message.text)
+        case .assistant(let message):
+            if message.quiet { QuietMessage(text: message.text) } else { AssistantMessage(text: message.text) }
         case .work(let work): WorkRow(work: work)
         case .approval(let approval):
             if let request = approval.secret {
@@ -67,6 +68,35 @@ private struct AssistantMessage: View {
         VStack(alignment: .leading, spacing: 12) {
             MarkdownView(text: text)
             CopyButton(text: text).font(.footnote)
+        }
+    }
+}
+
+/// A scheduled run's answer when it found nothing new: one quiet line, the
+/// text on a tap. (Its phone stayed quiet too.)
+private struct QuietMessage: View {
+    let text: String
+    @State private var open = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.snappy(duration: 0.2)) { open.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "moon.zzz").font(.footnote)
+                    Text("Nothing new").font(.subheadline)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.bold))
+                        .rotationEffect(.degrees(open ? 90 : 0))
+                }
+                .foregroundStyle(.secondary)
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            if open {
+                MarkdownView(text: text).foregroundStyle(.secondary)
+            }
         }
     }
 }
@@ -408,7 +438,7 @@ private struct ApprovalCard: View {
                 .controlSize(.large)
             case .approved: Outcome(text: "Approved", icon: "checkmark.circle.fill", color: .green)
             case .denied: Outcome(text: "Denied", icon: "xmark.circle.fill", color: .red)
-            case .expired: Outcome(text: "Expired", icon: "clock", color: .secondary)
+            case .expired: Outcome(text: expiredText(approval), icon: "clock", color: .secondary)
             }
         }
         .card()
@@ -501,7 +531,7 @@ private struct BrowserApprovalCard: View {
                 .controlSize(.large)
             case .approved: Outcome(text: "Approved", icon: "checkmark.circle.fill", color: .green)
             case .denied: Outcome(text: "Denied", icon: "xmark.circle.fill", color: .red)
-            case .expired: Outcome(text: "Expired", icon: "clock", color: .secondary)
+            case .expired: Outcome(text: expiredText(approval), icon: "clock", color: .secondary)
             }
         }
         .card()
@@ -538,6 +568,11 @@ private struct BrowserApprovalCard: View {
         guard let store, let client else { return }
         Task { await store.answer(approval, approved: approved, client: client) }
     }
+}
+
+/// "Expired", or why when agentd said.
+private func expiredText(_ approval: Approval) -> String {
+    approval.expiredBecause == "policy_changed" ? "Expired: the rules changed while it waited" : "Expired"
 }
 
 private struct Outcome: View {
@@ -724,7 +759,7 @@ private struct SecretRequestCard: View {
                 form
             case .approved: Outcome(text: "Saved on your desktop", icon: "lock.fill", color: .green)
             case .denied: Outcome(text: "Not given", icon: "xmark.circle.fill", color: .secondary)
-            case .expired: Outcome(text: "Expired", icon: "clock", color: .secondary)
+            case .expired: Outcome(text: expiredText(approval), icon: "clock", color: .secondary)
             }
         }
         .card()

@@ -150,7 +150,7 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     })
 }
 
-pub fn schemas(shell: bool, skills: bool, memory_v2: bool) -> Value {
+pub fn schemas(shell: bool, skills: bool, memory_v2: bool, scheduled: bool) -> Value {
     let max_chars = json!({"type": "integer", "description": "truncate after N characters (12000)"});
     let target = json!({
         "ref": {"type": "integer", "description": "ref from snapshot"},
@@ -300,6 +300,18 @@ pub fn schemas(shell: bool, skills: bool, memory_v2: bool) -> Value {
             &["id"],
         ));
     }
+    if scheduled {
+        tools.push(tool(
+            "report_outcome",
+            "End this scheduled run: result (the user can use what you found; it's pushed to their phone), \
+             nothing (nothing new: no notification) or blocked (you couldn't finish).",
+            json!({
+                "outcome": {"type": "string", "enum": ["result", "nothing", "blocked"]},
+                "summary": {"type": "string", "description": "at most 180 characters: the notification's text"},
+            }),
+            &["outcome", "summary"],
+        ));
+    }
     if skills {
         tools.push(tool(
             "read_skill",
@@ -379,13 +391,13 @@ mod tests {
 
     #[test]
     fn memory_v2_offers_three_memory_tools() {
-        let v2 = names(&schemas(true, true, true));
+        let v2 = names(&schemas(true, true, true, false));
         assert!(
             ["remember", "forget", "search_memory"]
                 .iter()
                 .all(|t| v2.contains(&t.to_string()))
         );
-        let v1 = names(&schemas(true, true, false));
+        let v1 = names(&schemas(true, true, false, false));
         assert!(v1.contains(&"remember".to_string()) && !v1.contains(&"search_memory".to_string()));
         assert_eq!(v2.len(), v1.len() + 1);
     }

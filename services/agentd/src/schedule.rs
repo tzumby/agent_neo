@@ -239,6 +239,8 @@ pub fn json(schedule: &Schedule) -> serde_json::Value {
         "last_run": schedule.last_run,
         "paused": schedule.paused,
         "created": schedule.created,
+        "policy_version": schedule.policy_version,
+        "created_from": schedule.created_from,
     })
 }
 
@@ -283,6 +285,22 @@ fn start_due(agent: &Arc<Agent>, due: Vec<Schedule>, now: i64) -> bool {
             advance(agent, &schedule, now, None);
             continue;
         }
+        // Set up under other rules: it still runs (every action is gated by
+        // today's rules anyway), and the chat says so once.
+        let current = agent.policy_version();
+        if schedule.policy_version.as_deref() != Some(current.as_str()) {
+            if schedule.policy_version.is_some() {
+                agent.emit(
+                    "message",
+                    json!({"role": "assistant", "text": format!(
+                        "Rules changed since “{}” was set up: it runs under today's rules.", schedule.name
+                    )}),
+                );
+            }
+            if let Err(err) = agent.store.set_schedule_policy(schedule.id, &current) {
+                tracing::error!(%err, schedule = schedule.id, "couldn't record the schedule's rules");
+            }
+        }
         match agent.start_scheduled(&schedule) {
             Ok(task) => {
                 tracing::info!(schedule = schedule.id, %task, late, "scheduled run started");
@@ -319,6 +337,64 @@ fn advance(agent: &Agent, schedule: &Schedule, now: i64, ran: Option<i64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_schedule_from_older_rules_runs_and_says_so_once() {
+        let (agent, dir) = crate::agent::test_agent();
+        let now = Timestamp::now().as_second();
+        let schedule = agent
+            .store
+            .add_schedule(
+                "Morning inbox",
+                "Summarize my inbox",
+                Some("0 8 * * *"),
+                "UTC",
+                now - 5,
+            )
+            .unwrap();
+        agent
+            .store
+            .set_schedule_origin(schedule.id, "0000000000000000", "user")
+            .unwrap();
+        let due = agent.store.due_schedules(now).unwrap();
+        assert!(!start_due(&agent, due, now)); // it started
+        let notes: Vec<String> = agent
+            .store
+            .events_after(0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "message" && e.data["role"] == "assistant")
+            .filter_map(|e| e.data["text"].as_str().map(String::from))
+            .collect();
+        assert_eq!(
+            notes,
+            ["Rules changed since “Morning inbox” was set up: it runs under today's rules."]
+        );
+        let stored = agent.store.schedule(schedule.id).unwrap().unwrap();
+        assert_eq!(stored.policy_version, Some(agent.policy_version()));
+        assert_eq!(stored.created_from, "user");
+        // A schedule from before 0.15 (no version) just takes today's, silently.
+        let old = agent
+            .store
+            .add_schedule("Old", "x", Some("0 9 * * *"), "UTC", now - 5)
+            .unwrap();
+        while agent.is_busy() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!start_due(
+            &agent,
+            vec![agent.store.schedule(old.id).unwrap().unwrap()],
+            now
+        ));
+        let notes = agent.store.events_after(0, 200).unwrap().into_iter().filter(|e| {
+            e.kind == "message"
+                && e.data["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("Rules changed"))
+        });
+        assert_eq!(notes.count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     const TORONTO: &str = "America/Toronto";
 

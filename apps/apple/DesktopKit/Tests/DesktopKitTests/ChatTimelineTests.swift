@@ -268,3 +268,22 @@ private func event(_ seq: Int, _ kind: String, _ json: String) throws -> AgentEv
     timeline.apply(try event(7, "memory.saved", #"{"id":9,"text":"x","trusted":true}"#))
     #expect(timeline.items.count == 4)
 }
+
+@Test func quietRunsAndCardsExpiredByARuleChange() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(try event(1, "message", #"{"role":"assistant","text":"Inbox is clear.","task":"t1","quiet":true}"#))
+    guard case .assistant(let quiet) = timeline.items.last else { Issue.record("no message"); return }
+    #expect(quiet.quiet)
+    timeline.apply(try event(2, "message", #"{"role":"assistant","text":"Done.","task":"t2"}"#))
+    guard case .assistant(let loud) = timeline.items.last else { return }
+    #expect(!loud.quiet)
+    timeline.apply(try event(3, "task.started", #"{"task":"t3","model":"m"}"#))
+    timeline.apply(
+        try event(
+            4, "approval.requested",
+            #"{"kind":"browser","id":"a1","task":"t3","action":"type","target":"Message","text":"hi","site":"slack.com"}"#))
+    timeline.apply(
+        try event(5, "approval.resolved", #"{"task":"t3","id":"a1","approved":false,"expired":true,"reason":"policy_changed"}"#))
+    guard case .approval(let card) = timeline.items.last else { return }
+    #expect(card.state == .expired && card.expiredBecause == "policy_changed")
+}

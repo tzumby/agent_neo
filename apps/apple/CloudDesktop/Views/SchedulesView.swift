@@ -92,6 +92,11 @@ private struct ScheduleRow: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
+            if schedule.createdFrom == "agent_tainted" {
+                Label("Set up after the agent read outside content", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
             if schedule.timezone != TimeZone.current.identifier {
                 Text("Times in \(schedule.timezone)").font(.caption).foregroundStyle(.tertiary)
             }

@@ -49,7 +49,8 @@ public struct ChatTimeline: Sendable, Equatable {
                 let schedule = data["schedule"]?["name"]?.string
                 items.append(.user(Message(id: event.seq, text: text, schedule: schedule)))
             } else {
-                items.append(.assistant(Message(id: event.seq, text: text)))
+                // A scheduled run that found nothing: shown collapsed.
+                items.append(.assistant(Message(id: event.seq, text: text, quiet: data["quiet"]?.bool ?? false)))
             }
         case "task.started":
             busy = true
@@ -119,8 +120,12 @@ public struct ChatTimeline: Sendable, Equatable {
                 return false
             } ?? false
             if data["expired"]?.bool == true {
-                // Given up (stopped, or a new message): task.finished closes its step.
-                update(approval: id) { $0.state = .expired }
+                // Given up (stopped, a new message, or the rules changed):
+                // task.finished closes its step.
+                update(approval: id) {
+                    $0.state = .expired
+                    $0.expiredBecause = data["reason"]?.string
+                }
                 return
             }
             update(approval: id) { $0.state = approved ? .approved : .denied }
@@ -294,6 +299,8 @@ public struct Message: Sendable, Equatable {
     public let text: String
     /// For a scheduled run's prompt: the schedule's name.
     public var schedule: String? = nil
+    /// A scheduled run's answer when it found nothing new: shown collapsed.
+    public var quiet = false
 }
 
 /// One task's tool calls, collapsed under a single row.
@@ -353,6 +360,9 @@ public struct Approval: Sendable, Equatable {
     public let command: String
     public let reason: String
     public var state: State = .pending
+    /// Why it expired, when agentd said: `policy_changed` (the rules changed
+    /// while it waited).
+    public var expiredBecause: String?
     /// Set when it's a browser action (typing, a key, a click) rather than a command.
     public var browser: BrowserAction?
     /// Set when it's a schedule the agent wants to set up.

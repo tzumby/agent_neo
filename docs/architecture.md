@@ -523,7 +523,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 
 | Method | Path | What it does |
 |---|---|---|
-| GET | `/api/v1/status` | Desktop name, `busy`, `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2` |
+| GET | `/api/v1/status` | Desktop name, `busy`, `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2`, `memory {active, pending}`, `stage` and `stage_detail` (below the table) |
 | GET | `/api/v1/messages?limit=` | The chat history (default 50, at most 500), with saved keys redacted |
 | POST | `/api/v1/messages` | `{text, timezone, utc_offset}` starts a task. 202 `{task}`, or 409 while one runs. The time zone is remembered for later tasks and schedules |
 | GET | `/api/v1/events?after=` | Server-Sent Events: up to 5,000 logged events after `after`, then live ones. Each SSE message has `id: seq`, `event: kind` and the JSON event. Keep-alive comments every 15 s. Subscribes to the live bus before reading the backlog, so nothing falls between them |
@@ -550,6 +550,21 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | PUT | `/api/v1/secrets/{name}` | `{value, label?, approval?}`. Saves or replaces a key. With `approval`, resumes the task whose request card asked for exactly this key. Returns `{secret, resumed, busy}`. The body is never logged |
 | DELETE | `/api/v1/secrets/{name}` | Delete a key |
 
+**`stage`** is one word for what the desktop needs, from the first matching row:
+
+| Stage | When |
+|---|---|
+| `needs_you/approval` | A command, browser or schedule card is waiting |
+| `needs_you/secret` | A key request is waiting |
+| `needs_you/action` | The latest task ended with Action needed |
+| `working` | A task is running |
+| `problem` | The latest task ended with an error, interrupted, stuck or out of steps; or an effect gave up |
+| `review` | Memories wait for approval (memory v2) |
+| `scheduled` | A schedule is due within a day |
+| `idle` | Anything else |
+
+`stage_detail` carries the ids behind it (card, run, pending count, next schedule) for deep links.
+
 ### 6.5 The event log
 
 Every change the apps show is an event: appended to `events` and broadcast on an in-process `tokio::broadcast` channel (capacity 1024).
@@ -560,17 +575,17 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 
 | Kind | Data | Emitted when |
 |---|---|---|
-| `message` | `role` (user or assistant), `text`, `task`, `by`, `schedule` ({id, name} for a scheduled run) | A request starts; an answer is final; agentd says something outside a task (e.g. a skipped schedule) |
+| `message` | `role` (user or assistant), `text`, `task`, `by`, `schedule` ({id, name} for a scheduled run), `quiet` (a scheduled run that found nothing: shown collapsed) | A request starts; an answer is final; agentd says something outside a task (e.g. a skipped schedule, or that a schedule's rules changed) |
 | `task.started` | `task`, `model` | A task starts |
 | `step` | `task`, `step`, `tool`, `args` (first 300 characters) | Each tool call, except a resumed one |
 | `shell` | `task`, `command`, `as_root`, `needs_approval`, `secrets` (key names) | A command is about to run or ask |
 | `shell.output` | `task`, `command`, `exit_code`, `timed_out`, `stopped`, `output` (last 4,000 characters), `seconds` | A command ended |
 | `approval.requested` | The card: `id`, `task`, `kind` (`shell`, `browser`, `schedule` or `secret`) and its fields | A task parks |
 | `task.paused` | `task`, `approval` | Right after the card |
-| `approval.resolved` | `task`, `id`, `approved`, `by`, `expired` | Answered, or given up on |
+| `approval.resolved` | `task`, `id`, `approved`, `by`, `expired`, `reason` (`policy_changed`) | Answered, or given up on |
 | `task.resumed` | `task` | A parked task carries on |
 | `task.stopping` | (nothing) | Stop was pressed while a task ran |
-| `task.finished` | `task`, `status`, `steps`, `seconds`, `model`, `usage` ({input, output, cached}), `cost` (USD) | A task ends |
+| `task.finished` | `task`, `status`, `steps`, `seconds`, `model`, `usage` ({input, output, cached}), `cost` (USD), `outcome` (a scheduled run's `report_outcome`) | A task ends |
 | `action_needed` | `task`, `id`, `reason`, `page` ("title \| url"), `image` | The agent called `needs_user` |
 | `action.resolved` | `id`, `choice`, `by` | "I'm done" or "Skip" |
 | `image` | `task`, `id`, `url`, `caption` | `show_screenshot` |
@@ -666,6 +681,7 @@ For each tool call:
 | `read_skill` | `name` | Returns a skill's Markdown (§6.16) | No |
 | `run_shell` | `command`, `timeout` (120 s; 1–900), `secrets` | Runs bash as `worker` (§6.10) | `sudo …`, dangerous patterns, and data-out after outside content |
 | `request_secret` | `name`, `label`, `why`, `how`, `url`, `replace` | Asks the user for an API key or token (§6.15) | Always: it's a card with a secure field |
+| `report_outcome` (memory v2, scheduled runs only) | `outcome` (result, nothing, blocked), `summary` (≤ 180 characters) | Ends a scheduled run. `result` pushes the summary, `blocked` pushes "<name>: needs you", `nothing` pushes nothing and leaves a quiet row in the chat (§6.17) | No |
 
 The shell tools (`run_shell`, `request_secret`) exist only when `SHELL_TOOL=on`; `read_skill` only when there are skills.
 
@@ -803,7 +819,16 @@ Each answer records who gave it (`by`, from `X-Tailscale-User`).
 - `RUN_AS`;
 - the allowed models, sorted.
 
-Every run and every parked card records it, and `/status` shows it. From memory v2 phase 4, work parked under other rules is checked again before it resumes. Memory never takes part.
+Every run, parked card and schedule records it, and `/status` shows it. Memory never takes part.
+
+**Approving a card parked under other rules.** The action is checked against today's rules first. If they'd refuse it outright, the card expires (`approval.resolved` with `reason: policy_changed`), the task ends with "The rules changed while this was waiting, so I didn't do it", and the app shows "Expired: the rules changed while it waited". That happens for:
+- a browser change with Browser actions now off;
+- a command with the shell tool off;
+- a model no longer allowed.
+
+If today's rules would still only ask, the approval stands.
+
+**A schedule set up under other rules** still runs (each action is gated at run time anyway). The chat says "Rules changed since “…” was set up" once, and its recorded version is updated.
 
 ### 6.12 Untrusted content
 
@@ -985,6 +1010,14 @@ The model therefore never sees a value, even if a command prints one or the user
 
 ### 6.17 Notifications
 
+- **Sending.** Every notification is a `push` effect first (§6.19): it's sent with retries (5 s doubling to 5 minutes) and survives a restart. The key is `task:<task>:<category>[:<card>]`, so one task's notifications never replace each other.
+- **What gets sent** follows the attention rules (`push::on_finish`, memory v2 §11). The phone hears only what the user must act on or can use:
+  - approval cards, key requests and Action needed;
+  - a user's task that finished, with the start of the answer;
+  - a task that hit a problem (error, interrupted, stuck, out of steps);
+  - a scheduled run's `report_outcome`: its summary for `result` and `blocked`, nothing for `nothing`. A scheduled run that didn't report pushes its answer, and the journal counts `report_outcome_missing`.
+
+  Never pushed: stopped tasks, Action needed's end (already pushed), pending memories, consolidation.
 - `push.rs` sends `{title, body, category, thread, data}` to the push relay's function URL. The request is signed with SigV4 using the desktop's instance role (§8).
 - Bodies are clipped to 180 characters and redacted.
 - Categories:
@@ -1017,9 +1050,8 @@ Side effects are stored first and done afterwards. Each is a row in `effects`, w
 - **Giving up:** after 10 failures the row stays, given up. `/status` lists it, and the journal names its kind and key only, since payloads can hold user content.
 - **Kinds today:**
   - `purge`, daily: hard-deletes memories deleted more than 30 days ago, with their search entries and the text in their history;
-  - `consolidate` (key `main`): memory consolidation (§6.13). It's re-enqueued by each finished task, waits while a task runs, and fails over to retries if the model's answer is invalid twice.
-
-  Push notifications move onto the queue in memory v2 phase 4.
+  - `consolidate` (key `main`): memory consolidation (§6.13). It's re-enqueued by each finished task, waits while a task runs, and fails over to retries if the model's answer is invalid twice;
+  - `push`: a notification (§6.17). It's done at once when no relay is configured.
 
 ## 7. The attested model gateway
 
@@ -1565,7 +1597,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 87 unit tests (plus a 5,000-memory speed test run on demand): memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
+| agentd | 95 unit tests (plus a 5,000-memory speed test run on demand): the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
 | DesktopKit | 21 tests (§10.8) |

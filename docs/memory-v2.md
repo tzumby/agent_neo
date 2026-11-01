@@ -597,6 +597,18 @@ Phase 3 (built; behind `MEMORY_V2`, mode `observe` by default):
 - **Settings.** `GET/PUT /settings` take `memory_consolidation` (off, observe, auto), `memory_consolidation_model` (one of the known models) and `memory_consolidation_daily_cap_usd` (0–10).
 - **First real run** (eval `consolidation-work-log`, GLM-5.3-Flash, $0.0006): it logged the one task worth remembering ("Drafted (but did not send) a two-line email to Dana…") and skipped a sum and a remember that was already saved. The entry added a small detail that may not have been in the draft, so the instructions may need to say "only what the answer shows".
 
+Phase 4 (built):
+
+- **Push key.** A push effect's key is `task:<task>:<category>` plus the card's id when there is one, so a task's distinct notifications (two approvals, then the answer) never replace each other.
+- **Behind `MEMORY_V2`:** `report_outcome`, its framing in the scheduled-run prompt, and quiet rows, like everything else new in the agent's behaviour in 0.15. Pushes through effects, the rules check on parked work, and `stage` are always on: they change reliability and safety, not what the agent does.
+- **`report_outcome`'s answer** is the model's own last text when it wrote one; otherwise the summary ("Nothing new." for `nothing`). `blocked` pushes "<schedule>: needs you".
+- **The rules check runs only when the user approves.** A denial changes nothing either way. A card that expires this way answers the API with 404, as any expired card does, and the app shows "Expired: the rules changed while it waited".
+- **`created_from`** is `agent_tainted` when the schedule was approved after outside content, and `user` otherwise. A clean task can't tell "the user asked" from "the agent proposed", so `agent_clean` isn't used yet. A schedule from before 0.15 (no recorded version) takes today's silently on its next run, with no note.
+- **The "rules changed" note** is a `message` event only. It isn't in the chat history the model sees.
+- **`/status`** also gives `memory {active, pending}`.
+- **The app** got the small parts now: quiet rows ("Nothing new", tap to open), "Expired: the rules changed while it waited", and "Set up after the agent read outside content" on such schedules. The stage headline is phase 5.
+
+
 
 ## 20. File map
 

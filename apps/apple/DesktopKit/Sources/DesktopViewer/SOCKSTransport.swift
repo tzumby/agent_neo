@@ -20,19 +20,24 @@ public struct SOCKSProxy: Sendable, Hashable {
 }
 
 /// Where the take-over view connects: the desktop's VNC port on the tailnet,
-/// through the in-app node's proxy.
+/// through the in-app node's proxy (directly without one: debug previews).
 public struct DesktopEndpoint: Sendable, Hashable {
-    public var proxy: SOCKSProxy
+    public var proxy: SOCKSProxy?
     public var host: String
     public var port: UInt16
 
-    public init(proxy: SOCKSProxy, host: String, port: UInt16 = 5900) {
+    public init(proxy: SOCKSProxy?, host: String, port: UInt16 = 5900) {
         self.proxy = proxy
         self.host = host
         self.port = port
     }
 
-    public func connect() async throws -> SOCKSTransport {
+    public func connect() async throws -> any RFBTransport {
+        guard let proxy else {
+            let transport = RFBTCPTransport(host: host, port: port)
+            try await transport.connect()
+            return transport
+        }
         let transport = SOCKSTransport(proxy: proxy, host: host, port: port)
         try await transport.connect()
         return transport

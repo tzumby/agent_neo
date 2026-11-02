@@ -1,7 +1,6 @@
 import AgentAPI
 import ChatCore
 import SwiftUI
-import UIKit
 
 /// Keys and tokens saved on the desktop (a GitHub token, an API key). The
 /// agent asks for one in the chat when a job needs it; they can also be added,
@@ -14,7 +13,7 @@ struct SecretsView: View {
     @State private var editing: SecretEditor.Target?
 
     var body: some View {
-        List {
+        GroupedList {
             if loaded, secrets.isEmpty {
                 Section {
                     Text("No keys yet. When a job needs one, like a GitHub token to clone a private repository, the agent asks for it in the chat. You can also add one here.")
@@ -29,9 +28,17 @@ struct SecretsView: View {
                             .swipeActions(edge: .trailing) {
                                 Button("Delete", role: .destructive) { Task { await delete(secret) } }
                             }
+                            .macContextMenu {
+                                Button("Replace…") { editing = .replace(secret) }
+                                Button("Delete", role: .destructive) { Task { await delete(secret) } }
+                            }
                     }
                 } footer: {
-                    Text("Keys stay on your desktop and never come back to this phone. The agent gives one to a command by name and never sees its value; it's hidden from the chat and notifications. Tap a key to replace it, swipe to delete it. Deleting doesn't revoke it: do that where you created it.")
+                    #if os(macOS)
+                        Text("Keys stay on your desktop and never come back to this Mac. The agent gives one to a command by name and never sees its value; it's hidden from the chat and notifications. Click a key to replace it, right-click to delete it. Deleting doesn't revoke it: do that where you created it.")
+                    #else
+                        Text("Keys stay on your desktop and never come back to this phone. The agent gives one to a command by name and never sees its value; it's hidden from the chat and notifications. Tap a key to replace it, swipe to delete it. Deleting doesn't revoke it: do that where you created it.")
+                    #endif
                 }
             }
             if let problem {
@@ -39,7 +46,7 @@ struct SecretsView: View {
             }
         }
         .navigationTitle("Keys & tokens")
-        .navigationBarTitleDisplayMode(.inline)
+        .inlineTitle()
         .toolbar {
             Button("Add a key", systemImage: "plus") { editing = .new(nil) }
         }
@@ -47,6 +54,7 @@ struct SecretsView: View {
             NavigationStack {
                 SecretEditor(client: client, target: target) { _ in await load() }
             }
+            .macSheetSize(height: 420)
         }
         .overlay { if !loaded { ProgressView() } }
         .task { await load() }
@@ -135,12 +143,14 @@ struct SecretEditor: View {
     }
 
     var body: some View {
-        Form {
+        GroupedForm {
             if isNew {
                 Section {
                     TextField("Name, like GITHUB_TOKEN", text: $name)
                         .font(.body.monospaced())
-                        .textInputAutocapitalization(.characters)
+                        #if os(iOS)
+                            .textInputAutocapitalization(.characters)
+                        #endif
                         .autocorrectionDisabled()
                         .onChange(of: name) { _, new in
                             let normalized = KeyDetector.normalizedName(new)
@@ -158,14 +168,14 @@ struct SecretEditor: View {
             Section {
                 KeyField(prompt: "Key or token", value: $value, pasted: $pasted)
             } footer: {
-                Text("Saved only on your desktop, over your tailnet. This phone can't read it back.")
+                Text("Saved only on your desktop, over your tailnet. This \(Device.noun) can't read it back.")
             }
             if let problem {
                 Section { Text(problem).foregroundStyle(.red) }
             }
         }
         .navigationTitle(isNew ? "Add a key" : "Replace key")
-        .navigationBarTitleDisplayMode(.inline)
+        .inlineTitle()
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Cancel") { dismiss() }
@@ -196,7 +206,7 @@ struct SecretEditor: View {
         do {
             _ = try await client.saveSecret(
                 name: name, value: value, label: label.isEmpty ? nil : label, approval: nil)
-            if pasted { UIPasteboard.general.items = [] }
+            if pasted { Clipboard.clear() }
             await onSaved(name)
             dismiss()
         } catch let error as AgentError {
@@ -218,7 +228,9 @@ struct KeyField: View {
     var body: some View {
         HStack(spacing: 8) {
             SecureField(prompt, text: $value)
-                .textInputAutocapitalization(.never)
+                #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                #endif
                 .autocorrectionDisabled()
             PasteButton(payloadType: String.self) { strings in
                 guard let text = strings.first else { return }

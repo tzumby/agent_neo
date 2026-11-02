@@ -13,7 +13,12 @@ struct ChatView: View {
     @State private var draft = ""
     @State private var showingSettings = false
     @State private var showingMemory = false
-    @State private var takeOver: TakeOverRequest?
+    #if os(iOS)
+        @State private var takeOver: TakeOverRequest?
+    #else
+        @Environment(\.openWindow) private var openWindow
+        @Environment(DesktopSession.self) private var session
+    #endif
     @State private var position = ScrollPosition(edge: .bottom)
     /// The spinner above the oldest message loaded is on screen.
     @State private var olderInView = false
@@ -27,6 +32,34 @@ struct ChatView: View {
     @Environment(PushCenter.self) private var push
 
     var body: some View {
+        presentations(over: chat)
+            .sensoryFeedback(.impact(weight: .light), trigger: sent)
+            .environment(\.chatStore, store)
+            .environment(\.agentClient, client)
+            .environment(\.takeOver, endpoint == nil ? nil : TakeOverAction { openDesktop(for: $0.id) })
+            .environment(\.openTask, OpenTask { task in openConversation(task) })
+            // Until the newest page is in, the splash covers everything (bars included).
+            // Only the splash fades: the chat under it is already at its end.
+            .overlay {
+                ZStack {
+                    if loading {
+                        SplashView(status: "Connecting to \(desktopName)…", detail: offlineDetail)
+                            .transition(.opacity)
+                    }
+                }
+                .animation(.easeOut(duration: 0.25), value: loading)
+            }
+            .toolbarVisibility(loading ? .hidden : .automatic, for: .appBar)
+            .task(id: connectionKey) { await store.run(client: client) }
+            .task(id: store.connection == .live) {
+                if store.connection == .live { await push.register() }
+            }
+            .task(id: "\(push.deviceToken ?? "")|\(connectionKey)") { await registerForPush() }
+            .task(id: push.pendingAnswer) { await sendPendingAnswer() }
+    }
+
+    /// The conversation with its bars: the stage banner, the composer.
+    private var chat: some View {
         messages
             .scrollDismissesKeyboard(.interactively)
             .overlay {
@@ -34,7 +67,7 @@ struct ChatView: View {
                     EmptyChat(desktopName: desktopName)
                 }
             }
-            .safeAreaBar(edge: .top) {
+            .bar(.top) {
                 if !loading, let banner = StageBanner.for(store.status) {
                     StageBanner(banner: banner) { follow(banner.target) }
                         .padding(.horizontal, 12)
@@ -43,7 +76,7 @@ struct ChatView: View {
                 }
             }
             .animation(.snappy, value: store.status?.stage)
-            .safeAreaBar(edge: .bottom) {
+            .bar(.bottom) {
                 VStack(spacing: 10) {
                     if empty {
                         Suggestions { send($0) }
@@ -53,32 +86,50 @@ struct ChatView: View {
                         focus: $composing,
                         onSend: { send(draft) }, onStop: { Task { await store.stop(client: client) } })
                 }
+                .frame(maxWidth: Theme.column)
                 .padding(.horizontal, 12)
                 .padding(.bottom, 6)
             }
             .background(Color.black)
-            .navigationBarTitleDisplayMode(.inline)
+            .inlineTitle()
             .toolbar { toolbar }
+            #if os(macOS)
+                // The model menu is the title, as on the iPhone.
+                .toolbar(removing: .title)
+            #endif
+    }
+
+    /// Settings, Memory, the key dialog and editor, notices and (on the
+    /// iPhone) the take-over view, over the chat.
+    private func presentations(over content: some View) -> some View {
+        content
             .sheet(isPresented: $showingSettings) {
                 NavigationStack { SettingsView(store: store, client: client) }
+                    .macSheetSize()
             }
             .sheet(isPresented: $showingMemory) {
                 NavigationStack {
                     MemoryView(client: client)
                         .toolbar { Button("Done") { showingMemory = false } }
                 }
+                .macSheetSize(width: 560, height: 640)
             }
-            .fullScreenCover(item: $takeOver) { request in
-                if let endpoint {
-                    TakeOverView(endpoint: endpoint, actionID: request.actionID, store: store, client: client)
-                } else {
-                    // Tailscale is restarting (e.g. the app was in the background).
-                    VStack(spacing: 16) {
-                        ProgressView("Reconnecting to Tailscale…")
-                        Button("Close") { takeOver = nil }.buttonStyle(.glass)
+            #if os(iOS)
+                .fullScreenCover(item: $takeOver) { request in
+                    if let endpoint {
+                        TakeOverView(endpoint: endpoint, actionID: request.actionID, store: store, client: client)
+                    } else {
+                        // Tailscale is restarting (e.g. the app was in the background).
+                        VStack(spacing: 16) {
+                            ProgressView("Reconnecting to Tailscale…")
+                            Button("Close") { takeOver = nil }.glassButton()
+                        }
                     }
                 }
-            }
+            #else
+                // ⌘, opens Settings while this window is in front.
+                .focusedSceneValue(\.openSettings, OpenSettings { showingSettings = true })
+            #endif
             .confirmationDialog(
                 "This looks like a \(foundKey?.label ?? "key")",
                 isPresented: Binding(get: { foundKey != nil }, set: { if !$0 { foundKey = nil } }),
@@ -99,6 +150,7 @@ struct ChatView: View {
                         }
                     }
                 }
+                .macSheetSize(height: 420)
             }
             .alert(
                 "Cloud Desktop",
@@ -108,29 +160,6 @@ struct ChatView: View {
             } message: {
                 Text(store.notice ?? "")
             }
-            .sensoryFeedback(.impact(weight: .light), trigger: sent)
-            .environment(\.chatStore, store)
-            .environment(\.agentClient, client)
-            .environment(\.takeOver, endpoint == nil ? nil : TakeOverAction { takeOver = TakeOverRequest(actionID: $0.id) })
-            .environment(\.openTask, OpenTask { task in openConversation(task) })
-            // Until the newest page is in, the splash covers everything (bars included).
-            // Only the splash fades: the chat under it is already at its end.
-            .overlay {
-                ZStack {
-                    if loading {
-                        SplashView(status: "Connecting to \(desktopName)…", detail: offlineDetail)
-                            .transition(.opacity)
-                    }
-                }
-                .animation(.easeOut(duration: 0.25), value: loading)
-            }
-            .toolbarVisibility(loading ? .hidden : .automatic, for: .navigationBar)
-            .task(id: connectionKey) { await store.run(client: client) }
-            .task(id: store.connection == .live) {
-                if store.connection == .live { await push.register() }
-            }
-            .task(id: "\(push.deviceToken ?? "")|\(connectionKey)") { await registerForPush() }
-            .task(id: push.pendingAnswer) { await sendPendingAnswer() }
     }
 
     /// The conversation, newest at the bottom; older pages load as the user
@@ -162,7 +191,8 @@ struct ChatView: View {
             .scrollTargetLayout()
             // A VStack is only as wide as its rows: without any (an empty
             // chat), the scroll view and the empty state over it shrank.
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: Theme.column, alignment: .leading)
+            .frame(maxWidth: .infinity)
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
         }
@@ -171,6 +201,13 @@ struct ChatView: View {
         .defaultScrollAnchor(.bottom, for: .initialOffset)
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { old, new in keepPlace(old, new) }
+        #if os(macOS)
+            // The Mac's scroll view starts at the top when the first page comes
+            // after it appeared (empty): go to the end, under the splash.
+            .onChange(of: store.loaded) { _, loaded in
+                if loaded { position.scrollTo(edge: .bottom) }
+            }
+        #endif
     }
 
     /// An older page went in above. Scrolled up to the top, the scroll view
@@ -199,7 +236,7 @@ struct ChatView: View {
         for _ in 0..<10 {
             if store.connection == .live {
                 do {
-                    try await client.registerDevice(token: token, name: UIDevice.current.name)
+                    try await client.registerDevice(token: token, name: Device.name)
                     return
                 } catch let error as AgentError where error.statusCode == 503 {
                     return  // push isn't set up on this desktop
@@ -281,16 +318,27 @@ struct ChatView: View {
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .topBarLeading) {
+        ToolbarItem(placement: .barLeading) {
             Button("Settings", systemImage: "slider.horizontal.3") { showingSettings = true }
         }
         ToolbarItem(placement: .principal) {
             ModelMenu(store: store, client: client, desktopName: desktopName)
         }
-        ToolbarItem(placement: .topBarTrailing) {
-            Button("Your desktop", systemImage: "display") { takeOver = TakeOverRequest(actionID: nil) }
+        ToolbarItem(placement: .barTrailing) {
+            Button("Your desktop", systemImage: "display") { openDesktop(for: nil) }
                 .disabled(endpoint == nil)
         }
+    }
+
+    /// Opens the take-over view, for an Action needed card or just to look:
+    /// full screen on the iPhone, its own window on the Mac.
+    private func openDesktop(for actionID: String?) {
+        #if os(iOS)
+            takeOver = TakeOverRequest(actionID: actionID)
+        #else
+            session.takeOverAction = actionID
+            openWindow(id: DesktopSession.desktopWindow)
+        #endif
     }
 
     /// `checked`: the user chose to send a message with a key in it.
@@ -335,6 +383,11 @@ private struct Composer: View {
             TextField("Ask your desktop", text: $text, axis: .vertical)
                 .lineLimit(1...6)
                 .focused(focus)
+                #if os(macOS)
+                    // Return sends, as in Messages (⌥Return starts a new line).
+                    .onSubmit { if !busy, canSend { onSend() } }
+                    .textFieldStyle(.plain)
+                #endif
                 .padding(.leading, 18)
                 .padding(.vertical, 14)
             Group {
@@ -364,7 +417,7 @@ private struct Composer: View {
             .animation(.snappy(duration: 0.2), value: busy)
             .animation(.snappy(duration: 0.2), value: stopping)
         }
-        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 26))
+        .glass(.rect(cornerRadius: 26), interactive: true)
     }
 }
 
@@ -392,29 +445,50 @@ private struct ModelMenu: View {
     let desktopName: String
 
     var body: some View {
-        Menu {
-            if let status = store.status {
-                Picker("Model", selection: modelBinding(status)) {
-                    ForEach(status.knownModels, id: \.self) { Text(shortName($0)).tag($0) }
-                }
-                Toggle("Browser actions", isOn: actionsBinding(status))
-            }
-            Section(desktopName) {
-                Text(connectionText)
-            }
-        } label: {
+        #if os(macOS)
+            // A Mac toolbar menu shows only its label's text and first image:
+            // the dot goes beside it, and the menu has the system's arrow.
             HStack(spacing: 6) {
                 Circle().fill(dotColor).frame(width: 7, height: 7)
-                Text(store.status.map { shortName($0.settings.model) } ?? desktopName)
-                    .font(.headline)
-                    .lineLimit(1)
-                Image(systemName: "chevron.down").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                Menu(title) { items }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
             }
-            .padding(.horizontal, 4)
-            .contentShape(.rect)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Model and connection")
+        #else
+            Menu {
+                items
+            } label: {
+                HStack(spacing: 6) {
+                    Circle().fill(dotColor).frame(width: 7, height: 7)
+                    Text(title)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 4)
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Model and connection")
+        #endif
+    }
+
+    private var title: String {
+        store.status.map { shortName($0.settings.model) } ?? desktopName
+    }
+
+    @ViewBuilder private var items: some View {
+        if let status = store.status {
+            Picker("Model", selection: modelBinding(status)) {
+                ForEach(status.knownModels, id: \.self) { Text(shortName($0)).tag($0) }
+            }
+            Toggle("Browser actions", isOn: actionsBinding(status))
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Model and connection")
+        Section(desktopName) {
+            Text(connectionText)
+        }
     }
 
     private var dotColor: Color {
@@ -495,7 +569,7 @@ private struct EmptyChat: View {
             Image(systemName: "sparkles")
                 .font(.system(size: 34, weight: .light))
                 .frame(width: 76, height: 76)
-                .glassEffect(.regular, in: .circle)
+                .glass(.circle)
             Text("What should your desktop do?")
                 .font(.title2.weight(.semibold))
                 .multilineTextAlignment(.center)
@@ -520,13 +594,13 @@ private struct Suggestions: View {
 
     var body: some View {
         ScrollView(.horizontal) {
-            GlassEffectContainer(spacing: 8) {
+            GlassGroup(spacing: 8) {
                 HStack(spacing: 8) {
                     ForEach(items, id: \.1) { icon, text in
                         Button { pick(text) } label: {
                             Label(text, systemImage: icon).font(.subheadline)
                         }
-                        .buttonStyle(.glass)
+                        .glassButton()
                     }
                 }
                 .padding(.horizontal, 4)
@@ -573,7 +647,7 @@ private struct StageBanner: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .glassEffect(.regular.interactive(), in: .capsule)
+        .glass(.capsule, interactive: true)
     }
 
     static func `for`(_ status: AgentStatus?) -> Banner? {

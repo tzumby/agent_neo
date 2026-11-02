@@ -10,6 +10,8 @@ enum Theme {
     static let inset = Color(white: 0.06)  // code inside cards
     static let userBubble = Color(white: 0.17)
     static let hairline = Color.white.opacity(0.08)
+    /// The chat's widest column, for a readable line on the Mac (wider than any iPhone).
+    static let column: CGFloat = 760
 }
 
 extension View {
@@ -18,11 +20,6 @@ extension View {
         padding(16)
             .background(Theme.surface, in: .rect(cornerRadius: 24))
             .overlay(RoundedRectangle(cornerRadius: 24).strokeBorder(Theme.hairline, lineWidth: 0.5))
-    }
-
-    /// The white glass button for the main action (its label is set black).
-    func primaryGlass() -> some View {
-        buttonStyle(.glassProminent).tint(.white)
     }
 }
 

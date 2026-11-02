@@ -24,7 +24,13 @@ let package = Package(
         .target(name: "Tailnet", dependencies: ["TailscaleKit"]),
         .target(name: "AgentAPI"),
         .target(name: "ChatCore", dependencies: ["AgentAPI"]),
-        .target(name: "DesktopViewer", dependencies: [.product(name: "RFB", package: "swift-rfb")]),
+        .target(
+            name: "DesktopViewer",
+            dependencies: [
+                .product(name: "RFB", package: "swift-rfb"),
+                // The Mac's take-over view draws with swift-rfb's Metal view.
+                .product(name: "RFBMetal", package: "swift-rfb", condition: .when(platforms: [.macOS])),
+            ]),
         .testTarget(
             name: "DesktopKitTests",
             dependencies: ["Tailnet", "AgentAPI", "ChatCore", "DesktopViewer", .product(name: "RFB", package: "swift-rfb")]

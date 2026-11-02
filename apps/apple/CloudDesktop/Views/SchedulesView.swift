@@ -10,7 +10,7 @@ struct SchedulesView: View {
     @State private var problem: String?
 
     var body: some View {
-        List {
+        GroupedList {
             if loaded, schedules.isEmpty {
                 Section {
                     Text("Nothing scheduled. Ask the agent, like “Every weekday at 8, summarize my unread email.”")
@@ -30,9 +30,19 @@ struct SchedulesView: View {
                                 }
                                 .tint(schedule.paused ? .green : .orange)
                             }
+                            .macContextMenu {
+                                Button(schedule.paused ? "Resume" : "Pause") {
+                                    Task { await setPaused(!schedule.paused, schedule) }
+                                }
+                                Button("Cancel", role: .destructive) { Task { await cancel(schedule) } }
+                            }
                     }
                 } footer: {
-                    Text("Each run is a new task with just its prompt. Approvals still apply: you get a notification when one needs you. Swipe left to cancel, right to pause.")
+                    #if os(macOS)
+                        Text("Each run is a new task with just its prompt. Approvals still apply: you get a notification when one needs you. Right-click a schedule to pause or cancel it.")
+                    #else
+                        Text("Each run is a new task with just its prompt. Approvals still apply: you get a notification when one needs you. Swipe left to cancel, right to pause.")
+                    #endif
                 }
             }
             if let problem {
@@ -40,7 +50,7 @@ struct SchedulesView: View {
             }
         }
         .navigationTitle("Schedules")
-        .navigationBarTitleDisplayMode(.inline)
+        .inlineTitle()
         .overlay { if !loaded { ProgressView() } }
         .task { await load() }
         .refreshable { await load() }

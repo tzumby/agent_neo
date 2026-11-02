@@ -1,6 +1,5 @@
 import ChatCore
 import SwiftUI
-import UIKit
 
 /// The agent's answer as Markdown: headings, lists (nested, numbered, tasks),
 /// quotes, code blocks, tables and rules, with inline styles and links.
@@ -83,7 +82,7 @@ private struct Prose: View {
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contextMenu {
-                Button("Copy", systemImage: "doc.on.doc") { UIPasteboard.general.string = source }
+                Button("Copy", systemImage: "doc.on.doc") { Clipboard.copy(source) }
             }
     }
 }

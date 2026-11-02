@@ -1,6 +1,5 @@
 import AgentAPI
 import SwiftUI
-import UIKit
 import UniformTypeIdentifiers
 
 /// What the agent remembers between conversations (docs/memory-v2.md §14).
@@ -26,14 +25,14 @@ struct MemoryView: View {
     private var v2: Bool { stats != nil || memories.contains { $0.kind != nil } }
 
     var body: some View {
-        List {
+        GroupedList {
             if v2 { v2Sections } else { v1Sections }
             if let problem {
                 Section { Text(problem).foregroundStyle(.red) }
             }
         }
         .navigationTitle("Memory")
-        .navigationBarTitleDisplayMode(.inline)
+        .inlineTitle()
         .searchable(text: $query, prompt: "Search memories")
         .toolbar {
             if v2 {
@@ -52,8 +51,17 @@ struct MemoryView: View {
         .refreshable { await load() }
         .sheet(item: $editing) { memory in
             NavigationStack { MemoryEditor(client: client, memory: memory) { await load() } }
+                .macSheetSize(height: 480)
         }
-        .sheet(item: $sharing) { file in ShareSheet(url: file.url) }
+        #if os(iOS)
+            .sheet(item: $sharing) { file in ShareSheet(url: file.url) }
+        #else
+            // The Mac saves an export where you choose.
+            .fileMover(
+                isPresented: Binding(get: { sharing != nil }, set: { if !$0 { sharing = nil } }),
+                file: sharing?.url
+            ) { _ in sharing = nil }
+        #endif
         .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in
             Task { await importFile(result) }
         }
@@ -130,10 +138,24 @@ struct MemoryView: View {
                             Button("Confirm") { Task { await answer(memory, approve: true) } }.tint(.green)
                         }
                     }
+                    .macContextMenu {
+                        if memory.isGone {
+                            Button("Restore") { Task { await restore(memory) } }
+                        } else {
+                            if memory.isInferred {
+                                Button("Confirm") { Task { await answer(memory, approve: true) } }
+                            }
+                            Button("Forget", role: .destructive) { Task { await forget(memory) } }
+                        }
+                    }
             }
         } footer: {
             if query.isEmpty {
-                Text("Tap one to edit it. Swipe left to forget it; right to confirm a hint, or to restore an expired one.")
+                #if os(macOS)
+                    Text("Click one to edit it. Right-click to forget it, to confirm a hint, or to restore an expired one.")
+                #else
+                    Text("Tap one to edit it. Swipe left to forget it; right to confirm a hint, or to restore an expired one.")
+                #endif
             }
         }
         if query.isEmpty, let stats {
@@ -194,11 +216,19 @@ struct MemoryView: View {
                         .swipeActions(edge: .trailing) {
                             Button("Forget", role: .destructive) { Task { await forget(memory) } }
                         }
+                        .macContextMenu {
+                            Button("Confirm") { Task { await answer(memory, approve: true) } }
+                            Button("Forget", role: .destructive) { Task { await forget(memory) } }
+                        }
                 }
             } header: {
                 Text("To confirm")
             } footer: {
-                Text("Saved after the agent read a web page, an email or command output, so they could come from that content. It treats them as hints until you confirm them: swipe right to confirm, left to forget.")
+                #if os(macOS)
+                    Text("Saved after the agent read a web page, an email or command output, so they could come from that content. It treats them as hints until you confirm them: right-click to confirm or forget.")
+                #else
+                    Text("Saved after the agent read a web page, an email or command output, so they could come from that content. It treats them as hints until you confirm them: swipe right to confirm, left to forget.")
+                #endif
             }
         }
         if !trusted.isEmpty {
@@ -206,6 +236,9 @@ struct MemoryView: View {
                 ForEach(trusted) { memory in
                     Text(memory.text)
                         .swipeActions(edge: .trailing) {
+                            Button("Forget", role: .destructive) { Task { await forget(memory) } }
+                        }
+                        .macContextMenu {
                             Button("Forget", role: .destructive) { Task { await forget(memory) } }
                         }
                 }
@@ -463,7 +496,7 @@ private struct MemoryEditor: View {
     }
 
     var body: some View {
-        Form {
+        GroupedForm {
             Section {
                 TextField("What to remember", text: $text, axis: .vertical).lineLimit(2...8)
             } footer: {
@@ -509,7 +542,7 @@ private struct MemoryEditor: View {
             }
         }
         .navigationTitle("Memory")
-        .navigationBarTitleDisplayMode(.inline)
+        .inlineTitle()
         .toolbar {
             ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
             ToolbarItem(placement: .confirmationAction) {
@@ -592,13 +625,15 @@ private struct ShareFile: Identifiable {
     var id: String { url.path() }
 }
 
-/// The system share sheet for a file.
-private struct ShareSheet: UIViewControllerRepresentable {
-    let url: URL
+#if os(iOS)
+    /// The system share sheet for a file.
+    private struct ShareSheet: UIViewControllerRepresentable {
+        let url: URL
 
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        func makeUIViewController(context: Context) -> UIActivityViewController {
+            UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        }
+
+        func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
     }
-
-    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
-}
+#endif

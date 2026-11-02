@@ -1,7 +1,6 @@
 import AgentAPI
 import ChatCore
 import SwiftUI
-import UIKit
 
 /// One item of the chat: a message, a picture, or a card waiting for the
 /// user. Its only input is the item, so SwiftUI skips rows that didn't change
@@ -49,7 +48,7 @@ private struct UserBubble: View {
                 .padding(.vertical, 11)
                 .background(Theme.userBubble, in: .rect(cornerRadius: 22))
                 .contextMenu {
-                    Button("Copy", systemImage: "doc.on.doc") { UIPasteboard.general.string = text }
+                    Button("Copy", systemImage: "doc.on.doc") { Clipboard.copy(text) }
                 }
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
@@ -106,7 +105,7 @@ struct CopyButton: View {
 
     var body: some View {
         Button {
-            UIPasteboard.general.string = text
+            Clipboard.copy(text)
             copied = true
             Task {
                 try? await Task.sleep(for: .seconds(1.5))
@@ -179,7 +178,7 @@ private struct ApprovalCard: View {
             // Shown only while it waits: answered, it leaves the chat.
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                    .buttonStyle(.glass)
+                    .glassButton()
                 Button { answer(true) } label: {
                     Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
                 }
@@ -266,7 +265,7 @@ private struct BrowserApprovalCard: View {
             // Shown only while it waits: answered, it leaves the chat.
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                    .buttonStyle(.glass)
+                    .glassButton()
                 Button { answer(true) } label: {
                     Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
                 }
@@ -353,7 +352,7 @@ private struct ScheduleApprovalCard: View {
                 .foregroundStyle(.secondary)
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                    .buttonStyle(.glass)
+                    .glassButton()
                 Button { answer(true) } label: {
                     Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
                 }
@@ -401,7 +400,7 @@ private struct SecretRequestCard: View {
                 HStack {
                     Outcome(text: "Saved on your desktop", icon: "lock.fill", color: .green)
                     Spacer()
-                    Button("Continue") { answer(true) }.buttonStyle(.glass)
+                    Button("Continue") { answer(true) }.glassButton()
                 }
             } else {
                 form
@@ -423,7 +422,7 @@ private struct SecretRequestCard: View {
                 Label("Open \(request.host ?? url.host() ?? "the page")", systemImage: "arrow.up.right")
                     .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.glass)
+            .glassButton()
             .controlSize(.large)
         }
         KeyField(prompt: "Paste your \(request.label)", value: $value, pasted: $pasted)
@@ -432,7 +431,7 @@ private struct SecretRequestCard: View {
             .background(Theme.inset, in: .rect(cornerRadius: 14))
         HStack(spacing: 10) {
             Button { answer(false) } label: { Text("Not now").frame(maxWidth: .infinity) }
-                .buttonStyle(.glass)
+                .glassButton()
             Button { save() } label: {
                 Group {
                     if saving { ProgressView().tint(.black) } else { Text("Save") }
@@ -467,7 +466,7 @@ private struct SecretRequestCard: View {
             if await store.save(secret: value, for: approval, client: client) {
                 value = ""
                 // The clipboard still holds the key: clear it (writing needs no permission).
-                if pasted { UIPasteboard.general.items = [] }
+                if pasted { Clipboard.clear() }
             }
             saving = false
         }
@@ -503,9 +502,9 @@ private struct ActionCard: View {
             }
             HStack(spacing: 8) {
                 Button { resolve(false) } label: { Text("Skip").frame(maxWidth: .infinity) }
-                    .buttonStyle(.glass)
+                    .glassButton()
                 Button { resolve(true) } label: { Text("I'm done").frame(maxWidth: .infinity) }
-                    .buttonStyle(.glass)
+                    .glassButton()
                 Button { takeOver?.open(action) } label: {
                     Text("Take over").foregroundStyle(.black).frame(maxWidth: .infinity)
                 }
@@ -539,7 +538,7 @@ private struct ActionCard: View {
 // MARK: - Screenshots the agent shows
 
 private struct PictureRow: View {
-    let picture: Picture
+    let picture: ChatCore.Picture  // the Mac also has QuickDraw's Picture
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {

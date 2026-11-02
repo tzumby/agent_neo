@@ -4,6 +4,7 @@ options:
   bundleIdPrefix: com.tzumby
   deploymentTarget:
     iOS: "18.1" # TailscaleKit's minimum
+    macOS: "15.6" # DesktopKit's minimum
   createIntermediateGroups: true
 settings:
   base:
@@ -15,21 +16,26 @@ settings:
 packages:
   DesktopKit:
     path: DesktopKit
+# Two apps, one bundle id (so the push relay's one APNs topic covers both).
+# CloudDesktop/ is shared; CloudDesktop/iOS and CloudDesktop/macOS hold what
+# only one of them has.
 targets:
   CloudDesktop:
     type: application
     platform: iOS
     deploymentTarget: "26.0" # Liquid Glass; the DesktopKit package stays at 18.1
-    sources: [CloudDesktop]
+    sources:
+      - path: CloudDesktop
+        excludes: ["macOS/**"]
     dependencies:
       - package: DesktopKit
         products: [Tailnet, AgentAPI, ChatCore, DesktopViewer]
     entitlements:
-      path: CloudDesktop/CloudDesktop.entitlements
+      path: CloudDesktop/iOS/CloudDesktop.entitlements
       properties:
         aps-environment: development # Xcode installs; production for TestFlight/App Store
     info:
-      path: CloudDesktop/Info.plist
+      path: CloudDesktop/iOS/Info.plist
       properties:
         CFBundleDisplayName: Cloud Desktop
         UILaunchScreen:
@@ -42,3 +48,37 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.tzumby.clouddesktop
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: false
+
+  CloudDesktopMac:
+    type: application
+    platform: macOS
+    # Runs on macOS 15.6 too, where the app draws materials instead of Liquid Glass.
+    deploymentTarget: "15.6"
+    sources:
+      - path: CloudDesktop
+        excludes: ["iOS/**"]
+    dependencies:
+      - package: DesktopKit
+        products: [Tailnet, AgentAPI, ChatCore, DesktopViewer]
+    entitlements:
+      path: CloudDesktop/macOS/CloudDesktop.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        # The app's Tailscale node serves its SOCKS5 proxy on 127.0.0.1.
+        com.apple.security.network.server: true
+        # Memory: import a file, save an export.
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.developer.aps-environment: development # Xcode builds; production when distributed
+    info:
+      path: CloudDesktop/macOS/Info.plist
+      properties:
+        CFBundleDisplayName: Cloud Desktop
+        LSApplicationCategoryType: public.app-category.productivity
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tzumby.clouddesktop
+        PRODUCT_NAME: Cloud Desktop
+        GENERATE_INFOPLIST_FILE: false
+        ENABLE_HARDENED_RUNTIME: true
+        ARCHS: arm64 # TailscaleKit has no Intel slice

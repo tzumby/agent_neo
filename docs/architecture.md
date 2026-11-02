@@ -13,7 +13,7 @@
 7. [The attested model gateway](#7-the-attested-model-gateway)
 8. [The push relay](#8-the-push-relay)
 9. [tailnet-proxy: the desktop on the user's tailnet](#9-tailnet-proxy-the-desktop-on-the-users-tailnet)
-10. [The iPhone app](#10-the-iphone-app)
+10. [The iPhone and Mac apps](#10-the-iphone-and-mac-apps)
 11. [End-to-end flows](#11-end-to-end-flows)
 12. [Security model](#12-security-model)
 13. [Operations](#13-operations)
@@ -23,7 +23,7 @@
 
 ## 1. Overview
 
-Each user gets an **always-on Linux desktop**: an EC2 instance with XFCE and Google Chrome, logged in to the user's own accounts. An AI agent works on it for them. The user talks to the agent from an **iPhone app**. They can watch, approve its actions, and take over the screen to sign in to sites themselves.
+Each user gets an **always-on Linux desktop**: an EC2 instance with XFCE and Google Chrome, logged in to the user's own accounts. An AI agent works on it for them. The user talks to the agent from an **iPhone or Mac app**. They can watch, approve its actions, and take over the screen to sign in to sites themselves.
 
 The pieces:
 
@@ -35,7 +35,7 @@ The pieces:
 - **agentd** (Rust): the model loop, browser tools over Chrome's DevTools Protocol, a shell tool, approvals that park and resume, memory, scheduled tasks, saved keys, and the HTTP + SSE API the app uses. All of the user's agent state lives on the VM, in `/var/lib/agentd`.
 - **The attested model gateway** (Rust, `gatewayd`): one c7g.medium running a read-only image that nobody can log into. It holds the Together AI key and forwards desktops' model calls. agentd verifies its NitroTPM attestation and pins its TLS certificate before sending a prompt.
 - **The push relay** (Node.js Lambda): the only holder of the APNs key. Desktops call it with their IAM identity to notify the devices registered through them.
-- **The iPhone app** (SwiftUI, iOS 26): runs its own userspace Tailscale node (TailscaleKit), finds the desktop by its tag, streams agentd's event log into a chat, and shows the screen over VNC for take-over.
+- **The iPhone and Mac apps** (SwiftUI; iOS 26, macOS 15.6): each runs its own userspace Tailscale node (TailscaleKit), finds the desktop by its tag, streams agentd's event log into a chat, and shows the screen over VNC for take-over. They share their screens (§10).
 - **The model provider**: Together AI (serverless; zero data retention on). The default model is `zai-org/GLM-5.3`, which is text-only. The agent reads pages through the accessibility tree and text, not screenshots.
 
 ```
@@ -124,7 +124,7 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
 | `services/tailnet-proxy/` | The tailnet node (Go, tsnet) |
 | `images/gateway/` | The gateway's KIWI-NG image description (Amazon Linux 2023, attestable) |
 | `scripts/` | `put-secret.py`, `put-apns-key.py` (hidden input → SSM), `build-gateway-image.sh`, `browser.py` (drive the desktop's Chrome from the Mac over `make cdp`) |
-| `apps/apple/` | The iPhone app (`CloudDesktop/`), shared `DesktopKit` package, XcodeGen `project.yml`, scripts |
+| `apps/apple/` | The iPhone and Mac apps (`CloudDesktop/`: shared screens, `iOS/`, `macOS/`), shared `DesktopKit` package, XcodeGen `project.yml`, scripts |
 
 ## 4. AWS infrastructure (Terraform)
 
@@ -1240,18 +1240,23 @@ Notifications to the iPhone go through a relay in our AWS account. The APNs key 
   - the tag `tag:cloud-desktop` (owner `autogroup:admin`);
   - a pre-approved auth key with that tag, stored with `make tailscale-key`.
 
-## 10. The iPhone app
+## 10. The iPhone and Mac apps
 
 `apps/apple` contains:
-- one iOS app target, **CloudDesktop** (iPhone only, portrait, dark, iOS 26 for Liquid Glass);
-- a Swift package, **DesktopKit**, for code the planned Mac app will share.
+- an iOS app target, **CloudDesktop** (iPhone only, portrait, dark, iOS 26 for Liquid Glass);
+- a macOS app target, **CloudDesktopMac** ("Cloud Desktop.app", macOS 15.6 or later, Apple silicon only because TailscaleKit has no Intel slice; dark). Liquid Glass from macOS 26; before it, materials and capsule buttons in the same colours (§10.9);
+- a Swift package, **DesktopKit**, with the code that isn't views.
 
-XcodeGen generates the Xcode project from `project.yml`; the project itself is gitignored. Swift 6. Bundle id `com.tzumby.clouddesktop`, team `4UVAPZYV4Q`. There is **no Mac app yet**: DesktopKit builds for macOS 15.6, its tests run there, and the Mac app is phase 5 of the native app plan.
+Both apps compile the screens in `CloudDesktop/`. `CloudDesktop/iOS/` and `CloudDesktop/macOS/` hold what only one of them has (the app entry, its delegate, the take-over view, Info.plist and entitlements), and `Views/Platform.swift` the few differences inside shared screens (clipboard, glass, toolbar placements, list styles).
+
+XcodeGen generates the Xcode project from `project.yml`; the project itself is gitignored. Swift 6. Both apps have the bundle id `com.tzumby.clouddesktop` (so the push relay's one APNs topic covers both), team `4UVAPZYV4Q`.
 
 ### 10.1 Build inputs
 
-- **Entitlements:** `aps-environment = development` only (switch to `production` for TestFlight). No Network Extension: the app doesn't use a VPN profile. No keychain groups.
-- **Info.plist:** display name "Cloud Desktop", portrait only, single scene. No background modes.
+- **Entitlements:**
+  - iPhone: `aps-environment = development` only (switch to `production` for TestFlight). No Network Extension: the app doesn't use a VPN profile. No keychain groups.
+  - Mac: the App Sandbox with network client and server (the Tailscale node's SOCKS5 proxy listens on 127.0.0.1), user-selected files read-write (memory import and export), and `com.apple.developer.aps-environment = development`. Hardened runtime on. Push needs a provisioning profile, and a development profile lists the Macs it runs on: `make app-mac` registers this Mac on its first run.
+- **Info.plist:** display name "Cloud Desktop". iPhone: portrait only, single scene, no background modes. Mac: category Productivity.
 - **TailscaleKit.xcframework** comes from `tailscale/libtailscale` pinned at `ac7ed43a` (it includes the TS-2026-012 fix). `make app-tailscalekit` builds the ios, ios-sim and macOS slices into `DesktopKit/Vendor/`, which is gitignored. Before TestFlight: a privacy manifest per slice (TODO).
 - **swift-rfb** 0.1.0 (MIT): the RFB/VNC client with Tight, ZRLE, Hextile, CopyRect and Raw.
 
@@ -1262,18 +1267,18 @@ XcodeGen generates the Xcode project from `project.yml`; the project itself is g
 | `Tailnet` | TailscaleKit, Network | The app's own Tailscale node, sign-in, finding desktops, the URLSession and SOCKS5 proxy into the tailnet |
 | `AgentAPI` | Foundation | `AgentClient` for agentd's API, SSE parsing, `JSONValue` |
 | `ChatCore` | AgentAPI | `ChatStore` (streaming and commands), `ChatTimeline` (events → chat items), Markdown parsing, `KeyDetector` |
-| `DesktopViewer` | RFB, Network | VNC over the node's SOCKS5 proxy (`SOCKSTransport`), `RemoteDesktop` (frames and input) |
+| `DesktopViewer` | RFB, Network; RFBMetal on macOS | VNC over the node's SOCKS5 proxy (`SOCKSTransport`), `RemoteDesktop` (frames and input); on the Mac, `MacDesktopView` (swift-rfb's Metal view with Mac shortcuts) and `MacShortcut` |
 
-None of them imports UIKit; the app target holds everything iOS-specific.
+None of them imports UIKit; the app targets hold everything platform-specific except the Mac's desktop view, which lives in `DesktopViewer` so its shortcut table is tested with the package.
 
 ### 10.3 Tailscale inside the app (`TailnetService`)
 
 - **The node:**
-  - a userspace node, `TailscaleNode(hostName: "cloud-desktop-iphone")`;
-  - state in `Application Support/tailscale`, plain files, not the Keychain;
+  - a userspace node, `TailscaleNode(hostName: "cloud-desktop-iphone")`, or `"cloud-desktop-mac"` in the Mac app (a second device of yours on the tailnet; the Mac's own Tailscale app isn't used);
+  - state in `Application Support/tailscale`, plain files, not the Keychain (on the Mac, inside the app's sandbox container);
   - Tailscale's default control server, not ephemeral;
   - the node's own logs are discarded.
-- **Sign-in:** the node starts without an auth key. The service polls `statusJSON()`; while the state is `NeedsLogin`, `AuthURL` is the sign-in link, and the app opens it in an `SFSafariViewController`. No Tailscale app is needed.
+- **Sign-in:** the node starts without an auth key. The service polls `statusJSON()`; while the state is `NeedsLogin`, `AuthURL` is the sign-in link, and the app opens it in an `SFSafariViewController` (the Mac app: in the default browser). No Tailscale app is needed.
 - **Phases:**
   - `stopped`, `starting`;
   - `needsLogin(url)`;
@@ -1294,7 +1299,9 @@ None of them imports UIKit; the app target holds everything iOS-specific.
   - **Back in time:** it probes the proxy (a 1 s TCP connect) and restarts the node if iOS took the loopback listener away.
   - **Back later:** it restarts the node with the same identity, in `reconnecting`, keeping the screen up.
   - **The "No desktop yet" fix:** a fresh node reports Running before it knows its peers, so desktops are only replaced once peers arrive.
+  - **The Mac** isn't suspended; it restarts the node (same identity, in `reconnecting`) when the Mac wakes from sleep, since connections don't survive it.
 - **Log out** closes the node, deletes its state and starts over.
+- **The chat store** is one per desktop for the app's life (`DesktopSession`), so the Mac's take-over window and the chat window share it, and a Tailscale restart keeps the chat on screen.
 
 ### 10.4 Talking to agentd (`AgentAPI`, `ChatCore`)
 
@@ -1369,7 +1376,7 @@ None of them imports UIKit; the app target holds everything iOS-specific.
   - **Keys & tokens** (add, replace, delete; values never shown);
   - desktop name and address;
   - Tailscale account, device and Log out.
-- **Take-over** (full screen, from an Action needed card or the toolbar):
+- **Take-over** (full screen on the iPhone, from an Action needed card or the toolbar; the Mac's is in §10.9):
   - VNC to the desktop through SOCKS5 (`RemoteDesktop`). The swift-rfb client offers no password (x11vnc runs with `-nopw` on localhost), prefers Tight with JPEG quality 8, sends continuous updates, and holds at most 2 undrawn frames. It reconnects every 2 s.
   - A zoomable UIKit canvas with gestures:
     - tap: click;
@@ -1389,14 +1396,14 @@ None of them imports UIKit; the app target holds everything iOS-specific.
   - `ACTION`: opens the app.
 - **Registration:** once the chat is live, the app asks permission, registers with APNs and sends the hex token to agentd (`POST /devices`), which registers it with the relay. A 503 means push isn't set up on that desktop.
 - **Answering from a notification:** the answer is held in memory. Once the chat is live (up to 45 s after a cold launch, while Tailscale comes up), it's sent with `POST /approvals/{id}`. The card then updates from the `approval.resolved` event.
-- **In the foreground:** no banners.
+- **In the foreground:** no banners. The Mac app keeps running behind other apps and with its windows closed, so it shows banners whenever it isn't the frontmost app. Clicking one reopens the chat window if it was closed, so a notification's answer still goes out.
 
 ### 10.7 Debug modes
 
-- `CHAT_PREVIEW_URL`: ChatView against any agentd-compatible server, without Tailscale. Used with a stand-in server for Simulator screenshots.
-- `TAKEOVER_SOCKS` / `TAKEOVER_VNC`: the take-over view over any SOCKS5 proxy.
+- `CHAT_PREVIEW_URL`: ChatView against any agentd-compatible server, without Tailscale. Used with a local agentd for Simulator and Mac screenshots. `PREVIEW_SCREEN=memory`, `settings`, `schedules` or `keys` shows that screen instead.
+- `TAKEOVER_VNC` (and `TAKEOVER_SOCKS`): the take-over view on any VNC server, through a SOCKS5 proxy if given (the iPhone needs both; the Mac connects directly without a proxy).
 
-Both are DEBUG-only.
+All are DEBUG-only. On the Mac, set them with `open --env NAME=value "Cloud Desktop.app"`.
 
 **Stage banner.** A slim banner over the chat comes from agentd's `stage` and leads where you need to go:
 - "Needs you: approve a command" (or a browser change, or a schedule) and "Needs you: a key or token" scroll to the card;
@@ -1414,9 +1421,26 @@ Nothing shows while the desktop is idle, working or only has a schedule coming. 
 - the timeline: only the conversation and the cards waiting show, the later part of the log gives the same chat, Action needed, Stop, browser and schedule cards, key requests, scheduled runs, a command card's plain words;
 - a page of events;
 - Markdown;
-- key detection.
+- key detection;
+- the Mac's take-over shortcuts (⌘ as Ctrl, the ones that stay with the Mac, ⌘V, ⌘ arrows).
 
 Live tests run only with `AGENTD_URL` (a real agentd) or `VNC_ADDR` (a real VNC server).
+
+### 10.9 The Mac app
+
+The same screens as the iPhone's, in Mac form:
+- **Windows:** one chat window ("Cloud Desktop"; one only, as two would each stream the same chat) and the take-over window ("Your desktop"). Closing them leaves the app running for notifications; the Dock icon or a notification brings the chat back.
+- **Chat:** a column at most 760 points wide, centred. The model menu with its connection dot is the window's title. Return sends and ⌥Return starts a new line. The window's scroll view starts at the top when the first page arrives after it appeared, so the Mac scrolls to the end once the page is in (under the splash).
+- **Settings, Memory, the key editor:** sheets, as on the iPhone, sized for the Mac. ⌘, opens Settings while the chat window is in front. Lists are grouped forms (as in System Settings). Rows that have swipe actions on the iPhone have the same actions in a right-click menu. Memory exports go through a save panel instead of the share sheet.
+- **Take over:** swift-rfb's Metal view (`RFBView`), scaled to fit the window, wrapped in `MacDesktopView`. `RemoteDesktop.run(connect:renderer:)` hands the view every event and each connection's client, and the view paces updates itself. The pointer, scroll wheel and keys go to the desktop. A local key monitor sees ⌘ shortcuts before the menu does:
+  - ⌘ itself never reaches the desktop (it would be Super);
+  - ⌘ plus a key becomes Ctrl plus that key (⌘C, ⌘T, ⌘L, ⌘F, ⌘Z…), and ⌘←/⌘→/⌘↑/⌘↓ become Home, End, Ctrl+Home and Ctrl+End;
+  - ⌘V types the Mac's clipboard as keystrokes, like the iPhone's Paste (x11vnc drops clients that use the extended clipboard);
+  - after ⌘C or ⌘X, the text x11vnc sends within 3 s goes onto the Mac's clipboard (or, after 0.6 s with nothing new, the last text it sent: x11vnc doesn't resend a selection it already sent). Only then: a page can't fill the Mac's clipboard by itself;
+  - ⌘Q, ⌘W, ⌘H, ⌘M, ⌘, and ⌘` stay with the Mac.
+
+  The toolbar has the connection dot, Paste, and I'm done while the card waits; I'm done resolves it and closes the window. The window's subtitle is the card's reason.
+- **Before macOS 26:** `glass(_:)` draws the regular material with a hairline edge, and buttons are capsules in the iPhone's colours (white for the main action, a faint white for others), since the system's bordered buttons ignore a white tint.
 
 ## 11. End-to-end flows
 
@@ -1578,7 +1602,7 @@ Live tests run only with `AGENTD_URL` (a real agentd) or `VNC_ADDR` (a real VNC 
 | `gatewayd-test`, `gatewayd-build`, `gateway-image` | gatewayd tests; static arm64 build; build an attestable AMI and publish its measurements |
 | `tailnet-build`, `tailnet-deploy` | tailnet-proxy |
 | `llm-keys`, `tailscale-key`, `apns-key` | Store secrets in SSM from hidden input or a file |
-| `app-tailscalekit`, `app-test`, `app-sim`, `app-device` | The iPhone app: build TailscaleKit; DesktopKit tests; Simulator build; build, install and launch on the paired iPhone |
+| `app-tailscalekit`, `app-test`, `app-sim`, `app-device`, `app-mac` | The apps: build TailscaleKit; DesktopKit tests; Simulator build; build, install and launch on the paired iPhone; build the Mac app, install it in /Applications and open it |
 | `screenshot`, `viewer`, `cdp`, `shell` | Look at the desktop (screenshot file; noVNC on `localhost:6080`; Chrome DevTools on `localhost:9222`; a shell), all over SSM |
 
 `AWS_PROFILE` (default `default`) and `AWS_REGION` (default `ca-central-1`) are exported to every recipe. On macOS, Ansible runs with `no_proxy='*'` and `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`; otherwise forked workers crash in the system proxy lookup.
@@ -1631,7 +1655,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 | agentd | 107 unit tests (plus a 5,000-memory speed test run on demand): bulk approval by reason, restore, where a memory came from and what a proposal replaces, export and import round trips, consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
-| DesktopKit | 25 tests (§10.8) |
+| DesktopKit | 28 tests (§10.8) |
 
 ## 14. How this differs from PLAN.MD
 

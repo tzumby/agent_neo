@@ -10,7 +10,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        List {
+        GroupedList {
             if let status = store.status {
                 Section {
                     Picker(
@@ -63,7 +63,7 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
-        .navigationBarTitleDisplayMode(.inline)
+        .inlineTitle()
         .toolbar { Button("Done") { dismiss() } }
     }
 

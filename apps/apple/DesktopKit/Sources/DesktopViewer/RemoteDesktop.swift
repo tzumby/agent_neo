@@ -42,28 +42,53 @@ public final class RemoteDesktop {
     /// The latest frame. Frames bypass SwiftUI: the view sets `onFrame`.
     @ObservationIgnored public private(set) var frame: CGImage?
     @ObservationIgnored public var onFrame: ((CGImage) -> Void)?
+    /// Text the desktop put on its clipboard (x11vnc sends selections as they change).
+    @ObservationIgnored public var onClipboard: ((String) -> Void)?
 
     @ObservationIgnored private var client: RFBClient?
+
+    /// A view that draws the frames itself (swift-rfb's Metal view on the
+    /// Mac): it gets every event, and each connection's client, through which
+    /// it sends input and paces updates (`framebufferConsumed()` once drawn).
+    public struct Renderer: Sendable {
+        public let events: @Sendable (RFBEvent) -> Void
+        public let attach: @MainActor @Sendable (RFBClient?) -> Void
+
+        public init(events: @escaping @Sendable (RFBEvent) -> Void, attach: @escaping @MainActor @Sendable (RFBClient?) -> Void) {
+            self.events = events
+            self.attach = attach
+        }
+    }
 
     public init() {}
 
     /// Runs until the calling task is cancelled. `connect` opens a new,
-    /// connected transport for each attempt.
-    public func run(connect: @escaping @Sendable () async throws -> any RFBTransport) async {
+    /// connected transport for each attempt. Without a `renderer`, frames
+    /// come as images through `onFrame`.
+    public func run(
+        connect: @escaping @Sendable () async throws -> any RFBTransport, renderer: Renderer? = nil
+    ) async {
         while !Task.isCancelled {
             state = .connecting
             do {
                 let client = RFBClient(transport: try await connect())
                 self.client = client
+                renderer?.attach(client)
                 try await client.run { [weak self] event in
+                    renderer?.events(event)
                     // This runs on the session's task, so copy the frame before
                     // the next update is decoded into the same memory.
                     switch event {
                     case .connected:
                         DispatchQueue.main.async { MainActor.assumeIsolated { self?.state = .live } }
-                    case .updated(let framebuffer, _):
+                    case .resized(let framebuffer) where renderer != nil:
+                        let size = CGSize(width: framebuffer.width, height: framebuffer.height)
+                        DispatchQueue.main.async { MainActor.assumeIsolated { self?.resized(size, from: client) } }
+                    case .updated(let framebuffer, _) where renderer == nil:
                         guard let image = framebuffer.makeImage() else { return client.framebufferConsumed() }
                         DispatchQueue.main.async { MainActor.assumeIsolated { self?.show(image, from: client) } }
+                    case .clipboard(let text):
+                        DispatchQueue.main.async { MainActor.assumeIsolated { self?.onClipboard?(text) } }
                     default:
                         break
                     }
@@ -74,10 +99,17 @@ public final class RemoteDesktop {
                 state = .offline((error as? RFBError)?.description ?? error.localizedDescription)
             }
             client = nil
+            renderer?.attach(nil)
             try? await Task.sleep(for: .seconds(2))
         }
         client?.close()
         client = nil
+        renderer?.attach(nil)
+    }
+
+    private func resized(_ newSize: CGSize, from source: RFBClient) {
+        guard source === client else { return }
+        if size != newSize { size = newSize }
     }
 
     private func show(_ image: CGImage, from source: RFBClient) {

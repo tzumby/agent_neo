@@ -6,8 +6,9 @@ on the dev desktop). **Phase 2 done 2026-10-31**: the iPhone app signs in with T
 2026-10-31**: chat on the iPhone, with steps, approvals and Action needed cards (agentd now
 reminds the model to call `needs_user` when it stops on a sign-in page). **Phase 4 done
 2026-10-31**: take over (VNC over the tailnet, native keyboard), reconnects after app switches, the
-Liquid Glass redesign, terminal cards, and approvals for browser writes and sends (agentd 0.3.0). See
-the README. Library facts checked on that date (sources at
+Liquid Glass redesign, terminal cards, and approvals for browser writes and sends (agentd 0.3.0).
+**Phase 5 built 2026-11-02**: the Mac app, with the iPhone app's screens (shared code), its own
+Tailscale node and a take-over window (architecture.md §10.9). See the README. Library facts checked on that date (sources at
 the end). Items marked UNVERIFIED need a spike before we rely on them.*
 
 > **Since this plan (2026-10-31):**
@@ -270,9 +271,11 @@ guardrails.
     - Don't use `down()` (#21005).
   - **Key expiry:** 180 days. Detect `HasExpiredAuth` and offer "Log in
     again".
-- **Mac (POC):** uses the Mac's own Tailscale (running and logged in) and
-  normal `URLSession`/`NWConnection`. It sits behind the same `Tailnet`
-  protocol, so the Mac app can switch to embedded TailscaleKit later.
+- **Mac:** the same embedded TailscaleKit node as the iPhone (hostname
+  `cloud-desktop-mac`), inside the app's sandbox. (The first plan was the
+  Mac's own Tailscale; changed when building phase 5, 2026-11-02: one code
+  path, and nothing else has to be running and signed in.) It restarts the
+  node after the Mac wakes from sleep.
 
 ### 5.3 Chat (`Chat`, `AgentAPI`)
 - **Timeline:**
@@ -361,7 +364,7 @@ guardrails.
 | 2. App skeleton | TailscaleKit build; XcodeGen project; login sheet; discovery; status | The iPhone app logs in with Tailscale (no Tailscale app) and shows the desktop's status |
 | 3. Chat | SSE client, timeline, approvals, action-needed cards, Stop | You run a Gmail task from the phone, and Slack produces an Action needed card |
 | 4. Take over | Loopback forwarder; VNC spike; iOS view, keyboard + accessory bar, bottom bar, gestures, clipboard | **POC done:** you log into Slack from the phone with a native keyboard, tap I'm done, and the task continues |
-| 5. Mac app | macOS target: chat and take over | Same flows on the Mac |
+| 5. Mac app (built 2026-11-02) | macOS target: chat and take over | Same flows on the Mac |
 | 6. Parity, then retire | Shell tool + approvals + root actions; click/type with browser actions on; push (APNs); turn off the Python agent and Telegram | Telegram is off and everything runs through `agentd` and the apps |
 
 ## 9. Open items
@@ -378,7 +381,7 @@ guardrails.
    to devices registered through the calling desktop. Desktops may invoke the
    function only through its URL, so they can't forge that identity. The
    gateway can take this over later.
-3. **Mac app in the POC:** your Mac's Tailscale must be running.
+3. **Mac app:** ~~your Mac's Tailscale must be running~~ (it has its own node since 2026-11-02).
 4. **Approval needed before phase 1 deploys:** removing passwordless sudo from
    `agent` changes today's behavior. Root actions then go through `agentd`
    approvals.

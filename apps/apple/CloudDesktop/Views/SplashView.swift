@@ -13,7 +13,7 @@ struct SplashView: View {
             Image(systemName: "display")
                 .font(.system(size: 38, weight: .light))
                 .frame(width: 92, height: 92)
-                .glassEffect(.regular, in: .circle)
+                .glass(.circle)
                 .scaleEffect(breathing ? 1.04 : 0.97)
                 .animation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true), value: breathing)
             Text("Cloud Desktop")
@@ -38,7 +38,7 @@ struct SplashView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
         .ignoresSafeArea()
-        .toolbarVisibility(.hidden, for: .navigationBar)
+        .toolbarVisibility(.hidden, for: .appBar)
         .onAppear { breathing = true }
     }
 }

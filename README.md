@@ -5,7 +5,7 @@ See [PLAN.MD](PLAN.MD) for the full design and milestones.
 
 **Current state:** one test desktop, configured by Ansible over SSM, runs Chrome
 on a virtual display with **agentd** (the agent), an attested model gateway, a
-push relay, and an iPhone app that reaches the desktop over your tailnet. No
+push relay, and iPhone and Mac apps that reach the desktop over your tailnet. No
 Packer, launch template, data volume or control plane yet. The full picture is in
 [docs/architecture.md](docs/architecture.md).
 
@@ -194,8 +194,10 @@ from the desktop.
 
 ## Apple apps (`apps/apple`)
 
-SwiftUI app for iPhone (iOS 26+, dark, Liquid Glass; a Mac target follows), generated with XcodeGen
-from `apps/apple/project.yml`. `DesktopKit` holds the shared code: `Tailnet`
+SwiftUI apps for iPhone (iOS 26+, dark, Liquid Glass) and Mac (macOS 15.6+, Apple
+silicon; Liquid Glass from macOS 26), generated with XcodeGen from
+`apps/apple/project.yml`. They share their screens (`CloudDesktop/`, with
+`iOS/` and `macOS/` for what only one has). `DesktopKit` holds the rest of the shared code: `Tailnet`
 (the app's own Tailscale node via TailscaleKit; you sign in with Tailscale in the
 app, no Tailscale app needed), `AgentAPI` (agentd's API and event stream over the
 tailnet), `ChatCore` (turns the event stream into the chat timeline) and
@@ -219,11 +221,24 @@ keys. Paste types the phone's clipboard on the desktop, and I'm done tells the
 agent to carry on. Settings (gear) has the model, the browser-actions switch and
 Tailscale log out. After a disconnect the app resumes from the last event it saw.
 
+**The Mac app** has the same chat, cards, Settings, Memory, Schedules and Keys,
+with its own Tailscale node (you sign in in your browser; the Mac's Tailscale app
+isn't used). Return sends (⌥Return for a new line), ⌘, opens Settings, and list
+rows have right-click menus. Take over opens the desktop in its own window with
+the Mac's pointer, scroll wheel and keyboard: ⌘ shortcuts act as Ctrl on the
+desktop (⌘C, ⌘T, ⌘L…; ⌘← and ⌘→ are Home and End), ⌘V types the Mac's
+clipboard, and what you copy there with ⌘C comes back to the Mac. ⌘Q, ⌘W, ⌘H,
+⌘M and ⌘, stay with the Mac. The app keeps running with its windows closed, so
+notifications still come (with banners while it isn't in front), and it
+reconnects after the Mac wakes.
+
 ```sh
 make app-tailscalekit   # once: build TailscaleKit.xcframework (Go + Xcode)
 make app-test           # DesktopKit unit tests (AGENTD_URL=http://127.0.0.1:8765 adds a live test against a local agentd;
                         # VNC_ADDR=127.0.0.1:15900 one against x11vnc through an SSM port forward)
 make app-device         # build, sign (team 4UVAPZYV4Q), install and launch on your iPhone
+make app-mac            # build the Mac app, install it in /Applications and open it
+                        # (its first run registers this Mac in the developer account, for push)
 ```
 
 **Push notifications** (approvals with Approve/Deny on the notification, Action

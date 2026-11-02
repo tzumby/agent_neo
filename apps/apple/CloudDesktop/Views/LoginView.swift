@@ -1,11 +1,16 @@
-import SafariServices
 import SwiftUI
 
-/// First launch: sign in with Tailscale in an in-app browser. The app becomes
-/// one of your devices on the tailnet; no Tailscale app needed.
+#if os(iOS)
+    import SafariServices
+#endif
+
+/// First launch: sign in with Tailscale in an in-app browser (on the Mac, in
+/// the default browser). The app becomes one of your devices on the tailnet;
+/// no Tailscale app needed.
 struct LoginView: View {
     let loginURL: URL?
     @State private var showingLogin = false
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         VStack(spacing: 18) {
@@ -13,7 +18,7 @@ struct LoginView: View {
             Image(systemName: "display")
                 .font(.system(size: 40, weight: .light))
                 .frame(width: 96, height: 96)
-                .glassEffect(.regular, in: .circle)
+                .glass(.circle)
             Text("Cloud Desktop")
                 .font(.largeTitle.bold())
             Text("Sign in with Tailscale to reach your desktop. This app joins your tailnet as one of your devices.")
@@ -21,7 +26,11 @@ struct LoginView: View {
                 .foregroundStyle(.secondary)
             Spacer()
             Button {
-                showingLogin = true
+                #if os(iOS)
+                    showingLogin = true
+                #else
+                    if let loginURL { openURL(loginURL) }
+                #endif
             } label: {
                 Group {
                     if loginURL == nil {
@@ -38,16 +47,21 @@ struct LoginView: View {
             .disabled(loginURL == nil)
         }
         .padding(28)
+        .frame(maxWidth: 480)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
-        // Closes by itself: once you've signed in, the root view moves on.
-        .sheet(isPresented: $showingLogin) {
-            if let loginURL {
-                SafariView(url: loginURL).ignoresSafeArea()
+        #if os(iOS)
+            // Closes by itself: once you've signed in, the root view moves on.
+            .sheet(isPresented: $showingLogin) {
+                if let loginURL {
+                    SafariView(url: loginURL).ignoresSafeArea()
+                }
             }
-        }
+        #endif
     }
 }
 
+#if os(iOS)
 struct SafariView: UIViewControllerRepresentable {
     let url: URL
 
@@ -57,3 +71,4 @@ struct SafariView: UIViewControllerRepresentable {
 
     func updateUIViewController(_ controller: SFSafariViewController, context: Context) {}
 }
+#endif

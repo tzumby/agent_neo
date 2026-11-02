@@ -14,7 +14,7 @@ INSTANCE ?= $(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-logs tailnet-build tailnet-deploy tailscale-key apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-logs tailnet-build tailnet-deploy tailscale-key apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -126,6 +126,9 @@ app-sim: ## Build the iPhone app for the Simulator
 
 app-device: ## Build, install and launch the iPhone app on your paired iPhone (unlock it first)
 	apps/apple/scripts/run-on-device.sh
+
+app-mac: ## Build the Mac app, install it in /Applications and open it (first run registers this Mac)
+	apps/apple/scripts/run-on-mac.sh
 
 # --- Access (SSM only) -------------------------------------------------------
 

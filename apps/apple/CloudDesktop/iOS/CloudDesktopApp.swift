@@ -4,6 +4,7 @@ import Tailnet
 @main
 struct CloudDesktopApp: App {
     @State private var tailnet = TailnetService(hostName: "cloud-desktop-iphone")
+    @State private var session = DesktopSession()
     @State private var grace = BackgroundGrace()
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
@@ -25,6 +26,7 @@ struct CloudDesktopApp: App {
             }
             .preferredColorScheme(.dark)  // Grok-style: dark only
             .environment(PushCenter.shared)
+            .environment(session)
         }
         .onChange(of: scenePhase) { old, new in
             if new == .background {

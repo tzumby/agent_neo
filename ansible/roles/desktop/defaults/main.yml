@@ -98,3 +98,6 @@ desktop_chrome_policy:
   # For other schemes the prompt still appears, without "Always allow…", so
   # nobody makes xdg-open permanent from Take over.
   ExternalProtocolDialogShowAlwaysOpenCheckbox: false
+  # No print dialog (a page's window.print(), Ctrl+P): it's Chrome's own UI,
+  # which the agent can't see either, and there's no printer here.
+  PrintingEnabled: false

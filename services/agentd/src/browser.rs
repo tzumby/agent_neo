@@ -78,6 +78,12 @@ impl Browser {
         self.page.as_ref().ok_or_else(|| anyhow!("no tab is open"))
     }
 
+    /// What the current tab did on its own since the last call: dialogs
+    /// agentd answered, file pickers it held back (cdp.rs).
+    pub fn take_notes(&self) -> Vec<String> {
+        self.page.as_ref().map(Page::take_notes).unwrap_or_default()
+    }
+
     async fn switch_to(&mut self, target: &crate::cdp::Target) -> Result<()> {
         self.cdp.activate(&target.id).await?;
         self.connect(target).await
@@ -322,7 +328,12 @@ impl Browser {
         if let Err(problem) = self.actionable(element, true).await {
             return Ok(format!("not clicked: '{}' {problem}", element.label));
         }
-        self.click_node(element.node).await?;
+        // A click on "Attach file" would open a system dialog the agent can't see.
+        let page = self.page()?;
+        page.hold_file_pickers(true).await;
+        let clicked = self.click_node(element.node).await;
+        page.hold_file_pickers(false).await;
+        clicked?;
         let settled = self.settle(Duration::from_secs(8)).await?;
         Ok(format!(
             "clicked '{}' ({settled}); now at {}{}",
@@ -352,8 +363,13 @@ impl Browser {
     }
 
     pub async fn press_key(&self, key: &str) -> Result<String> {
-        // Keys can send, open or scroll in more content.
-        self.key(key).await?;
+        // Keys can send, open or scroll in more content (Enter or Space on a
+        // file input opens a picker).
+        let page = self.page()?;
+        page.hold_file_pickers(true).await;
+        let pressed = self.key(key).await;
+        page.hold_file_pickers(false).await;
+        pressed?;
         let settled = self.settle(Duration::from_secs(8)).await?;
         Ok(format!("pressed ({settled})"))
     }

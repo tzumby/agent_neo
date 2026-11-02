@@ -88,13 +88,54 @@ type Pending = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 /// A command session with one page (tab).
 pub struct Page {
     pub target_id: String,
-    sink: Mutex<Sink>,
+    sink: Arc<Mutex<Sink>>,
     pending: Pending,
     /// DevTools events from the tab (network requests and so on).
     events: broadcast::Sender<Value>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
+    /// What the page did on its own that the agent should hear about (a
+    /// dialog it answered, a file picker held back), until `take_notes`.
+    notes: Arc<StdMutex<Vec<String>>>,
     reader: tokio::task::JoinHandle<()>,
 }
+
+/// How agentd answers a dialog the page opens (`alert`, `confirm`, `prompt`,
+/// `beforeunload`): whether to accept it, and what to tell the model. While a
+/// dialog is open the page is frozen and every DevTools call to it waits, so
+/// it's answered at once. Closing a message box and leaving a page the agent
+/// asked to leave are what it wanted; OK on "Are you sure?" would be a second
+/// action nobody approved, so that's cancelled and the model told.
+pub fn answer_dialog(kind: &str, message: &str) -> (bool, String) {
+    let message: String = message.trim().chars().take(300).collect();
+    match kind {
+        "alert" => (
+            true,
+            format!("the page showed a message box: \"{message}\"; agentd closed it"),
+        ),
+        "beforeunload" => (
+            true,
+            "the page warned that leaving could lose unsaved changes; agentd left it, as you asked".into(),
+        ),
+        "prompt" => (
+            false,
+            format!(
+                "the page asked for input in a pop-up (\"{message}\"); agentd cancelled it, so what it was \
+                 about to do didn't happen"
+            ),
+        ),
+        _ => (
+            false,
+            format!(
+                "the page asked \"{message}\" (OK or Cancel); agentd answered Cancel, so what it was about to do \
+                 didn't happen. If it matters, tell the user: they can do it through Take over"
+            ),
+        ),
+    }
+}
+
+/// What the model hears when the page tries to open a file picker.
+pub const FILE_PICKER_NOTE: &str = "the page opened a file picker; agentd can't choose files, so nothing was \
+     attached. If a file is needed, tell the user to attach it through Take over";
 
 impl Page {
     pub async fn connect(target: &Target) -> Result<Self> {
@@ -105,10 +146,14 @@ impl Page {
             .await
             .with_context(|| format!("connecting to tab {}", target.id))?;
         let (sink, mut stream) = ws.split();
+        let sink = Arc::new(Mutex::new(sink));
         let pending: Pending = Arc::default();
         let replies = pending.clone();
         let (events, _) = broadcast::channel(4096);
         let notify = events.clone();
+        let next_id = Arc::new(AtomicU64::new(1));
+        let notes: Arc<StdMutex<Vec<String>>> = Arc::default();
+        let (answer_sink, answer_ids, noted) = (sink.clone(), next_id.clone(), notes.clone());
         let reader = tokio::spawn(async move {
             while let Some(Ok(message)) = stream.next().await {
                 let Message::Text(text) = message else { continue };
@@ -116,6 +161,27 @@ impl Page {
                     continue;
                 };
                 let Some(id) = value["id"].as_u64() else {
+                    match value["method"].as_str() {
+                        // Answered here, at once: the page waits for it.
+                        Some("Page.javascriptDialogOpening") => {
+                            let params = &value["params"];
+                            let (accept, note) = answer_dialog(
+                                params["type"].as_str().unwrap_or(""),
+                                params["message"].as_str().unwrap_or(""),
+                            );
+                            let id = answer_ids.fetch_add(1, Ordering::Relaxed);
+                            let answer = json!({"id": id, "method": "Page.handleJavaScriptDialog",
+                                                "params": {"accept": accept}});
+                            let _ = answer_sink
+                                .lock()
+                                .await
+                                .send(Message::Text(answer.to_string().into()))
+                                .await;
+                            noted.lock().unwrap().push(note);
+                        }
+                        Some("Page.fileChooserOpened") => noted.lock().unwrap().push(FILE_PICKER_NOTE.into()),
+                        _ => {}
+                    }
                     // An event: for whoever listens (nobody, most of the time).
                     let _ = notify.send(value);
                     continue;
@@ -135,10 +201,11 @@ impl Page {
         });
         let page = Self {
             target_id: target.id.clone(),
-            sink: Mutex::new(sink),
+            sink,
             pending,
             events,
-            next_id: AtomicU64::new(1),
+            next_id,
+            notes,
             reader,
         };
         // Node IDs, quads and the accessibility tree; network events tell
@@ -161,6 +228,22 @@ impl Page {
     /// Listens to the tab's events from now on.
     pub fn events(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
+    }
+
+    /// What the page did on its own since the last call (dialogs answered,
+    /// file pickers held back), for the model.
+    pub fn take_notes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notes.lock().unwrap())
+    }
+
+    /// While on, a file picker the page opens is held back (no system dialog,
+    /// which the agent couldn't see) and noted instead. Only around the
+    /// agent's own clicks and keys, so the user's still open in Take over.
+    pub async fn hold_file_pickers(&self, on: bool) {
+        // Best effort: an older Chrome without it still opens the dialog.
+        let _ = self
+            .call("Page.setInterceptFileChooserDialog", json!({"enabled": on}))
+            .await;
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -196,5 +279,61 @@ impl Page {
 impl Drop for Page {
     fn drop(&mut self) {
         self.reader.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dialogs_are_answered_as_the_agent_would_want() {
+        assert!(answer_dialog("alert", "Saved").0);
+        assert!(answer_dialog("beforeunload", "").0);
+        let (ok, note) = answer_dialog("confirm", "Delete all 12 messages?");
+        assert!(!ok && note.contains("\"Delete all 12 messages?\"") && note.contains("Cancel"));
+        assert!(!answer_dialog("prompt", "Your name").0);
+        assert!(!answer_dialog("something new", "?").0); // unknown kinds: cancelled
+        let long = answer_dialog("alert", &"y".repeat(1000)).1;
+        assert!(long.contains(&"y".repeat(300)) && !long.contains(&"y".repeat(301)));
+    }
+
+    /// Against a real Chrome: `CHROME_CDP=http://127.0.0.1:9333 cargo test --
+    /// --ignored page_dialogs_and_file_pickers` with a headless Chrome on that
+    /// debugging port.
+    #[tokio::test]
+    #[ignore]
+    async fn page_dialogs_and_file_pickers() {
+        let cdp = Cdp::new(&std::env::var("CHROME_CDP").expect("CHROME_CDP")).unwrap();
+        let page = Page::connect(&cdp.new_page().await.unwrap()).await.unwrap();
+        let html =
+            "<input type=file id=f style='position:absolute;left:10px;top:10px;width:200px;height:40px'>";
+        page.call("Page.navigate", json!({"url": format!("data:text/html,{html}")}))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // A pop-up freezes the page until it's answered: these return at once.
+        assert_eq!(
+            page.eval("confirm('Delete everything?')").await.unwrap(),
+            json!(false)
+        );
+        assert_eq!(page.eval("alert('Saved'); 1").await.unwrap(), json!(1));
+        // A real click on the file input, with pickers held back: no dialog, a note.
+        page.hold_file_pickers(true).await;
+        for kind in ["mousePressed", "mouseReleased"] {
+            page.call(
+                "Input.dispatchMouseEvent",
+                json!({"type": kind, "x": 100, "y": 30, "button": "left", "clickCount": 1}),
+            )
+            .await
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        page.hold_file_pickers(false).await;
+        let notes = page.take_notes();
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(notes[0].contains("answered Cancel") && notes[1].contains("closed it"));
+        assert_eq!(notes[2], FILE_PICKER_NOTE);
+        assert!(page.take_notes().is_empty());
     }
 }

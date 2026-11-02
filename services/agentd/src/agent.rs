@@ -1077,6 +1077,24 @@ impl Agent {
                     state.tainted = true;
                 }
                 let result = guard::label_untrusted(&name, result);
+                // What the page did on its own meanwhile (a dialog agentd
+                // answered, a file picker it held back), whatever the tool:
+                // page text, so it's labelled and taints like a read.
+                let notes = browser.take_notes();
+                let result = if notes.is_empty() {
+                    result
+                } else {
+                    state.tainted = true;
+                    tracing::info!(task = %task_id, notes = notes.len(), "the page acted on its own");
+                    let notes = notes
+                        .iter()
+                        .map(|n| format!("(agentd: {n}.)"))
+                        .collect::<Vec<_>>();
+                    format!(
+                        "{result}\n\n{}",
+                        guard::label_untrusted("read_text", notes.join("\n"))
+                    )
+                };
                 state
                     .messages
                     .push(json!({"role": "tool", "tool_call_id": call["id"], "content": result}));

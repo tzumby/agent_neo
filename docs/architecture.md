@@ -310,6 +310,7 @@ For a fresh desktop, run them in this order: desktops, agentd, tailnet-proxy.
     - `PasswordManagerEnabled: false`, so the browser never stores the user's passwords (PLAN.MD ground rule 4).
     - `URLBlocklist` of desktop-app link schemes (`slack:*`, Zoom's, Teams', `discord:*`, `figma:*`, `notion:*`, `vscode:*` and others, 28 in all). Web apps try to open their desktop apps, as Slack's web client does with `slack://`. Chrome then asks "Open xdg-open?" in its own UI, which the agent can't see or answer over DevTools, so tasks hung there (2026-11-02). Blocked, the launch fails quietly and the web app stays in the browser.
     - `ExternalProtocolDialogShowAlwaysOpenCheckbox: false`: any other scheme's prompt has no "Always allow…", so it can't be made permanent from Take over.
+    - `PrintingEnabled: false`: no print dialog from a page's `window.print()` or Ctrl+P. It's Chrome's own UI too, and there's no printer.
 - **Units** (`Restart=always`, `RestartSec=2`, no start-rate limit; started in this order):
 
 | Unit | Runs as | Command |
@@ -751,6 +752,16 @@ The shell tools (`run_shell`, `request_secret`) exist only when `SHELL_TOOL=on`;
 3. Two animation frames must pass with no element added or removed, no new request and no loading indicator. Otherwise go back to step 1.
 
 The cap is a safety net: 10 s for `open_url`, and the `wait_for` timeout. Measured on Slack, GitHub, Gmail, Amazon, Notion and Wikipedia, pages are complete 0.1–1.3 s after navigating.
+
+**What the page does on its own.** Pop-ups and pickers that DevTools can't drive would otherwise stall a task. Dialogs freeze the tab, so every call to it timed out after 30 s, and Chrome's own prompts are invisible to the agent.
+- **JavaScript dialogs** (`Page.javascriptDialogOpening`) are answered at once by the WebSocket reader, before anything waits on the frozen page (`cdp::answer_dialog`):
+  - `alert`: closed;
+  - `beforeunload` ("Leave site?"): left, since the agent navigated;
+  - `confirm` and `prompt`: cancelled, because OK would be a second action nobody approved. The model is told what was asked, and can tell the user to do it through Take over.
+- **File pickers:** around the agent's own clicks and key presses only, `Page.setInterceptFileChooserDialog` holds them back. No system dialog opens; the model is told nothing was attached and the user can attach it through Take over. The user's own file pickers in Take over still open.
+- **Telling the model:** these notes go into the next tool result as `(agentd: …)` lines, labelled as outside content (they quote the page), and they taint the task like a read.
+- **Chrome's own prompts** are switched off in its policy (§5.3): app-link launches (`xdg-open`) and printing.
+- Checked against a real headless Chrome: `page_dialogs_and_file_pickers` (ignored by default; `CHROME_CDP=…`).
 
 **Sign-in detection.** A heuristic: a visible password field, or a sign-in URL. It adds a hint to `open_url` results and triggers the one-time `needs_user` reminder.
 

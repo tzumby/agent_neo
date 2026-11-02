@@ -59,9 +59,11 @@ public struct ChatTimeline: Sendable, Equatable {
                 let schedule = data["schedule"]?["name"]?.string
                 items.append(.user(Message(id: event.seq, text: text, task: task, schedule: schedule)))
             } else {
-                // A scheduled run that found nothing: shown collapsed.
-                items.append(
-                    .assistant(Message(id: event.seq, text: text, task: task, quiet: data["quiet"]?.bool ?? false)))
+                // A scheduled run that found nothing: shown collapsed, when
+                // it says so in a line. A report is shown as one even when
+                // nothing in it needed the user (no notification came).
+                let quiet = data["quiet"]?.bool == true && Message.isOneLine(text)
+                items.append(.assistant(Message(id: event.seq, text: text, task: task, quiet: quiet)))
             }
         case "task.started":
             busy = true
@@ -194,6 +196,12 @@ public struct Message: Sendable, Equatable {
     public var schedule: String? = nil
     /// A scheduled run's answer when it found nothing new: shown collapsed.
     public var quiet = false
+
+    /// "Nothing new since 8:00." rather than a report: a single short line.
+    static func isOneLine(_ text: String) -> Bool {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !text.contains("\n") && text.count <= 200
+    }
 }
 
 public struct Approval: Sendable, Equatable {

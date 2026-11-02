@@ -24,6 +24,10 @@ struct ChatView: View {
     @State private var olderInView = false
     /// The oldest event of the chat on screen, to spot an older page going in (`keepPlace`).
     @State private var oldestShown: Int?
+    #if os(macOS)
+        /// Scrolled to the end: what the agent adds keeps it there (`followEnd`).
+        @State private var atEnd = true
+    #endif
     @State private var sent = 0
     /// A key in the message about to be sent: offer to save it instead.
     @State private var foundKey: KeyDetector.Found?
@@ -200,7 +204,15 @@ struct ChatView: View {
         // Start at the newest message and stay there as the agent adds more.
         .defaultScrollAnchor(.bottom, for: .initialOffset)
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
-        .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { old, new in keepPlace(old, new) }
+        .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { old, new in
+            #if os(macOS)
+                let olderPage = store.oldestLoaded != oldestShown
+            #endif
+            keepPlace(old, new)
+            #if os(macOS)
+                followEnd(old, new, olderPage: olderPage)
+            #endif
+        }
         #if os(macOS)
             // The Mac's scroll view starts at the top when the first page comes
             // after it appeared (empty): go to the end, under the splash.
@@ -228,6 +240,23 @@ struct ChatView: View {
         // scrollTo(y:) counts from the content's top; contentOffset includes the top inset (the bars).
         position.scrollTo(y: new.contentOffset.y + added + new.contentInsets.top)
     }
+
+    #if os(macOS)
+        /// The Mac's scroll view doesn't keep its end as the content grows
+        /// (`defaultScrollAnchor(.bottom, for: .sizeChanges)` does nothing
+        /// there), so new messages went in below the window. Scrolled to the
+        /// end, it goes back there; scrolled up to read, it stays put. Only
+        /// scrolling decides which: the content's height unchanged and the
+        /// offset moved (other updates come between growing and catching up).
+        private func followEnd(_ old: ScrollGeometry, _ new: ScrollGeometry, olderPage: Bool) {
+            if new.contentSize.height != old.contentSize.height {
+                if atEnd, !olderPage { position.scrollTo(edge: .bottom) }
+            } else if new.contentOffset.y != old.contentOffset.y {
+                // Within a few lines of the end (the composer covers the last ones).
+                atEnd = new.visibleRect.maxY >= new.contentSize.height - 80
+            }
+        }
+    #endif
 
     /// Hands this iPhone's push token to the desktop, which registers it with
     /// the push relay. Retries while the connection comes up.
@@ -351,7 +380,13 @@ struct ChatView: View {
         }
         draft = ""
         sent += 1
-        withAnimation(.snappy) { position.scrollTo(edge: .bottom) }
+        #if os(macOS)
+            // At once: offsets seen mid-animation would read as scrolled up.
+            atEnd = true
+            position.scrollTo(edge: .bottom)
+        #else
+            withAnimation(.snappy) { position.scrollTo(edge: .bottom) }
+        #endif
         Task { await store.send(text, client: client) }
     }
 }
@@ -463,9 +498,9 @@ private struct ModelMenu: View {
                 HStack(spacing: 6) {
                     Circle().fill(dotColor).frame(width: 7, height: 7)
                     Text(title)
-                        .font(.headline)
+                        .font(.app(.headline))
                         .lineLimit(1)
-                    Image(systemName: "chevron.down").font(.caption2.weight(.bold)).foregroundStyle(.secondary)
+                    Image(systemName: "chevron.down").font(.app(.caption2).weight(.bold)).foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 4)
                 .contentShape(.rect)
@@ -571,10 +606,10 @@ private struct EmptyChat: View {
                 .frame(width: 76, height: 76)
                 .glass(.circle)
             Text("What should your desktop do?")
-                .font(.title2.weight(.semibold))
+                .font(.app(.title2).weight(.semibold))
                 .multilineTextAlignment(.center)
             Text(desktopName)
-                .font(.subheadline)
+                .font(.app(.subheadline))
                 .foregroundStyle(.secondary)
         }
         .padding(.bottom, 80)
@@ -598,7 +633,7 @@ private struct Suggestions: View {
                 HStack(spacing: 8) {
                     ForEach(items, id: \.1) { icon, text in
                         Button { pick(text) } label: {
-                            Label(text, systemImage: icon).font(.subheadline)
+                            Label(text, systemImage: icon).font(.app(.subheadline))
                         }
                         .glassButton()
                     }
@@ -638,9 +673,9 @@ private struct StageBanner: View {
         Button(action: tap) {
             HStack(spacing: 8) {
                 Image(systemName: banner.icon).foregroundStyle(banner.tint)
-                Text(banner.text).font(.subheadline.weight(.medium)).lineLimit(1)
+                Text(banner.text).font(.app(.subheadline).weight(.medium)).lineLimit(1)
                 Spacer(minLength: 4)
-                Image(systemName: "chevron.right").font(.caption.weight(.bold)).foregroundStyle(.secondary)
+                Image(systemName: "chevron.right").font(.app(.caption).weight(.bold)).foregroundStyle(.secondary)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)

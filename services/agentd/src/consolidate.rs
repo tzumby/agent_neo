@@ -10,11 +10,11 @@
 //! - it can't override what the user stated: replacing, merging away or
 //!   expiring a user-stated memory becomes a proposal for the user instead.
 //!
-//! Modes (`memory_consolidation`): `off` runs nothing; `observe` (the
-//! default) writes the work log and proposes everything else (pending, for
-//! the user to approve); `auto` applies facts, merges and expiries, and
-//! still proposes preferences. Decay and expiry by date need no model and run
-//! in both modes.
+//! Modes (`memory_consolidation`): `off` runs nothing; `observe` writes the
+//! work log and proposes everything else (pending, for the user to approve);
+//! `auto` (the default since 0.15.2, the user's choice) applies facts, merges
+//! and expiries, and still proposes preferences. Decay and expiry by date
+//! need no model and run in both modes.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -101,7 +101,7 @@ pub fn mode(store: &Store) -> Mode {
         .ok()
         .flatten()
         .and_then(|m| Mode::parse(&m))
-        .unwrap_or(Mode::Observe)
+        .unwrap_or(Mode::Auto)
 }
 
 pub fn model(store: &Store) -> String {
@@ -1297,6 +1297,14 @@ mod tests {
     }
 
     #[test]
+    fn tidying_is_automatic_unless_the_user_chose_otherwise() {
+        let (store, _) = setup();
+        assert_eq!(mode(&store), Mode::Auto);
+        store.set_setting("memory_consolidation", "observe").unwrap();
+        assert_eq!(mode(&store), Mode::Observe);
+    }
+
+    #[test]
     fn stats_show_the_month_and_the_last_run() {
         let (store, keys) = setup();
         assert_eq!(stats(&store)["last_run"], Value::Null);
@@ -1308,9 +1316,10 @@ mod tests {
             r#"{"work_log": [{"source_run": "t1", "text": "Did a thing"}]}"#,
         );
         let stats = stats(&store);
+        // The mode is the setting's (automatic when unset), not the run's.
         assert_eq!(
             (stats["mode"].as_str(), stats["month_cost"].as_f64()),
-            (Some("observe"), Some(0.002))
+            (Some("auto"), Some(0.002))
         );
         assert_eq!(stats["last_run"]["status"], "done");
         assert_eq!(stats["last_run"]["counts"]["saved"], 1);

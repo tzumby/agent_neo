@@ -161,7 +161,7 @@ ALTER TABLE runs      ADD COLUMN schedule TEXT;                              -- 
 
 PRAGMA user_version = 2;
 ```
-Settings keys added to the `settings` table: `memory_consolidation` (`off | observe | auto`, default `observe`), `memory_consolidation_model` (default `zai-org/GLM-5.3-Flash`), `memory_consolidation_daily_cap_usd` (default `0.50`), `memory_last_consolidated_run` (per agent, `runs.id`), `memory_fact_half_life_days` (default `30`).
+Settings keys added to the `settings` table: `memory_consolidation` (`off | observe | auto`, default `auto` since 0.15.2; `observe` before), `memory_consolidation_model` (default `zai-org/GLM-5.3-Flash`), `memory_consolidation_daily_cap_usd` (default `0.50`), `memory_last_consolidated_run` (per agent, `runs.id`), `memory_fact_half_life_days` (default `30`).
 
 Limits: `text` ≤ 500 characters; at most 2,000 active memories per agent (further `remember` calls are refused with a message that consolidation must run first); work log entries expire after 12 months unless the user pins them (`valid_until` set by hand).
 
@@ -273,8 +273,8 @@ A background job turns finished tasks into work-log entries and keeps the fact s
 | `memory_consolidation` | work_log | facts | merges, supersedes, expiries |
 |---|---|---|---|
 | `off` | nothing runs | — | — |
-| `observe` (default) | written active (`agent_inferred`) | `pending`, `pending_reason = proposed` | recorded as `propose` events and shown as proposals; nothing changes |
-| `auto` | written active | `fact` active and `agent_inferred`; `preference` pending | applied; `user_stated` protection above still holds |
+| `observe` | written active (`agent_inferred`) | `pending`, `pending_reason = proposed` | recorded as `propose` events and shown as proposals; nothing changes |
+| `auto` (default since 0.15.2) | written active | `fact` active and `agent_inferred`; `preference` pending | applied; `user_stated` protection above still holds |
 
 The app shows proposals with Approve all / Reject all. The recommended path is observe for the first two weeks, then auto.
 
@@ -333,7 +333,7 @@ The phone is notified when the person must act or can use a result, and at no ot
 | User-started task finished `done` | Yes, can use the result | none | Start of the answer, as today |
 | Task finished `error`, `interrupted`, `stuck`, `max_steps` | Yes, must act | none | "Your desktop hit a problem", as today |
 | Scheduled run ended with `report_outcome(result)` | Yes | none | The `summary` field, not the answer |
-| Scheduled run ended with `report_outcome(nothing)` | No | — | The chat gets a collapsed `message` event with `quiet: true` ("Nothing new") |
+| Scheduled run ended with `report_outcome(nothing)` | No | — | The chat gets a `message` event with `quiet: true`: the apps collapse it into "Nothing new" when it's one short line (≤ 200 characters), and show a longer report in full (2026-11-02: reports were hidden behind "Nothing new") |
 | Scheduled run ended with `report_outcome(blocked)` | Yes, must act | none | The `summary` |
 | Scheduled run ended without calling `report_outcome` | Yes (fail open) | none | Start of the answer; the journal counts `report_outcome_missing` so the prompt can be tuned |
 | `cancelled`, `needs_user` (already pushed), pending memories, consolidation finished | No | — | Visible in the app |
@@ -467,7 +467,7 @@ Two tiers. Deterministic tests run in `make agentd-test` and gate every commit; 
 
 **Deploy safety.** The Ansible `agentd` role copies `agentd.db` to `agentd.db.pre-<version>` (keeping the last 3) before restarting the unit, as it already checks the desktop is not mid-task. Phase 0 verifies whether 0.14.0's migration runner tolerates a higher `user_version`; if it does not, rollback is "redeploy 0.14.0 and restore the copy", written into the README's deploy notes.
 
-**Defaults at launch:** `memory_consolidation = observe`, Flash, $0.50/day cap, 30-day half-life. Switch to `auto` only after reviewing proposals in the app for at least a week.
+**Defaults at launch:** `memory_consolidation = observe`, Flash, $0.50/day cap, 30-day half-life. Switch to `auto` only after reviewing proposals in the app for at least a week. **Changed 2026-11-02 (0.15.2), the user's decision:** the default is `auto`, during the soak; a desktop that saved a mode keeps it, and `observe` stays available ("Review first").
 
 
 ## 18. Phases, exit criteria and effort

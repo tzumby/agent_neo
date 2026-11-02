@@ -222,3 +222,34 @@ struct GroupedForm<Content: View>: View {
         #endif
     }
 }
+
+extension Font {
+    /// A text style at the app's size. The iPhone's are the system's (Dynamic
+    /// Type). The Mac's styles are fixed and small (body text is 13 points)
+    /// and macOS has no Dynamic Type, so there each is two points larger.
+    static func app(_ style: Font.TextStyle, design: Font.Design? = nil) -> Font {
+        #if os(iOS)
+            .system(style, design: design)
+        #else
+            .system(size: macSize(style), weight: style == .headline ? .semibold : .regular, design: design ?? .default)
+        #endif
+    }
+
+    #if os(macOS)
+        /// The system's Mac sizes plus two points.
+        private static func macSize(_ style: Font.TextStyle) -> CGFloat {
+            switch style {
+            case .largeTitle: 28
+            case .title: 24
+            case .title2: 19
+            case .title3: 17
+            case .headline, .body: 15
+            case .callout: 14
+            case .subheadline: 13
+            case .footnote, .caption: 12
+            case .caption2: 11
+            default: 15
+            }
+        }
+    #endif
+}

@@ -28,6 +28,7 @@ struct CloudDesktopMacApp: App {
                 #endif
             }
             .frame(minWidth: 420, minHeight: 520)
+            .font(.app(.body))  // text without a style of its own: the Mac's larger body
             .preferredColorScheme(.dark)
             .environment(PushCenter.shared)
             .environment(tailnet)
@@ -39,6 +40,7 @@ struct CloudDesktopMacApp: App {
         Window("Your desktop", id: DesktopSession.desktopWindow) {
             DesktopWindow()
                 .frame(minWidth: 640, minHeight: 440)
+                .font(.app(.body))
                 .preferredColorScheme(.dark)
                 .environment(tailnet)
                 .environment(session)

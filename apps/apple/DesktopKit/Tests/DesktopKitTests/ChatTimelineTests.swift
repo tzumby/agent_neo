@@ -189,6 +189,20 @@ private func aTask() throws -> [AgentEvent] {
     #expect(quiet.quiet && !loud.quiet)
 }
 
+@Test func aReportFromARunThatFoundNothingUrgentIsShownInFull() throws {
+    var timeline = ChatTimeline()
+    // JSON-escaped newlines: a short report with a list, as a run writes one.
+    let report = #"Checked the three blogs.\n\n- **One:** a new post\n- **Two:** nothing\n\nNothing urgent."#
+    timeline.apply(try event(1, "message", #"{"role":"assistant","text":"\#(report)","task":"t2","quiet":true}"#))
+    timeline.apply(try event(2, "message", #"{"role":"assistant","text":"Nothing new.","task":"t3","quiet":true}"#))
+    guard case .assistant(let full) = timeline.items[0], case .assistant(let line) = timeline.items[1] else {
+        Issue.record("no messages")
+        return
+    }
+    #expect(!full.quiet && full.text.contains("\n- **One:**"))
+    #expect(line.quiet)
+}
+
 @Test func commandCardsCarryPlainWords() throws {
     var timeline = ChatTimeline()
     timeline.apply(

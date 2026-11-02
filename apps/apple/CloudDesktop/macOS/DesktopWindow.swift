@@ -90,7 +90,7 @@ struct MacTakeOverView: View {
         case .connecting:
             if desktop.size == .zero {
                 Label("Connecting to your desktop…", systemImage: "display")
-                    .font(.subheadline.weight(.medium))
+                    .font(.app(.subheadline).weight(.medium))
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
                     .glass(.capsule)
@@ -98,8 +98,8 @@ struct MacTakeOverView: View {
             }
         case .offline(let reason):
             VStack(spacing: 4) {
-                Label("Reconnecting…", systemImage: "wifi.exclamationmark").font(.subheadline.weight(.semibold))
-                Text(reason).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                Label("Reconnecting…", systemImage: "wifi.exclamationmark").font(.app(.subheadline).weight(.semibold))
+                Text(reason).font(.app(.caption)).foregroundStyle(.secondary).multilineTextAlignment(.center)
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 10)

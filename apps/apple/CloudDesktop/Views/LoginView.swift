@@ -20,7 +20,7 @@ struct LoginView: View {
                 .frame(width: 96, height: 96)
                 .glass(.circle)
             Text("Cloud Desktop")
-                .font(.largeTitle.bold())
+                .font(.app(.largeTitle).bold())
             Text("Sign in with Tailscale to reach your desktop. This app joins your tailnet as one of your devices.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
@@ -36,7 +36,7 @@ struct LoginView: View {
                     if loginURL == nil {
                         ProgressView().tint(.black)
                     } else {
-                        Text("Log in with Tailscale").font(.headline).foregroundStyle(.black)
+                        Text("Log in with Tailscale").font(.app(.headline)).foregroundStyle(.black)
                     }
                 }
                 .frame(maxWidth: .infinity)

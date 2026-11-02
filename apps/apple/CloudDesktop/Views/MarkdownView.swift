@@ -60,10 +60,10 @@ private struct BlockView: View {
 
     private static func font(heading level: Int) -> Font {
         switch level {
-        case 1: .title2.bold()
-        case 2: .title3.bold()
-        case 3: .headline
-        default: .subheadline.weight(.semibold)
+        case 1: .app(.title2).bold()
+        case 2: .app(.title3).bold()
+        case 3: .app(.headline)
+        default: .app(.subheadline).weight(.semibold)
         }
     }
 }
@@ -139,7 +139,7 @@ private struct TableBlock: View {
                 if !header.isEmpty {
                     GridRow {
                         ForEach(columns.indices, id: \.self) { column in
-                            cell(header[column], column).font(.subheadline.weight(.semibold))
+                            cell(header[column], column).font(.app(.subheadline).weight(.semibold))
                         }
                     }
                     line
@@ -147,7 +147,7 @@ private struct TableBlock: View {
                 ForEach(rows.indices, id: \.self) { row in
                     GridRow {
                         ForEach(columns.indices, id: \.self) { column in
-                            cell(rows[row][column], column).font(.subheadline)
+                            cell(rows[row][column], column).font(.app(.subheadline))
                         }
                     }
                     if row < rows.count - 1 { line }
@@ -218,7 +218,7 @@ enum MarkdownText {
             // Narrow no-break spaces give the chip a little room on each side,
             // and keep that room on the code's line when it wraps.
             var code = AttributedString("\u{202F}\(String(piece.characters))\u{202F}")
-            code.font = .system(.callout, design: .monospaced)
+            code.font = .app(.callout, design: .monospaced)
             code.foregroundColor = Color(white: 0.95)
             result = Text("\(result)\(Text(prose))\(Text(code).customAttribute(InlineCode()))")
             prose = AttributedString()
@@ -267,9 +267,9 @@ struct CodeBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text(language ?? "code").font(.caption.weight(.semibold))
+                Text(language ?? "code").font(.app(.caption).weight(.semibold))
                 Spacer()
-                CopyButton(text: code).font(.caption)
+                CopyButton(text: code).font(.app(.caption))
             }
             .foregroundStyle(.secondary)
             .padding(.leading, 12)
@@ -278,7 +278,7 @@ struct CodeBlock: View {
             Rectangle().fill(Theme.hairline).frame(height: 0.5)
             ScrollView(.horizontal) {
                 Text(code)
-                    .font(.system(.footnote, design: .monospaced))
+                    .font(.app(.footnote, design: .monospaced))
                     .textSelection(.enabled)
                     .padding(12)
             }

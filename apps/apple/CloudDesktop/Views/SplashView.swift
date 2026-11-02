@@ -17,18 +17,18 @@ struct SplashView: View {
                 .scaleEffect(breathing ? 1.04 : 0.97)
                 .animation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true), value: breathing)
             Text("Cloud Desktop")
-                .font(.title3.weight(.semibold))
+                .font(.app(.title3).weight(.semibold))
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
                 Text(status)
             }
-            .font(.subheadline)
+            .font(.app(.subheadline))
             .foregroundStyle(.secondary)
             .contentTransition(.opacity)
             .animation(.easeOut(duration: 0.2), value: status)
             if let detail {
                 Text(detail)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 40)

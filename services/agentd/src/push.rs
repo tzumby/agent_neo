@@ -3,6 +3,7 @@
 //! instance-role credentials (SigV4), and the relay only reaches devices that
 //! were registered through this desktop. The key never comes here.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -138,14 +139,32 @@ pub fn on_finish(
     }
 }
 
-/// Cuts text for a notification line.
+/// Cuts text for a notification line: plain text on one line (notifications
+/// don't render Markdown, so its marks would show as they are).
 pub fn clip(text: &str, max_chars: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = plain(text).split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max_chars {
         return flat;
     }
     let kept: String = flat.chars().take(max_chars - 1).collect();
     format!("{}…", kept.trim_end())
+}
+
+/// Markdown's marks dropped: headings and quotes lose their marks, list
+/// items become "•", links their text, and bold, strikethrough and code marks go.
+fn plain(text: &str) -> String {
+    static BLOCK: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?m)^\s*(?:#{1,6}\s+|>\s?)").expect("valid pattern"));
+    static ITEM: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?m)^\s*[-*+]\s+").expect("valid pattern"));
+    static LINK: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"!?\[([^\]]*)\]\([^)]*\)").expect("valid pattern"));
+    static MARKS: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\*\*|__|~~|`").expect("valid pattern"));
+    let text = BLOCK.replace_all(text, "");
+    let text = ITEM.replace_all(&text, "• ");
+    let text = LINK.replace_all(&text, "$1");
+    MARKS.replace_all(&text, "").into_owned()
 }
 
 #[cfg(test)]
@@ -233,5 +252,18 @@ mod tests {
         assert_eq!(clip("short", 10), "short");
         assert_eq!(clip("one\ntwo   three", 50), "one two three");
         assert_eq!(clip("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn notifications_are_plain_text() {
+        assert_eq!(
+            clip(
+                "## Blogs\n\n**Hacker News:** a new `db`\n- one\n* two\n> quoted [the post](https://x.y/z)",
+                180
+            ),
+            "Blogs Hacker News: a new db • one • two quoted the post"
+        );
+        // Single marks stay: they're more often maths or names than emphasis.
+        assert_eq!(clip("2 * 3 and snake_case", 50), "2 * 3 and snake_case");
     }
 }

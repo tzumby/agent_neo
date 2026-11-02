@@ -87,28 +87,28 @@ private struct ScheduleRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(schedule.name).font(.headline)
+                Text(schedule.name).font(.app(.headline))
                 if schedule.paused {
-                    Text("Paused").font(.caption.weight(.semibold)).foregroundStyle(.orange)
+                    Text("Paused").font(.app(.caption).weight(.semibold)).foregroundStyle(.orange)
                 }
             }
-            Text(schedule.description).font(.subheadline)
+            Text(schedule.description).font(.app(.subheadline))
             if !schedule.paused {
                 Text("Next: \(schedule.nextRun.formatted(.dateTime.weekday().month().day().hour().minute()))")
-                    .font(.footnote)
+                    .font(.app(.footnote))
                     .foregroundStyle(.secondary)
             }
             Text(schedule.prompt)
-                .font(.footnote)
+                .font(.app(.footnote))
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
             if schedule.createdFrom == "agent_tainted" {
                 Label("Set up after the agent read outside content", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.orange)
             }
             if schedule.timezone != TimeZone.current.identifier {
-                Text("Times in \(schedule.timezone)").font(.caption).foregroundStyle(.tertiary)
+                Text("Times in \(schedule.timezone)").font(.app(.caption)).foregroundStyle(.tertiary)
             }
         }
         .padding(.vertical, 2)

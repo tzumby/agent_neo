@@ -96,7 +96,7 @@ struct MemoryView: View {
                                         Task { await answerAll(reason, approve: false) }
                                     }
                                 }
-                                .font(.footnote.weight(.semibold))
+                                .font(.app(.footnote).weight(.semibold))
                                 .buttonStyle(.borderless)
                             }
                         }
@@ -332,17 +332,17 @@ private struct PendingRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
-                Text(MemoryRow.kindName(memory.kind)).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Text(MemoryRow.kindName(memory.kind)).font(.app(.caption).weight(.semibold)).foregroundStyle(.secondary)
                 Spacer()
-                Text(String(memory.created.prefix(10))).font(.caption).foregroundStyle(.tertiary)
+                Text(String(memory.created.prefix(10))).font(.app(.caption)).foregroundStyle(.tertiary)
             }
             Text(memory.text)
             ForEach(memory.replaces ?? [], id: \.id) { old in
                 HStack(alignment: .top, spacing: 6) {
-                    Text("Replaces").font(.caption.weight(.semibold))
+                    Text("Replaces").font(.app(.caption).weight(.semibold))
                     Text(old.text).strikethrough()
                 }
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
             }
             HStack(spacing: 10) {
@@ -367,7 +367,7 @@ struct MemoryRow: View {
             Text(memory.text)
                 .strikethrough(memory.isGone)
                 .foregroundStyle(memory.isGone ? .secondary : .primary)
-            Text(detail).font(.caption).foregroundStyle(.secondary)
+            Text(detail).font(.app(.caption)).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(.rect)

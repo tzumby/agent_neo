@@ -28,7 +28,7 @@ struct RemoteImage: View {
             if let image {
                 image.view.resizable().scaledToFill()
             } else if failed {
-                Image(systemName: "photo").font(.title2).foregroundStyle(.tertiary)
+                Image(systemName: "photo").font(.app(.title2)).foregroundStyle(.tertiary)
             } else {
                 ProgressView()
             }

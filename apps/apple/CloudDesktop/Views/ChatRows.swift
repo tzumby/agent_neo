@@ -40,7 +40,7 @@ private struct UserBubble: View {
         VStack(alignment: .trailing, spacing: 6) {
             if let schedule {
                 Label("Scheduled · \(schedule)", systemImage: "clock")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
             Text(text)
@@ -64,7 +64,7 @@ private struct AssistantMessage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             MarkdownView(text: text)
-            CopyButton(text: text).font(.footnote)
+            CopyButton(text: text).font(.app(.footnote))
         }
     }
 }
@@ -81,10 +81,10 @@ private struct QuietMessage: View {
                 withAnimation(.snappy(duration: 0.2)) { open.toggle() }
             } label: {
                 HStack(spacing: 6) {
-                    Image(systemName: "moon.zzz").font(.footnote)
-                    Text("Nothing new").font(.subheadline)
+                    Image(systemName: "moon.zzz").font(.app(.footnote))
+                    Text("Nothing new").font(.app(.subheadline))
                     Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.bold))
+                        .font(.app(.caption2).weight(.bold))
                         .rotationEffect(.degrees(open ? 90 : 0))
                 }
                 .foregroundStyle(.secondary)
@@ -137,19 +137,19 @@ private struct ApprovalCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Label {
-                Text("Needs your OK").font(.subheadline.weight(.semibold))
+                Text("Needs your OK").font(.app(.subheadline).weight(.semibold))
             } icon: {
                 Image(systemName: "exclamationmark.shield.fill")
             }
             .foregroundStyle(.orange)
-            Text(approval.summary ?? "Run a command on your desktop").font(.headline)
-            Text("It \(approval.reason).").font(.subheadline).foregroundStyle(.secondary)
+            Text(approval.summary ?? "Run a command on your desktop").font(.app(.headline))
+            Text("It \(approval.reason).").font(.app(.subheadline)).foregroundStyle(.secondary)
             if approval.tainted {
                 Label(
                     "The agent read web pages or other outside content before asking. Check the command if this isn't what you asked for.",
                     systemImage: "exclamationmark.triangle.fill"
                 )
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.orange)
             }
             Button {
@@ -158,17 +158,17 @@ private struct ApprovalCard: View {
                 HStack(spacing: 4) {
                     Text(showCommand ? "Hide the command" : "Show the command")
                     Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.bold))
+                        .font(.app(.caption2).weight(.bold))
                         .rotationEffect(.degrees(showCommand ? 90 : 0))
                 }
-                .font(.footnote.weight(.medium))
+                .font(.app(.footnote).weight(.medium))
                 .foregroundStyle(.secondary)
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
             if showCommand {
                 Text(approval.command)
-                    .font(.footnote.monospaced())
+                    .font(.app(.footnote).monospaced())
                     .textSelection(.enabled)
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -203,7 +203,7 @@ private struct KeyCap: View {
 
     var body: some View {
         Text(key)
-            .font(.callout.monospaced().weight(.semibold))
+            .font(.app(.callout).monospaced().weight(.semibold))
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
             .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.secondary.opacity(0.6), lineWidth: 1))
@@ -220,10 +220,10 @@ private struct BrowserApprovalCard: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 Image(systemName: icon).foregroundStyle(.orange)
-                Text(title).font(.headline)
+                Text(title).font(.app(.headline))
                 Spacer()
                 if !action.site.isEmpty {
-                    Label(site, systemImage: "globe").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Label(site, systemImage: "globe").font(.app(.caption)).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
             // What the agent would do, shown as a quote or a key, not a box that
@@ -231,7 +231,7 @@ private struct BrowserApprovalCard: View {
             switch action.action {
             case "type":
                 if !action.target.isEmpty {
-                    Text("In “\(action.target)”").font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+                    Text("In “\(action.target)”").font(.app(.footnote)).foregroundStyle(.secondary).lineLimit(2)
                 }
                 HStack(alignment: .top, spacing: 10) {
                     Capsule().fill(.orange.opacity(0.6)).frame(width: 3)
@@ -247,20 +247,20 @@ private struct BrowserApprovalCard: View {
                         Text("in “\(action.target)”").foregroundStyle(.secondary).lineLimit(2)
                     }
                 }
-                .font(.callout)
+                .font(.app(.callout))
             default:
-                Text("“\(action.target)”").font(.callout.weight(.medium)).lineLimit(3)
+                Text("“\(action.target)”").font(.app(.callout).weight(.medium)).lineLimit(3)
             }
             if action.action == "type", action.submit {
                 Label("Then presses Enter, which may send it", systemImage: "return")
-                    .font(.footnote)
+                    .font(.app(.footnote))
                     .foregroundStyle(.orange)
             } else if action.action == "type", action.sends {
                 Label("Approving also lets it send this", systemImage: "paperplane")
-                    .font(.footnote)
+                    .font(.app(.footnote))
                     .foregroundStyle(.orange)
             } else if action.action != "type", !approval.reason.isEmpty {
-                Text("It \(approval.reason).").font(.footnote).foregroundStyle(.secondary)
+                Text("It \(approval.reason).").font(.app(.footnote)).foregroundStyle(.secondary)
             }
             // Shown only while it waits: answered, it leaves the chat.
             HStack(spacing: 10) {
@@ -314,7 +314,7 @@ private struct Outcome: View {
     let color: Color
 
     var body: some View {
-        Label(text, systemImage: icon).font(.subheadline.weight(.medium)).foregroundStyle(color)
+        Label(text, systemImage: icon).font(.app(.subheadline).weight(.medium)).foregroundStyle(color)
     }
 }
 
@@ -331,15 +331,15 @@ private struct ScheduleApprovalCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Label {
-                Text("Schedule this?").font(.headline)
+                Text("Schedule this?").font(.app(.headline))
             } icon: {
                 Image(systemName: "calendar.badge.exclamationmark").foregroundStyle(.orange)
             }
             VStack(alignment: .leading, spacing: 4) {
-                Text(proposal.name).font(.subheadline.weight(.semibold))
-                Text(proposal.when).font(.subheadline)
+                Text(proposal.name).font(.app(.subheadline).weight(.semibold))
+                Text(proposal.when).font(.app(.subheadline))
                 Text(proposal.prompt)
-                    .font(.footnote)
+                    .font(.app(.footnote))
                     .foregroundStyle(.secondary)
                     .lineLimit(8)
                     .textSelection(.enabled)
@@ -348,7 +348,7 @@ private struct ScheduleApprovalCard: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Theme.inset, in: .rect(cornerRadius: 14))
             Text("The agent asked for this after reading outside content. Approve only if you asked for it.")
-                .font(.footnote)
+                .font(.app(.footnote))
                 .foregroundStyle(.secondary)
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
@@ -388,7 +388,7 @@ private struct SecretRequestCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Label {
-                Text(request.replace ? "A new \(request.label)" : request.label).font(.headline)
+                Text(request.replace ? "A new \(request.label)" : request.label).font(.app(.headline))
             } icon: {
                 Image(systemName: "key.fill").foregroundStyle(.yellow)
             }
@@ -412,7 +412,7 @@ private struct SecretRequestCard: View {
     @ViewBuilder private var form: some View {
         if !request.how.isEmpty {
             MarkdownView(text: request.how)
-                .font(.subheadline)
+                .font(.app(.subheadline))
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Theme.inset, in: .rect(cornerRadius: 14))
@@ -447,14 +447,14 @@ private struct SecretRequestCard: View {
             "Kept only on your desktop. The agent uses it by name and never sees it.",
             systemImage: "lock.fill"
         )
-        .font(.caption)
+        .font(.app(.caption))
         .foregroundStyle(.secondary)
         if request.tainted {
             Label(
                 "Asked for after the agent read a page or command output. Only go on if you asked for something that needs this key.",
                 systemImage: "exclamationmark.triangle.fill"
             )
-            .font(.caption)
+            .font(.app(.caption))
             .foregroundStyle(.orange)
         }
     }
@@ -489,16 +489,16 @@ private struct ActionCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Label("Computer", systemImage: "laptopcomputer")
-                .font(.footnote.weight(.semibold))
+                .font(.app(.footnote).weight(.semibold))
                 .foregroundStyle(.secondary)
-            Text("Action needed").font(.title3.bold())
+            Text("Action needed").font(.app(.title3).bold())
             Text(action.reason)
             if let path = action.imagePath {
                 RemoteImage(path: path)
                     .onTapGesture { takeOver?.open(action) }
             }
             if let title = pageTitle {
-                Text(title).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(title).font(.app(.caption)).foregroundStyle(.secondary).lineLimit(1)
             }
             HStack(spacing: 8) {
                 Button { resolve(false) } label: { Text("Skip").frame(maxWidth: .infinity) }
@@ -518,7 +518,7 @@ private struct ActionCard: View {
             } icon: {
                 Image(systemName: "checkmark.shield")
             }
-            .font(.caption)
+            .font(.app(.caption))
             .foregroundStyle(.secondary)
         }
         .card()
@@ -544,7 +544,7 @@ private struct PictureRow: View {
         VStack(alignment: .leading, spacing: 6) {
             RemoteImage(path: picture.path)
             if let caption = picture.caption, !caption.isEmpty {
-                Text(caption).font(.caption).foregroundStyle(.secondary)
+                Text(caption).font(.app(.caption)).foregroundStyle(.secondary)
             }
         }
     }

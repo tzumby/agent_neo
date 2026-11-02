@@ -581,7 +581,7 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 
 | Kind | Data | Emitted when |
 |---|---|---|
-| `message` | `role` (user or assistant), `text`, `task`, `by`, `schedule` ({id, name} for a scheduled run), `quiet` (a scheduled run that found nothing: shown collapsed) | A request starts; an answer is final; agentd says something outside a task (e.g. a skipped schedule, or that a schedule's rules changed) |
+| `message` | `role` (user or assistant), `text`, `task`, `by`, `schedule` ({id, name} for a scheduled run), `quiet` (a scheduled run that found nothing: the apps collapse it into "Nothing new" when it's one short line, and show a longer report in full) | A request starts; an answer is final; agentd says something outside a task (e.g. a skipped schedule, or that a schedule's rules changed) |
 | `task.started` | `task`, `model` | A task starts |
 | `step` | `task`, `step`, `tool`, `args` (first 300 characters) | Each tool call, except a resumed one |
 | `shell` | `task`, `command`, `as_root`, `needs_approval`, `secrets` (key names) | A command is about to run or ask |
@@ -925,8 +925,8 @@ Web pages, emails and command output can carry injected instructions. The defenc
   - never a rule;
   - nothing replaces, merges away or expires what the user stated without their approval.
 - **Modes (`memory_consolidation`):**
-  - `observe` (the default): writes the work log and proposes everything else as pending items;
-  - `auto`: applies facts (inferred), merges and expiries, and still proposes preferences;
+  - `observe` ("Review first" in the app): writes the work log and proposes everything else as pending items;
+  - `auto` ("Automatic", the default since 0.15.2): applies facts (inferred), merges and expiries, and still proposes preferences;
   - `off`: does nothing.
 - **Decay:**
   - facts not recalled for 60 days lose 10% importance per run;
@@ -1031,7 +1031,7 @@ The model therefore never sees a value, even if a command prints one or the user
 
   Never pushed: stopped tasks, Action needed's end (already pushed), pending memories, consolidation.
 - `push.rs` sends `{title, body, category, thread, data}` to the push relay's function URL. The request is signed with SigV4 using the desktop's instance role (§8).
-- Bodies are clipped to 180 characters and redacted.
+- Bodies are plain text (Markdown's marks dropped, list items as "•"; notifications don't render Markdown), on one line, clipped to 180 characters and redacted.
 - Categories:
   - `APPROVAL`: Approve/Deny on the notification (command, browser and schedule cards);
   - `ACTION`: Action needed;
@@ -1418,7 +1418,7 @@ Nothing shows while the desktop is idle, working or only has a schedule coming. 
 `make app-test` runs `swift test` on macOS. The tests cover:
 - decoding of Tailscale status and agentd status;
 - SSE lines;
-- the timeline: only the conversation and the cards waiting show, the later part of the log gives the same chat, Action needed, Stop, browser and schedule cards, key requests, scheduled runs, a command card's plain words;
+- the timeline: only the conversation and the cards waiting show, the later part of the log gives the same chat, Action needed, Stop, browser and schedule cards, key requests, scheduled runs (a one-line "nothing new" collapses, a report shows in full), a command card's plain words;
 - a page of events;
 - Markdown;
 - key detection;
@@ -1430,7 +1430,7 @@ Live tests run only with `AGENTD_URL` (a real agentd) or `VNC_ADDR` (a real VNC 
 
 The same screens as the iPhone's, in Mac form:
 - **Windows:** one chat window ("Cloud Desktop"; one only, as two would each stream the same chat) and the take-over window ("Your desktop"). Closing them leaves the app running for notifications; the Dock icon or a notification brings the chat back.
-- **Chat:** a column at most 760 points wide, centred. The model menu with its connection dot is the window's title. Return sends and ⌥Return starts a new line. The window's scroll view starts at the top when the first page arrives after it appeared, so the Mac scrolls to the end once the page is in (under the splash).
+- **Chat:** a column at most 760 points wide, centred. The model menu with its connection dot is the window's title. Return sends and ⌥Return starts a new line. The Mac's scroll view ignores `defaultScrollAnchor(.bottom)`: it starts at the top when the first page arrives after it appeared, and doesn't keep its end as the content grows. So the Mac scrolls to the end once the first page is in (under the splash), and `followEnd` scrolls back to the end whenever the content grows while the chat was at its end (sending sets that too). Scrolling up to read stops it, until you scroll back down; only a change of scroll position decides, since other geometry updates come between the content growing and the scroll catching up.
 - **Settings, Memory, the key editor:** sheets, as on the iPhone, sized for the Mac. ⌘, opens Settings while the chat window is in front. Lists are grouped forms (as in System Settings). Rows that have swipe actions on the iPhone have the same actions in a right-click menu. Memory exports go through a save panel instead of the share sheet.
 - **Take over:** swift-rfb's Metal view (`RFBView`), scaled to fit the window, wrapped in `MacDesktopView`. `RemoteDesktop.run(connect:renderer:)` hands the view every event and each connection's client, and the view paces updates itself. The pointer, scroll wheel and keys go to the desktop. A local key monitor sees ⌘ shortcuts before the menu does:
   - ⌘ itself never reaches the desktop (it would be Super);
@@ -1440,6 +1440,7 @@ The same screens as the iPhone's, in Mac form:
   - ⌘Q, ⌘W, ⌘H, ⌘M, ⌘, and ⌘` stay with the Mac.
 
   The toolbar has the connection dot, Paste, and I'm done while the card waits; I'm done resolves it and closes the window. The window's subtitle is the card's reason.
+- **Text sizes:** macOS's text styles are fixed and small (body 13 points) and it has no Dynamic Type, so the screens use `Font.app(_:)`: the system style on the iPhone, two points larger on the Mac (body 15, subheadline 13, caption 12, title3 17…). The Mac windows set the larger body as their default font.
 - **Before macOS 26:** `glass(_:)` draws the regular material with a hairline edge, and buttons are capsules in the iPhone's colours (white for the main action, a faint white for others), since the system's bordered buttons ignore a white tint.
 
 ## 11. End-to-end flows
@@ -1652,10 +1653,10 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 107 unit tests (plus a 5,000-memory speed test run on demand): bulk approval by reason, restore, where a memory came from and what a proposal replaces, export and import round trips, consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
+| agentd | 109 unit tests (plus a 5,000-memory speed test run on demand): bulk approval by reason, restore, where a memory came from and what a proposal replaces, export and import round trips, consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text notification bodies, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto (auto unless set), protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
-| DesktopKit | 28 tests (§10.8) |
+| DesktopKit | 29 tests (§10.8) |
 
 ## 14. How this differs from PLAN.MD
 

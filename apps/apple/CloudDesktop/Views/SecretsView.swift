@@ -82,10 +82,10 @@ private struct SecretRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(secret.label).font(.headline)
-            Text(secret.name).font(.caption.monospaced()).foregroundStyle(.secondary)
+            Text(secret.label).font(.app(.headline))
+            Text(secret.name).font(.app(.caption).monospaced()).foregroundStyle(.secondary)
             if let detail {
-                Text(detail).font(.caption).foregroundStyle(.tertiary)
+                Text(detail).font(.app(.caption)).foregroundStyle(.tertiary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -147,7 +147,7 @@ struct SecretEditor: View {
             if isNew {
                 Section {
                     TextField("Name, like GITHUB_TOKEN", text: $name)
-                        .font(.body.monospaced())
+                        .font(.app(.body).monospaced())
                         #if os(iOS)
                             .textInputAutocapitalization(.characters)
                         #endif
@@ -162,7 +162,7 @@ struct SecretEditor: View {
                 }
             } else {
                 Section {
-                    LabeledContent(label, value: name).font(.body.monospaced())
+                    LabeledContent(label, value: name).font(.app(.body).monospaced())
                 }
             }
             Section {

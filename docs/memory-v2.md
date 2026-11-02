@@ -336,7 +336,7 @@ The phone is notified when the person must act or can use a result, and at no ot
 | User-started task finished `done` | Yes, can use the result | none | Start of the answer, as today |
 | Task finished `error`, `interrupted`, `stuck`, `max_steps` | Yes, must act | none | "Your desktop hit a problem", as today |
 | Scheduled run ended with `report_outcome(result)` | Yes | none | The `summary` field, not the answer |
-| Scheduled run ended with `report_outcome(nothing)` | No | — | The chat gets a `message` event with `quiet: true`: the apps collapse it into "Nothing new" when it's one short line (≤ 200 characters), and show a longer report in full (2026-11-02: reports were hidden behind "Nothing new") |
+| Scheduled run ended with `report_outcome(nothing)` | No | — | The chat gets a `message` event with `quiet: true`: the apps show it as one grey line in its own words when it's one short line (≤ 200 characters), folded with the schedule's earlier such runs, and show a longer report in full. Since 2026-11-02 a scheduled run is a report in the chat, its prompt folded away as the instructions (it used to show as a bubble from the user, with the answer behind "Nothing new") |
 | Scheduled run ended with `report_outcome(blocked)` | Yes, must act | none | The `summary` |
 | Scheduled run ended without calling `report_outcome` | Yes (fail open) | none | Start of the answer; the journal counts `report_outcome_missing` so the prompt can be tuned |
 | `cancelled`, `needs_user` (already pushed), pending memories, consolidation finished | No | — | Visible in the app |

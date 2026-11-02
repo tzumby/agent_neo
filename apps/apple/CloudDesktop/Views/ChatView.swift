@@ -313,9 +313,9 @@ struct ChatView: View {
         }
     }
 
-    /// The id of the message that started a task.
+    /// The id of the row where a task started: its message, or its report.
     private func prompt(of task: String) -> String? {
-        store.timeline.items.first { if case .user(let message) = $0 { message.task == task } else { false } }?.id
+        store.timeline.itemID(startingTask: task)
     }
 
     /// Where the stage banner leads.

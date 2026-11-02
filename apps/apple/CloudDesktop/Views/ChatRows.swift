@@ -10,9 +10,10 @@ struct ChatRow: View, Equatable {
 
     var body: some View {
         switch item {
-        case .user(let message): UserBubble(text: message.text, schedule: message.schedule)
+        case .user(let message): UserBubble(text: message.text)
         case .assistant(let message):
-            if message.quiet { QuietMessage(text: message.text) } else { AssistantMessage(text: message.text) }
+            if message.quiet { QuietLine(text: message.text) } else { AssistantMessage(text: message.text) }
+        case .report(let report): ReportRow(report: report)
         case .approval(let approval):
             if let request = approval.secret {
                 SecretRequestCard(approval: approval, request: request)
@@ -33,26 +34,17 @@ struct ChatRow: View, Equatable {
 
 private struct UserBubble: View {
     let text: String
-    /// Set when the desktop sent this itself: a scheduled task's run.
-    let schedule: String?
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: 6) {
-            if let schedule {
-                Label("Scheduled · \(schedule)", systemImage: "clock")
-                    .font(.app(.caption))
-                    .foregroundStyle(.secondary)
+        Text(text)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+            .background(Theme.userBubble, in: .rect(cornerRadius: 22))
+            .contextMenu {
+                Button("Copy", systemImage: "doc.on.doc") { Clipboard.copy(text) }
             }
-            Text(text)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 11)
-                .background(Theme.userBubble, in: .rect(cornerRadius: 22))
-                .contextMenu {
-                    Button("Copy", systemImage: "doc.on.doc") { Clipboard.copy(text) }
-                }
-        }
-        .frame(maxWidth: .infinity, alignment: .trailing)
-        .padding(.leading, 56)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.leading, 56)
     }
 }
 
@@ -69,32 +61,145 @@ private struct AssistantMessage: View {
     }
 }
 
-/// A scheduled run's answer when it found nothing new: one quiet line, the
-/// text on a tap. (Its phone stayed quiet too.)
-private struct QuietMessage: View {
-    let text: String
-    @State private var open = false
+/// A scheduled run's report, not a message from the user: the schedule and
+/// when, its instructions on a tap, then what it found. A run that found
+/// nothing is one grey line with its own words ("No spike: 5.4k requests"),
+/// earlier such runs folded under it; a result is a card.
+private struct ReportRow: View {
+    let report: Report
+    @State private var showInstructions = false
+    @State private var showEarlier = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        if let answer = report.answer, !report.quiet {
+            VStack(alignment: .leading, spacing: 12) {
+                header
+                if showInstructions { instructions }
+                MarkdownView(text: answer.text)
+                CopyButton(text: answer.text).font(.app(.footnote))
+            }
+            .card()
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                header
+                if showInstructions { instructions }
+                if let answer = report.answer {
+                    QuietLine(text: answer.text)
+                    if !report.earlier.isEmpty { earlier }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// "APX attack spike watch · 12:00", or for folded runs "· 4 checks, 9:00–12:00".
+    private var header: some View {
+        Button {
+            withAnimation(.snappy(duration: 0.2)) { showInstructions.toggle() }
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: "clock")
+                Text(report.schedule).fontWeight(.semibold).foregroundStyle(.primary.opacity(0.85))
+                Text("· \(when)")
+                Image(systemName: "chevron.right")
+                    .font(.app(.caption2).weight(.bold))
+                    .rotationEffect(.degrees(showInstructions ? 90 : 0))
+            }
+            .font(.app(.footnote))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .help("Scheduled task. Show the instructions it runs with")
+        .contextMenu {
+            if let answer = report.answer {
+                Button("Copy the report", systemImage: "doc.on.doc") { Clipboard.copy(answer.text) }
+            }
+            Button("Copy the instructions", systemImage: "doc.on.doc") { Clipboard.copy(report.instructions) }
+        }
+    }
+
+    private var when: String {
+        guard let first = report.earlier.first else { return Self.time(report.ts) }
+        return "\(report.earlier.count + 1) checks, \(Self.time(first.ts))–\(Self.time(report.ts))"
+    }
+
+    private var instructions: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Instructions").font(.app(.caption).weight(.semibold))
+            Text(report.instructions).font(.app(.footnote)).textSelection(.enabled)
+        }
+        .foregroundStyle(.secondary)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.inset, in: .rect(cornerRadius: 14))
+        .transition(.opacity)
+    }
+
+    /// The folded runs, newest first, with their times.
+    private var earlier: some View {
+        VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(.snappy(duration: 0.2)) { open.toggle() }
+                withAnimation(.snappy(duration: 0.2)) { showEarlier.toggle() }
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "moon.zzz").font(.app(.footnote))
-                    Text("Nothing new").font(.app(.subheadline))
+                HStack(spacing: 4) {
+                    Text(report.earlier.count == 1 ? "1 earlier check" : "\(report.earlier.count) earlier checks")
                     Image(systemName: "chevron.right")
                         .font(.app(.caption2).weight(.bold))
-                        .rotationEffect(.degrees(open ? 90 : 0))
+                        .rotationEffect(.degrees(showEarlier ? 90 : 0))
                 }
-                .foregroundStyle(.secondary)
+                .font(.app(.caption).weight(.medium))
+                .foregroundStyle(.tertiary)
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
-            if open {
-                MarkdownView(text: text).foregroundStyle(.secondary)
+            .padding(.leading, 26)
+            if showEarlier {
+                ForEach(report.earlier.reversed(), id: \.id) { run in
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text(Self.time(run.ts)).monospacedDigit().foregroundStyle(.tertiary)
+                        if let answer = run.answer { QuietLine.inline(answer.text) }
+                    }
+                    .font(.app(.footnote))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 26)
+                }
             }
         }
+    }
+
+    /// Today: "12:00"; earlier: "Nov 1, 12:00".
+    static func time(_ ts: String) -> String {
+        guard let date = Date(agentTimestamp: ts) else { return "" }
+        return Calendar.current.isDateInToday(date)
+            ? date.formatted(date: .omitted, time: .shortened)
+            : date.formatted(.dateTime.month(.abbreviated).day().hour().minute())
+    }
+}
+
+/// A run that found nothing: its own one line, grey. (Its phone stayed quiet.)
+private struct QuietLine: View {
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "moon.zzz").font(.app(.footnote))
+            Self.inline(text).fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.app(.subheadline))
+        .foregroundStyle(.secondary)
+        .contextMenu {
+            Button("Copy", systemImage: "doc.on.doc") { Clipboard.copy(text) }
+        }
+    }
+
+    /// The line's Markdown (bold, code, links), inline.
+    static func inline(_ text: String) -> Text {
+        if case .paragraph(let attributed)? = MarkdownBlock.parse(text).first {
+            return MarkdownText.text(attributed)
+        }
+        return Text(text)
     }
 }
 

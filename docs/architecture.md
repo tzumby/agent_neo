@@ -578,7 +578,7 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 
 | Kind | Data | Emitted when |
 |---|---|---|
-| `message` | `role` (user or assistant), `text`, `task`, `by`, `schedule` ({id, name} for a scheduled run), `quiet` (a scheduled run that found nothing: the apps collapse it into "Nothing new" when it's one short line, and show a longer report in full) | A request starts; an answer is final; agentd says something outside a task (e.g. a skipped schedule, or that a schedule's rules changed) |
+| `message` | `role` (user or assistant), `text`, `task`, `by`, `schedule` ({id, name} for a scheduled run), `quiet` (a scheduled run that found nothing: the apps show it as one grey line when it's one short line, folded with the schedule's other such runs, and show a longer report in full) | A request starts; an answer is final; agentd says something outside a task (e.g. a skipped schedule, or that a schedule's rules changed) |
 | `task.started` | `task`, `model` | A task starts |
 | `step` | `task`, `step`, `tool`, `args` (first 300 characters) | Each tool call, except a resumed one |
 | `shell` | `task`, `command`, `as_root`, `needs_approval`, `secrets` (key names) | A command is about to run or ask |
@@ -1352,7 +1352,8 @@ None of them imports UIKit; the app targets hold everything platform-specific ex
   - the model menu, with a model picker, the Browser actions switch and a connection dot;
   - "Your desktop", which opens take-over.
 - **Rows:**
-  - user bubbles ("Scheduled · name" for scheduled runs);
+  - user bubbles;
+  - **scheduled runs as reports**, not as the user speaking: a header with a clock, the schedule's name and the time ("APX attack spike watch · 1:00 PM"); tapping it shows the instructions (the run's prompt). A report that found something is a card with the answer as Markdown and Copy. A run that found nothing is one grey line in its own words ("No spike: 5.5k total…"); runs of one schedule that found nothing, one after another, fold into the latest ("4 checks, 9:00 AM–12:00 PM", "3 earlier checks" opens them). The header's context menu copies the report or the instructions;
   - answers rendered as Markdown, with code chips, tables that scroll sideways, code blocks with Copy, and long-press to copy the answer;
   - cards, only while they wait for the user (answered, they leave the chat):
     - **Needs your OK** for a command: what it does in plain words (the model's `summary`), why it needs the OK, a warning when the agent read outside content before asking (its words could be steered), and the command behind "Show the command";
@@ -1416,7 +1417,7 @@ Nothing shows while the desktop is idle, working or only has a schedule coming. 
 `make app-test` runs `swift test` on macOS. The tests cover:
 - decoding of Tailscale status and agentd status;
 - SSE lines;
-- the timeline: only the conversation and the cards waiting show, the later part of the log gives the same chat, Action needed, Stop, browser and schedule cards, key requests, scheduled runs (a one-line "nothing new" collapses, a report shows in full), a command card's plain words;
+- the timeline: only the conversation and the cards waiting show, the later part of the log gives the same chat, Action needed, Stop, browser and schedule cards, key requests, scheduled runs as reports (the answer goes into its run's report; a one-line "nothing new" is quiet, a report shows in full; quiet runs of one schedule fold into the latest until one finds something, keeping the first one's id; "Open that conversation" finds a folded run), a command card's plain words;
 - a page of events;
 - Markdown;
 - key detection;
@@ -1522,7 +1523,7 @@ The same screens as the iPhone's, in Mac form:
    - `schedule_task(cron "0 8 * * 1-5")` in the user's zone (America/Toronto);
    - next run computed with DST;
    - `schedule.created` emitted; the answer says so, and Settings → Schedules lists it.
-2. At 08:00 local, the scheduler (woken by its timer) starts a task with the stored prompt, no history and the scheduled framing. The chat shows "Scheduled · Morning inbox".
+2. At 08:00 local, the scheduler (woken by its timer) starts a task with the stored prompt, no history and the scheduled framing. The chat shows a report headed "Morning inbox · 8:00 AM".
 3. If a parked task or another task is running, the scheduler retries every 5 s. A run that's an hour late is skipped with a note.
 4. The answer is pushed, titled "Morning inbox". The schedule moves to the next weekday.
 
@@ -1654,7 +1655,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 | agentd | 110 unit tests (plus a 5,000-memory speed test run on demand): memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text notification bodies, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the app's filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
-| DesktopKit | 29 tests (§10.8) |
+| DesktopKit | 30 tests (§10.8) |
 
 ## 14. How this differs from PLAN.MD
 

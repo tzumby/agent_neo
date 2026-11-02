@@ -2,8 +2,9 @@ import AgentAPI
 import Foundation
 
 /// The chat as the apps show it, built from agentd's event log: the user's
-/// messages, the agent's answers and pictures, and the cards waiting for the
-/// user. What the agent does on the way (steps, commands, saves) stays out;
+/// messages, the agent's answers and pictures, scheduled runs as reports, and
+/// the cards waiting for the user. What the agent does on the way (steps,
+/// commands, saves) stays out;
 /// `busy` only says that it's working. A pure value: apply events in order.
 /// Replaying the later part of the log gives the chat of that part, so the
 /// apps can load it a page at a time from the newest.
@@ -23,6 +24,8 @@ public struct ChatTimeline: Sendable, Equatable {
 
     private var approvalIndex: [String: Int] = [:]
     private var actionIndex: [String: Int] = [:]
+    /// A scheduled run's report, by task: its answer goes into it.
+    private var reportIndex: [String: Int] = [:]
 
     public init() {}
 
@@ -31,16 +34,40 @@ public struct ChatTimeline: Sendable, Equatable {
         events.forEach { apply($0) }
     }
 
-    /// What the chat shows: messages, pictures, and the cards still waiting
-    /// for an answer (answered, they leave the chat).
+    /// What the chat shows: messages, pictures, reports, and the cards still
+    /// waiting for an answer (answered, they leave the chat). Runs of one
+    /// schedule that found nothing, one after another, fold into the latest
+    /// (an hourly check doesn't fill the chat); the row keeps the first one's id.
     public var visibleItems: [ChatItem] {
-        items.filter {
-            switch $0 {
-            case .approval(let approval): approval.state == .pending
-            case .action(let action): action.state == .pending
-            default: true
+        var shown: [ChatItem] = []
+        for item in items {
+            switch item {
+            case .approval(let approval) where approval.state != .pending: continue
+            case .action(let action) where action.state != .pending: continue
+            case .report(var report) where report.quiet:
+                if case .report(let previous) = shown.last, previous.quiet, previous.schedule == report.schedule {
+                    report.earlier = previous.earlier + [previous.alone]
+                    report.groupID = previous.groupID ?? previous.id
+                    shown[shown.count - 1] = .report(report)
+                } else {
+                    shown.append(item)
+                }
+            default: shown.append(item)
             }
         }
+        return shown
+    }
+
+    /// The row that shows where a task started: its message, or its report
+    /// (maybe folded into a later one). For "Open that conversation".
+    public func itemID(startingTask task: String) -> String? {
+        visibleItems.first { item in
+            switch item {
+            case .user(let message): message.task == task
+            case .report(let report): report.task == task || report.earlier.contains { $0.task == task }
+            default: false
+            }
+        }?.id
     }
 
     /// Stop was pressed: show it at once, before agentd's events arrive.
@@ -55,15 +82,28 @@ public struct ChatTimeline: Sendable, Equatable {
             let text = data["text"]?.string ?? ""
             let task = data["task"]?.string
             if data["role"]?.string == "user" {
-                // A scheduled run's prompt, started by the desktop on its own.
-                let schedule = data["schedule"]?["name"]?.string
-                items.append(.user(Message(id: event.seq, text: text, task: task, schedule: schedule)))
+                if let schedule = data["schedule"]?["name"]?.string {
+                    // A scheduled run, started by the desktop on its own: a
+                    // report, its prompt folded away as the instructions.
+                    if let task { reportIndex[task] = items.count }
+                    items.append(
+                        .report(Report(id: event.seq, task: task, schedule: schedule, instructions: text, ts: event.ts)))
+                } else {
+                    items.append(.user(Message(id: event.seq, text: text, task: task)))
+                }
             } else {
-                // A scheduled run that found nothing: shown collapsed, when
-                // it says so in a line. A report is shown as one even when
+                // A scheduled run that found nothing: one quiet line, when it
+                // says so in a line. A report is shown as one even when
                 // nothing in it needed the user (no notification came).
                 let quiet = data["quiet"]?.bool == true && Message.isOneLine(text)
-                items.append(.assistant(Message(id: event.seq, text: text, task: task, quiet: quiet)))
+                let message = Message(id: event.seq, text: text, task: task, quiet: quiet)
+                if let task, let index = reportIndex[task], case .report(var report) = items[index], report.answer == nil {
+                    report.answer = message
+                    items[index] = .report(report)
+                } else {
+                    // An answer (or one whose report is on an older page).
+                    items.append(.assistant(message))
+                }
             }
         case "task.started":
             busy = true
@@ -162,6 +202,8 @@ public struct ChatTimeline: Sendable, Equatable {
 public enum ChatItem: Sendable, Equatable, Identifiable {
     case user(Message)
     case assistant(Message)
+    /// A scheduled run: the schedule, when, and what it found.
+    case report(Report)
     case approval(Approval)
     case action(Action)
     case image(Picture)
@@ -170,6 +212,7 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
         switch self {
         case .user(let m): "user-\(m.id)"
         case .assistant(let m): "assistant-\(m.id)"
+        case .report(let r): "report-\(r.groupID ?? r.id)"
         case .approval(let a): "approval-\(a.id)"
         case .action(let a): "action-\(a.id)"
         case .image(let p): "image-\(p.id)"
@@ -180,6 +223,7 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
     public var seq: Int {
         switch self {
         case .user(let m), .assistant(let m): m.id
+        case .report(let r): r.groupID ?? r.id
         case .approval(let a): a.seq
         case .action(let a): a.seq
         case .image(let p): p.id
@@ -192,15 +236,53 @@ public struct Message: Sendable, Equatable {
     public let text: String
     /// The task it started or answered.
     public var task: String? = nil
-    /// For a scheduled run's prompt: the schedule's name.
-    public var schedule: String? = nil
-    /// A scheduled run's answer when it found nothing new: shown collapsed.
+    /// A scheduled run's answer when it found nothing new: one quiet line.
     public var quiet = false
 
     /// "Nothing new since 8:00." rather than a report: a single short line.
     static func isOneLine(_ text: String) -> Bool {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return !text.contains("\n") && text.count <= 200
+    }
+}
+
+/// A scheduled run as the chat shows it: not the user speaking, but the
+/// schedule's report. Its prompt is kept as the instructions, out of the way.
+public struct Report: Sendable, Equatable {
+    /// The seq of the run's prompt.
+    public let id: Int
+    public let task: String?
+    /// The schedule's name.
+    public let schedule: String
+    /// The prompt the run was given.
+    public let instructions: String
+    /// When it started (agentd's ISO 8601 timestamp).
+    public let ts: String
+    /// The report; nil while the run works (or waits on a card).
+    public var answer: Message? = nil
+    /// Earlier runs of this schedule that found nothing, oldest first, folded
+    /// into this one (`visibleItems`).
+    public var earlier: [Report] = []
+    /// The first folded run's id, which the folded row keeps.
+    public var groupID: Int? = nil
+
+    public init(id: Int, task: String?, schedule: String, instructions: String, ts: String) {
+        self.id = id
+        self.task = task
+        self.schedule = schedule
+        self.instructions = instructions
+        self.ts = ts
+    }
+
+    /// It found nothing new, and said so in a line.
+    public var quiet: Bool { answer?.quiet == true }
+
+    /// This run on its own, without what's folded into it.
+    var alone: Report {
+        var report = self
+        report.earlier = []
+        report.groupID = nil
+        return report
     }
 }
 

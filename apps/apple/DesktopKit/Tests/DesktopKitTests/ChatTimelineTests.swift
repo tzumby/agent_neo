@@ -173,20 +173,66 @@ private func aTask() throws -> [AgentEvent] {
     #expect(timeline.visibleItems.count == 1)  // the user's message
 }
 
-@Test func scheduledRunsAreLabelledAndQuietAnswersCollapse() throws {
+private func event(_ seq: Int, _ kind: String, _ json: String, at ts: String) throws -> AgentEvent {
+    AgentEvent(seq: seq, ts: ts, kind: kind, data: try JSONDecoder().decode(JSONValue.self, from: Data(json.utf8)))
+}
+
+/// A scheduled run's prompt and answer, as agentd logs them.
+private func run(_ seq: Int, _ task: String, _ schedule: String, _ answer: String, quiet: Bool) throws -> [AgentEvent] {
+    let ts = "2026-11-02T1\(seq / 10 % 10):00:00.000Z"
+    return [
+        try event(
+            seq, "message",
+            #"{"role":"user","text":"Check the dashboard and report spikes","task":"\#(task)","schedule":{"id":4,"name":"\#(schedule)"}}"#,
+            at: ts),
+        try event(seq + 1, "task.started", #"{"task":"\#(task)","model":"m"}"#, at: ts),
+        try event(
+            seq + 2, "message", #"{"role":"assistant","text":"\#(answer)","task":"\#(task)","quiet":\#(quiet)}"#, at: ts),
+        try event(seq + 3, "task.finished", #"{"task":"\#(task)","status":"done"}"#, at: ts),
+    ]
+}
+
+@Test func aScheduledRunIsAReportNotTheUserSpeaking() throws {
     var timeline = ChatTimeline()
-    timeline.apply(
-        try event(1, "message", #"{"role":"user","text":"Summarize my inbox","task":"t2","schedule":{"id":4,"name":"Inbox"}}"#))
-    timeline.apply(try event(2, "message", #"{"role":"assistant","text":"Inbox is clear.","task":"t2","quiet":true}"#))
-    timeline.apply(try event(3, "message", #"{"role":"assistant","text":"Done.","task":"t3"}"#))
-    guard case .user(let prompt) = timeline.items[0], case .assistant(let quiet) = timeline.items[1],
-        case .assistant(let loud) = timeline.items[2]
-    else {
-        Issue.record("no messages")
+    let events = try run(1, "t2", "Inbox", "Inbox is clear.", quiet: true)
+    events[..<2].forEach { timeline.apply($0) }
+    // Working: the report's header, no answer yet, no bubble from the user.
+    guard case .report(let working) = timeline.visibleItems.first else {
+        Issue.record("no report")
         return
     }
-    #expect(prompt.schedule == "Inbox" && prompt.task == "t2")
-    #expect(quiet.quiet && !loud.quiet)
+    #expect(working.schedule == "Inbox" && working.instructions.hasPrefix("Check the dashboard") && working.answer == nil)
+    #expect(working.ts == "2026-11-02T10:00:00.000Z")
+    events[2...].forEach { timeline.apply($0) }
+    timeline.apply(try event(9, "message", #"{"role":"assistant","text":"Done.","task":"t3"}"#))
+    guard case .report(let done) = timeline.items[0], case .assistant(let loud) = timeline.items[1] else {
+        Issue.record("no report and answer")
+        return
+    }
+    #expect(done.answer?.text == "Inbox is clear." && done.quiet && done.task == "t2")
+    #expect(!loud.quiet && timeline.items.count == 2)
+}
+
+@Test func runsThatFoundNothingFoldIntoTheLatestUntilOneFindsSomething() throws {
+    var events: [AgentEvent] = []
+    events += try run(10, "a1", "Spike watch", "No spike: 5.3k total", quiet: true)
+    events += try run(20, "a2", "Spike watch", "No spike: 5.4k total", quiet: true)
+    events += try run(30, "n1", "News", "Nothing new.", quiet: true)  // another schedule in between
+    events += try run(40, "a3", "Spike watch", "No spike: 5.2k total", quiet: true)
+    events += try run(50, "a4", "Spike watch", "No spike: 5.6k total", quiet: true)
+    // JSON-escaped newlines: a report with a list.
+    events += try run(60, "a5", "Spike watch", #"**Spike:** 41k mitigated requests\n\n- from one ASN"#, quiet: false)
+    events += try run(70, "a6", "Spike watch", "Back to normal: 5.5k total", quiet: true)
+    let timeline = ChatTimeline(replaying: events)
+    let reports: [Report] = timeline.visibleItems.compactMap { if case .report(let r) = $0 { r } else { nil } }
+    #expect(reports.map(\.task) == ["a2", "n1", "a4", "a5", "a6"])
+    #expect(reports[0].earlier.map(\.task) == ["a1"] && reports[2].earlier.map(\.task) == ["a3"])
+    // The folded row keeps its first run's id, so it doesn't jump as checks arrive.
+    #expect(timeline.visibleItems[0].id == "report-10" && timeline.visibleItems[2].id == "report-40")
+    #expect(!reports[3].quiet && reports[3].earlier.isEmpty)
+    // "Open that conversation" finds a run folded into a later one.
+    #expect(timeline.itemID(startingTask: "a3") == "report-40")
+    #expect(timeline.itemID(startingTask: "a5") == "report-60")
 }
 
 @Test func aReportFromARunThatFoundNothingUrgentIsShownInFull() throws {

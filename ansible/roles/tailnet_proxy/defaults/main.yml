@@ -8,17 +8,20 @@ tailnet_proxy_vnc: 127.0.0.1:5900
 tailnet_proxy_ssm_prefix: /cloud-desktops/dev
 tailnet_proxy_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"
 
-# Where the auth key and allowlist are. A desktop on its user's own tailnet
-# (inventory: desktop_tailnet "own") reads only that user's, under
-# tailscale/users/<user>/, never the operator's: a missing key fails the play.
-tailnet_proxy_own_tailnet: "{{ (desktop_tailnet | default('shared')) == 'own' }}"
+# A desktop on the desktops tailnet (inventory: desktop_tailnet "desktops")
+# reads its auth key from tailscale/users/<user>/auth_key, made for it by
+# scripts/tailnet.py, never the operator's: a missing key fails the play. Only
+# its user's devices (tag:user-<user>) get in.
+tailnet_proxy_desktops_tailnet: "{{ (desktop_tailnet | default('shared')) == 'desktops' }}"
 tailnet_proxy_params: >-
   {{ tailnet_proxy_ssm_prefix ~ '/tailscale'
-     ~ (('/users/' ~ desktop_user) if tailnet_proxy_own_tailnet | bool else '') }}
+     ~ (('/users/' ~ desktop_user) if tailnet_proxy_desktops_tailnet | bool else '') }}
+tailnet_proxy_allow_tags: "{{ ('tag:user-' ~ desktop_user) if tailnet_proxy_desktops_tailnet | bool else '' }}"
 
-# Tailscale login names let in (comma-separated), from SSM so they stay out of
-# git. Empty or missing: anyone the tailnet policy lets through (the operator's
-# tailnet only: an own-tailnet desktop requires one).
+# On the operator's tailnet: Tailscale login names let in (comma-separated),
+# from SSM so they stay out of git. Empty or missing: anyone the tailnet
+# policy lets through. Not used on the desktops tailnet.
 tailnet_proxy_allow: >-
-  {{ lookup('amazon.aws.ssm_parameter', tailnet_proxy_params ~ '/allowed_logins',
+  {{ '' if tailnet_proxy_desktops_tailnet | bool else
+     lookup('amazon.aws.ssm_parameter', tailnet_proxy_params ~ '/allowed_logins',
             region=tailnet_proxy_ssm_region, on_missing='skip') | default('', true) }}

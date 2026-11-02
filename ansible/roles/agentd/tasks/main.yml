@@ -96,6 +96,19 @@
   # A dry run hasn't written the unit yet.
   ignore_errors: "{{ ansible_check_mode }}"
 
+- name: Set up the shell user's egress proxy
+  ansible.builtin.import_tasks: egress.yml
+
+# Squid must run with its new allowlist before the shell user downloads
+# anything. This runs the handlers notified so far, so it comes before any
+# task that notifies "Restart agentd": on a new desktop, agentd's unit isn't
+# installed until the end of the role (found setting up a tester's desktop).
+- name: Apply the proxy changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Set up Nix for the shell user
+  ansible.builtin.import_tasks: nix.yml
+
 - name: Install the binary
   ansible.builtin.copy:
     src: "{{ agentd_binary }}"
@@ -186,16 +199,6 @@
   no_log: true
   when: agentd_gateway_url | length == 0
   notify: Restart agentd
-
-- name: Set up the shell user's egress proxy
-  ansible.builtin.import_tasks: egress.yml
-
-# Squid must run with its new allowlist before the shell user downloads anything.
-- name: Apply the proxy changes now
-  ansible.builtin.meta: flush_handlers
-
-- name: Set up Nix for the shell user
-  ansible.builtin.import_tasks: nix.yml
 
 - name: Install the agent's skills
   ansible.builtin.copy:

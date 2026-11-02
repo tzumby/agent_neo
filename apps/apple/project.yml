@@ -47,6 +47,11 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         APSEnvironment: $(APS_ENVIRONMENT)
+        NSCameraUsageDescription: To scan the setup code you were sent.
+        # Setup links for testers' devices: clouddesktop://join?key=… (SetupLink)
+        CFBundleURLTypes:
+          - CFBundleURLName: com.tzumby.clouddesktop.setup
+            CFBundleURLSchemes: [clouddesktop]
         UILaunchScreen:
           UIColorName: LaunchBackground # black, like the splash
         UIApplicationSceneManifest:
@@ -86,6 +91,9 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         APSEnvironment: $(APS_ENVIRONMENT)
+        CFBundleURLTypes:
+          - CFBundleURLName: com.tzumby.clouddesktop.setup
+            CFBundleURLSchemes: [clouddesktop]
         LSApplicationCategoryType: public.app-category.productivity
     settings:
       base:

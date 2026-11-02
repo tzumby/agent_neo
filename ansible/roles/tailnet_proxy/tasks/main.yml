@@ -4,14 +4,13 @@
 - name: Check this desktop's tailnet settings
   ansible.builtin.assert:
     that:
-      - desktop_user | default('') | length > 0
-      - tailnet_proxy_allow | length > 0
+      - desktop_user | default('') is match('^[a-z][a-z0-9-]{1,19}$')
     fail_msg: >-
-      This desktop joins its user's own tailnet, so it needs that user's allowlist at
-      {{ tailnet_proxy_params }}/allowed_logins (and auth key at .../auth_key):
-      scripts/new-desktop.sh stores both.
+      This desktop joins the desktops tailnet, so it needs its user's name (EC2 tag User)
+      for its key at {{ tailnet_proxy_params }}/auth_key and its rule (tag:user-<name>):
+      scripts/new-desktop.sh sets both up.
     quiet: true
-  when: tailnet_proxy_own_tailnet | bool
+  when: tailnet_proxy_desktops_tailnet | bool
 
 # --- Migration from viewer-proxy (keeps the same tailnet device) --------------
 

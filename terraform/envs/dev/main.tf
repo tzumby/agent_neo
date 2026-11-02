@@ -231,9 +231,10 @@ resource "aws_instance" "test_desktop" {
 
 # --- Other desktops (a tester, later users) ----------------------------------
 # One per entry in var.desktops, set up like the test desktop: its own role,
-# its user's own encryption key, a private subnet, no inbound. It joins its
-# user's own tailnet with their auth key (Tailnet = "own"): never the
-# operator's. Added and set up with scripts/new-desktop.sh.
+# its user's own encryption key, a private subnet, no inbound. It joins the
+# desktops tailnet (Tailnet = "desktops"), tagged tag:desktop-<name>, where
+# only devices tagged tag:user-<name> reach it (scripts/tailnet.py); never
+# the operator's personal tailnet. Added and set up with scripts/new-desktop.sh.
 
 module "desktop_identity" {
   source   = "../../modules/desktop_identity"
@@ -276,7 +277,7 @@ resource "aws_instance" "desktop" {
     Name        = "${local.name}-desktop-${each.key}"
     Role        = "desktop"
     User        = each.key
-    Tailnet     = "own"
+    Tailnet     = "desktops"
     TailnetName = "cloud-desktop-${each.key}"
   }
 

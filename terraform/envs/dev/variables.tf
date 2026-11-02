@@ -117,7 +117,7 @@ variable "users" {
 }
 
 variable "desktops" {
-  description = "Desktops besides the test desktop, one per user, by name (a tester, later users). Each joins its user's own tailnet. Each name must also be in users (its encryption key). Added with scripts/new-desktop.sh."
+  description = "Desktops besides the test desktop, one per user, by name (a tester, later users). Each joins the desktops tailnet, where only its user's devices reach it. Each name must also be in users (its encryption key). Added with scripts/new-desktop.sh."
   type = map(object({
     # Defaults to desktop_instance_type.
     instance_type = optional(string)

@@ -1,15 +1,17 @@
 # Onboarding a tester
 
-*2026-11-02. How to give someone else a desktop and the apps: a notarized Mac app, the iPhone app through TestFlight, and their own desktop on their own tailnet. You run every step from your laptop; nothing is fully automated yet. The tester's part is in §4 and §7, written so you can send it to them.*
+*2026-11-02. How to give someone else a desktop and the apps: a notarized Mac app, the iPhone app through TestFlight, and their own desktop. You run every step from your laptop; nothing is fully automated yet. The tester only installs the apps and scans a setup code (or taps its link) per device: no Tailscale account (§7, written so you can send it to them).*
 
 ## 0. Before you start
 
-**What the tester gets:** their own VM, set up like yours, with its own IAM role, encryption key, chat, memory and logged-in Chrome. It joins **their own tailnet**, never yours: your Tailscale policy doesn't change, and their devices never reach yours.
+**What the tester gets:** their own VM, set up like yours, with its own IAM role, encryption key, chat, memory and logged-in Chrome.
+- It joins the **desktops tailnet**: a second Tailscale account of yours, kept for testers' desktops. Your personal tailnet, your devices and your own desktop stay as they are.
+- Their phone and Mac join that tailnet with **setup links** you send them. Each link carries a single-use key, tagged for them, so they need no Tailscale account, and tagged devices don't count as Tailscale users (the free plan covers it).
+- The tailnet's rules, which `scripts/tailnet.py` writes from Terraform's list of desktops, let each tester's devices reach their own desktop on ports 443 and 5900, and nothing else. Tailscale checks built-in tests on every change: if a rule would let one tester reach another's desktop, it refuses the rules.
 
 **What they need:**
 - an iPhone on iOS 26;
-- or a Mac with Apple silicon on macOS 15.6 or later (TailscaleKit has no Intel build);
-- a free Tailscale account.
+- or a Mac with Apple silicon on macOS 15.6 or later (TailscaleKit has no Intel build).
 
 **What it costs you:**
 - their instance (`desktop_instance_type`, a t3a.medium like yours) and its 20 GB disk;
@@ -24,18 +26,29 @@
 
 | Step | Who | Time |
 |---|---|---|
-| §1 Code changes deployed (relay, agentd) | you | part of §5 |
-| §2 Apple setup, once | you | 15 min |
+| §1 Code changes deployed (relay, agentd, tailnet-proxy) | you | part of §5 |
+| §2 Apple setup and the desktops tailnet, once | you | 25 min |
 | §3 The apps: notarized DMG, TestFlight upload | you | 20 min, mostly waiting |
-| §4 Their Tailscale: account, tag, auth key | the tester | 5 min |
-| §5 Their desktop: `make new-desktop` | you | 20 min, mostly waiting |
-| §6 TestFlight: their invitation | you | 5 min, plus Apple's review |
-| §7 First run | the tester | 5 min |
+| §4 TestFlight: their invitation | you | 5 min, plus Apple's review |
+| §5 Their desktop and setup links: `make new-desktop` | you | 20 min, mostly waiting |
+| §6 Sending them the apps and links | you | 2 min |
+| §7 First run | the tester | 2 min |
 
 ## 1. What changed in the code for this
 
-- **Desktops per person.** In Terraform, `desktops = { <name> = {} }` adds a desktop like the test desktop for a user also listed in `users`, who needs an encryption key. Each instance is tagged with its user and tailnet: `Tailnet = "own"`, and `shared` for yours.
-- **Ansible follows those tags.** A desktop on its user's own tailnet reads its auth key and allowlist from `/cloud-desktops/dev/tailscale/users/<name>/`, never yours: a missing key fails the play. Its tailnet name is `cloud-desktop-<name>`.
+- **Desktops per person.** In Terraform, `desktops = { <name> = {} }` adds a desktop like the test desktop for a user also listed in `users`, who needs an encryption key. Each instance is tagged with its user and tailnet: `Tailnet = "desktops"`, and `shared` (your personal tailnet) for yours.
+- **The desktops tailnet through its API** (`scripts/tailnet.py`, with the OAuth client from §2):
+  - its whole policy, from Terraform's `desktops`, with isolation tests;
+  - a one-hour key for each cloud desktop, tagged `tag:cloud-desktop` and `tag:desktop-<name>`, straight into SSM;
+  - setup links for the tester's devices, tagged `tag:user-<name>`, each single-use, valid for 3 days, printed with a QR code;
+  - listing and removing a tester's devices.
+- **Ansible follows those tags.** A desktop on the desktops tailnet reads its key from `/cloud-desktops/dev/tailscale/users/<name>/auth_key`, never your personal key: a missing key fails the play. Its tailnet name is `cloud-desktop-<name>`. tailnet-proxy lets in only devices tagged `tag:user-<name>` (`-allow-tags`), on top of the tailnet's rules.
+- **The apps take setup codes:** the QR code of a setup link (`clouddesktop://join?key=…`).
+  - On the iPhone, **Scan setup code** opens the camera.
+  - On both apps, **Use a picture of the code** reads one from a picture: on the iPhone, a photo or screenshot; on the Mac, an image file.
+  - The link also works tapped, or pasted with **Paste the link**.
+
+  The app asks before connecting, then joins with the key, which isn't needed again: the device keeps its identity. "Log in with Tailscale" stays, for you.
 - **Deploys can target one desktop.** `LIMIT=<instance id>` or `DESKTOP=<name>` work for `make desktop`, `agentd-deploy`, `tailnet-deploy` and `screenshot`. `DESKTOP=<name>` also works for `shell`, `viewer`, `agentd-logs` and `agentd-soak`. Without either, a deploy hits every desktop, the tester's included.
 - **Push works for distributed builds.** TestFlight and the notarized Mac app get tokens for Apple's production push servers, while your Xcode installs keep sandbox tokens.
   - The app now sends its environment when it registers.
@@ -47,7 +60,9 @@
 
 Your desktop gets this agentd with the next `make agentd-deploy`. It only matters to you if you install a TestFlight or notarized build yourself.
 
-## 2. Apple setup (you, once)
+## 2. Apple setup and the desktops tailnet (you, once)
+
+### Apple
 
 You've done most of this before; here's what this app needs.
 
@@ -69,6 +84,22 @@ You've done most of this before; here's what this app needs.
    ```
 
    It asks for that password and keeps it in your login keychain, so it's never in a file. Another profile name works too: run with `NOTARY_PROFILE=<name>`.
+
+### The desktops tailnet
+
+1. Make a second Tailscale account, any spare Google or GitHub identity, just for testers' desktops. Done 2026-11-02: `tzumby.github`.
+2. **DNS:** turn on MagicDNS and HTTPS Certificates.
+3. **Access controls → JSON editor:** add the tag the OAuth client carries, and save. `scripts/tailnet.py policy` writes everything else later, replacing the whole policy.
+   ```json
+   "tagOwners": { "tag:provisioner": ["autogroup:admin"] },
+   ```
+4. **Settings → Trust credentials → Credential → OAuth:**
+   - scopes Policy File (write), Devices Core (write), Posture Attributes (read) and Auth Keys (write);
+   - tag `tag:provisioner`;
+   - then **Generate credential**.
+5. While the secret is on screen: `make tailscale-oauth`, which asks for the client ID, then the secret (hidden input), and stores both in SSM.
+
+The OAuth client doesn't expire; revoke it in the admin console if it leaks, and store a new one. Your own devices signed in to this tailnet keep reaching each other under the rules the script writes, never the desktops.
 
 ## 3. The apps (you)
 
@@ -106,23 +137,19 @@ App Store Connect then processes the build: you get an email after 5 to 15 minut
 
 If Apple emails about a missing privacy manifest (ITMS-91053), it will name an API, likely from TailscaleKit. Tell me which, and we'll add the manifest with the right reason. The app itself uses none of those APIs.
 
-## 4. Their Tailscale (the tester; you can send them this)
+## 4. TestFlight: their invitation (you)
 
-> 1. Sign up at tailscale.com (the free Personal plan) with the account you'll use in the Cloud Desktop app.
-> 2. In the admin console, **DNS**: turn on **MagicDNS** and **HTTPS Certificates**.
-> 3. **Access controls**: add this to the policy file, inside the outer braces, and save:
->    ```json
->    "tagOwners": { "tag:cloud-desktop": ["autogroup:admin"] },
->    ```
->    The default policy already lets your own devices reach it. If you changed the policy, also allow yourself to reach `tag:cloud-desktop` on ports 443 and 5900.
-> 4. **Settings → Keys → Generate auth key**:
->    - not reusable, not ephemeral, pre-approved;
->    - tags: `tag:cloud-desktop`;
->    - expiry: 1 day, or longer if your desktop is set up later.
-> 5. Send the key through a channel you'd send a password through (Signal, a 1Password share). It works once and then expires.
-> 6. Also send your Tailscale login, as the Users page shows it (e.g. `alex@gmail.com`). Only that login can open your desktop.
+In App Store Connect → your app → TestFlight:
+- **External testing (recommended):**
+  1. Add a group (e.g. "Testers"), add the build to it, and add the tester by email.
+  2. The first build of each version goes through **Beta App Review**, usually within a day; later builds of the same version often don't.
+  3. Fill in **Test Information**: what to test and a feedback email.
+  4. For the reviewer, say that the app connects only to a private desktop set up for each tester, with a setup link, so there's no demo account.
+- **Internal testing**, if the review stalls on sign-in: no review, but the tester has to be a user of your App Store Connect team.
+  - Add them under Users and Access with the narrowest role, restricted to this app.
+  - Then add them to an internal group.
 
-## 5. Their desktop (you)
+## 5. Their desktop and setup links (you)
 
 1. Add them to `terraform/envs/dev/terraform.tfvars`, which isn't in git:
 
@@ -147,8 +174,15 @@ If Apple emails about a missing privacy manifest (ITMS-91053), it will name an A
 
       That's "8 to add, 4 to change, 0 to destroy", checked with a read-only plan for a made-up tester on 2026-11-02.
    3. **SSM:** waits up to 10 minutes for the new VM to come online.
-   4. **Tailscale:** asks for their auth key (hidden input, straight into SSM as a SecureString) and their login (the allowlist).
-   5. **Ansible, on their desktop only (`--limit`):** the desktop playbook (about 10 minutes), then agentd, then tailnet-proxy. Each asks first.
+   4. **Ansible, on their desktop only (`--limit`):** the desktop playbook (about 10 minutes), then agentd. Each asks first.
+   5. **The desktops tailnet:**
+      - writes its rules for every desktop in Terraform, showing the new and current rules and asking first;
+      - makes a one-hour key for the desktop, straight into SSM;
+      - runs the tailnet-proxy playbook, which puts the desktop on the tailnet as `cloud-desktop-<name>`.
+   6. **Setup codes:** two, one for their phone and one for their Mac. Each works once and lasts 3 days, and comes three ways:
+      - the link, as text;
+      - its QR code in the terminal;
+      - a PNG of the code, in a private folder that opens in Finder.
 
 3. Check it:
 
@@ -157,27 +191,27 @@ If Apple emails about a missing privacy manifest (ITMS-91053), it will name an A
    make viewer DESKTOP=alex      # its screen over SSM, at http://localhost:6080/vnc.html
    ```
 
-   In their Tailscale admin console, which they can show you, the desktop appears as `cloud-desktop-alex` with `tag:cloud-desktop`.
+   In the desktops tailnet's admin console, the desktop appears as `cloud-desktop-alex`, tagged `tag:cloud-desktop` and `tag:desktop-alex`. `scripts/tailnet.py devices alex` lists their devices once they've joined.
 
-## 6. TestFlight: their invitation (you)
+## 6. Sending them the apps and links (you)
 
-In App Store Connect → your app → TestFlight:
-- **External testing (recommended):**
-  1. Add a group (e.g. "Testers"), add the build to it, and add the tester by email.
-  2. The first build of each version goes through **Beta App Review**, usually within a day; later builds of the same version often don't.
-  3. Fill in **Test Information**: what to test and a feedback email.
-  4. For the reviewer, say that signing in needs a Tailscale account and a desktop set up for the tester, so there's no demo account.
-- **Internal testing**, if the review stalls on sign-in: no review, but the tester has to be a user of your App Store Connect team.
-  - Add them under Users and Access with the narrowest role, restricted to this app.
-  - Then add them to an internal group.
+- **The apps:** the DMG for a Mac (§3), and the TestFlight invitation for an iPhone (§4).
+- **The codes:** send each one privately, with §7 below: the PNG, or the link as text, by text message or Signal. In person, they can scan the code off your screen. Whoever uses a code first joins as them, so don't post it anywhere else: not in a shared channel, an issue, or a chat with Claude. Delete the PNG folder once you've sent them.
+- **Which way suits them:**
+  - The iPhone's code is easiest to scan off another screen, like their laptop or yours.
+  - If it arrives on the phone itself, they use **Use a picture of the code** (save it to Photos first), or tap the link.
+  - On the Mac, they click the link, or use the PNG with **Use a picture of the code…**.
+- **A code that expired or got used** (a new phone, a reinstall): `make tester-link NAME=alex` makes new ones. Remove the device it replaces with `scripts/tailnet.py forget alex`, which shows their devices and asks first, or in the admin console.
 
 ## 7. First run (the tester; you can send them this)
 
 > - **iPhone:** open the TestFlight invitation email on the phone, install TestFlight, then install Cloud Desktop.
 > - **Mac:** open the DMG, drag Cloud Desktop to Applications, open it.
 >
-> Then, in the app:
-> 1. **Sign in to Tailscale** when it asks, with the account that owns your tailnet. Your desktop appears as `cloud-desktop-<name>`.
+> Then:
+> 1. **Use the setup code** I sent you, one per device (each works once). Then tap Connect; your desktop appears in a few seconds.
+>    - **iPhone:** in the app, tap **Scan setup code** and point the camera at the code, for example on your computer's screen. If the code is on the phone itself: save the picture, then **Use a picture of the code**. Or tap the link.
+>    - **Mac:** click the link, or in the app choose **Use a picture of the code…** and pick the picture I sent.
 > 2. **Allow notifications.** The agent asks before risky steps, and tells you when a scheduled task finds something.
 > 3. **Sign in to the sites** you want the agent to use (email, Slack…) through **Take over**, the desktop icon. The agent never logs in for you and never stores passwords.
 
@@ -200,8 +234,9 @@ In App Store Connect → your app → TestFlight:
 
 1. **The desktop:** remove them from `desktops`, then `make plan` and `make apply`. This destroys their instance and disk.
 2. **The encryption key:** later, remove them from `users`. This schedules their key for deletion after 30 days, after which anything left encrypted with it, like a snapshot, is unreadable. It can be cancelled within those 30 days.
-3. **Their parameters:**
+3. **Their devices and rules on the desktops tailnet:** `scripts/tailnet.py forget <name>` removes their desktop's and devices' entries (it asks first). Then `make tailnet-rules` writes the rules without them.
+4. **Their key in SSM** (expired anyway):
    ```sh
-   aws ssm delete-parameters --names /cloud-desktops/dev/tailscale/users/<name>/auth_key /cloud-desktops/dev/tailscale/users/<name>/allowed_logins
+   aws ssm delete-parameter --name /cloud-desktops/dev/tailscale/users/<name>/auth_key
    ```
-4. **TestFlight:** remove them from the group. Their tailnet is theirs: they remove the desktop's device there.
+5. **TestFlight:** remove them from the group.

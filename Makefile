@@ -19,7 +19,7 @@ PLAYBOOK_LIMIT = $(if $(LIMIT),--limit $(LIMIT),)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-logs tailnet-build tailnet-deploy tailscale-key tailscale-oauth apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac app-release-mac app-testflight new-desktop cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-logs tailnet-build tailnet-deploy tailscale-key tailscale-oauth apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac app-release-mac app-testflight new-desktop tester-link tailnet-rules cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -59,8 +59,14 @@ ANSIBLE_PLAYBOOK := cd ansible && no_proxy='*' OBJC_DISABLE_INITIALIZE_FORK_SAFE
 galaxy: ## Install the Ansible collections
 	cd ansible && ansible-galaxy collection install -r requirements.yml
 
-new-desktop: ## A desktop for someone else, on their own tailnet, step by step: NAME=<name> (docs/onboarding.md)
+new-desktop: ## A desktop for someone else on the desktops tailnet, step by step, with setup links: NAME=<name> (docs/onboarding.md)
 	scripts/new-desktop.sh $(NAME)
+
+tester-link: ## New setup links for a tester's devices (each works once, 3 days): NAME=<name> [DEVICES=2]
+	scripts/tailnet.py link $(NAME) --devices $(or $(DEVICES),2)
+
+tailnet-rules: ## Write the desktops tailnet's access rules from Terraform's desktops (shows them, asks first)
+	scripts/tailnet.py policy
 
 desktop: ## Run the desktop playbook against running desktops (LIMIT= or DESKTOP= for one)
 	$(ANSIBLE_PLAYBOOK) playbooks/desktops.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
@@ -114,8 +120,8 @@ gateway-image: gatewayd-build ## Build the attested gateway image (AMI) on a tem
 apns-key: ## Store the APNs push key in SSM: make apns-key FILE=AuthKey_XXXXXXXXXX.p8 KEY_ID=XXXXXXXXXX
 	SSM_PREFIX=/cloud-desktops/$(ENV) scripts/put-apns-key.py "$(FILE)" "$(KEY_ID)"
 
-tailscale-key: ## Store a Tailscale auth key (tagged tag:cloud-desktop) in SSM (prompted, not echoed); DESKTOP=<name> for a user's own tailnet
-	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale$(if $(DESKTOP),/users/$(DESKTOP))/auth_key
+tailscale-key: ## Store your personal tailnet's auth key (tagged tag:cloud-desktop) for the test desktop in SSM (prompted, not echoed)
+	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/auth_key
 
 tailscale-oauth: ## Store the desktops tailnet's OAuth client (id, then secret; prompted, not echoed)
 	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/desktops/oauth_client_id

@@ -243,10 +243,12 @@ make app-release-mac    # for others: Developer ID, notarized and stapled, in a 
 make app-testflight     # for others: archive and upload the iPhone app to TestFlight
 ```
 
-**Someone else (a tester)** gets their own desktop on their own tailnet and the
-apps through a notarized DMG and TestFlight: [docs/onboarding.md](docs/onboarding.md)
-walks through it, and `make new-desktop NAME=<name>` sets the desktop up from
-your laptop, asking before each change. With more than one desktop, deploys
+**Someone else (a tester)** gets their own desktop and the apps through a
+notarized DMG and TestFlight: [docs/onboarding.md](docs/onboarding.md) walks
+through it. `make new-desktop NAME=<name>` sets the desktop up from your laptop,
+asking before each change, on a desktops tailnet of yours that its API
+manages (`scripts/tailnet.py`). It prints setup links: the tester taps one per
+device and needs no Tailscale account. With more than one desktop, deploys
 reach all of them unless `DESKTOP=<name>` (or `LIMIT=<instance id>`) picks one.
 
 **Push notifications** (approvals with Approve/Deny on the notification, Action
@@ -294,8 +296,9 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   agent's tools; the main agent reads their chats and memories, corrects their
   memories, changes their schedules after your OK, and hands them work only when
   you name them.
-- [docs/onboarding.md](docs/onboarding.md): giving a tester a desktop on their own
-  tailnet, the notarized Mac app and the iPhone app through TestFlight (2026-11-02).
+- [docs/onboarding.md](docs/onboarding.md): giving a tester a desktop, setup links for
+  their devices (no Tailscale account), the notarized Mac app and the iPhone app
+  through TestFlight (2026-11-02).
 - [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'
   prompts and data unreadable to us (attested gateway and desktops; draft).
 - **No public IPs on desktops:** they sit in private subnets and reach the

@@ -14,8 +14,9 @@ struct QuietLogger: LogSink {
 }
 
 /// The app's own Tailscale node (TailscaleKit, userspace; no VPN profile and no
-/// Tailscale app needed). Signs in as the user, finds their cloud desktops,
-/// and hands out a URLSession that reaches them over the tailnet.
+/// Tailscale app needed). Signs in as the user, or joins with a setup link's
+/// key (a tester's device), finds their cloud desktops, and hands out a
+/// URLSession that reaches them over the tailnet.
 @MainActor
 @Observable
 public final class TailnetService {
@@ -69,6 +70,20 @@ public final class TailnetService {
     }
 
     public func start() {
+        start(authKey: nil)
+    }
+
+    /// Joins with a setup link's key (`SetupLink`): forgets this device's
+    /// current identity, then starts with the key. The key is used once; the
+    /// node keeps its new identity from then on.
+    public func join(authKey: String) async {
+        await stop(keepingConnections: false)
+        try? FileManager.default.removeItem(at: stateDirectory)
+        status = nil
+        start(authKey: authKey)
+    }
+
+    private func start(authKey: String?) {
         guard node == nil else { return }
         if phase != .reconnecting { phase = .starting }
         do {
@@ -76,7 +91,7 @@ public final class TailnetService {
             let config = Configuration(
                 hostName: hostName,
                 path: stateDirectory.path,
-                authKey: nil,  // sign in through the browser
+                authKey: authKey,  // nil: sign in through the browser
                 controlURL: kDefaultControlURL,
                 ephemeral: false
             )

@@ -128,7 +128,7 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
 
 ## 4. AWS infrastructure (Terraform)
 
-Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0), `hashicorp/archive ~> 2.7`. One account, region `ca-central-1`, profile `default`; both come from the Makefile. Terraform owns long-lived infrastructure only. Per-user desktops are meant to be launched by a control plane **(planned)**; today Terraform creates the operator's test desktop and one desktop per entry in `desktops` (a tester: [onboarding.md](onboarding.md), `scripts/new-desktop.sh`). Those are set up like the test desktop (own role, the user's own KMS key, private subnet, no public IP) and tagged `User`, `Tailnet = own` and `TailnetName = cloud-desktop-<name>`; the test desktop is tagged `Tailnet = shared`. Each name must also be in `users` (a variable validation checks).
+Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0), `hashicorp/archive ~> 2.7`. One account, region `ca-central-1`, profile `default`; both come from the Makefile. Terraform owns long-lived infrastructure only. Per-user desktops are meant to be launched by a control plane **(planned)**; today Terraform creates the operator's test desktop and one desktop per entry in `desktops` (a tester: [onboarding.md](onboarding.md), `scripts/new-desktop.sh`). Those are set up like the test desktop (own role, the user's own KMS key, private subnet, no public IP) and tagged `User`, `Tailnet = desktops` and `TailnetName = cloud-desktop-<name>`: they join the desktops tailnet, a second Tailscale account kept for testers (§5.9), never the operator's personal tailnet. The test desktop is tagged `Tailnet = shared`. Each name must also be in `users` (a variable validation checks).
 
 ### 4.1 State
 
@@ -226,7 +226,8 @@ Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0), `hashicorp/archiv
 | `/cloud-desktops/dev/llm/together_api_key` | SecureString | `make llm-keys` (hidden input) | gatewayd at boot. Ansible only when there's no gateway (bootstrap) |
 | `/cloud-desktops/dev/tailscale/auth_key` | SecureString | `make tailscale-key` | Ansible → `/etc/tailnet-proxy.env` |
 | `/cloud-desktops/dev/tailscale/allowed_logins` | String | by hand | Ansible → tailnet-proxy `-allow` |
-| `/cloud-desktops/dev/tailscale/users/<name>/auth_key`, `…/allowed_logins` | SecureString, String | `scripts/new-desktop.sh` (hidden input for the key) | Ansible, for a desktop on its user's own tailnet: the key is the user's, for their tailnet; the allowlist their login. The shared ones above are never used for it |
+| `/cloud-desktops/dev/tailscale/desktops/oauth_client_id`, `…/oauth_client_secret` | SecureString | `make tailscale-oauth` (hidden input) | `scripts/tailnet.py`: the desktops tailnet's API (scopes Policy File, Devices Core, Auth Keys; tag `tag:provisioner`). Doesn't expire |
+| `/cloud-desktops/dev/tailscale/users/<name>/auth_key` | SecureString | `scripts/tailnet.py desktop-key` (from the Tailscale API, never shown) | Ansible → that desktop's `/etc/tailnet-proxy.env`. One hour, single use, tagged `tag:cloud-desktop` and `tag:desktop-<name>`. The shared key above is never used for it |
 | `/cloud-desktops/dev/apns/key_p8` | SecureString | `make apns-key` | Push relay |
 | `/cloud-desktops/dev/apns/key_id` | String | `make apns-key` | Push relay |
 | `/cloud-desktops/dev/push/relay_url` | String | Terraform (push_relay) | Ansible → `agentd.env` |
@@ -323,6 +324,8 @@ For a fresh desktop, run them in this order: desktops, agentd, tailnet-proxy.
 
 ### 5.4 Role `agentd`: users, files and units
 
+**Order.** Users and directories, the guard firewall, the shell's egress proxy (Squid), then a handler flush (Squid runs with its allowlist before Nix downloads anything), Nix, and only then agentd's binary, settings, skills, rules and unit. Nothing before the flush may notify "Restart agentd": on a new desktop its unit doesn't exist yet, and the restart failed the play (a tester's desktop, 2026-11-02).
+
 **Users.**
 
 | User | Kind | Home | Purpose |
@@ -404,13 +407,31 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 ### 5.8 Role `tailnet_proxy`
 
 - **Binary:** `/usr/local/bin/tailnet-proxy` (Go, `CGO_ENABLED=0`, built per architecture).
-- **Unit** `tailnet-proxy.service`: `User=tailnet-proxy`, `EnvironmentFile=/etc/tailnet-proxy.env` (root 0600, `TS_AUTHKEY` from SSM `<prefix>/tailscale/auth_key`, only used if the node must log in again), `-hostname <desktop_tailnet_name> -state-dir /var/lib/tailnet-proxy -novnc http://127.0.0.1:6080 -agentd /run/agentd/agentd.sock -vnc 127.0.0.1:5900 [-allow <logins>]`.
+- **Unit** `tailnet-proxy.service`: `User=tailnet-proxy`, `EnvironmentFile=/etc/tailnet-proxy.env` (root 0600, `TS_AUTHKEY` from SSM `<prefix>/tailscale/auth_key`, only used if the node must log in again), `-hostname <desktop_tailnet_name> -state-dir /var/lib/tailnet-proxy -novnc http://127.0.0.1:6080 -agentd /run/agentd/agentd.sock -vnc 127.0.0.1:5900 [-allow <logins>] [-allow-tags tag:user-<user>]`.
   - **Hardening:** `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ReadWritePaths=/var/lib/tailnet-proxy -/run/agentd`, no capabilities, address families `AF_INET`, `AF_INET6`, `AF_UNIX`, `AF_NETLINK`.
 - **Allowlist:** `-allow` comes from SSM `<prefix>/tailscale/allowed_logins` (comma-separated Tailscale logins; kept out of git).
-- **A desktop on its user's own tailnet** (`desktop_tailnet: own`) reads its auth key and allowlist from `<prefix>/tailscale/users/<user>/` only. The role asserts the allowlist is there before anything else, and a missing key fails the lookup: it never falls back to the operator's key, which would put it on the operator's tailnet.
+- **A desktop on the desktops tailnet** (`desktop_tailnet: desktops`) reads its key from `<prefix>/tailscale/users/<user>/auth_key` only, and gets `-allow-tags tag:user-<user>` instead of a login allowlist. The role asserts the user's name first; a missing key fails the lookup. It never falls back to the operator's key, which would put it on the operator's personal tailnet.
+
+### 5.9 The desktops tailnet (`scripts/tailnet.py`)
+
+A second Tailscale account of the operator's (`tzumby.github`), kept for testers' desktops, managed through its API with an OAuth client (SSM `<prefix>/tailscale/desktops/`). Testers have no Tailscale account: their devices join with keys from setup links, tagged, and tagged devices aren't Tailscale users, so the free plan covers them.
+
+- **Tags**, all owned by `tag:provisioner`, the OAuth client's tag (owned by `autogroup:admin`):
+  - `tag:cloud-desktop`, which the apps look for, and `tag:desktop-<name>`, on each cloud desktop;
+  - `tag:user-<name>`, on each of that tester's devices.
+- **`policy`** writes the whole policy from Terraform's `desktops` (`terraform console`). It shows the new and current rules and asks first, after Tailscale's validation endpoint has accepted them.
+  - **Grants:** `tag:user-<name>` → `tag:desktop-<name>` on `tcp:443` and `tcp:5900`. Signed-in members' own devices → `autogroup:self`, so the operator's devices on this tailnet reach each other, never the desktops. Nothing reaches a tester's devices, and the desktops reach nothing.
+  - **Tests**, checked by Tailscale on every save, so a rule that breaks them can't be saved:
+    - each tester's devices reach their desktop on 443 and 5900, not on 22, and not other desktops;
+    - a desktop doesn't reach its tester's devices.
+
+    A validation run of 2026-11-02 refused a leaking rule (laur's devices to sam's desktop).
+- **`desktop-key <name>`:** a single-use, pre-approved key, for an hour, straight into SSM; never printed.
+- **`link <name> [--devices N] [--days D]`:** single-use, pre-approved keys tagged `tag:user-<name>`, 3 days by default. Each is printed as `clouddesktop://join?key=…` with a terminal QR code, and saved as a PNG of the code (`pypng`; 0600, in a new private temp folder opened in Finder). Whoever uses one first joins as that tester, so they're sent privately.
+- **`devices <name>`** lists their desktop's and devices' entries; **`forget <name>`** removes them, asking first.
 - **Migration:** the role also migrates the older `viewer-proxy`, keeping its tailnet identity.
 
-### 5.9 What listens where on a desktop
+### 5.10 What listens where on a desktop
 
 | Port or socket | Bound to | Who can reach it |
 |---|---|---|
@@ -1234,7 +1255,7 @@ Notifications to the iPhone go through a relay in our AWS account. The APNs key 
 | `:5900` (TCP) | Raw VNC to `127.0.0.1:5900` for the native viewer. Plaintext RFB, inside WireGuard |
 
 - **Access:** every request and connection is checked with `LocalClient().WhoIs`.
-  - If `-allow` is set (SSM `<prefix>/tailscale/allowed_logins`, or `<prefix>/tailscale/users/<user>/allowed_logins` on a user's own tailnet), the login must be on the list; otherwise it gets 403 and the attempt is logged.
+  - If `-allow` or `-allow-tags` is set, the login must be on the list (SSM `<prefix>/tailscale/allowed_logins`), or the device must carry one of the tags (`tag:user-<user>` on the desktops tailnet); otherwise it gets 403 and the attempt is logged. A tagged device's `X-Tailscale-User` is its tags (its login is only `tagged-devices`).
   - If the list is empty, whatever the tailnet's ACLs allow gets in.
   - agentd itself trusts the socket, not the header: `X-Tailscale-User` is for attribution (`by`) only.
 - **What's logged:** viewer and VNC sessions opened, closed or denied, with login and device.
@@ -1282,6 +1303,12 @@ None of them imports UIKit; the app targets hold everything platform-specific ex
   - Tailscale's default control server, not ephemeral;
   - the node's own logs are discarded.
 - **Sign-in:** the node starts without an auth key. The service polls `statusJSON()`; while the state is `NeedsLogin`, `AuthURL` is the sign-in link, and the app opens it in an `SFSafariViewController` (the Mac app: in the default browser). No Tailscale app is needed.
+- **Setup codes (testers):**
+  - The link `clouddesktop://join?key=tskey-auth-…` can be tapped (the `clouddesktop` URL scheme, `onOpenURL`) or pasted.
+  - Its QR code can be scanned with **Scan setup code** (iPhone: VisionKit's `DataScannerViewController`, QR only, after camera permission, `NSCameraUsageDescription`), or read from a picture with **Use a picture of the code** (iPhone: `PhotosPicker`; Mac: an image file). Pictures are read with Vision's `VNDetectBarcodesRequest`, off the main thread.
+  - `SetupLink` accepts only that link, or a bare `tskey-auth-` key; other QR codes are ignored.
+  - After the user's OK, `join(authKey:)` forgets the current identity and starts the node with the key.
+  - The key is used once: restarts start without it, from the saved identity.
 - **Phases:**
   - `stopped`, `starting`;
   - `needsLogin(url)`;
@@ -1339,7 +1366,10 @@ None of them imports UIKit; the app targets hold everything platform-specific ex
 
 - **RootView** follows the phase:
   - Splash ("Connecting…");
-  - LoginView ("Log in with Tailscale");
+  - LoginView:
+    - iPhone: **Scan setup code** first, then "Use a picture of the code · Paste the link", then "Log in with Tailscale";
+    - Mac: the picture and paste options above "Log in with Tailscale";
+  - a tapped setup link, from any phase, asks "Connect to your desktop?" first;
   - DesktopHome → ChatView;
   - "Tailscale isn't connected" with Try again.
 - **ChatView:**
@@ -1608,10 +1638,11 @@ The same screens as the iPhone's, in Mac form:
 | `llm-keys`, `tailscale-key`, `apns-key` | Store secrets in SSM from hidden input or a file |
 | `app-tailscalekit`, `app-test`, `app-sim`, `app-device`, `app-mac` | The apps: build TailscaleKit; DesktopKit tests; Simulator build; build, install and launch on the paired iPhone; build the Mac app, install it in /Applications and open it |
 | `app-release-mac`, `app-testflight` | The apps for others ([onboarding.md](onboarding.md)): the Mac app signed with Developer ID, notarized and stapled, in a signed, notarized DMG (`release-mac.sh`; notarytool profile `cloud-desktop-notary`); the iPhone app archived and uploaded to App Store Connect for TestFlight (`release-ios.sh`). Both build with `APS_ENVIRONMENT=production` and a new build number; the Mac archive with `ARCHS=arm64` for the packages too (TailscaleKit has no Intel slice) |
-| `new-desktop` | `NAME=<name>`: a desktop for someone else on their own tailnet, step by step, asking before each change (`scripts/new-desktop.sh`): tfvars check, Terraform plan then apply, SSM wait, their auth key (hidden input) and login, then the desktop, agentd and tailnet-proxy playbooks on that desktop only |
+| `new-desktop` | `NAME=<name>`: a desktop for someone else on the desktops tailnet, step by step, asking before each change (`scripts/new-desktop.sh`). In order: the tfvars check, Terraform plan then apply, the SSM wait, the desktop and agentd playbooks on that desktop only, the tailnet's rules, a one-hour key and the tailnet-proxy playbook, and two setup links |
+| `tester-link`, `tailnet-rules`, `tailscale-oauth` | New setup links for a tester (`NAME=`, `DEVICES=`); the desktops tailnet's rules; its OAuth client into SSM (§5.9) |
 | `screenshot`, `viewer`, `cdp`, `shell` | Look at the desktop (screenshot file; noVNC on `localhost:6080`; Chrome DevTools on `localhost:9222`; a shell), all over SSM |
 
-Desktops: `desktop`, `agentd-deploy`, `tailnet-deploy` and `screenshot` run on every running desktop unless `LIMIT=<instance id>` or `DESKTOP=<name>` names one; an unknown `DESKTOP` matches no host, never all of them. `viewer`, `cdp`, `shell`, `agentd-logs` and `agentd-soak` take `DESKTOP=<name>` (default: the test desktop). `tailscale-key DESKTOP=<name>` stores a user's own auth key.
+Desktops: `desktop`, `agentd-deploy`, `tailnet-deploy` and `screenshot` run on every running desktop unless `LIMIT=<instance id>` or `DESKTOP=<name>` names one; an unknown `DESKTOP` matches no host, never all of them. `viewer`, `cdp`, `shell`, `agentd-logs` and `agentd-soak` take `DESKTOP=<name>` (default: the test desktop). `tailscale-oauth` stores the desktops tailnet's OAuth client; `tailnet-rules` writes its rules; `tester-link NAME=<name>` makes new setup links.
 
 `AWS_PROFILE` (default `default`) and `AWS_REGION` (default `ca-central-1`) are exported to every recipe. On macOS, Ansible runs with `no_proxy='*'` and `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`; otherwise forked workers crash in the system proxy lookup.
 
@@ -1663,7 +1694,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 | agentd | 110 unit tests (plus a 5,000-memory speed test run on demand): memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text notification bodies, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the app's filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
-| DesktopKit | 30 tests (§10.8) |
+| DesktopKit | 32 tests (§10.8): also setup links and setup codes read from pictures |
 
 ## 14. How this differs from PLAN.MD
 

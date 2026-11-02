@@ -12,8 +12,10 @@
 // On port 5900 it forwards raw VNC to x11vnc, for the apps' native viewer.
 //
 // Every connection is checked against the tailnet identity (WhoIs) and the
-// -allow list. The first run needs an auth key in TS_AUTHKEY; the node's
-// identity is then kept in -state-dir.
+// -allow list of logins or the -allow-tags list of device tags (a tester's
+// devices join the desktops tailnet with a key, tagged, without a login). The
+// first run needs an auth key in TS_AUTHKEY; the node's identity is then kept
+// in -state-dir.
 package main
 
 import (
@@ -35,20 +37,38 @@ import (
 )
 
 type gate struct {
-	who     *local.Client
-	allowed []string
+	who         *local.Client
+	allowed     []string
+	allowedTags []string
 }
 
-// identity returns the caller's Tailscale login and device, or an error if
-// they aren't on the tailnet or not allowed.
+// admits says whether a caller gets in: with neither list set, whoever the
+// tailnet policy lets through; otherwise a login on the list, or a device
+// with one of the tags.
+func admits(login string, tags, allowed, allowedTags []string) bool {
+	if len(allowed) == 0 && len(allowedTags) == 0 {
+		return true
+	}
+	if slices.Contains(allowed, login) {
+		return true
+	}
+	return slices.ContainsFunc(tags, func(tag string) bool { return slices.Contains(allowedTags, tag) })
+}
+
+// identity returns the caller's Tailscale login (for a tagged device, its
+// tags) and device, or an error if they aren't on the tailnet or not allowed.
 func (g gate) identity(ctx context.Context, remoteAddr string) (login, node string, err error) {
 	peer, err := g.who.WhoIs(ctx, remoteAddr)
 	if err != nil {
 		return "", "", err
 	}
 	login, node = peer.UserProfile.LoginName, peer.Node.ComputedName
-	if len(g.allowed) > 0 && !slices.Contains(g.allowed, login) {
+	tags := peer.Node.Tags
+	if !admits(login, tags, g.allowed, g.allowedTags) {
 		return login, node, errNotAllowed
+	}
+	if len(tags) > 0 {
+		login = strings.Join(tags, ",") // "tagged-devices" says nothing
 	}
 	return login, node, nil
 }
@@ -62,18 +82,14 @@ func main() {
 	agentd := flag.String("agentd", "/run/agentd/agentd.sock", "agentd's Unix socket")
 	vnc := flag.String("vnc", "127.0.0.1:5900", "x11vnc to forward port 5900 to")
 	allow := flag.String("allow", "", "comma-separated Tailscale login names allowed in (default: whoever the tailnet policy lets through)")
+	allowTags := flag.String("allow-tags", "", "comma-separated device tags allowed in, e.g. tag:user-alex (as well as -allow)")
 	flag.Parse()
 
 	novncURL, err := url.Parse(*novnc)
 	if err != nil {
 		log.Fatalf("bad -novnc: %v", err)
 	}
-	var allowed []string
-	for _, name := range strings.Split(*allow, ",") {
-		if name = strings.TrimSpace(name); name != "" {
-			allowed = append(allowed, name)
-		}
-	}
+	allowed, allowedTags := list(*allow), list(*allowTags)
 
 	srv := &tsnet.Server{
 		Hostname: *hostname,
@@ -91,7 +107,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("local client: %v", err)
 	}
-	g := gate{who: who, allowed: allowed}
+	g := gate{who: who, allowed: allowed, allowedTags: allowedTags}
 
 	vncLn, err := srv.Listen("tcp", ":5900")
 	if err != nil {
@@ -177,4 +193,15 @@ func serveVNC(ln net.Listener, g gate, target string) {
 			log.Printf("VNC session closed for %s on %s", login, node)
 		}()
 	}
+}
+
+// list splits a comma-separated flag, dropping blanks.
+func list(flag string) []string {
+	var items []string
+	for _, item := range strings.Split(flag, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
 }

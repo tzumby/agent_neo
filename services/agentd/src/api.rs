@@ -21,6 +21,7 @@ use crate::clock::UserClock;
 use crate::llm::KNOWN_MODELS;
 use crate::memory;
 use crate::schedule;
+use crate::store::Event;
 
 type App = State<Arc<Agent>>;
 
@@ -29,6 +30,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/status", get(status))
         .route("/api/v1/messages", get(messages).post(post_message))
         .route("/api/v1/events", get(events))
+        .route("/api/v1/events/page", get(events_page))
         .route("/api/v1/approvals/{id}", post(answer_approval))
         .route("/api/v1/actions/{id}", post(resolve_action))
         .route("/api/v1/stop", post(stop))
@@ -262,9 +264,23 @@ async fn post_message(State(agent): App, headers: HeaderMap, Json(body): Json<Ne
 #[derive(Deserialize)]
 struct After {
     after: Option<i64>,
+    /// Comma-separated event kinds; all when absent.
+    kinds: Option<String>,
+}
+
+/// `a,b,c` → the kinds asked for (at most 64; none means all).
+fn kinds(list: Option<&str>) -> Vec<String> {
+    list.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .take(64)
+        .map(String::from)
+        .collect()
 }
 
 /// Server-Sent Events: everything after `after` from the log, then live events.
+/// `kinds` keeps only those (the app's chat skips steps and command output).
 async fn events(
     State(agent): App,
     Query(query): Query<After>,
@@ -275,7 +291,10 @@ async fn events(
         .events_after(query.after.unwrap_or(0), 5_000)
         .unwrap_or_default();
     let last = backlog.last().map_or(query.after.unwrap_or(0), |e| e.seq);
-    let live = live.filter_map(move |event| event.ok().filter(|e| e.seq > last));
+    let kinds = kinds(query.kinds.as_deref());
+    let wanted = move |event: &Event| kinds.is_empty() || kinds.contains(&event.kind);
+    let backlog: Vec<Event> = backlog.into_iter().filter(&wanted).collect();
+    let live = live.filter_map(move |event| event.ok().filter(|e| e.seq > last && wanted(e)));
     // Older events may hold a key pasted into the chat before it was saved.
     let stream = tokio_stream::iter(backlog).chain(live).map(move |mut event| {
         agent.secrets.redact_json(&mut event.data);
@@ -285,6 +304,30 @@ async fn events(
             .data(serde_json::to_string(&event).unwrap_or_default()))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Deserialize)]
+struct PageQuery {
+    before: Option<i64>,
+    limit: Option<i64>,
+    kinds: Option<String>,
+}
+
+/// The chat a page at a time: the apps load the newest page, then older ones
+/// as the user scrolls up, and stream what comes next after `last_seq`.
+async fn events_page(State(agent): App, Query(query): Query<PageQuery>) -> Response {
+    let kinds = kinds(query.kinds.as_deref());
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    match agent.store.events_page(query.before, limit, &kinds) {
+        Ok(mut page) => {
+            // Older events may hold a key pasted into the chat before it was saved.
+            for event in &mut page.events {
+                agent.secrets.redact_json(&mut event.data);
+            }
+            Json(json!({"events": page.events, "more": page.more, "last_seq": page.last_seq})).into_response()
+        }
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -907,6 +950,14 @@ mod tests {
                 "needs_you/approval"
             );
         }
+    }
+
+    #[test]
+    fn kinds_are_a_comma_list() {
+        assert!(kinds(None).is_empty());
+        assert!(kinds(Some(" , ")).is_empty());
+        assert_eq!(kinds(Some("message, task.started,")), ["message", "task.started"]);
+        assert_eq!(kinds(Some(&"k,".repeat(100))).len(), 64);
     }
 
     #[test]

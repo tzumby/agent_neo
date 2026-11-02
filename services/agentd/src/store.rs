@@ -19,6 +19,26 @@ pub struct Event {
     pub data: Value,
 }
 
+fn event_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
+    let data: String = row.get(3)?;
+    Ok(Event {
+        seq: row.get(0)?,
+        ts: row.get(1)?,
+        kind: row.get(2)?,
+        data: serde_json::from_str(&data).unwrap_or(Value::Null),
+    })
+}
+
+/// A page of the event log, oldest first (`Store::events_page`).
+#[derive(Debug)]
+pub struct EventPage {
+    pub events: Vec<Event>,
+    /// Older events of those kinds remain.
+    pub more: bool,
+    /// The log's newest seq when the page was read.
+    pub last_seq: i64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct HistoryEntry {
     pub ts: String,
@@ -710,16 +730,39 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
             conn.prepare("SELECT seq, ts, kind, data FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
-        let rows = stmt.query_map(params![after, limit], |row| {
-            let data: String = row.get(3)?;
-            Ok(Event {
-                seq: row.get(0)?,
-                ts: row.get(1)?,
-                kind: row.get(2)?,
-                data: serde_json::from_str(&data).unwrap_or(Value::Null),
-            })
-        })?;
+        let rows = stmt.query_map(params![after, limit], event_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Up to `limit` events before `before` (from the newest when None), of
+    /// `kinds` only (all when empty), oldest first: the apps load the chat a
+    /// page at a time, newest page first. The log's newest seq is read under
+    /// the same lock, so the live stream can resume right after it.
+    pub fn events_page(&self, before: Option<i64>, limit: i64, kinds: &[String]) -> Result<EventPage> {
+        let conn = self.conn.lock().unwrap();
+        let filter = if kinds.is_empty() {
+            String::new()
+        } else {
+            format!(" AND kind IN ({})", vec!["?"; kinds.len()].join(", "))
+        };
+        let sql =
+            format!("SELECT seq, ts, kind, data FROM events WHERE seq < ?{filter} ORDER BY seq DESC LIMIT ?");
+        let mut values: Vec<rusqlite::types::Value> = vec![before.unwrap_or(i64::MAX).into()];
+        values.extend(kinds.iter().map(|kind| kind.clone().into()));
+        values.push((limit + 1).into()); // one more says whether older ones remain
+        let mut stmt = conn.prepare(&sql)?;
+        let mut events: Vec<Event> = stmt
+            .query_map(rusqlite::params_from_iter(values), event_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        let more = events.len() as i64 > limit;
+        events.truncate(limit as usize);
+        events.reverse();
+        let last_seq = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |row| row.get(0))?;
+        Ok(EventPage {
+            events,
+            more,
+            last_seq,
+        })
     }
 
     pub fn last_seq(&self) -> Result<i64> {
@@ -927,6 +970,11 @@ mod tests {
         assert!(second.seq > first.seq);
         assert_eq!(store.events_after(first.seq, 10).unwrap()[0].kind, "step");
         assert_eq!(store.last_seq().unwrap(), second.seq);
+        let page = store.events_page(None, 10, &[]).unwrap();
+        assert_eq!(
+            (page.events.len(), page.more, page.last_seq),
+            (2, false, second.seq)
+        );
         for i in 0..5 {
             store.add_history("user", &format!("m{i}")).unwrap();
         }
@@ -936,6 +984,39 @@ mod tests {
         store.set_setting("model", "a").unwrap();
         store.set_setting("model", "b").unwrap();
         assert_eq!(store.setting("model").unwrap().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn the_chat_comes_a_page_at_a_time_newest_first() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut messages = vec![];
+        for i in 0..5 {
+            messages.push(store.append_event("message", &json!({"text": i})).unwrap().seq);
+            store.append_event("step", &json!({"tool": "read_text"})).unwrap();
+        }
+        let last = store
+            .append_event("shell.output", &json!({"output": "…"}))
+            .unwrap();
+        let kinds = vec!["message".to_string()];
+
+        let newest = store.events_page(None, 2, &kinds).unwrap();
+        let seqs: Vec<_> = newest.events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, messages[3..]); // oldest first, steps left out
+        assert!(newest.more);
+        assert_eq!(newest.last_seq, last.seq); // the stream resumes after the step and the output
+
+        let older = store.events_page(Some(seqs[0]), 2, &kinds).unwrap();
+        assert_eq!(
+            older.events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            messages[1..3]
+        );
+        assert!(older.more);
+        let oldest = store.events_page(Some(messages[1]), 2, &kinds).unwrap();
+        assert_eq!(oldest.events.len(), 1);
+        assert!(!oldest.more);
+
+        // No kinds: everything, steps included.
+        assert_eq!(store.events_page(None, 100, &[]).unwrap().events.len(), 11);
     }
 
     #[test]

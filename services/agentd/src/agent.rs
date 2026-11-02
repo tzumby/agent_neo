@@ -139,6 +139,15 @@ struct RunState {
     asked_again: bool,
 }
 
+/// The last second of a local date (`YYYY-MM-DD`) in `timezone` (UTC if
+/// unknown), as a unix time. Touches no store, so it's safe anywhere.
+pub fn end_of_day_in(date: &str, timezone: &str) -> Option<i64> {
+    let day: jiff::civil::Date = date.parse().ok()?;
+    let zone = jiff::tz::TimeZone::get(timezone).unwrap_or(jiff::tz::TimeZone::UTC);
+    let next = day.tomorrow().ok()?.to_zoned(zone).ok()?;
+    Some(next.timestamp().as_second() - 1)
+}
+
 /// A reply with no text to show (null, empty or only whitespace).
 fn is_empty_reply(message: &Value) -> bool {
     message["content"]
@@ -231,6 +240,17 @@ fn unix_now() -> i64 {
 
 /// Whether an action, looked at again when its task resumes, is the one the
 /// user approved: same kind, element, text, key, site or command.
+/// The model's plain words for a command, as the card shows them: one line,
+/// at most 120 characters; none when empty.
+fn clip_summary(summary: &str) -> Option<String> {
+    let line = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    match line.char_indices().nth(120) {
+        _ if line.is_empty() => None,
+        Some((cut, _)) => Some(format!("{}…", line[..cut].trim_end())),
+        None => Some(line),
+    }
+}
+
 fn same_request(approved: &Value, now: &Value) -> bool {
     [
         "kind", "action", "role", "target", "text", "key", "submit", "site", "command", "when", "name",
@@ -1402,6 +1422,7 @@ impl Agent {
                 self.run_shell(
                     task_id,
                     required("command")?,
+                    text("summary"),
                     &asked,
                     timeout,
                     tainted,
@@ -1592,10 +1613,14 @@ impl Agent {
     /// The end of a local date (`YYYY-MM-DD`) in the user's time zone, as
     /// unix seconds.
     pub fn end_of_day(&self, date: &str) -> Option<i64> {
-        let day: jiff::civil::Date = date.parse().ok()?;
-        let zone = jiff::tz::TimeZone::get(&self.user_clock().timezone).unwrap_or(jiff::tz::TimeZone::UTC);
-        let next = day.tomorrow().ok()?.to_zoned(zone).ok()?;
-        Some(next.timestamp().as_second() - 1)
+        end_of_day_in(date, &self.user_timezone())
+    }
+
+    /// The user's IANA time zone (from the app). It reads settings: never
+    /// call it inside a `Store::transact` or `Store::read`, whose lock isn't
+    /// re-entrant.
+    pub fn user_timezone(&self) -> String {
+        self.user_clock().timezone
     }
 
     /// Sets up a scheduled task. After outside content, the request may come
@@ -1738,6 +1763,7 @@ impl Agent {
         &self,
         task_id: &str,
         command: &str,
+        summary: Option<&str>,
         asked: &[String],
         timeout: u64,
         tainted: bool,
@@ -1763,11 +1789,12 @@ impl Agent {
         } else if let Some(reason) = self.policy.danger(inner) {
             Some(reason)
         } else if tainted && self.policy.sends_data(inner) {
-            // Injected instructions in a page could try to send data out.
+            // Injected instructions in a page could try to send data out (the
+            // card says it came after outside content: `tainted`).
             Some(if keys.is_empty() {
-                "could send data off the desktop, after reading outside content"
+                "could send data off the desktop"
             } else {
-                "could send data off the desktop with your saved key, after reading outside content"
+                "could send data off the desktop with your saved key"
             })
         } else {
             None
@@ -1783,7 +1810,12 @@ impl Agent {
             );
         }
         if let Some(reason) = reason {
-            let card = json!({"kind": "shell", "command": command, "reason": reason, "secrets": keys});
+            // The model's plain words lead the card; the command is a tap away. After
+            // outside content they may be steered, so the card says so (`tainted`).
+            let card = json!({
+                "kind": "shell", "command": command, "reason": reason, "secrets": keys,
+                "summary": summary.and_then(clip_summary), "tainted": tainted,
+            });
             if !matches!(self.approve(task_id, card, resumed)?, Decision::Approved) {
                 return Ok(format!(
                     "denied: the user did not approve this command (it {reason})"
@@ -1804,7 +1836,7 @@ impl Agent {
         }
         // Before it's cut to size, so no part of a value is left at the cut.
         output.text = self.secrets.redact(&output.text).into_owned();
-        // The app shows each command as a terminal card with its output.
+        // For the log: the app's chat shows only messages and the cards waiting for the user.
         self.emit(
             "shell.output",
             json!({
@@ -2062,6 +2094,19 @@ fn approval_push(task_id: &str, id: &str, details: &Value) -> Push {
             format!("Click this on {site}?"),
             format!("“{}”. It {}.", text("target"), text("reason")),
         ),
+        _ if !text("summary").is_empty() => (
+            "Run a command?".into(),
+            format!(
+                "{}. It {}{}.",
+                text("summary").trim_end_matches('.'),
+                text("reason"),
+                if details["tainted"] == true {
+                    ", asked after reading outside content"
+                } else {
+                    ""
+                }
+            ),
+        ),
         _ => (
             "Run this command?".into(),
             format!("{} (it {})", text("command"), text("reason")),
@@ -2178,6 +2223,38 @@ mod tests {
         assert!(agent.answer_approval(&id, true, Some("me".into())).is_ok());
         assert_eq!(events(&agent, "approval.resolved")[0]["approved"], true);
         assert_eq!(events(&agent, "task.resumed").len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_command_card_leads_with_plain_words() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        let command = "sudo env | grep -i proxy";
+        let summary = "  Check which   proxy\n the shell uses ";
+        let err = agent
+            .run_shell("t4", command, Some(summary), &[], 10, true, None, &mut cancel)
+            .await
+            .unwrap_err();
+        let park = err.downcast_ref::<Park>().expect("parked on a card");
+        assert_eq!(park.card["summary"], "Check which proxy the shell uses");
+        assert_eq!(park.card["command"], command);
+        assert_eq!(park.card["reason"], "runs as root");
+        assert_eq!(park.card["tainted"], true); // the app says the words may be steered
+
+        let push = approval_push("t4", &park.id, &park.card);
+        assert_eq!(push.title, "Run a command?");
+        assert_eq!(
+            push.body,
+            "Check which proxy the shell uses. It runs as root, asked after reading outside content."
+        );
+        // No plain words (a model that left them out): the command, as before.
+        let mut bare = park.card.clone();
+        bare["summary"] = Value::Null;
+        assert!(approval_push("t4", "x", &bare).body.starts_with(command));
+
+        assert_eq!(clip_summary(&"word ".repeat(40)).unwrap().chars().count(), 120);
+        assert_eq!(clip_summary(" \n "), None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

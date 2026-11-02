@@ -15,6 +15,10 @@ struct ChatView: View {
     @State private var showingMemory = false
     @State private var takeOver: TakeOverRequest?
     @State private var position = ScrollPosition(edge: .bottom)
+    /// The spinner above the oldest message loaded is on screen.
+    @State private var olderInView = false
+    /// The oldest event of the chat on screen, to spot an older page going in (`keepPlace`).
+    @State private var oldestShown: Int?
     @State private var sent = 0
     /// A key in the message about to be sent: offer to save it instead.
     @State private var foundKey: KeyDetector.Found?
@@ -23,13 +27,142 @@ struct ChatView: View {
     @Environment(PushCenter.self) private var push
 
     var body: some View {
+        messages
+            .scrollDismissesKeyboard(.interactively)
+            .overlay {
+                if empty {
+                    EmptyChat(desktopName: desktopName)
+                }
+            }
+            .safeAreaBar(edge: .top) {
+                if !loading, let banner = StageBanner.for(store.status) {
+                    StageBanner(banner: banner) { follow(banner.target) }
+                        .padding(.horizontal, 12)
+                        .padding(.top, 4)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .animation(.snappy, value: store.status?.stage)
+            .safeAreaBar(edge: .bottom) {
+                VStack(spacing: 10) {
+                    if empty {
+                        Suggestions { send($0) }
+                    }
+                    Composer(
+                        text: $draft, busy: store.busy, stopping: store.stopping, canSend: store.connection == .live,
+                        focus: $composing,
+                        onSend: { send(draft) }, onStop: { Task { await store.stop(client: client) } })
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 6)
+            }
+            .background(Color.black)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { toolbar }
+            .sheet(isPresented: $showingSettings) {
+                NavigationStack { SettingsView(store: store, client: client) }
+            }
+            .sheet(isPresented: $showingMemory) {
+                NavigationStack {
+                    MemoryView(client: client)
+                        .toolbar { Button("Done") { showingMemory = false } }
+                }
+            }
+            .fullScreenCover(item: $takeOver) { request in
+                if let endpoint {
+                    TakeOverView(endpoint: endpoint, actionID: request.actionID, store: store, client: client)
+                } else {
+                    // Tailscale is restarting (e.g. the app was in the background).
+                    VStack(spacing: 16) {
+                        ProgressView("Reconnecting to Tailscale…")
+                        Button("Close") { takeOver = nil }.buttonStyle(.glass)
+                    }
+                }
+            }
+            .confirmationDialog(
+                "This looks like a \(foundKey?.label ?? "key")",
+                isPresented: Binding(get: { foundKey != nil }, set: { if !$0 { foundKey = nil } }),
+                titleVisibility: .visible, presenting: foundKey
+            ) { found in
+                Button("Save it on your desktop") { savingKey = .new(found) }
+                Button("Send it in the chat anyway", role: .destructive) { send(draft, checked: true) }
+                Button("Cancel", role: .cancel) {}
+            } message: { _ in
+                Text("Messages go to the AI model and stay in the chat. A key saved on your desktop is given to commands by name, and the agent never sees it.")
+            }
+            .sheet(item: $savingKey) { target in
+                NavigationStack {
+                    SecretEditor(client: client, target: target) { name in
+                        // The message keeps its meaning, without the key.
+                        if case .new(let found?) = target {
+                            draft = draft.replacingOccurrences(of: found.value, with: "$\(name)")
+                        }
+                    }
+                }
+            }
+            .alert(
+                "Cloud Desktop",
+                isPresented: Binding(get: { store.notice != nil }, set: { if !$0 { store.notice = nil } })
+            ) {
+                Button("OK") {}
+            } message: {
+                Text(store.notice ?? "")
+            }
+            .sensoryFeedback(.impact(weight: .light), trigger: sent)
+            .environment(\.chatStore, store)
+            .environment(\.agentClient, client)
+            .environment(\.takeOver, endpoint == nil ? nil : TakeOverAction { takeOver = TakeOverRequest(actionID: $0.id) })
+            .environment(\.openTask, OpenTask { task in openConversation(task) })
+            // Until the newest page is in, the splash covers everything (bars included).
+            // Only the splash fades: the chat under it is already at its end.
+            .overlay {
+                ZStack {
+                    if loading {
+                        SplashView(status: "Connecting to \(desktopName)…", detail: offlineDetail)
+                            .transition(.opacity)
+                    }
+                }
+                .animation(.easeOut(duration: 0.25), value: loading)
+            }
+            .toolbarVisibility(loading ? .hidden : .automatic, for: .navigationBar)
+            .task(id: connectionKey) { await store.run(client: client) }
+            .task(id: store.connection == .live) {
+                if store.connection == .live { await push.register() }
+            }
+            .task(id: "\(push.deviceToken ?? "")|\(connectionKey)") { await registerForPush() }
+            .task(id: push.pendingAnswer) { await sendPendingAnswer() }
+    }
+
+    /// The conversation, newest at the bottom; older pages load as the user
+    /// scrolls up to the oldest one loaded. A VStack, not a lazy one: only
+    /// the pages loaded are in it, and its exact height keeps the place when
+    /// a page goes in above (a lazy stack only estimates rows not yet shown).
+    private var messages: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 20) {
+                if store.hasOlder {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                        .onScrollVisibilityChange(threshold: 0.01) { olderInView = $0 }
+                        .task(id: OlderPage(inView: olderInView, oldest: store.oldestLoaded)) {
+                            while olderInView, !Task.isCancelled, store.hasOlder,
+                                await !store.loadOlder(client: client)
+                            {
+                                try? await Task.sleep(for: .seconds(3))  // offline: try again while in view
+                            }
+                        }
+                }
                 ForEach(store.timeline.visibleItems) { item in
                     ChatRow(item: item).equatable()
                 }
+                if store.busy {
+                    WorkingIndicator()
+                }
             }
             .scrollTargetLayout()
+            // A VStack is only as wide as its rows: without any (an empty
+            // chat), the scroll view and the empty state over it shrank.
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 18)
             .padding(.vertical, 12)
         }
@@ -37,107 +170,26 @@ struct ChatView: View {
         // Start at the newest message and stay there as the agent adds more.
         .defaultScrollAnchor(.bottom, for: .initialOffset)
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
-        .scrollDismissesKeyboard(.interactively)
-        .overlay {
-            if store.timeline.items.isEmpty, store.connection == .live {
-                EmptyChat(desktopName: desktopName)
-            }
-        }
-        .safeAreaBar(edge: .top) {
-            if !loading, let banner = StageBanner.for(store.status) {
-                StageBanner(banner: banner) { follow(banner.target) }
-                    .padding(.horizontal, 12)
-                    .padding(.top, 4)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
-        }
-        .animation(.snappy, value: store.status?.stage)
-        .safeAreaBar(edge: .bottom) {
-            VStack(spacing: 10) {
-                if store.timeline.items.isEmpty, store.connection == .live {
-                    Suggestions { send($0) }
-                }
-                Composer(
-                    text: $draft, busy: store.busy, stopping: store.stopping, canSend: store.connection == .live,
-                    focus: $composing,
-                    onSend: { send(draft) }, onStop: { Task { await store.stop(client: client) } })
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 6)
-        }
-        .background(Color.black)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar { toolbar }
-        .sheet(isPresented: $showingSettings) {
-            NavigationStack { SettingsView(store: store, client: client) }
-        }
-        .sheet(isPresented: $showingMemory) {
-            NavigationStack {
-                MemoryView(client: client)
-                    .toolbar { Button("Done") { showingMemory = false } }
-            }
-        }
-        .fullScreenCover(item: $takeOver) { request in
-            if let endpoint {
-                TakeOverView(endpoint: endpoint, actionID: request.actionID, store: store, client: client)
-            } else {
-                // Tailscale is restarting (e.g. the app was in the background).
-                VStack(spacing: 16) {
-                    ProgressView("Reconnecting to Tailscale…")
-                    Button("Close") { takeOver = nil }.buttonStyle(.glass)
-                }
-            }
-        }
-        .confirmationDialog(
-            "This looks like a \(foundKey?.label ?? "key")",
-            isPresented: Binding(get: { foundKey != nil }, set: { if !$0 { foundKey = nil } }),
-            titleVisibility: .visible, presenting: foundKey
-        ) { found in
-            Button("Save it on your desktop") { savingKey = .new(found) }
-            Button("Send it in the chat anyway", role: .destructive) { send(draft, checked: true) }
-            Button("Cancel", role: .cancel) {}
-        } message: { _ in
-            Text("Messages go to the AI model and stay in the chat. A key saved on your desktop is given to commands by name, and the agent never sees it.")
-        }
-        .sheet(item: $savingKey) { target in
-            NavigationStack {
-                SecretEditor(client: client, target: target) { name in
-                    // The message keeps its meaning, without the key.
-                    if case .new(let found?) = target {
-                        draft = draft.replacingOccurrences(of: found.value, with: "$\(name)")
-                    }
-                }
-            }
-        }
-        .alert(
-            "Cloud Desktop",
-            isPresented: Binding(get: { store.notice != nil }, set: { if !$0 { store.notice = nil } })
-        ) {
-            Button("OK") {}
-        } message: {
-            Text(store.notice ?? "")
-        }
-        .sensoryFeedback(.impact(weight: .light), trigger: sent)
-        .environment(\.chatStore, store)
-        .environment(\.agentClient, client)
-        .environment(\.takeOver, endpoint == nil ? nil : TakeOverAction { takeOver = TakeOverRequest(actionID: $0.id) })
-        .environment(\.openTask, OpenTask { task in openConversation(task) })
-        // Until the first sync, the splash covers everything (bars included).
-        .overlay {
-            if loading {
-                SplashView(status: "Connecting to \(desktopName)…", detail: offlineDetail)
-                    .transition(.opacity)
-            }
-        }
-        .toolbarVisibility(loading ? .hidden : .automatic, for: .navigationBar)
-        .animation(.easeOut(duration: 0.25), value: loading)
-        .task(id: connectionKey) { await store.run(client: client) }
-        // Ask for notifications once the chat is up, not over the splash.
-        .task(id: store.connection == .live) {
-            if store.connection == .live { await push.register() }
-        }
-        .task(id: "\(push.deviceToken ?? "")|\(connectionKey)") { await registerForPush() }
-        .task(id: push.pendingAnswer) { await sendPendingAnswer() }
+        .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { old, new in keepPlace(old, new) }
+    }
+
+    /// An older page went in above. Scrolled up to the top, the scroll view
+    /// keeps its offset, which would show the new page's first messages (and
+    /// its spinner, loading the next page, and the next): move down by the
+    /// height that went in, so what was on screen stays put. (Runs as the
+    /// content's size changes, which comes before an onChange of the store.)
+    private func keepPlace(_ old: ScrollGeometry, _ new: ScrollGeometry) {
+        let oldest = store.oldestLoaded
+        guard oldest != oldestShown else { return }
+        defer { oldestShown = oldest }
+        let added = new.contentSize.height - old.contentSize.height
+        guard let shown = oldestShown, let oldest, oldest < shown, added > 0,
+            // Not moved down by the scroll view itself (scrolled to the end, it
+            // keeps the end); a finger still dragging moves only a little.
+            new.contentOffset.y - old.contentOffset.y < added / 2
+        else { return }
+        // scrollTo(y:) counts from the content's top; contentOffset includes the top inset (the bars).
+        position.scrollTo(y: new.contentOffset.y + added + new.contentInsets.top)
     }
 
     /// Hands this iPhone's push token to the desktop, which registers it with
@@ -176,21 +228,28 @@ struct ChatView: View {
         push.pendingAnswer = nil
     }
 
-    /// Closes Settings and scrolls to a task's conversation.
+    /// Closes Settings and scrolls to a task's conversation (the message that
+    /// started it), loading older chat until it's there.
     private func openConversation(_ task: String) {
         showingSettings = false
         showingMemory = false
-        let target = store.timeline.items.first { item in
-            if case .work(let work) = item { work.task == task } else { false }
-        }
         Task {
             try? await Task.sleep(for: .milliseconds(450))  // the sheet closing
+            var target = prompt(of: task)
+            while target == nil, await store.loadOlder(client: client) {
+                target = prompt(of: task)
+            }
             if let target {
-                withAnimation(.snappy) { position.scrollTo(id: target.id, anchor: .top) }
+                withAnimation(.snappy) { position.scrollTo(id: target, anchor: .top) }
             } else {
-                store.notice = "That conversation is older than what the app has loaded."
+                store.notice = "Couldn't find that conversation in the chat."
             }
         }
+    }
+
+    /// The id of the message that started a task.
+    private func prompt(of task: String) -> String? {
+        store.timeline.items.first { if case .user(let message) = $0 { message.task == task } else { false } }?.id
     }
 
     /// Where the stage banner leads.
@@ -210,8 +269,11 @@ struct ChatView: View {
         }
     }
 
-    /// The first sync with the desktop hasn't finished yet.
-    private var loading: Bool { store.status == nil && store.timeline.items.isEmpty }
+    /// The newest page of the chat hasn't come yet.
+    private var loading: Bool { !store.loaded }
+
+    /// Nothing said yet on this desktop.
+    private var empty: Bool { store.loaded && store.timeline.items.isEmpty && store.connection == .live }
 
     private var offlineDetail: String? {
         if case .offline(let reason) = store.connection { return "Still trying: \(reason)" }
@@ -244,6 +306,13 @@ struct ChatView: View {
         withAnimation(.snappy) { position.scrollTo(edge: .bottom) }
         Task { await store.send(text, client: client) }
     }
+}
+
+/// When to (re)load the page before the oldest one: the spinner came into
+/// view, or a page came and it's still in view.
+private struct OlderPage: Equatable {
+    let inView: Bool
+    let oldest: Int?
 }
 
 // MARK: - Composer
@@ -386,6 +455,33 @@ private struct ModelMenu: View {
                 settings.allowActions = allow
                 Task { await store.update(settings: settings, client: client) }
             })
+    }
+}
+
+// MARK: - Working
+
+/// Three dots that pulse while the agent works: all the chat shows of it.
+private struct WorkingIndicator: View {
+    var body: some View {
+        TimelineView(.animation) { context in
+            let time = context.date.timeIntervalSinceReferenceDate
+            HStack(spacing: 5) {
+                ForEach(0..<3, id: \.self) { dot in
+                    Circle()
+                        .frame(width: 7, height: 7)
+                        .opacity(0.25 + 0.6 * pulse(time - Double(dot) * 0.2))
+                }
+            }
+        }
+        .foregroundStyle(.secondary)
+        .padding(.vertical, 6)
+        .accessibilityElement()
+        .accessibilityLabel("Working")
+    }
+
+    /// 0…1 and back, once every 1.2 s.
+    private func pulse(_ time: Double) -> Double {
+        (sin(time * 2 * .pi / 1.2) + 1) / 2
     }
 }
 

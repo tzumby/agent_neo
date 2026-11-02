@@ -654,3 +654,56 @@ Phase 5 (built; on the device once deployed):
   - approve-all, edit (a stale version refused with 409, then saved, the date cleared), restore, export (JSON and Markdown) and import (9 imported, a PIN refused) all work.
   - Not yet on the device.
 
+Phase 6 (in progress; started 2026-11-01):
+
+- **Evals at 41 scenarios** (`make agentd-evals`).
+  - New steps: scheduled runs (`run_schedule`, by waking the scheduler), restarts, dated seeds (`{date+12}`, `age_days`), a busy day of finished tasks (`seed_runs`), and `expect_outcome`.
+  - New metrics: recall@8 (whether the fact was in the task's notes, read from `recall_count`; rules and preferences always count), the false-memory rate, staleness, the `report_outcome` missing rate and cost per scenario.
+  - `--compare OLD NEW` lines two runs up scenario by scenario.
+  - New scenarios cover scheduled runs (quiet, a result, blocked at a sign-in, continuing from the last run, following a rule), a request buried in a task, an API key refused, an email kept, a hyphenated word, a year-old fact, a restart, "what do you remember", a fact used unasked, two false-memory traps, three staleness cases, consolidation skipping trivia, and a full batch.
+- **A soak report:** `make agentd-soak SINCE=<date>` (`scripts/agentd-soak.py`).
+  - It reads the desktop over SSM, read-only, and only counts and costs leave it.
+  - It checks the exit criteria it can: effect failures, consolidation under the cap every day, consolidations that didn't finish, and days of soak. Then it gives tasks and costs by day, and counts from the journal.
+- **Found by the first soak report** (the dev desktop, 2026-11-01): every consolidation of the 20 waiting tasks failed with "no JSON object in the reply".
+  - GLM-5.3-Flash thinks before it answers, and its thinking used up the 4,096-token reply.
+  - The effect retried 10 times, gave up and started over, at about $0.004 an attempt; the daily cap kept it small.
+  - Fix: the reply limit is 16,384 (the gateway's maximum), and the error records the `finish_reason`.
+- **Found by the evals, before it reached the desktop: consolidation could freeze agentd.**
+  - `apply` converted a proposal's `valid_until` inside its transaction, by reading the user's time zone from settings.
+  - That waited forever for the store lock the transaction already held, and every database access in agentd with it.
+  - The desktop never got that far only because its consolidations failed first.
+  - Fix: the time zone is read before the transaction. `a_proposal_with_an_end_date_doesnt_block_the_store` fails (it doesn't hang) on the old code.
+- **Batches of 10, not 20** (a change to §8). Flash thought for 6,000–8,000 tokens per 10 busy tasks (journal line `consolidation reply`). A full batch that leaves more behind runs the next one 5 seconds later (`Later`), and a full batch waiting triggers one at once.
+- **Tried and dropped:**
+  - "Keep your thinking short" in the instructions cut thinking, but the model then skipped a work-log entry it should have written (0 of 3 against 3 of 3 without it).
+  - `reasoning_effort: "medium"` is honoured by GLM, but on the consolidation scenarios it changed nothing measurable (6 of 6 either way, similar cost).
+  - `reasoning: {"enabled": false}` is ignored by GLM-5.3-Flash.
+- **Recall fills up with recent notes** (a change to §6). With fewer than 8 full-text matches, the most recent facts and work-log entries fill the rest of the notes, after the matches. The eval "newer-fact-wins" failed without it: "Which company do I work for now?" matched only "works at Acme", and "started a new job at Globex" shares no word with it.
+- **An empty reply gets one reminder.** A reply with neither text nor tool calls (the thinking used up the 8,192 tokens) now gets "Give your answer now, briefly" instead of ending as "(empty answer)". Seen once, in a scheduled run.
+- **Scheduled runs keep their own place.** In "scheduled-run-continues", the run saved its progress with `remember` (a `user_stated` fact tied to the schedule, since the schedule's prompt is the user's), and consolidation saw nothing more to log. Continuity works either way.
+- **Journal:** `task finished` carries the reported `outcome`; each consolidation call logs its time, `finish_reason` and token counts.
+- **The chat shows only the conversation** (an app change outside the plan, 2026-11-01). Messages, pictures and the cards waiting for the user; three dots while a task runs. So the memory notes of §9's "chat visibility" are gone, and the v2 prompt no longer says saves are shown: when the user asked to remember something, the model says so in a few words, and doesn't mention other saves. "Open that conversation" now scrolls to the message that started the task, loading older pages until it's there (the app loads the chat a page at a time, newest first, from agentd 0.15.1's `/events/page`).
+- **Dropped from the evals:** a poisoned web page. The browser refuses 127.0.0.1 pages, so the harness can't serve one; the poisoning unit tests (phase 1) cover the harness side.
+
+**Evals at phase 6:** 41 scenarios, GLM-5.3, 2026-11-01. v1 (`MEMORY_V2=off`) skips the 4 consolidation scenarios.
+
+| | v1 | v2 |
+|---|---|---|
+| Passed | 33/37 | **41/41** |
+| Worse than v1 | — | 0 scenarios |
+| recall@8 (advisory ≥ 0.85) | n/a | 0.93 (the paraphrase misses; the model recovers with `search_memory`) |
+| False-memory rate (≤ 5%) | 0 | 0 |
+| Staleness (≥ 90%) | 0.83 | 1.0 |
+| `report_outcome` missing | n/a | 0 of 6 scheduled runs |
+| Cost per scenario | $0.004 | $0.007 |
+
+v1's failures are the same as in phase 2, plus "old-fact-still-found": v1 shows only the latest 60 notes, and doesn't check end dates.
+
+**Soak status.** The week restarts on the day these fixes are deployed. Exit criteria:
+
+- no effect failures for a week (`make agentd-soak`);
+- the evals above (met);
+- consolidation under the cap every day.
+
+Then review the proposals in the app, switch to `auto`, and build 0.16.0 without the flag.
+

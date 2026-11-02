@@ -216,6 +216,20 @@ public struct AgentStatus: Decodable, Sendable, Equatable {
     }
 }
 
+/// A page of the event log, oldest first (GET /api/v1/events/page).
+public struct EventPage: Decodable, Sendable, Equatable {
+    public let events: [AgentEvent]
+    /// Older events of those kinds remain.
+    public let more: Bool
+    /// The log's newest seq when the page was read: the live stream goes on after it.
+    public let lastSeq: Int
+
+    enum CodingKeys: String, CodingKey {
+        case events, more
+        case lastSeq = "last_seq"
+    }
+}
+
 public struct AgentSettings: Codable, Sendable, Equatable {
     public var model: String
     public var allowActions: Bool
@@ -262,10 +276,12 @@ public struct AgentClient: Sendable {
         try await get("/api/v1/status")
     }
 
-    /// The live event stream, starting after `after`. Ends when the connection drops.
-    public func events(after: Int) -> AsyncThrowingStream<AgentEvent, Error> {
-        let url = baseURL.appending(path: "/api/v1/events")
-            .appending(queryItems: [URLQueryItem(name: "after", value: String(after))])
+    /// The live event stream, starting after `after`, of `kinds` only (all
+    /// when empty). Ends when the connection drops.
+    public func events(after: Int, kinds: Set<String> = []) -> AsyncThrowingStream<AgentEvent, Error> {
+        var query = [URLQueryItem(name: "after", value: String(after))]
+        if !kinds.isEmpty { query.append(URLQueryItem(name: "kinds", value: kinds.sorted().joined(separator: ","))) }
+        let url = baseURL.appending(path: "/api/v1/events").appending(queryItems: query)
         let session = session
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -288,6 +304,20 @@ public struct AgentClient: Sendable {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Up to `limit` events of `kinds` before `before` (the newest when nil),
+    /// oldest first: the chat a page at a time. agentd before 0.15.1 answers 404.
+    public func eventPage(before: Int?, limit: Int, kinds: Set<String>) async throws -> EventPage {
+        var query = [
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "kinds", value: kinds.sorted().joined(separator: ",")),
+        ]
+        if let before { query.append(URLQueryItem(name: "before", value: String(before))) }
+        let url = baseURL.appending(path: "/api/v1/events/page").appending(queryItems: query)
+        let (data, response) = try await session.data(from: url)
+        try Self.check(response, data)
+        return try JSONDecoder().decode(EventPage.self, from: data)
     }
 
     /// Image bytes for paths like /api/v1/images/<id> (thumbnails, screenshots).

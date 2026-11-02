@@ -17,7 +17,7 @@
 //! in both modes.
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -38,12 +38,13 @@ pub const DELAY_SECS: i64 = 600;
 /// timeout (phase 6 evals). A full batch that leaves more behind goes on with
 /// the next one (`more_waiting`).
 pub const MAX_BATCH: i64 = 10;
-/// How hard the model thinks, for the models that take `reasoning_effort`.
-/// GLM's default thinking ran to 8,000 tokens and more per batch, sometimes
-/// past the client's 3-minute timeout; "medium" keeps its judgment (phase 6
-/// evals) at a fraction of that.
-fn reasoning_effort(model: &str) -> Option<&'static str> {
-    model.starts_with("zai-org/GLM").then_some("medium")
+/// Turns a proposal's `valid_until` date into the end of that day for the
+/// user. The time zone is read now: `apply` calls this inside its
+/// transaction, and reading settings there would wait for the store's lock it
+/// already holds, blocking agentd for good (found in the phase 6 evals).
+fn date_ends(agent: &Agent) -> impl Fn(&str) -> Option<i64> + use<> {
+    let timezone = agent.user_timezone();
+    move |date: &str| crate::agent::end_of_day_in(date, &timezone)
 }
 
 /// The pause before the next batch.
@@ -795,15 +796,29 @@ pub async fn run(agent: &Agent) -> Outcome {
     let mut problem = String::new();
     // An answer that isn't valid gets one more try, with what was wrong.
     for _ in 0..2 {
-        let mut request = json!({"model": model, "messages": messages, "max_tokens": REPLY_TOKENS});
-        if let Some(effort) = reasoning_effort(&model) {
-            request["reasoning_effort"] = json!(effort);
-        }
+        let request = json!({"model": model, "messages": messages, "max_tokens": REPLY_TOKENS});
+        let asked = Instant::now();
         let reply = match agent.complete(&request).await {
             Ok(reply) => reply,
-            Err(err) => return Outcome::Failed(format!("{err:#}")),
+            Err(err) => {
+                let ms = asked.elapsed().as_millis() as u64;
+                tracing::warn!(tasks = runs.len(), ms, "consolidation call failed");
+                return Outcome::Failed(format!("{err:#}"));
+            }
         };
         usage.add(reply.get("usage"));
+        // Metadata only: how long, how it ended, how much thinking.
+        tracing::info!(
+            tasks = runs.len(),
+            ms = asked.elapsed().as_millis() as u64,
+            finish = reply["choices"][0]["finish_reason"].as_str().unwrap_or("?"),
+            prompt_tokens = reply["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+            completion_tokens = reply["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+            reasoning_tokens = reply["usage"]["completion_tokens_details"]["reasoning_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+            "consolidation reply"
+        );
         let content = reply["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
@@ -831,7 +846,7 @@ pub async fn run(agent: &Agent) -> Outcome {
             store.transact(|tx| record_run(tx, &run_id, &model, "error", Some(cost), &failed, runs.len()));
         return Outcome::Failed(format!("the model's answer wasn't valid twice: {problem}"));
     };
-    let valid_until = |date: &str| agent.end_of_day(date);
+    let valid_until = date_ends(agent);
     match apply(
         store,
         &agent.secrets,
@@ -968,6 +983,58 @@ mod tests {
         assert_eq!(runs[1].schedule, Some(4));
         let t3_rowid = runs[1].rowid;
         assert_eq!(mark, t3_rowid);
+    }
+
+    #[test]
+    fn a_proposal_with_an_end_date_doesnt_block_the_store() {
+        // apply() converts dates inside its transaction: a conversion that
+        // read settings there waited forever for the lock it was holding.
+        let (agent, dir) = crate::agent::test_agent();
+        agent
+            .store
+            .set_setting("user_timezone", "America/Toronto")
+            .unwrap();
+        agent.store.set_setting("user_utc_offset", "-18000").unwrap();
+        task(&agent.store, "t1", "done", None);
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = agent.clone();
+        std::thread::spawn(move || {
+            let output = parse(
+                r#"{"facts": [{"text": "The user is in Lisbon until Friday", "kind": "fact",
+                              "source_run": "t1", "valid_until": "2026-11-06"}]}"#,
+            )
+            .unwrap();
+            let (runs, mark) = batch(&worker.store).unwrap();
+            let applied = apply(
+                &worker.store,
+                &worker.secrets,
+                Mode::Auto,
+                "c1",
+                &runs,
+                &output,
+                mark,
+                &date_ends(&worker),
+                None,
+            );
+            let _ = done.send(applied.map(|a| a.saved));
+        });
+        let saved = finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("apply blocked on the store's lock");
+        assert_eq!(saved.unwrap(), 1);
+        // The end of Friday in Toronto (EST, UTC-5).
+        let until: i64 = agent
+            .store
+            .read(|conn| Ok(conn.query_row("SELECT valid_until FROM memory", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(
+            until,
+            "2026-11-07T04:59:59Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_second()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

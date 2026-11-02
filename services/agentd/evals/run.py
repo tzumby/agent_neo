@@ -293,6 +293,8 @@ class Desktop:
         http(self.base, "POST", "/api/v1/memory/consolidate", {})
 
         def finished():
+            # "waiting" first: a batch that commits in between then shows in rows.
+            waiting = http(self.base, "GET", "/api/v1/memory/consolidation")["waiting_tasks"]
             with sqlite3.connect(self.db) as db:
                 rows = db.execute(
                     "SELECT status, cost, answer FROM runs WHERE kind = 'consolidation' AND rowid > ? ORDER BY rowid",
@@ -302,7 +304,6 @@ class Desktop:
                 return None
             if rows[-1][0] != "done":
                 return rows
-            waiting = http(self.base, "GET", "/api/v1/memory/consolidation")["waiting_tasks"]
             return rows if waiting == 0 else None
 
         rows = wait_until(finished, 420, "consolidation")

@@ -45,6 +45,17 @@ import Testing
     #expect(status.lastSeq == 10)
 }
 
+@Test func decodesAPageOfEvents() throws {
+    // As served by agentd 0.15.1 (GET /api/v1/events/page).
+    let json = """
+        {"events":[{"seq":12,"ts":"2026-11-01T10:00:00Z","kind":"message","data":{"role":"user","text":"hi"}}],
+         "more":true,"last_seq":40}
+        """
+    let page = try JSONDecoder().decode(EventPage.self, from: Data(json.utf8))
+    #expect(page.events.map(\.seq) == [12])
+    #expect(page.more && page.lastSeq == 40)
+}
+
 @Test func decodesMemoryFromV1AndV2Desktops() throws {
     let v1 = try JSONDecoder().decode(
         AgentMemory.self, from: Data(#"{"id":1,"text":"x","trusted":false,"created":"2026-11-01T10:00:00Z"}"#.utf8))

@@ -201,11 +201,14 @@ app, no Tailscale app needed), `AgentAPI` (agentd's API and event stream over th
 tailnet), `ChatCore` (turns the event stream into the chat timeline) and
 `DesktopViewer` (VNC to the desktop through the node's SOCKS5 proxy).
 
-The app opens on a chat with the first desktop tagged `tag:cloud-desktop`. It
-shows the agent's replies, its steps (tap to expand), each shell command with its
-output, Approve/Deny cards for risky commands and for anything the agent types or
-sends in the browser (you see the exact text first), and "Action needed" cards with a screenshot when a site needs you to sign
-in (Skip / I'm done / Take over). Stop cancels the running task.
+The app opens on a chat with the first desktop tagged `tag:cloud-desktop`, at
+the newest message; older ones load as you scroll up. It shows your messages and
+the agent's replies, three dots while it works (its steps and commands stay out of
+the chat), Approve/Deny cards for risky commands (what the command does in plain
+words and why it needs your OK, the command itself a tap away) and for anything the agent types
+or sends in the browser (you see the exact text first), and "Action needed" cards
+with a screenshot when a site needs you to sign in (Skip / I'm done / Take over).
+A card leaves the chat once answered. Stop cancels the running task.
 
 **Take over** (on a card, or the desktop button in the toolbar) shows the desktop
 full screen over VNC through the app's own Tailscale node (`DesktopViewer`, using
@@ -255,10 +258,11 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   (replaced the earlier Python agent and Telegram bot).
 - [docs/memory-v2.md](docs/memory-v2.md): the plan for agentd's memory v2 (kinds,
   trust, retrieval, consolidation) and the effects queue, policy versions,
-  attention budget and stage; phases 0–5 are built (agentd 0.15.0, `MEMORY_V2=off`
-  by default, on for the dev desktop; v2 passes 20/20 memory evals, v1 17/20;
-  consolidation runs in review-first `observe` mode; notifications go through the
-  effects queue and follow the attention rules).
+  attention budget and stage; phases 0–5 are built and phase 6 (soak and launch)
+  is under way (agentd 0.15.2, `MEMORY_V2=off` by default, on for the dev desktop;
+  v2 passes 41/41 memory evals, v1 33/37; consolidation runs in review-first
+  `observe` mode; notifications go through the effects queue and follow the
+  attention rules; `make agentd-soak` reports the soak).
 - [docs/agents-and-bots.md](docs/agents-and-bots.md): design for a main agent with
   its own memory, and user-created bots it manages (draft, not built yet).
 - [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'

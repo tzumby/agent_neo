@@ -526,7 +526,8 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/status` | Desktop name, `busy`, `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2`, `memory {active, pending}`, `stage` and `stage_detail` (below the table) |
 | GET | `/api/v1/messages?limit=` | The chat history (default 50, at most 500), with saved keys redacted |
 | POST | `/api/v1/messages` | `{text, timezone, utc_offset}` starts a task. 202 `{task}`, or 409 while one runs. The time zone is remembered for later tasks and schedules |
-| GET | `/api/v1/events?after=` | Server-Sent Events: up to 5,000 logged events after `after`, then live ones. Each SSE message has `id: seq`, `event: kind` and the JSON event. Keep-alive comments every 15 s. Subscribes to the live bus before reading the backlog, so nothing falls between them |
+| GET | `/api/v1/events?after=&kinds=` | Server-Sent Events: up to 5,000 logged events after `after`, then live ones; `kinds` (comma-separated) keeps only those. Each SSE message has `id: seq`, `event: kind` and the JSON event. Keep-alive comments every 15 s. Subscribes to the live bus before reading the backlog, so nothing falls between them |
+| GET | `/api/v1/events/page?before=&limit=&kinds=` | A page of the log, oldest first: up to `limit` (default 100, at most 500) events of `kinds` before `before` (from the newest when absent). `{events, more, last_seq}`: `more` says older ones remain, and `last_seq` is the log's newest seq, read under the same lock, for the stream to go on from. Keys redacted as in the stream (0.15.1) |
 | POST | `/api/v1/approvals/{id}` | `{approved}`. Resumes the parked task. 404 if unknown or expired, 409 if another task is running |
 | POST | `/api/v1/actions/{id}` | `{choice: done or skip}` on an Action needed card. Starts a new task with "I've done what you asked… continue" or "I'm skipping that step…" |
 | POST | `/api/v1/stop` | Stops the running task, or gives up on a parked one |
@@ -575,7 +576,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 Every change the apps show is an event: appended to `events` and broadcast on an in-process `tokio::broadcast` channel (capacity 1024).
 
 - **Replay:** the app keeps the last `seq` it applied and reconnects with `?after=`, so after a disconnect it catches up exactly.
-- **Rebuilding:** replaying from 0 rebuilds the whole chat.
+- **Pages:** the app loads the chat newest page first (`/events/page`) and older pages as the user scrolls up. Replaying the later part of the log gives the chat of that part, so pages can go in front of what's loaded. Replaying from 0 still rebuilds the whole chat.
 - **Redaction:** before an event is stored, `emit()` replaces any saved key's value in it (§6.15). The SSE handler redacts again as it streams, which covers events logged before a key was saved.
 
 | Kind | Data | Emitted when |
@@ -585,7 +586,7 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 | `step` | `task`, `step`, `tool`, `args` (first 300 characters) | Each tool call, except a resumed one |
 | `shell` | `task`, `command`, `as_root`, `needs_approval`, `secrets` (key names) | A command is about to run or ask |
 | `shell.output` | `task`, `command`, `exit_code`, `timed_out`, `stopped`, `output` (last 4,000 characters), `seconds` | A command ended |
-| `approval.requested` | The card: `id`, `task`, `kind` (`shell`, `browser`, `schedule` or `secret`) and its fields | A task parks |
+| `approval.requested` | The card: `id`, `task`, `kind` (`shell`, `browser`, `schedule` or `secret`) and its fields. A `shell` card has `command`, `reason`, `secrets`, `summary` (the model's plain words, one line, at most 120 characters) and `tainted` (asked after outside content) | A task parks |
 | `task.paused` | `task`, `approval` | Right after the card |
 | `approval.resolved` | `task`, `id`, `approved`, `by`, `expired`, `reason` (`policy_changed`) | Answered, or given up on |
 | `task.resumed` | `task` | A parked task carries on |
@@ -687,7 +688,7 @@ For each tool call:
 | `schedule_task` | `name`, `prompt`, `cron` or `at` | Sets up a scheduled task (§6.14) | Only after outside content. Refused in scheduled runs |
 | `list_schedules`, `cancel_schedule` | `id` | Manage schedules | No |
 | `read_skill` | `name` | Returns a skill's Markdown (§6.16) | No |
-| `run_shell` | `command`, `timeout` (120 s; 1–900), `secrets` | Runs bash as `worker` (§6.10) | `sudo …`, dangerous patterns, and data-out after outside content |
+| `run_shell` | `command`, `summary` (what it does in plain words, for the approval card), `timeout` (120 s; 1–900), `secrets` | Runs bash as `worker` (§6.10) | `sudo …`, dangerous patterns, and data-out after outside content |
 | `request_secret` | `name`, `label`, `why`, `how`, `url`, `replace` | Asks the user for an API key or token (§6.15) | Always: it's a card with a secure field |
 | `report_outcome` (memory v2, scheduled runs only) | `outcome` (result, nothing, blocked), `summary` (≤ 180 characters) | Ends a scheduled run. `result` pushes the summary, `blocked` pushes "<name>: needs you", `nothing` pushes nothing and leaves a quiet row in the chat (§6.17) | No |
 
@@ -813,7 +814,7 @@ These patterns are a speed bump against mistakes and injected instructions, not 
 
 | Kind | Shows | Notification |
 |---|---|---|
-| `shell` | Command, reason, keys used | "Run this command?" with Approve/Deny on the notification |
+| `shell` | Command, reason, keys used, plain summary, taint | "Run a command?": the summary and the reason ("…, asked after reading outside content" when tainted), with Approve/Deny on the notification. Without a summary, "Run this command?" and the command |
 | `browser` | Action (type, key or click), target, the exact text, submit/sends, site, reason | "Write this on slack.com?" etc., with Approve/Deny |
 | `schedule` | Name, prompt, when | "Schedule this?", with Approve/Deny |
 | `secret` | Label, why, how (Markdown), link and its host, replace, tainted | "GitHub token needed"; opens the app (no buttons: a value is needed) |
@@ -915,7 +916,8 @@ Web pages, emails and command output can carry injected instructions. The defenc
 **Search.** `search_memory` uses the same ranking as the notes. On the evals, it rescues paraphrases that full-text matching misses.
 
 **Consolidation** (phase 3, `consolidate.rs`).
-- **When:** 10 minutes after the last finished task (a burst consolidates once), or at once when 20 tasks wait. It's a `consolidate` effect (§6.19), never alongside a task.
+- **When:** 10 minutes after the last finished task (a burst consolidates once), or at once when 10 tasks wait. It's a `consolidate` effect (§6.19), never alongside a task.
+- **Batches:** at most 10 tasks per model call. A full batch that leaves more behind runs the next one 5 seconds later (`Later`). With 20 busy tasks, GLM-5.3-Flash thought for 6,000–8,000 tokens or more per call.
 - **What it does:** it sends the batch of finished tasks (request, answer, status, schedule) and the current memories to `memory_consolidation_model` (GLM-5.3-Flash by default) through the gateway. The reply is a JSON object with `work_log`, `facts`, `merges` and `expire`, checked here before anything is written:
   - ids must be real and active;
   - texts pass the length and secret checks;
@@ -932,7 +934,8 @@ Web pages, emails and command output can carry injected instructions. The defenc
   - work-log entries expire after a year;
   - so does anything past `valid_until`.
 - **Accounting:** each run is a `runs` row (`kind = consolidation`) with its cost, under a daily cap (`memory_consolidation_daily_cap_usd`, $0.50), and emits `memory.consolidated`.
-- **Reply limit:** 16,384 tokens (the gateway's maximum), and the instructions ask for short thinking. GLM thinks before it answers, and with 4,096 tokens a batch of 20 tasks left no room for the JSON (found in the phase 6 soak). A reply without JSON records its `finish_reason` in the effect's error.
+- **Reply limit:** 16,384 tokens (the gateway's maximum). GLM thinks before it answers, and with 4,096 tokens a batch of 20 tasks left no room for the JSON (found in the phase 6 soak). A reply without JSON records its `finish_reason` in the effect's error. Each call gets a journal line (`consolidation reply`): tasks, milliseconds, `finish_reason`, prompt, completion and reasoning tokens.
+- **Dates:** a proposal's `valid_until` becomes the end of that day in the user's time zone, read before the transaction that applies the reply. Reading it inside, as 0.15.0 first did, waited forever for the store's lock the transaction held and froze agentd (found in the phase 6 evals before it reached the desktop; a test now fails on it).
 - **Cost:** about $0.0006 a run on Flash for a few tasks, about a cent for a full batch.
 - **Trigger it now:** `POST /api/v1/memory/consolidate`.
 
@@ -1296,7 +1299,7 @@ None of them imports UIKit; the app target holds everything iOS-specific.
 ### 10.4 Talking to agentd (`AgentAPI`, `ChatCore`)
 
 - **`AgentClient`** covers every endpoint in §6.4:
-  - `status`, `events(after:)`, `send`, `answer(approval:)`, `resolve(action:)`, `stop`, `registerDevice`, `update(settings:)`;
+  - `status`, `events(after:kinds:)`, `eventPage(before:limit:kinds:)`, `send`, `answer(approval:)`, `resolve(action:)`, `stop`, `registerDevice`, `update(settings:)`;
   - memories, schedules and secrets;
   - `imageData`.
 
@@ -1304,18 +1307,18 @@ None of them imports UIKit; the app target holds everything iOS-specific.
 - **SSE:** `URLSession.bytes`, line by line, with a 60 s idle timeout; agentd sends keep-alives every 15 s. Each `data:` line is one JSON event.
 - **`ChatStore`**: a `@MainActor @Observable` loop that runs until cancelled:
   1. `GET status` → live.
-  2. Stream events after `lastSeq`, applying each to the timeline once, and refreshing status after `settings` and `task.finished`.
-  3. On error: offline, wait 2 s, retry.
+  2. The first time, the newest page of the chat (60 events of the kinds the timeline reads), applied in one go, so the chat appears at its end rather than filling in event by event. `lastSeq` becomes the page's `last_seq`. An agentd before 0.15.1 answers 404, and the stream replays the whole log instead.
+  3. Stream events after `lastSeq`, of the timeline's kinds and those that change the status, applying each once and refreshing the status after the latter (`settings`, `task.*`, cards and their answers, memory approvals, schedules).
+  4. On error: offline, wait 2 s, retry. Later connections resume after `lastSeq`.
 
-  `lastSeq` starts at 0, so the first connection replays the whole log and rebuilds the chat. After that it resumes exactly where it left off.
+  `loadOlder` fetches the page before the oldest event loaded and rebuilds the timeline from every event loaded (an answer in a newer page closes a card from an older one). A load under way is joined, not repeated, and cards the desktop no longer knows stay expired across rebuilds.
 - **Commands:** send, stop (shown as stopping at once), answer, resolve, save a requested key, update settings. 409 becomes "Your desktop is busy…"; 404 on a card expires it ("That request has expired.").
-- **`ChatTimeline`**: a pure value type; applying events in order gives the chat. Items:
-  - `user` (with a schedule name for scheduled runs), `assistant`;
-  - `work`: one per task, with its steps, the commands' runs (state, exit code, output tail, seconds, keys used) and the finish summary (status, steps, seconds, cost, tokens);
+- **`ChatTimeline`**: a pure value type; applying events in order gives the chat. It reads only `ChatTimeline.kinds` (messages, images, `task.*`, cards and their answers, `secret.saved`): the agent's steps, commands and their output, and memory and schedule events stay out of the chat. Items:
+  - `user` (with its task, and a schedule name for scheduled runs), `assistant`;
   - `approval`, with a subtype for browser, schedule or secret; otherwise it's a command;
-  - `action` (Action needed), `image`, `schedule`.
+  - `action` (Action needed), `image`.
 
-  Answered command approvals are hidden, since their outcome shows on the command's step. Browser and key request cards stay.
+  `visibleItems` keeps the messages, the pictures and the cards still waiting; answered or expired, a card leaves the chat. `busy` (from `task.started` to `task.finished`, except while parked) drives the working indicator.
 - **Markdown** (`MarkdownBlock.parse`): Foundation's `AttributedString(markdown:)` with full syntax, rebuilt into blocks (headings, paragraphs, lists with ordinals and tasks, quotes, code, tables with alignment, rules).
   - Single newlines break lines, chat-style.
   - Raw HTML stays literal text.
@@ -1330,10 +1333,13 @@ None of them imports UIKit; the app target holds everything iOS-specific.
   - DesktopHome → ChatView;
   - "Tailscale isn't connected" with Try again.
 - **ChatView:**
-  - the timeline in a bottom-anchored `LazyVStack` (rows are `Equatable`, so only changed rows redraw);
+  - the timeline in a bottom-anchored `VStack` (rows are `Equatable`, so only changed rows redraw), holding only the pages loaded. A spinner above the oldest message loads the page before it when it scrolls into view (`onScrollVisibilityChange`).
+    - The page goes in above without moving what's on screen. Scrolled up to the top, the scroll view keeps its offset (it would show the new page and load the next, and the next), so `keepPlace` moves down by the height added, from `onScrollGeometryChange`.
+    - Not a `LazyVStack`: it only estimates the rows it hasn't shown, so the height added was wrong and the view jumped;
+  - three pulsing dots below the last message while a task runs: all the chat shows of the agent's work;
   - a glass composer with Send, which becomes Stop while a task runs and a spinner while it stops;
   - suggestions in an empty chat;
-  - a splash until the first sync.
+  - a splash until the newest page is in. Only the splash fades, so the chat appears already at its end.
 
   Toolbar:
   - Settings;
@@ -1342,14 +1348,13 @@ None of them imports UIKit; the app target holds everything iOS-specific.
 - **Rows:**
   - user bubbles ("Scheduled · name" for scheduled runs);
   - answers rendered as Markdown, with code chips, tables that scroll sideways, code blocks with Copy, and long-press to copy the answer;
-  - the task row ("Working · Opening github.com" with a shimmer, then "Worked for 21s · 4 steps"), expandable to steps with icons, commands in monospace, a `root` badge, a key icon for commands that got saved keys, and their status and output tail;
-  - cards:
-    - **Run this command?**
+  - cards, only while they wait for the user (answered, they leave the chat):
+    - **Needs your OK** for a command: what it does in plain words (the model's `summary`), why it needs the OK, a warning when the agent read outside content before asking (its words could be steered), and the command behind "Show the command";
     - **Write this? / Write and send this? / Press Enter? / Click this?**, with the site and the exact text;
     - **Schedule this?**;
     - **Key request** (§11.5);
     - **Action needed**, with a screenshot, Skip / I'm done / Take over;
-    - **Scheduled** notes, and screenshots.
+  - screenshots the agent shows (`show_screenshot`).
 - **Settings:**
   - model, Browser actions, agentd version;
   - **Memory** (memory v2; the plan's §14):
@@ -1406,7 +1411,8 @@ Nothing shows while the desktop is idle, working or only has a schedule coming. 
 `make app-test` runs `swift test` on macOS. The tests cover:
 - decoding of Tailscale status and agentd status;
 - SSE lines;
-- the timeline: tasks, approvals, browser cards, parking and resuming, schedules, key requests, denied and unfinished commands;
+- the timeline: only the conversation and the cards waiting show, the later part of the log gives the same chat, Action needed, Stop, browser and schedule cards, key requests, scheduled runs, a command card's plain words;
+- a page of events;
 - Markdown;
 - key detection.
 
@@ -1421,7 +1427,7 @@ Live tests run only with `AGENTD_URL` (a real agentd) or `VNC_ADDR` (a real VNC 
 3. `GET https://cloud-desktop-dev.<tailnet>.ts.net/api/v1/status` reaches the desktop:
    - tailnet-proxy's WhoIs check passes (the login is on the allowlist);
    - the request goes over the Unix socket to agentd.
-4. `GET /api/v1/events?after=0` replays the log, and the chat appears. The app then registers for notifications and sends its token, which agentd passes to the relay.
+4. `GET /api/v1/events/page` brings the newest page of the chat, which appears at its end as the splash fades. The stream follows from the page's `last_seq`. The app then registers for notifications and sends its token, which agentd passes to the relay.
 
 ### 11.2 A request from the chat
 
@@ -1492,7 +1498,7 @@ Live tests run only with `AGENTD_URL` (a real agentd) or `VNC_ADDR` (a real VNC 
 1. "Every weekday at 8, summarize my inbox":
    - `schedule_task(cron "0 8 * * 1-5")` in the user's zone (America/Toronto);
    - next run computed with DST;
-   - `schedule.created` emitted, and a "Scheduled" card shows in the chat.
+   - `schedule.created` emitted; the answer says so, and Settings → Schedules lists it.
 2. At 08:00 local, the scheduler (woken by its timer) starts a task with the stored prompt, no history and the scheduled framing. The chat shows "Scheduled · Morning inbox".
 3. If a parked task or another task is running, the scheduler retries every 5 s. A run that's an hour late is skipped with a note.
 4. The answer is pushed, titled "Morning inbox". The schedule moves to the next weekday.
@@ -1622,7 +1628,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 102 unit tests (plus a 5,000-memory speed test run on demand): bulk approval by reason, restore, where a memory came from and what a proposal replaces, export and import round trips, consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies |
+| agentd | 107 unit tests (plus a 5,000-memory speed test run on demand): bulk approval by reason, restore, where a memory came from and what a proposal replaces, export and import round trips, consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto, protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
 | DesktopKit | 25 tests (§10.8) |

@@ -60,3 +60,41 @@ desktop_units:
 # Chrome enterprise policies (/etc/opt/chrome/policies/managed).
 desktop_chrome_policy:
   PasswordManagerEnabled: false
+  # Web apps try to open their desktop apps (Slack's web client opens
+  # slack://…). Chrome then asks "Open xdg-open?" in its own UI, which the
+  # agent can't see or answer over DevTools, so the task hangs; and there are
+  # no such apps here. Blocked schemes fail quietly and the web app stays in
+  # the browser ("custom_scheme:*" is the policy's documented form). Add a
+  # scheme here when another app's prompt turns up.
+  URLBlocklist:
+    - "slack:*"
+    - "zoommtg:*"
+    - "zoomus:*"
+    - "zoomphonecall:*"
+    - "msteams:*"
+    - "ms-teams:*"
+    - "webex:*"
+    - "wbx:*"
+    - "discord:*"
+    - "figma:*"
+    - "notion:*"
+    - "linear:*"
+    - "spotify:*"
+    - "tg:*"
+    - "whatsapp:*"
+    - "skype:*"
+    - "ms-outlook:*"
+    - "ms-word:*"
+    - "ms-excel:*"
+    - "ms-powerpoint:*"
+    - "onenote:*"
+    - "vscode:*"
+    - "vscode-insiders:*"
+    - "cursor:*"
+    - "jetbrains:*"
+    - "x-github-client:*"
+    - "postman:*"
+    - "onepassword:*"
+  # For other schemes the prompt still appears, without "Always allow…", so
+  # nobody makes xdg-open permanent from Take over.
+  ExternalProtocolDialogShowAlwaysOpenCheckbox: false

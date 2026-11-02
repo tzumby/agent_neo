@@ -110,10 +110,15 @@ module "attested_gateway" {
   audience            = "${local.name}/model-gateway"
   ssm_prefix          = "/${var.project}/${var.env}"
   daily_budget_usd    = var.model_daily_budget_usd
+  # The models allowed through the gateway, with Together's serverless prices
+  # (agentd's llm.rs has the same). In the instance's user data: a change
+  # replaces the gateway instance (same image), and desktops attest it again.
   prices = {
-    "zai-org/GLM-5.3"       = [1.40, 0.26, 4.40]
-    "zai-org/GLM-5.3-Flash" = [0.15, 0.03, 0.50]
-    "moonshotai/Kimi-K3"    = [3.00, 0.30, 15.00]
+    "zai-org/GLM-5.3"                      = [1.40, 0.26, 4.40]
+    "zai-org/GLM-5.3-Flash"                = [0.15, 0.03, 0.50]
+    "moonshotai/Kimi-K3"                   = [3.00, 0.30, 15.00]
+    "deepseek-ai/DeepSeek-V4-Pro-0813"     = [1.32, 0.13, 3.96]
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017" = [0.30, 0.006, 1.20]
   }
 }
 

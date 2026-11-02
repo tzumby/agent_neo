@@ -17,17 +17,29 @@ const RETRYABLE: [u16; 5] = [429, 500, 502, 503, 504];
 /// Never wait longer than this between retries, whatever Retry-After says.
 const MAX_RETRY_DELAY_SECS: u64 = 30;
 
-/// USD per 1M tokens: input, cached input, output (Together serverless, 2026-10-30).
+/// USD per 1M tokens: input, cached input, output (Together serverless;
+/// GLM and Kimi 2026-10-30, DeepSeek 2026-11-02). Keep in step with the
+/// gateway's prices (terraform/envs/dev/main.tf), which allow the models.
 pub fn prices(model: &str) -> Option<(f64, f64, f64)> {
     match model {
         "zai-org/GLM-5.3-Flash" => Some((0.15, 0.03, 0.50)),
         "zai-org/GLM-5.3" => Some((1.40, 0.26, 4.40)),
         "moonshotai/Kimi-K3" => Some((3.00, 0.30, 15.00)),
+        "deepseek-ai/DeepSeek-V4-Pro-0813" => Some((1.32, 0.13, 3.96)),
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017" => Some((0.30, 0.006, 1.20)),
         _ => None,
     }
 }
 
-pub const KNOWN_MODELS: [&str; 3] = ["zai-org/GLM-5.3", "zai-org/GLM-5.3-Flash", "moonshotai/Kimi-K3"];
+/// The models a desktop may use, as the app lists them. DeepSeek's are pinned
+/// to dated snapshots, so a model doesn't change under a running desktop.
+pub const KNOWN_MODELS: [&str; 5] = [
+    "zai-org/GLM-5.3",
+    "zai-org/GLM-5.3-Flash",
+    "moonshotai/Kimi-K3",
+    "deepseek-ai/DeepSeek-V4-Pro-0813",
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+];
 
 /// Whether the model wants its `reasoning_content` sent back on later turns.
 /// GLM and Kimi do (they reason worse without it); others, such as DeepSeek,

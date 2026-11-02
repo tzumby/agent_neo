@@ -306,7 +306,10 @@ For a fresh desktop, run them in this order: desktops, agentd, tailnet-proxy.
   - Removed: `light-locker`, `xfce4-screensaver` and `xfce4-power-manager`, so the screen never blanks or locks.
 - **Chrome:**
   - Google Chrome stable for the host's architecture, from Google's signed apt repository (deb822 source with `Signed-By`). Ansible writes the source once; after that the Chrome package owns it.
-  - Managed policy `/etc/opt/chrome/policies/managed/cloud-desktops.json` = `{"PasswordManagerEnabled": false}`, so the browser never stores the user's passwords (PLAN.MD ground rule 4).
+  - Managed policy `/etc/opt/chrome/policies/managed/cloud-desktops.json` (`desktop_chrome_policy`; Chrome reloads it without a restart; `make desktop TAGS=chrome_policy` updates only it):
+    - `PasswordManagerEnabled: false`, so the browser never stores the user's passwords (PLAN.MD ground rule 4).
+    - `URLBlocklist` of desktop-app link schemes (`slack:*`, Zoom's, Teams', `discord:*`, `figma:*`, `notion:*`, `vscode:*` and others, 28 in all). Web apps try to open their desktop apps, as Slack's web client does with `slack://`. Chrome then asks "Open xdg-open?" in its own UI, which the agent can't see or answer over DevTools, so tasks hung there (2026-11-02). Blocked, the launch fails quietly and the web app stays in the browser.
+    - `ExternalProtocolDialogShowAlwaysOpenCheckbox: false`: any other scheme's prompt has no "Always allow…", so it can't be made permanent from Take over.
 - **Units** (`Restart=always`, `RestartSec=2`, no start-rate limit; started in this order):
 
 | Unit | Runs as | Command |
@@ -1198,13 +1201,19 @@ Desktops hold no model-provider key. Every model call goes to **gatewayd**, a sm
 
 ### 7.5 Models and prices
 
-`KNOWN_MODELS` in agentd and the gateway's allowlist in dev, in USD per 1M tokens (Together serverless, checked 2026-10-30):
+`KNOWN_MODELS` in agentd and the gateway's allowlist in dev, in USD per 1M tokens (Together serverless; GLM and Kimi checked 2026-10-30, DeepSeek 2026-11-02):
 
 | Model | Input | Cached input | Output | Notes |
 |---|---|---|---|---|
 | `zai-org/GLM-5.3` (default) | 1.40 | 0.26 | 4.40 | Text only; `reasoning_content` sent back |
 | `zai-org/GLM-5.3-Flash` | 0.15 | 0.03 | 0.50 | Text only |
 | `moonshotai/Kimi-K3` | 3.00 | 0.30 | 15.00 | `reasoning_content` sent back |
+| `deepseek-ai/DeepSeek-V4-Pro-0813` | 1.32 | 0.13 | 3.96 | Pinned snapshot; `reasoning_content` dropped |
+| `deepseek-ai/DeepSeek-V4.1-Flash-1017` | 0.30 | 0.006 | 1.20 | Pinned snapshot; `reasoning_content` dropped |
+
+- **Adding a model** takes three places: `prices` and `KNOWN_MODELS` in `llm.rs`, and the gateway's `prices` in `terraform/envs/dev/main.tf`. The gateway's prices are in its user data, so changing them replaces the gateway instance (same image), and desktops attest the new one when their pinned certificate stops working.
+- **The apps** list `known_models` from `/status` by readable name (`ModelName`): "DeepSeek V4.1 Flash", with no provider and no snapshot date.
+- **Checked:** both DeepSeek models passed two memory evals on 2026-11-02: a remembered fact recalled in a later task, and a scheduled check reporting a result. V4.1 Flash cost $0.004 for both, V4 Pro $0.018. Together has no non-Flash V4.1; V4 Pro is DeepSeek's larger model there.
 
 Together's zero data retention is turned on for the organization (an account setting, not enforced in code).
 

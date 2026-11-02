@@ -68,6 +68,6 @@ struct SettingsView: View {
     }
 
     private func shortName(_ model: String) -> String {
-        model.split(separator: "/").last.map(String.init) ?? model
+        ModelName.display(model)
     }
 }

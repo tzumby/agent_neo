@@ -68,8 +68,8 @@ tester-link: ## New setup links for a tester's devices (each works once, 3 days)
 tailnet-rules: ## Write the desktops tailnet's access rules from Terraform's desktops (shows them, asks first)
 	scripts/tailnet.py policy
 
-desktop: ## Run the desktop playbook against running desktops (LIMIT= or DESKTOP= for one)
-	$(ANSIBLE_PLAYBOOK) playbooks/desktops.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+desktop: ## Run the desktop playbook against running desktops (LIMIT= or DESKTOP= for one; TAGS=chrome_policy for just Chrome's policy)
+	$(ANSIBLE_PLAYBOOK) playbooks/desktops.yml $(PLAYBOOK_LIMIT) $(if $(TAGS),--tags $(TAGS)) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
 screenshot: ## Download a screenshot of each desktop to screenshots/
 	$(ANSIBLE_PLAYBOOK) playbooks/screenshot.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
@@ -90,12 +90,12 @@ agentd-build: ## Build agentd for the desktop (static linux binary for DESKTOP_A
 agentd-deploy: agentd-build ## Install agentd on running desktops (LIMIT= or DESKTOP= for one)
 	$(ANSIBLE_PLAYBOOK) playbooks/agentd.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
-agentd-evals: ## Memory evals on this Mac against Together (cents per scenario): MEMORY_V2=on|off SCENARIO=name
+agentd-evals: ## Memory evals on this Mac against Together (cents per scenario): MEMORY_V2=on|off SCENARIO=name MODEL=id
 	cd services/agentd && cargo build --quiet
 	TOGETHER_API_KEY="$${TOGETHER_API_KEY:-$$(aws ssm get-parameter --name /cloud-desktops/$(ENV)/llm/together_api_key \
 	  --with-decryption --query Parameter.Value --output text)}" \
 	  services/agentd/evals/run.py --agentd services/agentd/target/debug/agentd \
-	  --memory-v2 $(or $(MEMORY_V2),off) $(if $(SCENARIO),--scenario $(SCENARIO))
+	  --memory-v2 $(or $(MEMORY_V2),off) $(if $(SCENARIO),--scenario $(SCENARIO)) $(if $(MODEL),--model $(MODEL))
 
 agentd-soak: ## Memory v2 soak report for the desktop (read-only): SINCE=YYYY-MM-DD, the day the soak started
 	scripts/agentd-soak.py $(INSTANCE) $(if $(SINCE),--since $(SINCE))

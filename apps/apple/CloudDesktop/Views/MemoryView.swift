@@ -355,7 +355,7 @@ private struct ConsolidationSection: View {
     }
 
     private var footer: String {
-        let model = stats.model.split(separator: "/").last.map(String.init) ?? stats.model
+        let model = ModelName.display(stats.model)
         let what = stats.mode == "off"
             ? "Off: nothing is written or merged after tasks. Dated memories still end on their date."
             : "A few minutes after your tasks, a small model notes in the work log what each one changed (a pushed fix, a booked appointment), merges memories that say the same thing, and drops ones that are no longer true. It never changes what you said, never notes what a task only looked up, and skips scheduled runs."

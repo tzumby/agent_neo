@@ -38,6 +38,13 @@ enum Device {
         static let noun = "Mac"
     #endif
 
+    /// The APNs servers this build's device token belongs to: "production"
+    /// for TestFlight and the notarized Mac app, "sandbox" for Xcode installs
+    /// (Info.plist's APSEnvironment, from the APS_ENVIRONMENT build setting).
+    static var pushEnvironment: String {
+        Bundle.main.object(forInfoDictionaryKey: "APSEnvironment") as? String == "production" ? "production" : "sandbox"
+    }
+
     /// This device's name, as the desktop lists it for notifications.
     @MainActor static var name: String {
         #if os(iOS)

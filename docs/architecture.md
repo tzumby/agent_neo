@@ -108,7 +108,7 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
 | `Makefile` | Every operation (§13.1) |
 | `docs/` | Design docs (this one, native app plan, operator isolation, agents and bots, agent control) |
 | `terraform/bootstrap/` | The S3 state bucket (local state) |
-| `terraform/envs/dev/` | The only environment: composes the modules, the test desktop, per-user KMS keys |
+| `terraform/envs/dev/` | The only environment: composes the modules, the test desktop, a desktop per entry in `desktops` (testers), per-user KMS keys |
 | `terraform/modules/network` | VPC, subnets, fck-nat instance or NAT gateways, S3 endpoint, optional SSM endpoints |
 | `terraform/modules/security` | Security groups (ALB, control plane, desktop) |
 | `terraform/modules/iam` | The fleet desktop role |
@@ -128,7 +128,7 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
 
 ## 4. AWS infrastructure (Terraform)
 
-Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0), `hashicorp/archive ~> 2.7`. One account, region `ca-central-1`, profile `default`; both come from the Makefile. Terraform owns long-lived infrastructure only. Per-user desktops are meant to be launched by a control plane **(planned)**; today Terraform creates one test desktop.
+Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0), `hashicorp/archive ~> 2.7`. One account, region `ca-central-1`, profile `default`; both come from the Makefile. Terraform owns long-lived infrastructure only. Per-user desktops are meant to be launched by a control plane **(planned)**; today Terraform creates the operator's test desktop and one desktop per entry in `desktops` (a tester: [onboarding.md](onboarding.md), `scripts/new-desktop.sh`). Those are set up like the test desktop (own role, the user's own KMS key, private subnet, no public IP) and tagged `User`, `Tailnet = own` and `TailnetName = cloud-desktop-<name>`; the test desktop is tagged `Tailnet = shared`. Each name must also be in `users` (a variable validation checks).
 
 ### 4.1 State
 
@@ -189,7 +189,7 @@ Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0), `hashicorp/archiv
 - Policies: `AmazonSSMManagedInstanceCore`, `CloudWatchAgentServerPolicy`.
 - Inline **`deny-project-secrets`**: Deny `ssm:GetParameter`, `GetParameters`, `GetParametersByPath`, `GetParameterHistory` on `parameter/cloud-desktops/*`. `AmazonSSMManagedInstanceCore` allows reading any parameter, and the default `aws/ssm` key decrypts for anyone in the account. So without this deny, anything on a desktop that reaches the metadata service could read our model and APNs keys. Ansible reads what desktops need on the operator's machine instead.
 
-**Per-desktop identity** (`modules/desktop_identity`): role and profile `cloud-desktops-dev-desktop-<user>` (the test desktop's is `…-desktop-tzumby`).
+**Per-desktop identity** (`modules/desktop_identity`): role and profile `cloud-desktops-dev-desktop-<user>` (the test desktop's is `…-desktop-tzumby`; each entry in `desktops` gets its own). The push relay grants each of these roles invoke; the gateway accepts any role with the fleet prefix.
 - Trust: EC2.
 - Policies: `AmazonSSMManagedInstanceCore` and the same deny.
 - Plus the push relay's invoke policy.
@@ -226,6 +226,7 @@ Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0), `hashicorp/archiv
 | `/cloud-desktops/dev/llm/together_api_key` | SecureString | `make llm-keys` (hidden input) | gatewayd at boot. Ansible only when there's no gateway (bootstrap) |
 | `/cloud-desktops/dev/tailscale/auth_key` | SecureString | `make tailscale-key` | Ansible → `/etc/tailnet-proxy.env` |
 | `/cloud-desktops/dev/tailscale/allowed_logins` | String | by hand | Ansible → tailnet-proxy `-allow` |
+| `/cloud-desktops/dev/tailscale/users/<name>/auth_key`, `…/allowed_logins` | SecureString, String | `scripts/new-desktop.sh` (hidden input for the key) | Ansible, for a desktop on its user's own tailnet: the key is the user's, for their tailnet; the allowlist their login. The shared ones above are never used for it |
 | `/cloud-desktops/dev/apns/key_p8` | SecureString | `make apns-key` | Push relay |
 | `/cloud-desktops/dev/apns/key_id` | String | `make apns-key` | Push relay |
 | `/cloud-desktops/dev/push/relay_url` | String | Terraform (push_relay) | Ansible → `agentd.env` |
@@ -249,14 +250,14 @@ Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0), `hashicorp/archiv
 |---|---|---|---|
 | S3 `cloud-desktops-dev-ssm-<account>-<region>` | — | Ansible's SSM file transfers; gateway image bundles (presigned, deleted after the build) | Objects expire after 1 day |
 | DynamoDB `cloud-desktops-dev-model-usage` | `desktop`, `day` | Calls, tokens, cost per desktop per UTC day | TTL 90 days |
-| DynamoDB `cloud-desktops-dev-push-devices` | `desktop`, `token` | APNs tokens and device names per desktop | Until APNs rejects the token |
+| DynamoDB `cloud-desktops-dev-push-devices` | `desktop`, `token` | APNs tokens, device names and environments per desktop | Until APNs rejects the token |
 | CloudWatch `/aws/lambda/cloud-desktops-dev-push-relay` | — | The relay's metadata logs | 14 days |
 
 **Never in AWS-side stores:** chat history, prompts, memory, saved keys, screenshots. They live only on the user's desktop.
 
 ### 4.10 Outputs
 
-Outputs are VPC and subnet ids, security group ids, the fleet instance profile, the transfer bucket, the Ubuntu AMI, the test desktop's instance id and role, the relay URL, the per-user key ARNs, the image builder's settings (or null), and the gateway's `{url, instance_id}`. None of them is secret, and none is marked sensitive.
+Outputs are VPC and subnet ids, security group ids, the fleet instance profile, the transfer bucket, the Ubuntu AMI, the test desktop's instance id and role, every desktop's instance id by user (`desktop_instance_ids`), the relay URL, the per-user key ARNs, the image builder's settings (or null), and the gateway's `{url, instance_id}`. None of them is secret, and none is marked sensitive.
 
 ## 5. The desktop VM
 
@@ -268,7 +269,8 @@ Each user's desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default,
   - Region `ca-central-1` (hard-coded; keep it in sync with Terraform's `var.region`).
   - Filters: `tag:Project = cloud-desktops` and running instances.
   - Hostnames are instance ids.
-  - Groups come from the `Role` tag (`desktop`, `model-gateway`, `nat`). Every playbook targets only `desktop`.
+  - Groups come from the `Role` tag (`desktop`, `model-gateway`, `nat`). Every playbook targets only `desktop`; the Makefile's `LIMIT=<instance id>` or `DESKTOP=<name>` narrows it to one.
+  - Per-host variables from tags: `desktop_user` (`User`), `desktop_tailnet` (`Tailnet`: `shared` or `own`, default `shared`) and `desktop_tailnet_name` (`TailnetName`, default `cloud-desktop-dev`), used for tailnet-proxy's hostname and parameters and agentd's `DESKTOP_NAME`.
 - **Connection** (`group_vars/all.yml`):
   - `ansible_connection: amazon.aws.aws_ssm`, with file transfer through the SSM transfer bucket. The Makefile passes `ansible_aws_ssm_bucket_name` from the Terraform output.
   - `ansible_become_exe: sudo.ws`: Ubuntu 26.04's default `sudo-rs` swallows the SSM plugin's end-of-command marker, so every privileged task would hang.
@@ -402,9 +404,10 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 ### 5.8 Role `tailnet_proxy`
 
 - **Binary:** `/usr/local/bin/tailnet-proxy` (Go, `CGO_ENABLED=0`, built per architecture).
-- **Unit** `tailnet-proxy.service`: `User=tailnet-proxy`, `EnvironmentFile=/etc/tailnet-proxy.env` (root 0600, `TS_AUTHKEY` from SSM `<prefix>/tailscale/auth_key`, only used if the node must log in again), `-hostname cloud-desktop-dev -state-dir /var/lib/tailnet-proxy -novnc http://127.0.0.1:6080 -agentd /run/agentd/agentd.sock -vnc 127.0.0.1:5900 [-allow <logins>]`.
+- **Unit** `tailnet-proxy.service`: `User=tailnet-proxy`, `EnvironmentFile=/etc/tailnet-proxy.env` (root 0600, `TS_AUTHKEY` from SSM `<prefix>/tailscale/auth_key`, only used if the node must log in again), `-hostname <desktop_tailnet_name> -state-dir /var/lib/tailnet-proxy -novnc http://127.0.0.1:6080 -agentd /run/agentd/agentd.sock -vnc 127.0.0.1:5900 [-allow <logins>]`.
   - **Hardening:** `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ReadWritePaths=/var/lib/tailnet-proxy -/run/agentd`, no capabilities, address families `AF_INET`, `AF_INET6`, `AF_UNIX`, `AF_NETLINK`.
 - **Allowlist:** `-allow` comes from SSM `<prefix>/tailscale/allowed_logins` (comma-separated Tailscale logins; kept out of git).
+- **A desktop on its user's own tailnet** (`desktop_tailnet: own`) reads its auth key and allowlist from `<prefix>/tailscale/users/<user>/` only. The role asserts the allowlist is there before anything else, and a missing key fails the lookup: it never falls back to the operator's key, which would put it on the operator's tailnet.
 - **Migration:** the role also migrates the older `viewer-proxy`, keeping its tailnet identity.
 
 ### 5.9 What listens where on a desktop
@@ -534,7 +537,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
 | GET | `/api/v1/screenshot` | A live screenshot of the current tab (JPEG). Exists, but the app doesn't use it |
 | GET, PUT | `/api/v1/settings` | `{model, allow_actions, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}` |
-| POST | `/api/v1/devices` | `{token, name}`: registers an iPhone's APNs token with the push relay (503 if push isn't configured) |
+| POST | `/api/v1/devices` | `{token, name, environment?}`: registers a device's APNs token with the push relay (503 if push isn't configured). `environment` is `sandbox` (Xcode installs) or `production` (TestFlight, the notarized Mac app); anything else is 400, none means the relay's default |
 | GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active ones by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older apps still read it |
 | GET | `/api/v1/memory/search?q=&kinds=&limit=` | Memory v2: active memories ranked as the agent's notes are, each with its score (what `search_memory` sees) |
 | POST | `/api/v1/memory/consolidate` | Memory v2: consolidate now (`{ok, tasks, mode}`); it still waits for a running task |
@@ -1208,9 +1211,10 @@ Notifications to the iPhone go through a relay in our AWS account. The APNs key 
   - Sound is `default`.
 - **APNs:**
   - The `.p8` key (SSM `<prefix>/apns/key_p8`, SecureString) and its id (`<prefix>/apns/key_id`) are read once per execution environment.
-  - Each push is signed with an ES256 JWT (team id as issuer, cached 50 minutes) and sent over HTTP/2 to `api.sandbox.push.apple.com` or `api.push.apple.com` (`apns_environment`), with topic = the app's bundle id (`com.tzumby.clouddesktop`), push type `alert` and priority 10.
-  - 410, `BadDeviceToken` or `Unregistered` delete the token.
-- **Storage:** DynamoDB `<name>-push-devices`, key `(desktop, token)`, attributes `name` and `added`. Server-side encrypted, on-demand, no TTL.
+  - Each push is signed with an ES256 JWT (team id as issuer, cached 50 minutes) and sent over HTTP/2, with topic = the app's bundle id (`com.tzumby.clouddesktop`), push type `alert` and priority 10.
+  - **Which servers:** each device's own environment, from its registration: `api.push.apple.com` for `production` (TestFlight, the notarized Mac app), `api.sandbox.push.apple.com` for `sandbox` (Xcode installs). Devices registered without one (apps before 2026-11-02) go to `apns_environment`'s host (sandbox). One HTTP/2 connection per environment in use. The same `.p8` key works for both.
+  - 410, `BadDeviceToken` or `Unregistered` delete the token. A token sent to the wrong environment answers `BadDeviceToken`, and the app registers it again with its environment on its next connection.
+- **Storage:** DynamoDB `<name>-push-devices`, key `(desktop, token)`, attributes `name`, `added` and `environment` (when given). Server-side encrypted, on-demand, no TTL.
 - **Discovery:** the relay's URL is published in SSM `<prefix>/push/relay_url`, which Ansible writes into `agentd.env`.
 - **Privacy:**
   - Titles and bodies pass through the relay and Apple. They include clipped answers, commands to approve, text to type, schedule prompts and Action needed reasons.
@@ -1230,7 +1234,7 @@ Notifications to the iPhone go through a relay in our AWS account. The APNs key 
 | `:5900` (TCP) | Raw VNC to `127.0.0.1:5900` for the native viewer. Plaintext RFB, inside WireGuard |
 
 - **Access:** every request and connection is checked with `LocalClient().WhoIs`.
-  - If `-allow` is set (SSM `<prefix>/tailscale/allowed_logins`), the login must be on the list; otherwise it gets 403 and the attempt is logged.
+  - If `-allow` is set (SSM `<prefix>/tailscale/allowed_logins`, or `<prefix>/tailscale/users/<user>/allowed_logins` on a user's own tailnet), the login must be on the list; otherwise it gets 403 and the attempt is logged.
   - If the list is empty, whatever the tailnet's ACLs allow gets in.
   - agentd itself trusts the socket, not the header: `X-Tailscale-User` is for attribution (`by`) only.
 - **What's logged:** viewer and VNC sessions opened, closed or denied, with login and device.
@@ -1253,9 +1257,9 @@ XcodeGen generates the Xcode project from `project.yml`; the project itself is g
 ### 10.1 Build inputs
 
 - **Entitlements:**
-  - iPhone: `aps-environment = development` only (switch to `production` for TestFlight). No Network Extension: the app doesn't use a VPN profile. No keychain groups.
-  - Mac: the App Sandbox with network client and server (the Tailscale node's SOCKS5 proxy listens on 127.0.0.1), user-selected files read-write (memory import and export), and `com.apple.developer.aps-environment = development`. Hardened runtime on. Push needs a provisioning profile, and a development profile lists the Macs it runs on: `make app-mac` registers this Mac on its first run.
-- **Info.plist:** display name "Cloud Desktop". iPhone: portrait only, single scene, no background modes. Mac: category Productivity.
+  - iPhone: `aps-environment = $(APS_ENVIRONMENT)`: `development` by default (Xcode installs), `production` from `release-ios.sh` (TestFlight). No Network Extension: the app doesn't use a VPN profile. No keychain groups.
+  - Mac: the App Sandbox with network client and server (the Tailscale node's SOCKS5 proxy listens on 127.0.0.1), user-selected files read-write (memory import and export), and `com.apple.developer.aps-environment = $(APS_ENVIRONMENT)` (`production` from `release-mac.sh`, which checks it in the signed app). Hardened runtime on. Push needs a provisioning profile, and a development profile lists the Macs it runs on: `make app-mac` registers this Mac on its first run.
+- **Info.plist:** display name "Cloud Desktop"; version `$(MARKETING_VERSION)`, build `$(CURRENT_PROJECT_VERSION)` (the release scripts set a new one per upload: the UTC date and time); `APSEnvironment = $(APS_ENVIRONMENT)`, which the app sends with its push registration so the relay picks the right servers. iPhone: portrait only, single scene, no background modes. Mac: category Productivity.
 - **TailscaleKit.xcframework** comes from `tailscale/libtailscale` pinned at `ac7ed43a` (it includes the TS-2026-012 fix). `make app-tailscalekit` builds the ios, ios-sim and macOS slices into `DesktopKit/Vendor/`, which is gitignored. Before TestFlight: a privacy manifest per slice (TODO).
 - **swift-rfb** 0.1.0 (MIT): the RFB/VNC client with Tight, ZRLE, Hextile, CopyRect and Raw.
 
@@ -1603,7 +1607,11 @@ The same screens as the iPhone's, in Mac form:
 | `tailnet-build`, `tailnet-deploy` | tailnet-proxy |
 | `llm-keys`, `tailscale-key`, `apns-key` | Store secrets in SSM from hidden input or a file |
 | `app-tailscalekit`, `app-test`, `app-sim`, `app-device`, `app-mac` | The apps: build TailscaleKit; DesktopKit tests; Simulator build; build, install and launch on the paired iPhone; build the Mac app, install it in /Applications and open it |
+| `app-release-mac`, `app-testflight` | The apps for others ([onboarding.md](onboarding.md)): the Mac app signed with Developer ID, notarized and stapled, in a signed, notarized DMG (`release-mac.sh`; notarytool profile `cloud-desktop-notary`); the iPhone app archived and uploaded to App Store Connect for TestFlight (`release-ios.sh`). Both build with `APS_ENVIRONMENT=production` and a new build number; the Mac archive with `ARCHS=arm64` for the packages too (TailscaleKit has no Intel slice) |
+| `new-desktop` | `NAME=<name>`: a desktop for someone else on their own tailnet, step by step, asking before each change (`scripts/new-desktop.sh`): tfvars check, Terraform plan then apply, SSM wait, their auth key (hidden input) and login, then the desktop, agentd and tailnet-proxy playbooks on that desktop only |
 | `screenshot`, `viewer`, `cdp`, `shell` | Look at the desktop (screenshot file; noVNC on `localhost:6080`; Chrome DevTools on `localhost:9222`; a shell), all over SSM |
+
+Desktops: `desktop`, `agentd-deploy`, `tailnet-deploy` and `screenshot` run on every running desktop unless `LIMIT=<instance id>` or `DESKTOP=<name>` names one; an unknown `DESKTOP` matches no host, never all of them. `viewer`, `cdp`, `shell`, `agentd-logs` and `agentd-soak` take `DESKTOP=<name>` (default: the test desktop). `tailscale-key DESKTOP=<name>` stores a user's own auth key.
 
 `AWS_PROFILE` (default `default`) and `AWS_REGION` (default `ca-central-1`) are exported to every recipe. On macOS, Ansible runs with `no_proxy='*'` and `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`; otherwise forked workers crash in the system proxy lookup.
 
@@ -1668,7 +1676,7 @@ PLAN.MD was the starting plan. What changed, and why:
 | A FastAPI desktop agent with screenshot/click/type over HTTP (Claude computer-use style) | agentd in Rust: the whole agent loop on the desktop, browser through CDP and the accessibility tree, a shell | Text-only open models; keeps user data on the user's VM; faster and cheaper than screenshots |
 | Control plane (FastAPI on EC2 behind an ALB) runs the agent loop and proxies the viewer | Not built. The app talks to the desktop directly over the user's tailnet | Only one user so far. A control plane and gateway for users without Tailscale come later |
 | Viewer via the control plane with signed tokens | noVNC and raw VNC through tailnet-proxy (login allowlist); a native VNC view in the app | Tailscale gives identity and encryption |
-| Packer-baked AMIs, launch template, data volume, DynamoDB `desktops` table | Ansible on a plain Ubuntu AMI; one test desktop from Terraform; no data volume yet | Built incrementally; the attested-desktop design will replace Packer with attestable images |
+| Packer-baked AMIs, launch template, data volume, DynamoDB `desktops` table | Ansible on a plain Ubuntu AMI; the test desktop and testers' desktops from Terraform (`desktops`, `scripts/new-desktop.sh`); no data volume yet | Built incrementally; the attested-desktop design will replace Packer with attestable images |
 | Claude computer-use agent loop | Model-agnostic loop on Together (GLM-5.3 default) through an attested gateway | No dependency on one vendor; operator-blind goal |
 | Per-desktop bearer tokens | Tailscale identity + Unix socket; IAM roles for desktop → AWS services | No shared secrets to manage |
 | Telegram bot / Python desktop agent (earlier iterations) | Retired 2026-10-31 | Replaced by agentd and the app |

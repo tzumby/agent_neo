@@ -1,6 +1,6 @@
 # Built by `make tailnet-build` (services/tailnet-proxy).
 tailnet_proxy_binary: "{{ playbook_dir }}/../../services/tailnet-proxy/build/tailnet-proxy-linux-{{ 'arm64' if ansible_facts.architecture == 'aarch64' else 'amd64' }}"
-tailnet_proxy_hostname: cloud-desktop-dev
+tailnet_proxy_hostname: "{{ desktop_tailnet_name | default('cloud-desktop-dev') }}"
 tailnet_proxy_novnc: http://127.0.0.1:6080
 tailnet_proxy_agentd_socket: /run/agentd/agentd.sock
 tailnet_proxy_vnc: 127.0.0.1:5900
@@ -8,8 +8,17 @@ tailnet_proxy_vnc: 127.0.0.1:5900
 tailnet_proxy_ssm_prefix: /cloud-desktops/dev
 tailnet_proxy_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"
 
+# Where the auth key and allowlist are. A desktop on its user's own tailnet
+# (inventory: desktop_tailnet "own") reads only that user's, under
+# tailscale/users/<user>/, never the operator's: a missing key fails the play.
+tailnet_proxy_own_tailnet: "{{ (desktop_tailnet | default('shared')) == 'own' }}"
+tailnet_proxy_params: >-
+  {{ tailnet_proxy_ssm_prefix ~ '/tailscale'
+     ~ (('/users/' ~ desktop_user) if tailnet_proxy_own_tailnet | bool else '') }}
+
 # Tailscale login names let in (comma-separated), from SSM so they stay out of
-# git. Empty or missing: anyone the tailnet policy lets through.
+# git. Empty or missing: anyone the tailnet policy lets through (the operator's
+# tailnet only: an own-tailnet desktop requires one).
 tailnet_proxy_allow: >-
-  {{ lookup('amazon.aws.ssm_parameter', tailnet_proxy_ssm_prefix ~ '/tailscale/allowed_logins',
+  {{ lookup('amazon.aws.ssm_parameter', tailnet_proxy_params ~ '/allowed_logins',
             region=tailnet_proxy_ssm_region, on_missing='skip') | default('', true) }}

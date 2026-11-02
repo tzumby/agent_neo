@@ -195,6 +195,11 @@ struct Device {
     token: String,
     #[serde(default)]
     name: String,
+    /// The APNs servers the token belongs to: "sandbox" (Xcode installs) or
+    /// "production" (TestFlight, the notarized Mac app). Older apps send none:
+    /// the relay's default (sandbox).
+    #[serde(default)]
+    environment: Option<String>,
 }
 
 /// The apps register for push notifications here.
@@ -210,9 +215,19 @@ async fn register_device(State(agent): App, headers: HeaderMap, Json(body): Json
         );
     };
     let name: String = body.name.chars().take(80).collect();
-    match relay.register(&token, &name).await {
+    let environment = match body.environment.as_deref() {
+        None => None,
+        Some(env @ ("sandbox" | "production")) => Some(env),
+        Some(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "environment must be sandbox or production",
+            );
+        }
+    };
+    match relay.register(&token, &name, environment).await {
         Ok(()) => {
-            tracing::info!(device = %name, by = ?caller(&headers), "device registered for push");
+            tracing::info!(device = %name, environment = ?environment, by = ?caller(&headers), "device registered for push");
             Json(json!({"ok": true})).into_response()
         }
         Err(err) => {

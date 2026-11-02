@@ -58,7 +58,7 @@ agentd_shell_tool: "on"
 # Memory v2 (kinds, trust, retrieval, consolidation): "off" until it has been
 # tried on the dev desktop (docs/memory-v2.md §17).
 agentd_memory_v2: "off"
-agentd_desktop_name: cloud-desktop-dev
+agentd_desktop_name: "{{ desktop_tailnet_name | default('cloud-desktop-dev') }}"
 
 # Overrides the approval rules built into agentd (list of {pattern, reason};
 # regex patterns without single quotes). Empty: use the built-in rules.

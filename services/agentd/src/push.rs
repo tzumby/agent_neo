@@ -40,9 +40,14 @@ impl Relay {
         }))
     }
 
-    pub async fn register(&self, token: &str, name: &str) -> Result<()> {
-        self.post("/devices", &json!({"token": token, "name": name}))
-            .await
+    /// `environment`: the APNs servers the token belongs to (sandbox or
+    /// production); none for the relay's default.
+    pub async fn register(&self, token: &str, name: &str, environment: Option<&str>) -> Result<()> {
+        let mut body = json!({"token": token, "name": name});
+        if let Some(environment) = environment {
+            body["environment"] = json!(environment);
+        }
+        self.post("/devices", &body).await
     }
 
     pub async fn notify(&self, push: &Push) -> Result<()> {

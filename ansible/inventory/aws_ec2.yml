@@ -14,3 +14,9 @@ keyed_groups:
     separator: ""
 compose:
   ansible_aws_ssm_instance_id: instance_id
+  # Whose desktop, and which tailnet it joins (Terraform tags): "shared" is the
+  # operator's tailnet; "own" is its user's, with their own auth key and
+  # allowlist (scripts/new-desktop.sh). Untagged: the operator's test desktop.
+  desktop_user: ec2_tags.User | default('')
+  desktop_tailnet: ec2_tags.Tailnet | default('shared')
+  desktop_tailnet_name: ec2_tags.TailnetName | default('cloud-desktop-dev')

@@ -69,7 +69,31 @@ export function buildPayload(input) {
   return payload;
 }
 
-/** What to do with a device after APNs answered. */
+/** APNs servers by environment: sandbox for apps installed from Xcode,
+ * production for TestFlight, the App Store and notarized Mac apps. */
+export const APNS_HOSTS = { sandbox: "api.sandbox.push.apple.com", production: "api.push.apple.com" };
+
+/** A device's environment as registered: "sandbox", "production", or null
+ * (an older app: the relay's default). Anything else is an error. */
+export function deviceEnvironment(value) {
+  if (value == null || value === "") return null;
+  return Object.hasOwn(APNS_HOSTS, value) ? value : undefined;
+}
+
+/** Device tokens grouped by the APNs host to send them to; devices without
+ * an environment go to `defaultHost`. */
+export function tokensByHost(devices, defaultHost) {
+  const groups = new Map();
+  for (const { token, environment } of devices) {
+    const host = APNS_HOSTS[environment] ?? defaultHost;
+    groups.set(host, [...(groups.get(host) ?? []), token]);
+  }
+  return groups;
+}
+
+/** What to do with a device after APNs answered. A token sent to the wrong
+ * environment's servers answers BadDeviceToken: it's removed, and the app
+ * registers it again with its environment. */
 export function outcome(status, body) {
   if (status === 200) return "delivered";
   let reason = "";

@@ -12,7 +12,13 @@ settings:
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "6.0"
     MARKETING_VERSION: "0.1.0"
+    # The release scripts set a new build number for each upload.
     CURRENT_PROJECT_VERSION: "1"
+    # Which APNs servers the app's device token belongs to: development for
+    # Xcode installs (make app-device, make app-mac), production for TestFlight
+    # and the notarized Mac app (scripts/release-*.sh). The app tells agentd, and
+    # the push relay sends to the matching servers.
+    APS_ENVIRONMENT: development
 packages:
   DesktopKit:
     path: DesktopKit
@@ -33,11 +39,14 @@ targets:
     entitlements:
       path: CloudDesktop/iOS/CloudDesktop.entitlements
       properties:
-        aps-environment: development # Xcode installs; production for TestFlight/App Store
+        aps-environment: $(APS_ENVIRONMENT)
     info:
       path: CloudDesktop/iOS/Info.plist
       properties:
         CFBundleDisplayName: Cloud Desktop
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        APSEnvironment: $(APS_ENVIRONMENT)
         UILaunchScreen:
           UIColorName: LaunchBackground # black, like the splash
         UIApplicationSceneManifest:
@@ -69,11 +78,14 @@ targets:
         com.apple.security.network.server: true
         # Memory: import a file, save an export.
         com.apple.security.files.user-selected.read-write: true
-        com.apple.developer.aps-environment: development # Xcode builds; production when distributed
+        com.apple.developer.aps-environment: $(APS_ENVIRONMENT)
     info:
       path: CloudDesktop/macOS/Info.plist
       properties:
         CFBundleDisplayName: Cloud Desktop
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        APSEnvironment: $(APS_ENVIRONMENT)
         LSApplicationCategoryType: public.app-category.productivity
     settings:
       base:

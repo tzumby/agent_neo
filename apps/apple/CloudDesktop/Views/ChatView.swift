@@ -265,7 +265,8 @@ struct ChatView: View {
         for _ in 0..<10 {
             if store.connection == .live {
                 do {
-                    try await client.registerDevice(token: token, name: Device.name)
+                    try await client.registerDevice(
+                        token: token, name: Device.name, environment: Device.pushEnvironment)
                     return
                 } catch let error as AgentError where error.statusCode == 503 {
                     return  // push isn't set up on this desktop

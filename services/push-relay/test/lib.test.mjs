@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, verify } from "node:crypto";
 import { test } from "node:test";
-import { buildPayload, callerDesktop, outcome, signJwt, validDeviceToken } from "../src/lib.mjs";
+import {
+  buildPayload,
+  callerDesktop,
+  deviceEnvironment,
+  outcome,
+  signJwt,
+  tokensByHost,
+  validDeviceToken,
+} from "../src/lib.mjs";
 
 const config = { accountId: "461553546091", rolePrefix: "cloud-desktops-dev-desktop" };
 const event = (userArn, accountId = "461553546091") => ({
@@ -65,4 +73,25 @@ test("device tokens and APNs answers", () => {
   assert.equal(outcome(410, '{"reason":"Unregistered"}'), "gone");
   assert.equal(outcome(400, '{"reason":"BadDeviceToken"}'), "gone");
   assert.equal(outcome(403, '{"reason":"InvalidProviderToken"}'), "failed: 403 InvalidProviderToken");
+});
+
+test("each device gets the APNs servers of its environment", () => {
+  assert.equal(deviceEnvironment("production"), "production");
+  assert.equal(deviceEnvironment("sandbox"), "sandbox");
+  assert.equal(deviceEnvironment(undefined), null); // an older app: the default
+  assert.equal(deviceEnvironment("staging"), undefined); // refused
+  assert.equal(deviceEnvironment("__proto__"), undefined);
+  const groups = tokensByHost(
+    [
+      { token: "a", environment: "production" },
+      { token: "b", environment: null },
+      { token: "c", environment: "sandbox" },
+      { token: "d", environment: "production" },
+    ],
+    "api.sandbox.push.apple.com",
+  );
+  assert.deepEqual(Object.fromEntries(groups), {
+    "api.push.apple.com": ["a", "d"],
+    "api.sandbox.push.apple.com": ["b", "c"],
+  });
 });

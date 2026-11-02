@@ -9,12 +9,17 @@ export AWS_PROFILE AWS_REGION
 TF_BOOTSTRAP := terraform -chdir=$(CURDIR)/terraform/bootstrap
 TF           := terraform -chdir=$(CURDIR)/terraform/envs/$(ENV)
 
-# Instance to target with viewer/shell/vnc-password (defaults to the test desktop).
-INSTANCE ?= $(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null)
+# Instance to target with viewer/shell/logs/soak: the test desktop, or
+# DESKTOP=<name>'s (terraform output desktop_instance_ids).
+INSTANCE ?= $(if $(DESKTOP),$(shell $(TF) output -json desktop_instance_ids 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("$(DESKTOP)",""))'),$(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null))
+# Playbooks run on every running desktop; LIMIT=<instance id> (or DESKTOP=<name>) for one.
+# An unknown DESKTOP matches no host rather than all of them.
+LIMIT ?= $(if $(DESKTOP),$(or $(INSTANCE),no-desktop-named-$(DESKTOP)),)
+PLAYBOOK_LIMIT = $(if $(LIMIT),--limit $(LIMIT),)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-logs tailnet-build tailnet-deploy tailscale-key apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-logs tailnet-build tailnet-deploy tailscale-key tailscale-oauth apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac app-release-mac app-testflight new-desktop cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -54,11 +59,14 @@ ANSIBLE_PLAYBOOK := cd ansible && no_proxy='*' OBJC_DISABLE_INITIALIZE_FORK_SAFE
 galaxy: ## Install the Ansible collections
 	cd ansible && ansible-galaxy collection install -r requirements.yml
 
-desktop: ## Run the desktop playbook against running desktops
-	$(ANSIBLE_PLAYBOOK) playbooks/desktops.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+new-desktop: ## A desktop for someone else, on their own tailnet, step by step: NAME=<name> (docs/onboarding.md)
+	scripts/new-desktop.sh $(NAME)
+
+desktop: ## Run the desktop playbook against running desktops (LIMIT= or DESKTOP= for one)
+	$(ANSIBLE_PLAYBOOK) playbooks/desktops.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
 screenshot: ## Download a screenshot of each desktop to screenshots/
-	$(ANSIBLE_PLAYBOOK) playbooks/screenshot.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+	$(ANSIBLE_PLAYBOOK) playbooks/screenshot.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
 # --- Agent -------------------------------------------------------------------
 
@@ -73,8 +81,8 @@ agentd-test: ## Format check, clippy and unit tests for agentd
 agentd-build: ## Build agentd for the desktop (static linux binary for DESKTOP_ARCH)
 	cd services/agentd && cargo zigbuild --release --target $(DESKTOP_RUST_TARGET)
 
-agentd-deploy: agentd-build ## Install agentd on running desktops
-	$(ANSIBLE_PLAYBOOK) playbooks/agentd.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+agentd-deploy: agentd-build ## Install agentd on running desktops (LIMIT= or DESKTOP= for one)
+	$(ANSIBLE_PLAYBOOK) playbooks/agentd.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
 agentd-evals: ## Memory evals on this Mac against Together (cents per scenario): MEMORY_V2=on|off SCENARIO=name
 	cd services/agentd && cargo build --quiet
@@ -106,11 +114,15 @@ gateway-image: gatewayd-build ## Build the attested gateway image (AMI) on a tem
 apns-key: ## Store the APNs push key in SSM: make apns-key FILE=AuthKey_XXXXXXXXXX.p8 KEY_ID=XXXXXXXXXX
 	SSM_PREFIX=/cloud-desktops/$(ENV) scripts/put-apns-key.py "$(FILE)" "$(KEY_ID)"
 
-tailscale-key: ## Store a Tailscale auth key (tagged tag:cloud-desktop) in SSM (prompted, not echoed)
-	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/auth_key
+tailscale-key: ## Store a Tailscale auth key (tagged tag:cloud-desktop) in SSM (prompted, not echoed); DESKTOP=<name> for a user's own tailnet
+	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale$(if $(DESKTOP),/users/$(DESKTOP))/auth_key
 
-tailnet-deploy: tailnet-build ## Put the desktop on your tailnet (agent API, noVNC, VNC); deploy agentd first
-	$(ANSIBLE_PLAYBOOK) playbooks/tailnet-proxy.yml -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+tailscale-oauth: ## Store the desktops tailnet's OAuth client (id, then secret; prompted, not echoed)
+	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/desktops/oauth_client_id
+	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/desktops/oauth_client_secret
+
+tailnet-deploy: tailnet-build ## Put desktops on their tailnets (agent API, noVNC, VNC); deploy agentd first (LIMIT= or DESKTOP= for one)
+	$(ANSIBLE_PLAYBOOK) playbooks/tailnet-proxy.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
 # --- Apple apps (apps/apple) -------------------------------------------------------
 
@@ -129,6 +141,12 @@ app-device: ## Build, install and launch the iPhone app on your paired iPhone (u
 
 app-mac: ## Build the Mac app, install it in /Applications and open it (first run registers this Mac)
 	apps/apple/scripts/run-on-mac.sh
+
+app-release-mac: ## The Mac app for others: Developer ID, notarized, in a DMG (docs/onboarding.md)
+	apps/apple/scripts/release-mac.sh
+
+app-testflight: ## The iPhone app for TestFlight: archive and upload to App Store Connect (docs/onboarding.md)
+	apps/apple/scripts/release-ios.sh
 
 # --- Access (SSM only) -------------------------------------------------------
 

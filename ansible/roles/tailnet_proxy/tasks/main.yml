@@ -1,6 +1,18 @@
 # tailnet-proxy: the desktop's only presence on your tailnet (tsnet). Serves
 # the agent's API, the noVNC viewer and raw VNC to allowed Tailscale logins.
 
+- name: Check this desktop's tailnet settings
+  ansible.builtin.assert:
+    that:
+      - desktop_user | default('') | length > 0
+      - tailnet_proxy_allow | length > 0
+    fail_msg: >-
+      This desktop joins its user's own tailnet, so it needs that user's allowlist at
+      {{ tailnet_proxy_params }}/allowed_logins (and auth key at .../auth_key):
+      scripts/new-desktop.sh stores both.
+    quiet: true
+  when: tailnet_proxy_own_tailnet | bool
+
 # --- Migration from viewer-proxy (keeps the same tailnet device) --------------
 
 - name: Check for the old viewer-proxy
@@ -75,7 +87,7 @@
   ansible.builtin.copy:
     dest: /etc/tailnet-proxy.env
     content: |
-      TS_AUTHKEY={{ lookup('amazon.aws.ssm_parameter', tailnet_proxy_ssm_prefix ~ '/tailscale/auth_key', region=tailnet_proxy_ssm_region) }}
+      TS_AUTHKEY={{ lookup('amazon.aws.ssm_parameter', tailnet_proxy_params ~ '/auth_key', region=tailnet_proxy_ssm_region) }}
     mode: "0600"
   no_log: true
   notify: Restart tailnet-proxy

@@ -116,6 +116,30 @@ variable "users" {
   default     = ["tzumby"]
 }
 
+variable "desktops" {
+  description = "Desktops besides the test desktop, one per user, by name (a tester, later users). Each joins its user's own tailnet. Each name must also be in users (its encryption key). Added with scripts/new-desktop.sh."
+  type = map(object({
+    # Defaults to desktop_instance_type.
+    instance_type = optional(string)
+  }))
+  default = {}
+
+  validation {
+    condition     = alltrue([for name in keys(var.desktops) : can(regex("^[a-z][a-z0-9-]{1,19}$", name))])
+    error_message = "Desktop names are 2-20 lowercase letters, digits and dashes, starting with a letter."
+  }
+
+  validation {
+    condition     = alltrue([for name in keys(var.desktops) : contains(var.users, name)])
+    error_message = "Every desktop's name must also be in users, which gives it its own encryption key."
+  }
+
+  validation {
+    condition     = !contains(keys(var.desktops), var.test_desktop_user)
+    error_message = "The test desktop's user already has a desktop (the test desktop)."
+  }
+}
+
 variable "test_desktop_user" {
   description = "Whose desktop the test desktop is (picks its role and encryption key)."
   type        = string

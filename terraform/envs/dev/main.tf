@@ -51,7 +51,11 @@ module "iam" {
 locals {
   # The fleet role, and each desktop's own role (<fleet role>-<user>).
   desktop_role_prefix = module.iam.desktop_role_name
-  desktop_role_names  = concat([module.iam.desktop_role_name], module.test_desktop_identity[*].role_name)
+  desktop_role_names = concat(
+    [module.iam.desktop_role_name],
+    module.test_desktop_identity[*].role_name,
+    [for identity in values(module.desktop_identity) : identity.role_name],
+  )
 }
 
 # Push notifications to the iOS app. The APNs key stays in SSM and this
@@ -207,10 +211,76 @@ resource "aws_instance" "test_desktop" {
   tags = {
     Name = "${local.name}-test-desktop"
     Role = "desktop"
+    # For Ansible (inventory/aws_ec2.yml): whose desktop, and on which tailnet.
+    User        = var.test_desktop_user
+    Tailnet     = "shared" # the operator's tailnet, its auth key and allowlist
+    TailnetName = "cloud-desktop-dev"
   }
 
   lifecycle {
     # Don't replace the instance whenever Canonical publishes a new AMI.
+    ignore_changes       = [ami]
+    replace_triggered_by = [terraform_data.desktop_arch]
+
+    precondition {
+      condition     = var.enable_nat_gateway || var.enable_nat_instance
+      error_message = "Desktops have no public IP: enable_nat_gateway or enable_nat_instance must be on for them to reach the internet."
+    }
+  }
+}
+
+# --- Other desktops (a tester, later users) ----------------------------------
+# One per entry in var.desktops, set up like the test desktop: its own role,
+# its user's own encryption key, a private subnet, no inbound. It joins its
+# user's own tailnet with their auth key (Tailnet = "own"): never the
+# operator's. Added and set up with scripts/new-desktop.sh.
+
+module "desktop_identity" {
+  source   = "../../modules/desktop_identity"
+  for_each = var.desktops
+
+  role_name            = "${module.iam.desktop_role_name}-${each.key}"
+  user                 = each.key
+  ssm_parameter_prefix = "/${var.project}"
+}
+
+resource "aws_instance" "desktop" {
+  for_each = var.desktops
+
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = coalesce(each.value.instance_type, var.desktop_instance_type)
+  subnet_id                   = module.network.private_subnet_ids[0]
+  associate_public_ip_address = false
+  vpc_security_group_ids      = [module.security.desktop_sg_id]
+  iam_instance_profile        = module.desktop_identity[each.key].instance_profile_name
+
+  credit_specification {
+    cpu_credits = var.cpu_credits
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  root_block_device {
+    volume_type           = "gp3"
+    volume_size           = 20
+    encrypted             = true
+    kms_key_id            = aws_kms_key.user[each.key].arn
+    delete_on_termination = true
+  }
+
+  tags = {
+    Name        = "${local.name}-desktop-${each.key}"
+    Role        = "desktop"
+    User        = each.key
+    Tailnet     = "own"
+    TailnetName = "cloud-desktop-${each.key}"
+  }
+
+  lifecycle {
     ignore_changes       = [ami]
     replace_triggered_by = [terraform_data.desktop_arch]
 

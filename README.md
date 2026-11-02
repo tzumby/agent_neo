@@ -239,7 +239,15 @@ make app-test           # DesktopKit unit tests (AGENTD_URL=http://127.0.0.1:876
 make app-device         # build, sign (team 4UVAPZYV4Q), install and launch on your iPhone
 make app-mac            # build the Mac app, install it in /Applications and open it
                         # (its first run registers this Mac in the developer account, for push)
+make app-release-mac    # for others: Developer ID, notarized and stapled, in a DMG
+make app-testflight     # for others: archive and upload the iPhone app to TestFlight
 ```
+
+**Someone else (a tester)** gets their own desktop on their own tailnet and the
+apps through a notarized DMG and TestFlight: [docs/onboarding.md](docs/onboarding.md)
+walks through it, and `make new-desktop NAME=<name>` sets the desktop up from
+your laptop, asking before each change. With more than one desktop, deploys
+reach all of them unless `DESKTOP=<name>` (or `LIMIT=<instance id>`) picks one.
 
 **Push notifications** (approvals with Approve/Deny on the notification, Action
 needed, finished tasks) go through a push relay in the AWS account, so the APNs
@@ -286,6 +294,8 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   agent's tools; the main agent reads their chats and memories, corrects their
   memories, changes their schedules after your OK, and hands them work only when
   you name them.
+- [docs/onboarding.md](docs/onboarding.md): giving a tester a desktop on their own
+  tailnet, the notarized Mac app and the iPhone app through TestFlight (2026-11-02).
 - [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'
   prompts and data unreadable to us (attested gateway and desktops; draft).
 - **No public IPs on desktops:** they sit in private subnets and reach the

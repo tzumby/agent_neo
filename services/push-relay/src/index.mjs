@@ -6,7 +6,7 @@ import { createPrivateKey } from "node:crypto";
 import { connect } from "node:http2";
 import { DeleteItemCommand, DynamoDBClient, PutItemCommand, QueryCommand } from "@aws-sdk/client-dynamodb";
 import { GetParameterCommand, SSMClient } from "@aws-sdk/client-ssm";
-import { buildPayload, callerDesktop, outcome, signJwt, validDeviceToken } from "./lib.mjs";
+import { buildPayload, callerDesktop, deviceEnvironment, outcome, signJwt, tokensByHost, validDeviceToken } from "./lib.mjs";
 
 const env = process.env;
 const ddb = new DynamoDBClient({});
@@ -56,17 +56,19 @@ async function devicesOf(desktop) {
       TableName: env.TABLE,
       KeyConditionExpression: "desktop = :d",
       ExpressionAttributeValues: { ":d": { S: desktop } },
-      ProjectionExpression: "#t",
-      ExpressionAttributeNames: { "#t": "token" },
+      ProjectionExpression: "#t, #e",
+      ExpressionAttributeNames: { "#t": "token", "#e": "environment" },
     }),
   );
-  return (result.Items ?? []).map((item) => item.token.S);
+  return (result.Items ?? []).map((item) => ({ token: item.token.S, environment: item.environment?.S ?? null }));
 }
 
 async function register(desktop, body) {
   const token = String(body.token ?? "").toLowerCase();
   if (!validDeviceToken(token)) return reply(400, { error: "token must be the APNs device token in hex" });
-  const known = await devicesOf(desktop);
+  const environment = deviceEnvironment(body.environment);
+  if (environment === undefined) return reply(400, { error: "environment must be sandbox or production" });
+  const known = (await devicesOf(desktop)).map((device) => device.token);
   if (!known.includes(token) && known.length >= MAX_DEVICES) return reply(429, { error: "too many devices" });
   await ddb.send(
     new PutItemCommand({
@@ -76,10 +78,13 @@ async function register(desktop, body) {
         token: { S: token },
         name: { S: String(body.name ?? "").slice(0, 80) },
         added: { S: new Date().toISOString() },
+        ...(environment ? { environment: { S: environment } } : {}),
       },
     }),
   );
-  console.log(JSON.stringify({ desktop, action: "register", devices: known.length + (known.includes(token) ? 0 : 1) }));
+  console.log(
+    JSON.stringify({ desktop, action: "register", environment, devices: known.length + (known.includes(token) ? 0 : 1) }),
+  );
   return reply(200, { ok: true });
 }
 
@@ -109,25 +114,30 @@ function sendOne(session, token, jwt, payload) {
 async function notify(desktop, body) {
   const payload = buildPayload(body);
   if (!payload) return reply(400, { error: "needs a title or body, and only known categories and data keys" });
-  const tokens = await devicesOf(desktop);
-  if (tokens.length === 0) return reply(200, { sent: 0, removed: 0 });
+  const devices = await devicesOf(desktop);
+  if (devices.length === 0) return reply(200, { sent: 0, removed: 0 });
   const jwt = await providerToken();
-  const session = connect(`https://${env.APNS_HOST}`);
-  session.on("error", () => {});
   let sent = 0;
   let removed = 0;
   const failures = [];
-  try {
-    for (const token of tokens) {
-      const result = await sendOne(session, token, jwt, payload);
-      if (result === "delivered") sent += 1;
-      else if (result === "gone") {
-        removed += 1;
-        await ddb.send(new DeleteItemCommand({ TableName: env.TABLE, Key: { desktop: { S: desktop }, token: { S: token } } }));
-      } else failures.push(result);
+  // One connection per APNs environment the desktop's devices use.
+  for (const [host, tokens] of tokensByHost(devices, env.APNS_HOST)) {
+    const session = connect(`https://${host}`);
+    session.on("error", () => {});
+    try {
+      for (const token of tokens) {
+        const result = await sendOne(session, token, jwt, payload);
+        if (result === "delivered") sent += 1;
+        else if (result === "gone") {
+          removed += 1;
+          await ddb.send(
+            new DeleteItemCommand({ TableName: env.TABLE, Key: { desktop: { S: desktop }, token: { S: token } } }),
+          );
+        } else failures.push(result);
+      }
+    } finally {
+      session.close();
     }
-  } finally {
-    session.close();
   }
   console.log(JSON.stringify({ desktop, action: "notify", sent, removed, failures }));
   return reply(failures.length && !sent ? 502 : 200, { sent, removed, failures });

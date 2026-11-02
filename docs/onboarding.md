@@ -83,7 +83,9 @@ You've done most of this before; here's what this app needs.
    xcrun notarytool store-credentials cloud-desktop-notary --apple-id <your Apple ID> --team-id 4UVAPZYV4Q
    ```
 
-   It asks for that password and keeps it in your login keychain, so it's never in a file. Another profile name works too: run with `NOTARY_PROFILE=<name>`.
+   It asks for that password and keeps it in your login keychain, so it's never in a file.
+
+   Credentials belong to your Apple ID and team, not to an app, so an existing profile for team `4UVAPZYV4Q` works. The Makefile uses `selecta-notary`, made for Selecta (2026-11-02); another one works with `NOTARY_PROFILE=<name>`.
 
 ### The desktops tailnet
 

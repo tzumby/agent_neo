@@ -148,8 +148,12 @@ app-device: ## Build, install and launch the iPhone app on your paired iPhone (u
 app-mac: ## Build the Mac app, install it in /Applications and open it (first run registers this Mac)
 	apps/apple/scripts/run-on-mac.sh
 
-app-release-mac: ## The Mac app for others: Developer ID, notarized, in a DMG (docs/onboarding.md)
-	apps/apple/scripts/release-mac.sh
+# notarytool's keychain profile: credentials are per Apple ID and team, not per
+# app, so the one made for Selecta (same team, 4UVAPZYV4Q) works here.
+NOTARY_PROFILE ?= selecta-notary
+
+app-release-mac: ## The Mac app for others: Developer ID, notarized, in a DMG (docs/onboarding.md; NOTARY_PROFILE=)
+	NOTARY_PROFILE=$(NOTARY_PROFILE) apps/apple/scripts/release-mac.sh
 
 app-testflight: ## The iPhone app for TestFlight: archive and upload to App Store Connect (docs/onboarding.md)
 	apps/apple/scripts/release-ios.sh

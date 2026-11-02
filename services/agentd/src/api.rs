@@ -42,15 +42,12 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/memory/search", get(search_memory))
         .route("/api/v1/memory/consolidate", post(consolidate_now))
         .route("/api/v1/memory/consolidation", get(consolidation))
-        .route("/api/v1/memory/approve-all", post(approve_all))
-        .route("/api/v1/memory/reject-all", post(reject_all))
         .route("/api/v1/memory/export", get(export_memory))
         .route("/api/v1/memory/import", post(import_memory))
         .route("/api/v1/memory/{id}/restore", post(restore_memory))
         .route("/api/v1/memory/{id}", delete(forget_memory).patch(edit_memory))
         .route("/api/v1/memory/{id}/confirm", post(confirm_memory))
         .route("/api/v1/memory/{id}/approve", post(confirm_memory))
-        .route("/api/v1/memory/{id}/reject", post(reject_memory))
         .route("/api/v1/memory/{id}/history", get(memory_history))
         .route("/api/v1/schedules", get(schedules))
         .route("/api/v1/schedules/{id}", delete(delete_schedule))
@@ -81,7 +78,6 @@ pub struct StageFacts {
     pub latest: Option<(String, String)>,
     pub busy: bool,
     pub failing_effects: usize,
-    pub pending_memories: i64,
     /// The next schedule due within a day: (id, name, next_run).
     pub next_schedule: Option<(i64, String, i64)>,
 }
@@ -119,9 +115,6 @@ pub fn stage_of(facts: &StageFacts) -> (&'static str, Value) {
     if facts.failing_effects > 0 {
         return ("problem", json!({"failing_effects": facts.failing_effects}));
     }
-    if facts.pending_memories > 0 {
-        return ("review", json!({"pending": facts.pending_memories}));
-    }
     if let Some((id, name, next_run)) = &facts.next_schedule {
         return (
             "scheduled",
@@ -131,7 +124,7 @@ pub fn stage_of(facts: &StageFacts) -> (&'static str, Value) {
     ("idle", json!({}))
 }
 
-fn stage(agent: &Agent, failing_effects: usize, pending_memories: i64) -> (&'static str, Value) {
+fn stage(agent: &Agent, failing_effects: usize) -> (&'static str, Value) {
     let now = crate::memory::unix_now();
     let next_schedule = agent
         .store
@@ -146,19 +139,14 @@ fn stage(agent: &Agent, failing_effects: usize, pending_memories: i64) -> (&'sta
         latest: agent.store.latest_task().ok().flatten(),
         busy: agent.is_busy(),
         failing_effects,
-        pending_memories,
         next_schedule,
     })
 }
 
 async fn status(State(agent): App) -> Json<Value> {
     let (waiting, failing) = agent.store.effects_health().unwrap_or_default();
-    let (active_memories, pending_memories) = agent.store.memory_counts().unwrap_or_default();
-    let (stage, stage_detail) = stage(
-        &agent,
-        failing.len(),
-        if agent.cfg.memory_v2 { pending_memories } else { 0 },
-    );
+    let active_memories = agent.store.memory_counts().unwrap_or_default();
+    let (stage, stage_detail) = stage(&agent, failing.len());
     let failing: Vec<Value> = failing
         .iter()
         .map(|e| json!({"kind": e.kind, "key": e.key, "attempts": e.attempts, "last_error": e.last_error}))
@@ -177,7 +165,7 @@ async fn status(State(agent): App) -> Json<Value> {
         "policy_version": agent.policy_version(),
         "effects": {"pending": waiting, "failing": failing},
         "memory_v2": agent.cfg.memory_v2,
-        "memory": {"active": active_memories, "pending": pending_memories},
+        "memory": {"active": active_memories},
         // One word for the app's headline, and what's behind it.
         "stage": stage,
         "stage_detail": stage_detail,
@@ -471,57 +459,6 @@ async fn consolidate_now(State(agent): App, headers: HeaderMap) -> Response {
     }
 }
 
-#[derive(Deserialize, Default)]
-struct ByReason {
-    #[serde(default)]
-    pending_reason: Option<String>,
-}
-
-/// Memory v2: approves every pending memory, or those waiting for one reason
-/// ("Approve all" on a group).
-async fn approve_all(State(agent): App, headers: HeaderMap, body: Option<Json<ByReason>>) -> Response {
-    if !agent.cfg.memory_v2 {
-        return v2_off();
-    }
-    let by = caller(&headers);
-    let reason = body.and_then(|Json(b)| b.pending_reason);
-    match memory::approve_all(
-        &agent.store,
-        memory::Actor::User { login: by.as_deref() },
-        reason.as_deref(),
-    ) {
-        Ok(ids) => {
-            for id in &ids {
-                agent.emit("memory.confirmed", json!({"id": id, "by": by}));
-            }
-            Json(json!({"approved": ids})).into_response()
-        }
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
-    }
-}
-
-/// Memory v2: rejects every pending memory, or those waiting for one reason.
-async fn reject_all(State(agent): App, headers: HeaderMap, body: Option<Json<ByReason>>) -> Response {
-    if !agent.cfg.memory_v2 {
-        return v2_off();
-    }
-    let by = caller(&headers);
-    let reason = body.and_then(|Json(b)| b.pending_reason);
-    match memory::reject_all(
-        &agent.store,
-        memory::Actor::User { login: by.as_deref() },
-        reason.as_deref(),
-    ) {
-        Ok(ids) => {
-            for id in &ids {
-                agent.emit("memory.forgotten", json!({"id": id, "by": by, "rejected": true}));
-            }
-            Json(json!({"rejected": ids})).into_response()
-        }
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
-    }
-}
-
 /// Memory v2: brings back an expired or replaced memory.
 async fn restore_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
     if !agent.cfg.memory_v2 {
@@ -628,8 +565,8 @@ async fn forget_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMa
     }
 }
 
-/// The user vouches for an unverified memory, or (memory v2) approves a
-/// pending one, which then replaces what it was proposed to replace.
+/// The user vouches for an unverified memory (a hint): it becomes something
+/// they said.
 async fn confirm_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
     let by = caller(&headers);
     if !agent.cfg.memory_v2 {
@@ -643,32 +580,11 @@ async fn confirm_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderM
         };
     }
     match memory::approve(&agent.store, memory::Actor::User { login: by.as_deref() }, id) {
-        Ok(Some((item, superseded))) => {
+        Ok(Some(item)) => {
             agent.emit("memory.confirmed", json!({"id": id, "by": by}));
-            if let Some(old) = superseded {
-                agent.emit("memory.superseded", json!({"id": old, "by_id": id, "by": by}));
-            }
             Json(json!({"ok": true, "memory": item})).into_response()
         }
-        Ok(None) => error(
-            StatusCode::NOT_FOUND,
-            "no pending or unverified memory with that id",
-        ),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
-    }
-}
-
-async fn reject_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
-    if !agent.cfg.memory_v2 {
-        return v2_off();
-    }
-    let by = caller(&headers);
-    match memory::reject(&agent.store, memory::Actor::User { login: by.as_deref() }, id) {
-        Ok(Some(_)) => {
-            agent.emit("memory.forgotten", json!({"id": id, "by": by, "rejected": true}));
-            Json(json!({"ok": true})).into_response()
-        }
-        Ok(None) => error(StatusCode::NOT_FOUND, "no pending memory with that id"),
+        Ok(None) => error(StatusCode::NOT_FOUND, "no unverified memory with that id"),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
@@ -925,7 +841,6 @@ mod tests {
             with(|f| f.next_schedule = Some((4, "Morning inbox".into(), 100))),
             "scheduled"
         );
-        assert_eq!(with(|f| f.pending_memories = 2), "review");
         assert_eq!(with(|f| f.failing_effects = 1), "problem");
         for status in ["error", "interrupted", "stuck", "max_steps"] {
             assert_eq!(
@@ -967,7 +882,6 @@ mod tests {
             latest: Some(("t9".into(), "needs_user".into())),
             busy: true,
             failing_effects: 3,
-            pending_memories: 5,
             next_schedule: Some((4, "Morning inbox".into(), 100)),
         };
         assert_eq!(

@@ -12,12 +12,10 @@ public struct AgentMemory: Decodable, Sendable, Equatable, Identifiable {
     // Memory v2 (nil from a desktop that doesn't have it on).
     /// rule, preference, fact or work_log.
     public let kind: String?
-    /// active, pending, superseded or expired.
+    /// active, superseded or expired.
     public let status: String?
     /// user_stated, agent_inferred or imported.
     public let trust: String?
-    /// Why it waits: tainted_rule, conflict, proposed or imported.
-    public let pendingReason: String?
     /// For edits: the version the edit is based on.
     public let version: Int?
     /// Unix seconds; after it the memory expires.
@@ -26,25 +24,17 @@ public struct AgentMemory: Decodable, Sendable, Equatable, Identifiable {
     public let sourceRun: String?
     /// Who wrote it first: agent, user or consolidator.
     public let origin: String?
-    /// For a proposal: what approving it replaces.
-    public let replaces: [Replaced]?
-
-    public struct Replaced: Decodable, Sendable, Equatable {
-        public let id: Int
-        public let text: String
-    }
 
     enum CodingKeys: String, CodingKey {
-        case id, text, trusted, created, kind, status, trust, version, origin, replaces
-        case pendingReason = "pending_reason"
+        case id, text, trusted, created, kind, status, trust, version, origin
         case validUntil = "valid_until"
         case sourceRun = "source_run"
     }
 
     public init(
         id: Int, text: String, trusted: Bool, created: String, kind: String? = nil, status: String? = nil,
-        trust: String? = nil, pendingReason: String? = nil, version: Int? = nil, validUntil: Int? = nil,
-        sourceRun: String? = nil, origin: String? = nil, replaces: [Replaced]? = nil
+        trust: String? = nil, version: Int? = nil, validUntil: Int? = nil, sourceRun: String? = nil,
+        origin: String? = nil
     ) {
         self.id = id
         self.text = text
@@ -53,15 +43,12 @@ public struct AgentMemory: Decodable, Sendable, Equatable, Identifiable {
         self.kind = kind
         self.status = status
         self.trust = trust
-        self.pendingReason = pendingReason
         self.version = version
         self.validUntil = validUntil
         self.sourceRun = sourceRun
         self.origin = origin
-        self.replaces = replaces
     }
 
-    public var isPending: Bool { status == "pending" }
     /// Expired or replaced: it can be restored.
     public var isGone: Bool { status == "expired" || status == "superseded" }
     /// Saved after the agent read outside content: a hint, not an instruction.
@@ -87,7 +74,6 @@ public struct ConsolidationStats: Decodable, Sendable, Equatable {
 
     public struct Counts: Decodable, Sendable, Equatable {
         public let saved: Int
-        public let proposed: Int
         public let merged: Int
         public let expired: Int
     }
@@ -386,14 +372,13 @@ public struct AgentClient: Sendable {
         let _: Ignored = try await send("DELETE", "/api/v1/memory/\(id)", body: [String: String]())
     }
 
-    /// Vouches for a memory saved after the agent read outside content (memory
-    /// v2: approves a pending one too).
+    /// Vouches for a memory saved after the agent read outside content: it
+    /// becomes something the user said.
     public func confirm(memory id: Int) async throws {
         let _: Ignored = try await post("/api/v1/memory/\(id)/confirm", body: [String: String]())
     }
 
-    /// Memory v2: memories by status (default active and pending), kind and
-    /// full text.
+    /// Memory v2: memories by status (default active), kind and full text.
     public func memories(statuses: [String], kinds: [String] = [], query: String? = nil) async throws -> [AgentMemory] {
         struct Reply: Decodable { let memories: [AgentMemory] }
         var items = [URLQueryItem(name: "status", value: statuses.joined(separator: ","))]
@@ -403,15 +388,6 @@ public struct AgentClient: Sendable {
         let (data, response) = try await session.data(from: url)
         try Self.check(response, data)
         return try JSONDecoder().decode(Reply.self, from: data).memories
-    }
-
-    /// Memory v2: approves or rejects every pending memory (of one reason).
-    public func approveAll(reason: String?) async throws {
-        let _: Ignored = try await post("/api/v1/memory/approve-all", body: ["pending_reason": reason])
-    }
-
-    public func rejectAll(reason: String?) async throws {
-        let _: Ignored = try await post("/api/v1/memory/reject-all", body: ["pending_reason": reason])
     }
 
     /// Memory v2: brings back an expired or replaced memory.
@@ -487,11 +463,6 @@ public struct AgentClient: Sendable {
     /// Memory v2: tidy up now rather than 10 minutes after the last task.
     public func consolidateNow() async throws {
         let _: Ignored = try await post("/api/v1/memory/consolidate", body: [String: String]())
-    }
-
-    /// Memory v2: turns down a memory waiting for approval.
-    public func reject(memory id: Int) async throws {
-        let _: Ignored = try await post("/api/v1/memory/\(id)/reject", body: [String: String]())
     }
 
     public func schedules() async throws -> [AgentSchedule] {

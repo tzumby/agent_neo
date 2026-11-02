@@ -517,8 +517,8 @@
     "measures": "recall"
   },
   {
-    "name": "consolidation-work-log",
-    "about": "Three finished tasks become a sensible work log; nothing is written as a rule (MEMORY_V2=on only).",
+    "name": "consolidation-writes-no-results",
+    "about": "Tasks that only answered, drafted or remembered get no work-log entry, and tidying up writes no facts: what the user said stays as said (MEMORY_V2=on only).",
     "v2_only": true,
     "steps": [
       {
@@ -534,7 +534,10 @@
         "consolidate": true
       },
       {
-        "expect_work_log": 1
+        "expect_work_log_max": 0
+      },
+      {
+        "expect_memory": "Dr. Park"
       }
     ]
   },
@@ -616,7 +619,7 @@
   },
   {
     "name": "scheduled-run-continues",
-    "about": "A daily schedule picks up where its last run left off (from its own notes or the work log), with a consolidation in between as on a real desktop (MEMORY_V2=on only).",
+    "about": "A daily schedule picks up where its last run left off, from its own last report (scheduled runs write no memories) (MEMORY_V2=on only).",
     "v2_only": true,
     "steps": [
       {
@@ -629,9 +632,6 @@
         "expect_answer": [
           "chapter 1"
         ]
-      },
-      {
-        "consolidate": true
       },
       {
         "run_schedule": {

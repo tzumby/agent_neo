@@ -37,7 +37,7 @@ this Mac), and TOGETHER_API_KEY from the environment. Steps:
                                    of a list; "needs_user" for Action needed)
     {"expect_memory": "teal"}      a saved memory contains it (any case)
     {"expect_no_memory": "lee"}    no current memory contains it (v2 lists
-                                   active and pending ones only)
+                                   active ones only)
     {"expect_no_active_memory": "x"}  no active memory contains it
     {"expect_work_log": 2}         consolidation wrote at least that many
                                    work-log entries
@@ -290,6 +290,9 @@ class Desktop:
         or for one to fail; adds up their costs and counts."""
         with sqlite3.connect(self.db) as db:
             before = db.execute("SELECT COALESCE(MAX(rowid), 0) FROM runs").fetchone()[0]
+        # Nothing to tidy (only scheduled runs since the last time): no run to wait for.
+        if http(self.base, "GET", "/api/v1/memory/consolidation")["waiting_tasks"] == 0:
+            return {"status": "nothing to do", "batches": 0, "cost": 0.0, "counts": {}, "memories": []}
         http(self.base, "POST", "/api/v1/memory/consolidate", {})
 
         def finished():
@@ -313,8 +316,7 @@ class Desktop:
                 counts[name] = counts.get(name, 0) + n
         with sqlite3.connect(self.db) as db:
             memories = db.execute(
-                "SELECT kind, status, trust, text FROM memory WHERE kind = 'work_log' OR status = 'pending' "
-                "ORDER BY id"
+                "SELECT kind, status, trust, text FROM memory WHERE kind = 'work_log' ORDER BY id"
             ).fetchall()
         return {
             "status": rows[-1][0], "batches": len(rows), "cost": sum(cost or 0.0 for _, cost, _ in rows),

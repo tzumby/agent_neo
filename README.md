@@ -275,11 +275,17 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   trust, retrieval, consolidation) and the effects queue, policy versions,
   attention budget and stage; phases 0–5 are built and phase 6 (soak and launch)
   is under way (agentd 0.15.2, `MEMORY_V2=off` by default, on for the dev desktop;
-  v2 passes 41/41 memory evals, v1 33/37; consolidation runs in `auto` mode by
-  default since 0.15.2, `observe` (review first) on request; notifications go through the effects queue and follow the
+  v2 passes 41/41 memory evals, v1 33/37. Since 0.15.2 nothing waits for your
+  approval (the Memory screen is for fixing or forgetting), and tidying up only
+  notes tasks that changed something, merges duplicates and drops what's no longer
+  true: no facts, nothing from scheduled runs, which see their own last reports
+  instead; it's on by default; notifications go through the effects queue and follow the
   attention rules; `make agentd-soak` reports the soak).
-- [docs/agents-and-bots.md](docs/agents-and-bots.md): design for a main agent with
-  its own memory, and user-created bots it manages (draft, not built yet).
+- [docs/agents-and-bots.md](docs/agents-and-bots.md): the plan for bots (2026-11-02,
+  not built yet): agents you create, each its own chat and Unix user with the main
+  agent's tools; the main agent reads their chats and memories, corrects their
+  memories, changes their schedules after your OK, and hands them work only when
+  you name them.
 - [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'
   prompts and data unreadable to us (attested gateway and desktops; draft).
 - **No public IPs on desktops:** they sit in private subnets and reach the

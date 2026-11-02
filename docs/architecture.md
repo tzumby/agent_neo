@@ -502,9 +502,9 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | `events` | `seq` (autoincrement), `ts`, `kind`, `data` (JSON) | The append-only event log the apps stream and replay (§6.5) |
 | `history` | `id`, `ts`, `role`, `content`, `agent` | What the model sees as the conversation: user messages and final answers only. The last 20 entries go into each new task |
 | `settings` | `key`, `value` | `model`, `allow_actions`, `tab_target`, `user_timezone`, `user_utc_offset` |
-| `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule` | One row per task. `status` is `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `max_steps`, `stuck` or `interrupted` |
+| `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before) | One row per task. `status` is `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `max_steps`, `stuck` or `interrupted` |
 | `pending` | `id`, `kind` (`approval` or `action`), `run`, `card` (JSON), `checkpoint` (the task's serialized `RunState`), `created` (unix seconds); v2: `policy_version` | What the user is being asked: parked approvals and Action needed cards |
-| `memory` | `id`, `agent`, `text`, `trusted`, `created`; v2: `kind` (rule, preference, fact, work_log), `status` (active, pending, superseded, expired, deleted), `trust` (user_stated, agent_inferred, imported), `importance`, `source_run`, `source_seq`, `source_schedule`, `valid_until`, `superseded_by`, `pending_reason`, `version`, `updated`, `last_recalled`, `recall_count` | Long-term memory (§6.13). `trusted` is kept in step with `trust` and `status` by triggers, for 0.14.0 and the v1 path |
+| `memory` | `id`, `agent`, `text`, `trusted`, `created`; v2: `kind` (rule, preference, fact, work_log), `status` (active, superseded, expired, deleted; `pending` only before 0.15.2), `trust` (user_stated, agent_inferred, imported), `importance`, `source_run`, `source_seq`, `source_schedule`, `valid_until`, `superseded_by`, `pending_reason`, `version`, `updated`, `last_recalled`, `recall_count` | Long-term memory (§6.13). `trusted` is kept in step with `trust` and `status` by triggers, for 0.14.0 and the v1 path |
 | `memory_fts` | FTS5 (`id`, `text`; porter stemming) | Full-text index over `memory`, kept in step by triggers |
 | `memory_events` | `seq`, `memory_id`, `actor`, `action`, `by_user`, `run`, `before`, `after`, `created` | History of every memory change; `before` and `after` are cleared when a memory is purged |
 | `effects` | `kind`, `key` (primary key together), `payload`, `due`, `attempts`, `last_error`, `created` | Side effects waiting to be done (§6.19) |
@@ -535,18 +535,16 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/screenshot` | A live screenshot of the current tab (JPEG). Exists, but the app doesn't use it |
 | GET, PUT | `/api/v1/settings` | `{model, allow_actions, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}` |
 | POST | `/api/v1/devices` | `{token, name}`: registers an iPhone's APNs token with the push relay (503 if push isn't configured) |
-| GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active and pending by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older apps still read it |
+| GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active ones by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older apps still read it |
 | GET | `/api/v1/memory/search?q=&kinds=&limit=` | Memory v2: active memories ranked as the agent's notes are, each with its score (what `search_memory` sees) |
 | POST | `/api/v1/memory/consolidate` | Memory v2: consolidate now (`{ok, tasks, mode}`); it still waits for a running task |
 | GET | `/api/v1/memory/consolidation` | Memory v2: consolidation's mode, model, daily cap, this month's cost, last run and how many tasks wait |
-| POST | `/api/v1/memory/approve-all`, `/reject-all` | Memory v2: `{pending_reason?}` approves or rejects every pending memory, or those waiting for one reason |
 | POST | `/api/v1/memory/{id}/restore` | Memory v2: brings back an expired or replaced memory (a replaced one replaces its successor in turn) |
-| GET | `/api/v1/memory/export?format=json\|markdown` | Memory v2: JSON is `{version: 1, exported_at, agent, memories}` (all but deleted); Markdown is the active and pending ones by kind |
-| POST | `/api/v1/memory/import` | Memory v2: a JSON export (its active memories) or `[{text, kind?}]`, at most 2,000. Everything lands pending (`imported`) and goes through the content checks. Returns `{imported, rejected: [{text, reason}]}` |
+| GET | `/api/v1/memory/export?format=json\|markdown` | Memory v2: JSON is `{version: 1, exported_at, agent, memories}` (all but deleted); Markdown is the active ones by kind |
+| POST | `/api/v1/memory/import` | Memory v2: a JSON export (its active memories) or `[{text, kind?}]`, at most 2,000 (and under the 2,000-memory cap). Each goes through the content checks and is in use at once, marked `imported`: nothing waits for approval. Returns `{imported, rejected: [{text, reason}]}` |
 | DELETE | `/api/v1/memory/{id}` | Forget. Memory v2: status `deleted` (purged after 30 days) |
 | POST | `/api/v1/memory/{id}/confirm` | Vouch for an unverified memory. Memory v2: same as `/approve` |
-| POST | `/api/v1/memory/{id}/approve` | Memory v2: a pending or inferred memory becomes active and user-stated, and replaces what it was proposed to replace |
-| POST | `/api/v1/memory/{id}/reject` | Memory v2: a pending memory is deleted |
+| POST | `/api/v1/memory/{id}/approve` | Memory v2: an inferred or imported memory (a hint) becomes user-stated |
 | PATCH | `/api/v1/memory/{id}` | Memory v2: `{text?, kind?, valid_until?, importance?, expected_version}`. 409 with the current memory if it changed meanwhile. The text goes through the secret filter, and the memory becomes user-stated |
 | GET | `/api/v1/memory/{id}/history` | Memory v2: its `memory_events`, newest first |
 | GET | `/api/v1/schedules` | Schedules, each with its plain-language description |
@@ -565,11 +563,10 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | `needs_you/action` | The latest task ended with Action needed |
 | `working` | A task is running |
 | `problem` | The latest task ended with an error, interrupted, stuck or out of steps; or an effect gave up |
-| `review` | Memories wait for approval (memory v2) |
 | `scheduled` | A schedule is due within a day |
 | `idle` | Anything else |
 
-`stage_detail` carries the ids behind it (card, run, pending count, next schedule) for deep links.
+`stage_detail` carries the ids behind it (card, run, next schedule) for deep links. (Until 0.15.2 a `review` stage counted memories waiting for approval; nothing waits now.)
 
 ### 6.5 The event log
 
@@ -596,8 +593,8 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 | `action.resolved` | `id`, `choice`, `by` | "I'm done" or "Skip" |
 | `image` | `task`, `id`, `url`, `caption` | `show_screenshot` |
 | `memory.saved` / `memory.forgotten` / `memory.confirmed` | `id`, `text`, `trusted`, `by`; v2 adds `kind`, `trust`, `status` | Memory changes |
-| `memory.consolidated` | `runs`, `saved`, `proposed`, `merged`, `expired`, `cost`, `mode` | Memory v2: a consolidation finished |
-| `memory.pending` / `memory.superseded` / `memory.updated` | `id`, `text`, `kind`, `reason` / `id`, `by_id` / `id`, `version`; with `by` (`agent`, `user:<login>`) | Memory v2: a save waiting for the user; a memory replaced by a newer one; a user's edit |
+| `memory.consolidated` | `runs`, `saved`, `merged`, `expired`, `cost` | Memory v2: a consolidation finished |
+| `memory.superseded` / `memory.updated` | `id`, `by_id` / `id`, `version`; with `by` (`agent`, `user:<login>`) | Memory v2: a memory replaced by a newer one; a user's edit. (`memory.pending` went in 0.15.2) |
 | `schedule.created` / `schedule.updated` / `schedule.deleted` | The schedule (`schedule::json`), `task`, `by`, `done` | Schedule changes. `done` marks a one-time schedule that has run |
 | `secret.saved` / `secret.deleted` | `name`, `label`, `by` | Key changes (never values) |
 | `settings` | `{model, allow_actions}` | Settings changed |
@@ -874,13 +871,15 @@ Web pages, emails and command output can carry injected instructions. The defenc
   - `imported` from an import.
 
   The model can't choose.
-- **Standing instructions from outside content wait.** A rule or preference saved by a tainted task is `pending` (`tainted_rule`). It isn't shown to the model until the user approves it. A tainted fact is active but marked inferred.
+- **Nothing waits for the user** (since 0.15.2, the user's decision): the Memory screen is only for fixing or forgetting something.
+- **Standing instructions from outside content are only hints.** A rule or preference saved by a tainted task is saved as an inferred fact, never an instruction, and the tool result tells the model so (it tells the user to say it again in a new message if they asked for it). A tainted fact is active but marked inferred.
 - **Lower trust can't replace higher.**
-  - An inferred `replaces` of a user-stated note waits (`conflict`), and the original stays active.
+  - An inferred `replaces` of a user-stated note is refused, and the original stays.
   - Equal or higher trust supersedes it: the old note becomes `superseded`, with its history kept.
 - **Who writes what:**
-  - the model writes rules, preferences and facts;
-  - only consolidation writes the work log (phase 3), and it can never write a rule.
+  - the model writes rules, preferences and facts, but not in a scheduled run: its report is its record;
+  - only consolidation writes the work log, and nothing else.
+- **Left waiting by an older agentd:** settled at startup (`settle_pending`). Imports and outside-content rules become active (the rule as a fact); tidying up's proposals and conflicts are deleted.
 - **No secrets** (`secrets::looks_like_secret`), refused with a pointer to `request_secret`:
   - key formats (GitHub, OpenAI, Anthropic, Together, Slack, AWS, Google, Hugging Face, Stripe, GitLab);
   - card numbers that pass Luhn;
@@ -898,9 +897,8 @@ Web pages, emails and command output can carry injected instructions. The defenc
 
 **The notes in the prompt** (phase 2). They're built once per task and kept in its state, so a resumed task has the same notes. They go at the end of the system prompt, after the skills and the v2 memory instructions:
 - **"Your rules and the user's preferences":** always shown, within about 1,500 tokens; the least important preferences are dropped first.
-- **"Things you remember (dated hints; the live page wins)":**
-  - for a scheduled run, first its own last 3 work-log entries (about 600 tokens);
-  - then the facts and work-log entries most relevant to the request: the top 8, about 2,000 tokens.
+- **"This schedule's last reports"** (a scheduled run only): its last three finished reports from `runs`, newest first, one line each (at most 760 characters each, 2,400 in all), labelled as data. That's how a run knows what's new since last time; scheduled runs write no memories.
+- **"Things you remember (dated hints; the live page wins)":** the facts and work-log entries most relevant to the request: the top 8, about 2,000 tokens.
 
   They're ranked by 0.6 × relevance + 0.25 × recency + 0.15 × importance, × 0.8 if inferred:
   - relevance is FTS5 bm25 relative to the best match (stop words removed);
@@ -908,26 +906,27 @@ Web pages, emails and command output can carry injected instructions. The defenc
 
   With fewer than 8 full-text matches, the most recent facts and work-log entries fill the rest, after the matches; a request with nothing searchable gets only those. Full text misses paraphrases ("works at Acme" against "started a new job at Globex"), and a recent fact is the likeliest to correct an older one.
 - **Format:** each line reads `- #id [kind · date · user said|inferred] text`; a work-log line names its schedule.
-- **Never shown:** pending, deleted, superseded and expired memories (past `valid_until`).
+- **Never shown:** deleted, superseded and expired memories (past `valid_until`).
 - **Recall tracking:** what's shown gets its recall recorded (`last_recalled`, `recall_count`). The journal gets the ids, the size and the time taken, never the text. Building the notes from 5,000 memories takes 3.5–12 ms on the dev desktop.
 
 **The reminder.** When the user's message asks to remember something ("remember", "don't forget", "keep in mind", "from now on") and the task ends without a `remember` call, agentd adds one reminder turn.
 
 **Search.** `search_memory` uses the same ranking as the notes. On the evals, it rescues paraphrases that full-text matching misses.
 
-**Consolidation** (phase 3, `consolidate.rs`).
+**Consolidation, "tidying up"** (phase 3, `consolidate.rs`; smaller since 0.15.2, the user's decision).
 - **When:** 10 minutes after the last finished task (a burst consolidates once), or at once when 10 tasks wait. It's a `consolidate` effect (§6.19), never alongside a task.
+- **Which tasks:** finished ones, not stopped, not scheduled runs (the watermark passes them). A batch whose tasks only read or chatted (`runs.acted = 0`) and saved no memory needs no model: it only decays, and is recorded as a run with model `none` at no cost.
 - **Batches:** at most 10 tasks per model call. A full batch that leaves more behind runs the next one 5 seconds later (`Later`). With 20 busy tasks, GLM-5.3-Flash thought for 6,000–8,000 tokens or more per call.
-- **What it does:** it sends the batch of finished tasks (request, answer, status, schedule) and the current memories to `memory_consolidation_model` (GLM-5.3-Flash by default) through the gateway. The reply is a JSON object with `work_log`, `facts`, `merges` and `expire`, checked here before anything is written:
+- **What it does:** it sends the batch (request, answer, status, and whether each task "changed something" or "only read or chatted") and the current memories to `memory_consolidation_model` (GLM-5.3-Flash by default) through the gateway. The reply is a JSON object with `work_log`, `merges` and `expire`, checked here before anything is written:
   - ids must be real and active;
   - texts pass the length and secret checks;
-  - one work-log entry per task;
-  - never a rule;
-  - nothing replaces, merges away or expires what the user stated without their approval.
-- **Modes (`memory_consolidation`):**
-  - `observe` ("Review first" in the app): writes the work log and proposes everything else as pending items;
-  - `auto` ("Automatic", the default since 0.15.2): applies facts (inferred), merges and expiries, and still proposes preferences;
-  - `off`: does nothing.
+  - one work-log entry per task, only for a task that changed something: what it changed and what's left open, not what it found (at most 200 characters asked);
+  - no facts, preferences or rules: a `facts` key is ignored. Task results went stale as facts (2026-11-02);
+  - never changes what the user stated: a merge that would drop it is dropped, a merge into it keeps its words, an expiry of it is dropped.
+
+  Everything that passes applies at once; nothing is proposed.
+- **A task "changed something"** (`runs.acted`) when it ran a command, made a browser change the gates count as a write (a risky click, typing outside a search field, a key other than navigation, the approved send), or set up or cancelled a schedule. Older tasks (null) count as having acted.
+- **Modes (`memory_consolidation`):** `auto` ("Tidy up after tasks" on, the default) or `off`. A saved `observe` ("Review first", removed in 0.15.2) reads as `auto`.
 - **Decay:**
   - facts not recalled for 60 days lose 10% importance per run;
   - unimportant ones not recalled for 180 days expire;
@@ -935,7 +934,7 @@ Web pages, emails and command output can carry injected instructions. The defenc
   - so does anything past `valid_until`.
 - **Accounting:** each run is a `runs` row (`kind = consolidation`) with its cost, under a daily cap (`memory_consolidation_daily_cap_usd`, $0.50), and emits `memory.consolidated`.
 - **Reply limit:** 16,384 tokens (the gateway's maximum). GLM thinks before it answers, and with 4,096 tokens a batch of 20 tasks left no room for the JSON (found in the phase 6 soak). A reply without JSON records its `finish_reason` in the effect's error. Each call gets a journal line (`consolidation reply`): tasks, milliseconds, `finish_reason`, prompt, completion and reasoning tokens.
-- **Dates:** a proposal's `valid_until` becomes the end of that day in the user's time zone, read before the transaction that applies the reply. Reading it inside, as 0.15.0 first did, waited forever for the store's lock the transaction held and froze agentd (found in the phase 6 evals before it reached the desktop; a test now fails on it).
+- **No settings reads inside its transaction:** `apply` holds the store's lock, which isn't re-entrant. 0.15.0 read the time zone there (for a fact's end date) and froze agentd (found in the phase 6 evals before it reached the desktop). Facts, and so dates, are gone since 0.15.2.
 - **Cost:** about $0.0006 a run on Flash for a few tasks, about a cent for a full batch.
 - **Trigger it now:** `POST /api/v1/memory/consolidate`.
 
@@ -1365,10 +1364,10 @@ None of them imports UIKit; the app targets hold everything platform-specific ex
 - **Settings:**
   - model, Browser actions, agentd version;
   - **Memory** (memory v2; the plan's §14):
-    - "Needs your approval" first, grouped by why (from outside content, corrections to what you said, proposed while tidying up, imported), with Approve/Reject on each and Approve all / Reject all per group. A correction shows what it replaces.
-    - Then the memories by kind (Rules, Preferences, Facts, Work log), searchable (full text), with expired and replaced ones shown on request and restorable.
+    - Nothing waits for approval here (since 0.15.2): you come only to fix or forget something.
+    - The memories by kind (Rules, Preferences, Facts, Work log), searchable (full text), with expired and replaced ones shown on request and restorable. A hint (saved after outside content) can be confirmed.
     - Tap one to edit it (text, kind, end date). The edit is refused if the memory changed meanwhile ("Changed elsewhere, reloaded"). The sheet also has "Why do you know this?" with *Open that conversation*.
-    - "Tidying up": the consolidation mode (Off, Review first, Automatic), this month's cost, the last run, and *Tidy up now*.
+    - "Tidying up": a switch (*Tidy up after tasks*), a footer saying what it does, this month's cost, the last run ("1 noted, 1 merged") and *Tidy up now*.
     - Export (JSON or Markdown, through the share sheet) and import (a JSON file).
 
     A desktop without memory v2 gets v1's confirm-or-forget list;
@@ -1408,8 +1407,7 @@ All are DEBUG-only. On the Mac, set them with `open --env NAME=value "Cloud Desk
 **Stage banner.** A slim banner over the chat comes from agentd's `stage` and leads where you need to go:
 - "Needs you: approve a command" (or a browser change, or a schedule) and "Needs you: a key or token" scroll to the card;
 - "Needs you: action needed on the desktop" scrolls to the Action needed card;
-- "Something went wrong" opens that conversation;
-- "Review N memory items" opens Memory.
+- "Something went wrong" opens that conversation.
 
 Nothing shows while the desktop is idle, working or only has a schedule coming. The status is fetched again after each event that changes the stage.
 
@@ -1653,7 +1651,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 109 unit tests (plus a 5,000-memory speed test run on demand): bulk approval by reason, restore, where a memory came from and what a proposal replaces, export and import round trips, consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text notification bodies, a schedule from older rules running with one note, memory consolidation (batches, the reply's format, observe and auto (auto unless set), protection of what the user stated, duplicates and reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, the scheduled-run work log, the app's filters), write rules (trust from taint, pending standing instructions, conflicts and supersedes, caps), the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
+| agentd | 110 unit tests (plus a 5,000-memory speed test run on demand): memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text notification bodies, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the app's filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
 | gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
 | DesktopKit | 29 tests (§10.8) |

@@ -3,10 +3,11 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// What the agent remembers between conversations (docs/memory-v2.md §14).
-/// With memory v2: what waits for approval first, grouped by why; then the
-/// memories by kind, searchable, with expired ones restorable; an edit sheet
-/// with "Why do you know this?"; consolidation's mode and cost; export and
-/// import. A desktop without memory v2 gets v1's confirm-or-forget list.
+/// Nothing here waits for you: you come here only to fix or forget something.
+/// With memory v2: the memories by kind, searchable, with expired ones
+/// restorable; an edit sheet with "Why do you know this?"; tidying up (on or
+/// off) and its cost; export and import. A desktop without memory v2 gets
+/// v1's confirm-or-forget list.
 struct MemoryView: View {
     let client: AgentClient
     @State private var memories: [AgentMemory] = []
@@ -75,35 +76,6 @@ struct MemoryView: View {
     // MARK: Memory v2
 
     @ViewBuilder private var v2Sections: some View {
-        let pending = memories.filter(\.isPending)
-        if query.isEmpty {
-            ForEach(Self.reasons, id: \.self) { reason in
-                let group = pending.filter { ($0.pendingReason ?? "other") == reason }
-                if !group.isEmpty {
-                    Section {
-                        ForEach(group) { memory in
-                            PendingRow(memory: memory) { approve in Task { await answer(memory, approve: approve) } }
-                        }
-                    } header: {
-                        Text(Self.groupTitle(reason))
-                    } footer: {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(Self.groupFooter(reason))
-                            if group.count > 1 {
-                                HStack(spacing: 16) {
-                                    Button("Approve all") { Task { await answerAll(reason, approve: true) } }
-                                    Button("Reject all", role: .destructive) {
-                                        Task { await answerAll(reason, approve: false) }
-                                    }
-                                }
-                                .font(.app(.footnote).weight(.semibold))
-                                .buttonStyle(.borderless)
-                            }
-                        }
-                    }
-                }
-            }
-        }
         Section {
             if query.isEmpty {
                 Picker("Kind", selection: $kind) {
@@ -117,8 +89,7 @@ struct MemoryView: View {
                 .listRowInsets(EdgeInsets())
             }
             let shown = memories.filter { memory in
-                !memory.isPending && (query.isEmpty ? memory.kind == kind : true)
-                    && (showGone ? true : !memory.isGone)
+                (query.isEmpty ? memory.kind == kind : true) && (showGone ? true : !memory.isGone)
             }
             if loaded, shown.isEmpty {
                 Text(query.isEmpty ? Self.empty(kind) : "Nothing matches.").foregroundStyle(.secondary)
@@ -135,7 +106,7 @@ struct MemoryView: View {
                         if memory.isGone {
                             Button("Restore") { Task { await restore(memory) } }.tint(.blue)
                         } else if memory.isInferred {
-                            Button("Confirm") { Task { await answer(memory, approve: true) } }.tint(.green)
+                            Button("Confirm") { Task { await confirm(memory) } }.tint(.green)
                         }
                     }
                     .macContextMenu {
@@ -143,7 +114,7 @@ struct MemoryView: View {
                             Button("Restore") { Task { await restore(memory) } }
                         } else {
                             if memory.isInferred {
-                                Button("Confirm") { Task { await answer(memory, approve: true) } }
+                                Button("Confirm") { Task { await confirm(memory) } }
                             }
                             Button("Forget", role: .destructive) { Task { await forget(memory) } }
                         }
@@ -163,34 +134,11 @@ struct MemoryView: View {
         }
     }
 
-    private static let reasons = ["tainted_rule", "conflict", "proposed", "imported", "other"]
-
-    private static func groupTitle(_ reason: String) -> String {
-        switch reason {
-        case "tainted_rule": "From outside content"
-        case "conflict": "Corrections to what you said"
-        case "proposed": "Proposed while tidying up"
-        case "imported": "Imported"
-        default: "Waiting for you"
-        }
-    }
-
-    private static func groupFooter(_ reason: String) -> String {
-        switch reason {
-        case "tainted_rule":
-            "Saved after the agent read a page, an email or command output, so they could come from that content. They aren't used until you approve them."
-        case "conflict": "Approving one replaces what you said before."
-        case "proposed": "The agent's suggestions from tidying up its memory."
-        case "imported": "From an import: nothing counts until you approve it."
-        default: "The agent doesn't use these until you approve them."
-        }
-    }
-
     private static func empty(_ kind: String) -> String {
         switch kind {
         case "rule": "No rules yet. Tell the agent, like “From now on, reply in English.”"
         case "preference": "No preferences yet, like “I prefer summaries under 100 words.”"
-        case "work_log": "No work log yet: it's written after tasks, while the agent tidies up."
+        case "work_log": "No work log yet: after a task that changes something, the agent notes what it did."
         default: "No facts yet. Tell the agent something to keep, like “Remember that my manager is Lawrence.”"
         }
     }
@@ -211,13 +159,13 @@ struct MemoryView: View {
                 ForEach(unverified) { memory in
                     Text(memory.text)
                         .swipeActions(edge: .leading) {
-                            Button("Confirm") { Task { await answer(memory, approve: true) } }.tint(.green)
+                            Button("Confirm") { Task { await confirm(memory) } }.tint(.green)
                         }
                         .swipeActions(edge: .trailing) {
                             Button("Forget", role: .destructive) { Task { await forget(memory) } }
                         }
                         .macContextMenu {
-                            Button("Confirm") { Task { await answer(memory, approve: true) } }
+                            Button("Confirm") { Task { await confirm(memory) } }
                             Button("Forget", role: .destructive) { Task { await forget(memory) } }
                         }
                 }
@@ -252,7 +200,7 @@ struct MemoryView: View {
         do {
             stats = try? await client.consolidation()
             if stats != nil {
-                let statuses = showGone ? ["active", "pending", "expired", "superseded"] : ["active", "pending"]
+                let statuses = showGone ? ["active", "expired", "superseded"] : ["active"]
                 memories = try await client.memories(statuses: statuses, query: query.isEmpty ? nil : query)
             } else {
                 memories = try await client.memories()
@@ -278,18 +226,9 @@ struct MemoryView: View {
         await attempt { try await client.forget(memory: memory.id) }
     }
 
-    private func answer(_ memory: AgentMemory, approve: Bool) async {
-        memories.removeAll { $0.id == memory.id && !approve }
-        await attempt {
-            if approve { try await client.confirm(memory: memory.id) } else { try await client.reject(memory: memory.id) }
-        }
-    }
-
-    private func answerAll(_ reason: String, approve: Bool) async {
-        let group = reason == "other" ? nil : reason
-        await attempt {
-            if approve { try await client.approveAll(reason: group) } else { try await client.rejectAll(reason: group) }
-        }
+    /// Vouches for a hint: it becomes something you said.
+    private func confirm(_ memory: AgentMemory) async {
+        await attempt { try await client.confirm(memory: memory.id) }
     }
 
     private func restore(_ memory: AgentMemory) async {
@@ -315,46 +254,12 @@ struct MemoryView: View {
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             let done = try await client.importMemory(try Data(contentsOf: url))
             notice = done.rejected.isEmpty
-                ? "Imported \(done.imported). They're waiting for your approval."
+                ? "Imported \(done.imported). The agent uses them from now on; fix or forget any here."
                 : "Imported \(done.imported); skipped \(done.rejected.count) (\(done.rejected.first?.reason ?? ""))."
         } catch {
             problem = error.localizedDescription
         }
         await load()
-    }
-}
-
-/// A memory waiting for approval: its text, what it would replace, and the buttons.
-private struct PendingRow: View {
-    let memory: AgentMemory
-    let answer: (Bool) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(MemoryRow.kindName(memory.kind)).font(.app(.caption).weight(.semibold)).foregroundStyle(.secondary)
-                Spacer()
-                Text(String(memory.created.prefix(10))).font(.app(.caption)).foregroundStyle(.tertiary)
-            }
-            Text(memory.text)
-            ForEach(memory.replaces ?? [], id: \.id) { old in
-                HStack(alignment: .top, spacing: 6) {
-                    Text("Replaces").font(.app(.caption).weight(.semibold))
-                    Text(old.text).strikethrough()
-                }
-                .font(.app(.caption))
-                .foregroundStyle(.secondary)
-            }
-            HStack(spacing: 10) {
-                Button("Reject", role: .destructive) { answer(false) }
-                    .buttonStyle(.bordered)
-                Button("Approve") { answer(true) }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.green)
-            }
-            .controlSize(.small)
-        }
-        .padding(.vertical, 2)
     }
 }
 
@@ -402,7 +307,8 @@ struct MemoryRow: View {
     }
 }
 
-/// Consolidation ("tidying up"): its mode, what it cost this month, its last run.
+/// Tidying up (consolidation): on or off, what it does, what it cost this
+/// month, its last run.
 private struct ConsolidationSection: View {
     let stats: ConsolidationStats
     let client: AgentClient
@@ -411,16 +317,17 @@ private struct ConsolidationSection: View {
 
     var body: some View {
         Section {
-            Picker(
-                "Mode",
-                selection: Binding(
-                    get: { stats.mode },
-                    set: { mode in Task { try? await client.setConsolidation(mode: mode); await reload() } })
-            ) {
-                Text("Off").tag("off")
-                Text("Review first").tag("observe")
-                Text("Automatic").tag("auto")
-            }
+            Toggle(
+                "Tidy up after tasks",
+                isOn: Binding(
+                    get: { stats.mode != "off" },
+                    set: { on in
+                        Task {
+                            try? await client.setConsolidation(mode: on ? "auto" : "off")
+                            await reload()
+                        }
+                    })
+            )
             LabeledContent("This month", value: stats.monthCost.formatted(.currency(code: "USD").precision(.fractionLength(2...4))))
             if let last = stats.lastRun {
                 LabeledContent("Last run", value: lastRun(last))
@@ -449,24 +356,22 @@ private struct ConsolidationSection: View {
 
     private var footer: String {
         let model = stats.model.split(separator: "/").last.map(String.init) ?? stats.model
-        let mode = switch stats.mode {
-        case "off": "Off: nothing is written after tasks."
-        case "auto": "Automatic: after tasks, the agent keeps a work log, saves facts as hints and merges duplicates. New preferences, and anything that would change what you said, wait for your approval."
-        default: "Review first: after tasks, the agent keeps a work log; everything else it suggests waits here for your approval."
-        }
+        let what = stats.mode == "off"
+            ? "Off: nothing is written or merged after tasks. Dated memories still end on their date."
+            : "A few minutes after your tasks, a small model notes in the work log what each one changed (a pushed fix, a booked appointment), merges memories that say the same thing, and drops ones that are no longer true. It never changes what you said, never notes what a task only looked up, and skips scheduled runs."
         let waiting = stats.waitingTasks == 1 ? "1 task waits." : "\(stats.waitingTasks) tasks wait."
-        return "\(mode) It runs on \(model), at most \(stats.dailyCapUsd.formatted(.currency(code: "USD"))) a day. \(waiting)"
+        let cost = "It runs on \(model), at most \(stats.dailyCapUsd.formatted(.currency(code: "USD"))) a day."
+        return stats.mode == "off" ? what : "\(what) \(cost) \(waiting)"
     }
 
     private func lastRun(_ run: ConsolidationStats.LastRun) -> String {
         let when = Date(agentTimestamp: run.at)?.formatted(.relative(presentation: .named)) ?? run.at
         guard let counts = run.counts, run.status == "done" else { return "\(when), \(run.status)" }
         var parts: [String] = []
-        if counts.saved > 0 { parts.append("\(counts.saved) saved") }
-        if counts.proposed > 0 { parts.append("\(counts.proposed) proposed") }
+        if counts.saved > 0 { parts.append("\(counts.saved) noted") }
         if counts.merged > 0 { parts.append("\(counts.merged) merged") }
-        if counts.expired > 0 { parts.append("\(counts.expired) expired") }
-        return parts.isEmpty ? "\(when), nothing new" : "\(when): \(parts.joined(separator: ", "))"
+        if counts.expired > 0 { parts.append("\(counts.expired) dropped") }
+        return parts.isEmpty ? "\(when), nothing to do" : "\(when): \(parts.joined(separator: ", "))"
     }
 }
 
@@ -529,7 +434,7 @@ private struct MemoryEditor: View {
                 if memory.isGone {
                     Button("Restore") { Task { await act { try await client.restore(memory: memory.id) } } }
                 } else {
-                    if memory.isInferred && !memory.isPending {
+                    if memory.isInferred {
                         Button("Confirm it") { Task { await act { try await client.confirm(memory: memory.id) } } }
                     }
                     Button("Forget", role: .destructive) {
@@ -563,7 +468,7 @@ private struct MemoryEditor: View {
         let date = Date(agentTimestamp: memory.created)?.formatted(date: .abbreviated, time: .omitted)
             ?? String(memory.created.prefix(10))
         switch (memory.origin, memory.trust) {
-        case ("consolidator", _): return "Proposed while the agent tidied up its memory, on \(date)."
+        case ("consolidator", _): return "Noted while the agent tidied up its memory, on \(date)."
         case ("user", _): return "You added or edited it, on \(date)."
         case (_, "imported"): return "Imported on \(date)."
         case (_, "agent_inferred"):

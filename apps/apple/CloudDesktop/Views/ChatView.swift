@@ -709,10 +709,6 @@ private struct StageBanner: View {
                 return Banner(text: "Something went wrong", icon: "exclamationmark.triangle.fill", tint: .red, target: .task(run))
             }
             return Banner(text: "Notifications or memory upkeep are failing", icon: "exclamationmark.triangle.fill", tint: .red, target: .none)
-        case "review":
-            let count = detail?["pending"]?.int ?? 0
-            let items = count == 1 ? "1 memory item" : "\(count) memory items"
-            return Banner(text: "Review \(items)", icon: "brain", tint: .orange, target: .memory)
         default:
             return nil
         }

@@ -266,9 +266,20 @@ impl Store {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO runs (id, status, request, by_user, model, policy_version, schedule)
-             VALUES (?1, 'running', ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO runs (id, status, request, by_user, model, policy_version, schedule, acted)
+             VALUES (?1, 'running', ?2, ?3, ?4, ?5, ?6, 0)",
             params![id, request, by, model, policy_version, schedule],
+        )?;
+        Ok(())
+    }
+
+    /// The task changed something: ran a command, wrote in the browser, or
+    /// set up or cancelled a schedule.
+    pub fn mark_run_acted(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE runs SET acted = 1 WHERE id = ?1 AND acted = 0",
+            params![id],
         )?;
         Ok(())
     }
@@ -645,13 +656,12 @@ impl Store {
     }
 
     /// Memory counts: (active, pending).
-    pub fn memory_counts(&self) -> Result<(i64, i64)> {
+    pub fn memory_counts(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.query_row(
-            "SELECT COUNT(*) FILTER (WHERE status = 'active'), COUNT(*) FILTER (WHERE status = 'pending')
-             FROM memory WHERE agent = 'main'",
+            "SELECT COUNT(*) FROM memory WHERE agent = 'main' AND status = 'active'",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )?)
     }
 
@@ -865,6 +875,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 2 {
         // One transaction: a failed step leaves the database at version 1.
         conn.execute_batch(&format!("BEGIN; {MIGRATION_2} COMMIT;"))?;
+    }
+    if version < 3 {
+        // Whether a task changed something (a command, a write in the browser,
+        // a schedule): only those get a work-log entry. Null for older tasks.
+        conn.execute_batch(
+            "BEGIN; ALTER TABLE runs ADD COLUMN acted INTEGER; PRAGMA user_version = 3; COMMIT;",
+        )?;
     }
     Ok(())
 }
@@ -1169,12 +1186,19 @@ mod tests {
     }
 
     #[test]
-    fn migrates_a_v1_database_to_v2() {
+    fn migrates_a_v1_database_to_the_latest() {
         let (store, dir) = migrated_v1();
         {
             let conn = store.conn.lock().unwrap();
             let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(version, 2);
+            assert_eq!(version, 3);
+            // Tasks from before don't say whether they changed anything.
+            let acted: Option<i64> = conn
+                .query_row("SELECT acted FROM runs LIMIT 1", [], |r| r.get(0))
+                .optional()
+                .unwrap()
+                .flatten();
+            assert_eq!(acted, None);
             // Every existing memory is an active fact; trust follows `trusted`.
             let updated: i64 = conn
                 .query_row(

@@ -41,7 +41,7 @@ public final class ChatStore {
     /// Events after which the status (its stage above all) is worth fetching again.
     static let changesStatus: Set<String> = [
         "settings", "task.started", "task.paused", "task.resumed", "task.finished", "approval.requested",
-        "approval.resolved", "action_needed", "action.resolved", "secret.saved", "memory.pending",
+        "approval.resolved", "action_needed", "action.resolved", "secret.saved",
         "memory.confirmed", "memory.forgotten", "schedule.created", "schedule.updated", "schedule.deleted",
     ]
 

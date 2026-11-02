@@ -2,6 +2,8 @@
 
 *2026-11-01 · Razvan Draghici. Filed from the Claude doc [agentd Memory v2 and Borrowed Patterns](https://claude.ai/artifact/RSHkSqTRP897X5V3YxFQs2); this copy is kept current with decisions as the phases land.*
 
+> **Changed 2026-11-02 (agentd 0.15.2), the user's decisions: nothing waits for the user's approval, and tidying up is smaller.** The user never approves memories; the Memory screen is only for fixing or forgetting something. Tidying up writes no facts and skips scheduled runs, which see their own last reports instead. Where the sections below describe pending memories, proposals, "Review first" (`observe`) or a review stage, [§19 "No approvals, smaller tidying up"](#no-approvals-smaller-tidying-up-2026-11-02) replaces them.
+
 
 ## 0. Purpose and how to work from this plan
 
@@ -34,13 +36,13 @@ flowchart LR
 
 ## 1. Goal and principles
 
-The agent keeps rules, preferences, facts and a dated work log across tasks and scheduled runs, on the user's own VM, with the user able to see, edit, approve and delete every item. Memory is a dated hint the model reads; it is never consulted by policy and can never grant access.
+The agent keeps rules, preferences, facts and a dated work log across tasks and scheduled runs, on the user's own VM, with the user able to see, edit and delete every item (and, since 0.15.2, never asked to approve one). Memory is a dated hint the model reads; it is never consulted by policy and can never grant access.
 
 1. **Harness-enforced.** Trust, pending status, secret filtering, scope and budgets are decided in `agentd`, not by the model.
-2. **Taint decides trust.** A memory written after outside content is `agent_inferred`; rules and preferences written then are `pending` until the user approves. This keeps today's behaviour (§6.13) and makes it stricter for standing instructions.
+2. **Taint decides trust.** A memory written after outside content is `agent_inferred`; rules and preferences written then are kept as inferred facts, hints that are never instructions (until 0.15.2 they were `pending` until the user approved).
 3. **Dated and sourced.** Every injected item shows its date and where it came from, and the prompt says memories may be stale and the live source wins.
 4. **One binary, one database.** Everything lives in `agentd.db` on the encrypted root volume. FTS5 from the bundled SQLite does search. No queue process, no vector store, no embedding model.
-5. **Observe before auto.** Anything the agent writes on its own (consolidation now, proactive Bots later) starts in a mode that records what it would have done, and is switched to auto after the user has reviewed the record. Borrowed from dsh-superagent's accept modes.
+5. **Observe before auto.** Anything the agent writes on its own (consolidation now, proactive Bots later) starts in a mode that records what it would have done, and is switched to auto after the user has reviewed the record. Borrowed from dsh-superagent's accept modes. *Dropped for memory on 2026-11-02:* the review was 31 proposals the user approved one by one, mostly task results; consolidation now writes only what needs no review (§19).
 6. **Stored first, done afterwards.** Side effects (consolidation, push) are rows in an `effects` table written in the same transaction as the state change, then executed with retries. Borrowed from dsh-superagent's Effects.
 7. **Attention budget.** The phone is notified when the person must act or can use a result, and at no other time. Borrowed from dsh-superagent's philosophy.
 8. **Operator-blind stays intact.** Journal lines carry counts and ids; the gateway sees prompts as today; nothing new is logged or stored off the desktop.
@@ -192,14 +194,15 @@ Rules enforced in `agent.rs` / `memory.rs` (each has a unit test):
 | Rule | Enforcement |
 |---|---|
 | Trust follows taint | `trust = user_stated` if the task is not tainted at the moment of the call, else `agent_inferred`. The model cannot set trust |
-| Standing instructions need a clean source | A `rule` or `preference` saved while tainted gets `status = pending`, `pending_reason = tainted_rule`. It is never injected until approved. A `fact` saved while tainted is active but `agent_inferred` and injected as a hint |
-| Rules come only from the user | The consolidator may write `fact`, `preference` (pending) and `work_log`, never `rule` |
-| Lower trust cannot supersede higher trust | `replaces` on a memory with higher trust saves the new item as `pending`, `pending_reason = conflict`, and leaves the old one active. Equal or higher trust supersedes: old `status = superseded`, `superseded_by = new.id`, history kept |
+| Standing instructions need a clean source | A `rule` or `preference` saved while tainted is saved as a `fact`, active and `agent_inferred`: a hint, never an instruction, and the tool result says so (until 0.15.2: `pending`, `tainted_rule`). A `fact` saved while tainted is active but `agent_inferred` and injected as a hint |
+| Rules come only from the user | The consolidator writes only `work_log` (until 0.15.2 also `fact` and pending `preference`), never `rule` |
+| Lower trust cannot supersede higher trust | `replaces` on a memory with higher trust is refused, and the old one stays (until 0.15.2: saved `pending`, `conflict`). Equal or higher trust supersedes: old `status = superseded`, `superseded_by = new.id`, history kept |
+| Scheduled runs save nothing | `remember` in a scheduled run is refused: its report is its record, and the next run of the schedule sees it (§6) |
 | No secrets | The filter in §7 runs on every text before insert. A match is refused; the tool result tells the model to use `request_secret` for keys and that passwords are never stored |
 | Nothing a page said to remember | Unchanged prompt rule; the taint rule above is the code-level backstop |
 | Memory never grants access | `policy.rs` and the browser gates never read the `memory` table. A rule memory is prompt text only |
 | Caps | 500 characters per item; 2,000 active items per agent; `forget` by query removes only a single match whose FTS rank is clear (see §7) |
-| Every write is an event | `memory_events` row and an SSE event (`memory.saved`, `memory.pending`, `memory.forgotten`, `memory.superseded`) with `by` = `agent`, `user:<login>` or `consolidator` |
+| Every write is an event | `memory_events` row and an SSE event (`memory.saved`, `memory.forgotten`, `memory.superseded`; `memory.pending` until 0.15.2) with `by` = `agent`, `user:<login>` or `consolidator` |
 
 Tool availability: `remember`, `forget` and `search_memory` always; `report_outcome` only when the task is a scheduled run. The tool-schema cost in every request stays roughly where it is today (two tools removed, two added).
 
@@ -251,7 +254,7 @@ Every write goes through one function, `memory::write(op, ctx)`, used by the too
 
 ## 8. Consolidation
 
-A background job turns finished tasks into work-log entries and keeps the fact set small and current. It runs as the `consolidate` effect (§9) on `GLM-5.3-Flash`, starts in `observe` mode, and never writes a `rule`.
+A background job turns finished tasks into work-log entries and keeps the fact set small and current. It runs as the `consolidate` effect (§9) on `GLM-5.3-Flash`, starts in `observe` mode, and never writes a `rule`. *Since 0.15.2 it writes a work-log entry only for a task that changed something, never writes facts, skips scheduled runs and never proposes anything: see §19.*
 
 **Trigger.** `finish()` enqueues `consolidate` with key = agent, `due = now + 10 min`; a later finish replaces the row and pushes `due` out again, so a burst of tasks consolidates once. Hard limits: run at the latest when 20 tasks have finished since `memory_last_consolidated_run`, and never while `busy` is true (return `Later(60 s)`), so it does not compete with a task for the gateway budget. Skipped entirely when `memory_consolidation = off` or today's consolidation spend is over `memory_consolidation_daily_cap_usd`.
 
@@ -276,7 +279,7 @@ A background job turns finished tasks into work-log entries and keeps the fact s
 | `observe` | written active (`agent_inferred`) | `pending`, `pending_reason = proposed` | recorded as `propose` events and shown as proposals; nothing changes |
 | `auto` (default since 0.15.2) | written active | `fact` active and `agent_inferred`; `preference` pending | applied; `user_stated` protection above still holds |
 
-The app shows proposals with Approve all / Reject all. The recommended path is observe for the first two weeks, then auto.
+The app shows proposals with Approve all / Reject all. The recommended path is observe for the first two weeks, then auto. *Since 0.15.2: `off` or `auto` only (`observe` reads as `auto`); the work log is written for tasks that changed something, facts aren't written, and merges and expiries that would touch a `user_stated` memory are dropped (§19).*
 
 **Decay and expiry** (no model call; part of the same effect): items past `valid_until` become `expired`; facts not recalled for 60 days lose 10% importance per run, floor 0.1; facts under 0.15 and not recalled for 180 days become `expired`; work-log items older than 12 months become `expired`. Expired items stay visible in the app and can be restored.
 
@@ -354,7 +357,7 @@ The `summary` field also prepares the ground for `operator-isolation.md`'s propo
 | `needs_you/action` | The latest run ended `needs_user` and no user message followed |
 | `working` | `busy` is true |
 | `problem` | The latest run ended `error`, `interrupted`, `stuck` or `max_steps` and no user message followed; or `effects.failing` is non-empty |
-| `review` | Pending memories exist (tainted rules, conflicts, proposals, imports) |
+| `review` | Pending memories exist (tainted rules, conflicts, proposals, imports). *Removed in 0.15.2: nothing is pending* |
 | `scheduled` | A schedule is due within the next 24 hours |
 | `idle` | Everything else |
 
@@ -610,6 +613,32 @@ Phase 4 (built):
 
 
 
+### No approvals, smaller tidying up (2026-11-02)
+
+agentd 0.15.2, the user's decisions: "I should never ever have to approve memories, this should be buried in the Memory setting and the user should only have to go in there if there's something they feel is wrong with what the agent remembered", and "remembering ephemeral facts like the results of a scan is massively wasteful". They chose to keep tidying up, smaller.
+
+**What the dev desktop showed** (counts only, 2026-11-02): 32 memories had waited for approval, 31 of them proposals from tidying up; the user approved 26 by hand. 20 facts were replaced within three days: tidying up read each task's answer and wrote its results down as facts, which the next result replaced. The eval results show the same shape ("Unsent Gmail drafts are pending the user's decision: …").
+
+**Nothing is pending any more:**
+- A rule or preference the agent saves after outside content becomes an inferred fact, a hint that's never an instruction. The tool result tells the model, which tells the user to say it again in a new message if they asked for it. The prompt now says to call `remember` first, before opening pages or running commands.
+- A lower-trust "correction" of what the user said is refused; the user's memory stands until they change it.
+- Imports are active at once, marked `imported`, under the 2,000 cap.
+- At startup, memories an older agentd left pending are settled the same way (`memory::settle_pending`, `memory_events` actor `agentd`): imports and outside-content rules become active (the rule as a fact); tidying up's proposals and conflicts are deleted.
+- Removed: `memory.pending`, the `review` stage and the app's "Review N memory items" banner, `POST /memory/{id}/reject`, `/memory/approve-all` and `/memory/reject-all`, `replaces` on listed memories, and the Memory screen's approval groups. `/memory/{id}/confirm` (and its `/approve` alias) stays: it vouches for a hint, which becomes user-stated. `GET /memory` lists active memories by default. `/status` gives `memory {active}`.
+
+**Scheduled runs save nothing.** `remember` in a scheduled run is refused. Instead of its work-log entries, a scheduled run's notes hold the schedule's last three finished reports from `runs` (newest first, one line each, at most 760 characters each and 2,400 in all, under "This schedule's last reports", labelled as data). That's how "what's new since last time" works now, without a model writing it down. The reports are labelled, not tainting, as the inferred work log was.
+
+**Tidying up is smaller** (`consolidate.rs`):
+- **Only tasks that changed something get a work-log entry.** `runs.acted` (migration 3, additive; null for older tasks, which count as acting) is set when a task runs a command, makes a browser change the gates classify as a write (a risky click, typing outside a search field, a key other than navigation; the approved send too), or sets up or cancels a schedule. The prompt marks each task "changed something" or "only read or chatted", and asks for what was changed and what's left open, not what was found ("Pushed the login fix to acme/api; PR #12 waits for review"), in at most 200 characters. The harness drops entries for tasks that changed nothing.
+- **No facts.** The `facts` key is ignored (any shape) and counted as rejected. Facts come from the user, or from the agent during a task.
+- **Scheduled runs are skipped** in the batch; the watermark passes them.
+- **What the user said is never changed:** a merge that would drop a user-stated memory is dropped; a user-stated memory can absorb its duplicates but keeps its words; an expiry of one is dropped. Everything else applies at once.
+- **A batch that needs no model gets no call:** tasks that only read and saved no memory. Decay still runs, and the batch is recorded as a consolidation run with model `none` and no cost, so the app's "Last run" and the evals see it.
+- **Modes:** `off` and `auto`. A saved `observe` reads as `auto`. The app's picker is a switch, "Tidy up after tasks", with a footer saying what it does.
+- `Applied` and `memory.consolidated` lose `proposed`.
+
+**Tests:** agentd 110 (new: the settling, vouching, refused corrections, hints for tainted rules, last reports, work log only for acting tasks, no model call for a read-only batch, user-stated memories untouched by merges and expiries, scheduled runs refused, tasks marked as acting; the observe and proposal tests removed). DesktopKit 29. **Evals:** "consolidation-work-log" became "consolidation-writes-no-results" (three tasks that changed nothing: no work log, and the user's fact kept), and "scheduled-run-continues" no longer consolidates in between. Not yet re-run against Together.
+
 ## 20. File map
 
 | Path | Change |
@@ -705,5 +734,5 @@ v1's failures are the same as in phase 2, plus "old-fact-still-found": v1 shows 
 - the evals above (met);
 - consolidation under the cap every day.
 
-Then review the proposals in the app, switch to `auto`, and build 0.16.0 without the flag.
+Then build 0.16.0 without the flag. (Tidying up is already `auto`, and since 0.15.2 there are no proposals to review.)
 

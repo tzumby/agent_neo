@@ -1158,7 +1158,7 @@ Desktops hold no model-provider key. Every model call goes to **gatewayd**, a sm
 | Route | Auth | What it does |
 |---|---|---|
 | `GET /health` | none | `ok` |
-| `GET /attestation?nonce=<32–128 hex>` | none (reachable from desktops only) | Runs `nitro-tpm-attest --user-data <binding> --nonce <nonce>` with a 15 s timeout, at most 2 at once, and returns the COSE_Sign1 document (`application/cbor`) |
+| `GET /attestation?nonce=<32–128 hex>` | none (reachable from desktops only) | Runs `nitro-tpm-attest --user-data <binding> --nonce <nonce>` with a 15 s timeout, one at a time (`/dev/tpm0` takes one opener; others wait), and returns the COSE_Sign1 document (`application/cbor`) |
 | `POST /v1/chat/completions` | `x-desktop-identity` | The model call (below) |
 
 - **A model call:**
@@ -1642,7 +1642,7 @@ The same screens as the iPhone's, in Mac form:
 | A stolen phone | Approving from a notification needs the phone unlocked. The Tailscale session can be revoked from the admin console. Keys can't be read back from the app |
 | Destructive commands by mistake | Dangerous patterns ask; root asks; Stop kills the unit; limits on memory, processes, CPU and time |
 | Losing the user's data | Per-user KMS keys; the data volume is planned. Today state is on the root volume |
-| The operator reading users' data | Partly answered (gateway). Planned: attested NixOS desktops with a LUKS data disk unlocked only for measured images, no SSM, app-side verification, public measurements (`operator-isolation.md` phases 2–3) |
+| The operator reading users' data | Partly answered (gateway). Planned (`operator-isolation.md` §5–§11): attested Ubuntu desktops on c6a.large with no operator access, a LUKS data disk whose key comes from a per-desktop KMS key locked to approved images, a pinned and device-authenticated app channel, end-to-end encrypted notifications, customer-approved updates, and public measurements |
 
 ## 13. Operations
 
@@ -1746,7 +1746,9 @@ Found while writing this document. None of them is a known exploit; most are dri
 - The single fck-nat instance serves both AZs: a single point of failure.
 - Desktop egress at the security-group level is open (all protocols); only `worker` is restricted, and that's done on the host.
 - The gateway's budget is a pre-check (concurrent calls can overshoot), and there's no per-minute rate limit.
-- `/attestation` is unauthenticated, though only desktops can reach it, and only 2 run at once.
+- `/attestation` is unauthenticated, though only desktops can reach it, and only one runs at a time.
+- The running gateway image (Oct 31) still allows 2 attestations at once; a second one at the same moment fails with a 500 (`/dev/tpm0` busy). agentd's retry hides it on model calls. Fixed in gatewayd, not yet in a built image.
+- UNVERIFIED: with Secure Boot off, systemd may take extra kernel command-line options from the `SystemdOptions` EFI variable, which isn't measured. If it does, `systemd.debug_shell` would give a root shell on the gateway's serial console in a correctly measured boot. Test D4 in `operator-isolation.md` §11 checks it; the fix would ship in the next gateway image.
 - Both the gateway and the relay trust desktop role names by prefix. Anyone who can create IAM roles could mint a matching one. Only operators can, but it matters for the operator-blind goal.
 - agentd retries the gateway's budget 429 and usage 503 up to 6 times. Network-error backoff isn't capped at 30 s.
 - agentd accepts device tokens of 32+ hex characters, while the relay requires 64+.
@@ -1756,7 +1758,6 @@ Found while writing this document. None of them is a known exploit; most are dri
 
 **Drift in comments and docs.**
 - `terraform.tfvars.example` mentions a public IP. With both NATs off it fails the test desktop's precondition.
-- `docs/operator-isolation.md` says "Nothing here is built yet" while describing the built gateway, mentions t4g where the gateway is c7g.medium, and its §2 still describes the Lambda gateway.
 - A gatewayd comment says KMS releases the provider key only to the image. It's plain SSM (by design, per operator-isolation.md).
 - agentd's `aws.rs` header still mentions a gateway function URL. `desktop_identity`'s header says the gateway module grants desktops a permission; it doesn't.
 - `edit_boot_install.sh` mentions PCR7; PCR4 and PCR12 are what's published.

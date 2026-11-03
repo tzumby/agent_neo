@@ -301,7 +301,8 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   their devices (no Tailscale account), the notarized Mac app and the iPhone app
   through TestFlight (2026-11-02).
 - [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'
-  prompts and data unreadable to us (attested gateway and desktops; draft).
+  prompts and data unreadable to us: the attested gateway (built) and the plan for
+  attested desktops that customers verify and approve updates for (§11).
 - **No public IPs on desktops:** they sit in private subnets and reach the
   internet through a fck-nat instance (`enable_nat_instance`, a t4g.nano; switch
   to `enable_nat_gateway` when the product needs high availability). No inbound

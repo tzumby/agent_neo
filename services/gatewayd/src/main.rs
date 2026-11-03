@@ -84,7 +84,10 @@ async fn main() -> Result<()> {
             .build()?,
         key: SecretString::from(key.trim().to_string()),
         binding,
-        attesting: Semaphore::new(2),
+        // One at a time: nitro-tpm-attest opens /dev/tpm0, which takes one
+        // opener, so a second at the same moment failed ("Device or resource
+        // busy"). The others wait their turn (about a second each).
+        attesting: Semaphore::new(1),
         aws,
         cfg,
     });

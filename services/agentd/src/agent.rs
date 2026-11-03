@@ -21,6 +21,7 @@ use crate::destinations::{self, Destination, Kind, Poster, Severity, Update};
 use crate::guard;
 use crate::llm::{self, Together, Usage, truncate};
 use crate::memory;
+use crate::monitoring;
 use crate::policy::Gate;
 use crate::policy::Policy;
 use crate::push::{self, Push, Relay};
@@ -1965,9 +1966,11 @@ impl Agent {
             Some("runs as root")
         } else if let Some(reason) = self.policy.danger(inner) {
             Some(reason)
-        } else if tainted && self.policy.sends_data(inner) {
+        } else if tainted && self.policy.sends_data(inner) && !monitoring::is_monitoring_read(inner, &keys) {
             // Injected instructions in a page could try to send data out (the
-            // card says it came after outside content: `tainted`).
+            // card says it came after outside content: `tainted`). Reading the
+            // customer's own Cloudflare or Datadog, as monitoring does after
+            // reading their logs, doesn't ask (monitoring.rs).
             Some(if keys.is_empty() {
                 "could send data off the desktop"
             } else {

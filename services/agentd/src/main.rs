@@ -16,6 +16,7 @@ mod gateway;
 mod guard;
 mod llm;
 mod memory;
+mod monitoring;
 mod policy;
 mod push;
 mod schedule;

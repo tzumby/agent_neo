@@ -898,6 +898,16 @@ The hardening follows moltis' container settings (MIT).
    - `gh` commands that write (`api`; `gist create|edit`; `issue`/`pr` `create|comment|edit|close|reopen|merge|review`; `release create|upload|edit`; `repo create|fork|edit|rename|delete|sync`);
    - `npm`, `pnpm` and `yarn` `publish`, `cargo publish`, `twine upload`.
 
+   **Except a monitoring read** (`monitoring.rs`). Monitoring runs read logs, which attackers write, on their first call; without this, every call after it would ask, unattended. A command that reads the customer's own Cloudflare or Datadog doesn't ask, as long as all of it is understood:
+   - the only programs are curl and text tools (`jq`, `head`, `sort`, `date`…). Not sed, awk, python, xargs, find or env, which can run other programs, and not `sort --compress-program`;
+   - every curl goes to `https://api.cloudflare.com` or a Datadog site's API host (`https://api.datadoghq.eu`, `https://api.us3.datadoghq.com`…), written out, never in a variable;
+   - curl uses only known options: no `--resolve`, `--connect-to`, proxy, config file, `-u`, upload or form;
+   - the only saved keys are `CLOUDFLARE_API_TOKEN`, `DD_API_KEY` and `DD_APP_KEY`, and every credential header names one of them. A key written out could be an attacker's own account, for instance on Datadog's metrics API;
+   - output goes only to plain files in the work folder, `/tmp` or `/dev/null`: no dotfile like `~/.profile` that a later shell would run;
+   - no backticks, subshells, background jobs or process substitution, and an unquoted here-document holds no command substitution.
+
+   What such a command sends can only reach the customer's own accounts. Anything else asks as before, and so does whatever the check doesn't understand. The skill `security-monitoring` tells the agent to write its commands this way.
+
 These patterns are a speed bump against mistakes and injected instructions, not a security boundary. The boundaries are the privilege split, the guard firewall and the egress allowlist.
 
 **Browser gates.** Clicks, typing and keys are gated as in §6.8. With **Browser actions** off (read-only mode), they're refused rather than asked.

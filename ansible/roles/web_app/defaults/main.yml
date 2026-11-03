@@ -1,0 +1,4 @@
+# The web app (apps/web/public), served by the desktop's way in (tailnet-proxy
+# or front-door) at / and /assets/.
+web_app_src: "{{ playbook_dir }}/../../apps/web/public/"
+web_app_dir: /usr/local/share/agent-web

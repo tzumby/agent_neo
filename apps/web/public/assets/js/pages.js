@@ -255,7 +255,9 @@ export function mountSettings(store, view, session) {
       h("section", { class: "settings-group" },
         h("h2", { class: "page-h2" }, "You"),
         h("dl", { class: "facts" }, h("dt", null, "Signed in as"), h("dd", null, session.email || "")),
-        h("a", { class: "button", href: session.sign_out || "/cdn-cgi/access/logout" }, "Sign out")));
+        session.sign_out
+          ? h("a", { class: "button", href: session.sign_out }, "Sign out")
+          : h("p", { class: "muted" }, "Signed in by this device's Tailscale. To sign out, log out of Tailscale.")));
   }
 
   return { enter: load };

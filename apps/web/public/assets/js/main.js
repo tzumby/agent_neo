@@ -9,7 +9,9 @@ import { Store } from "./store.js";
 
 const store = new Store(api);
 const $ = (selector) => document.querySelector(selector);
-const session = { email: "", sign_out: "/cdn-cgi/access/logout" };
+// Who's signed in, and where signing out goes: Cloudflare Access's logout;
+// none on a tailnet, where Tailscale signs in the device, not the page.
+const session = { email: "", sign_out: "" };
 
 const views = {
   chat: { el: $("#view-chat"), title: "Chat" },
@@ -106,7 +108,8 @@ store.onNotice((text) => {
 api.session().then((s) => {
   Object.assign(session, s);
   $("#who").textContent = s.email;
-  $("#sign-out").href = s.sign_out;
+  $("#sign-out").hidden = !s.sign_out;
+  if (s.sign_out) $("#sign-out").href = s.sign_out;
 }).catch(() => {});
 
 store.run();

@@ -125,7 +125,7 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
 | `services/gatewayd/` | The attested model gateway (Rust) |
 | `services/push-relay/` | The push relay (Node.js) and its tests |
 | `services/tailnet-proxy/` | The tailnet node (Go, tsnet) |
-| `services/front-door/` | A customer deployment's way in: checks the Cloudflare Access token, then the web app, agentd's API or noVNC (Go); `devedge/` stands in for Access on a Mac |
+| `services/front-door/` | A customer deployment's way in: checks the Cloudflare Access token, then the web app, agentd's API or noVNC (Go). `door/` is those routes and protections, shared with tailnet-proxy; `devedge/` stands in for Access on a Mac |
 | `apps/web/` | The web app for customer deployments (`public/`: static HTML, CSS, ES modules), its tests and the Mac dev stack (`dev/`) |
 | `images/gateway/` | The gateway's KIWI-NG image description (Amazon Linux 2023, attestable) |
 | `scripts/` | `put-secret.py`, `put-apns-key.py` (hidden input → SSM), `build-gateway-image.sh`, `new-customer-env.sh`, `customer-preflight.sh`, `browser.py` (drive the desktop's Chrome from the Mac over `make cdp`) |
@@ -423,7 +423,7 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 ### 5.8 Role `tailnet_proxy`
 
 - **Binary:** `/usr/local/bin/tailnet-proxy` (Go, `CGO_ENABLED=0`, built per architecture).
-- **Unit** `tailnet-proxy.service`: `User=tailnet-proxy`, `EnvironmentFile=/etc/tailnet-proxy.env` (root 0600, `TS_AUTHKEY` from SSM `<prefix>/tailscale/auth_key`, only used if the node must log in again), `-hostname <desktop_tailnet_name> -state-dir /var/lib/tailnet-proxy -novnc http://127.0.0.1:6080 -agentd /run/agentd/agentd.sock -vnc 127.0.0.1:5900 [-allow <logins>] [-allow-tags tag:user-<user>]`.
+- **Unit** `tailnet-proxy.service`: `User=tailnet-proxy`, `EnvironmentFile=/etc/tailnet-proxy.env` (root 0600, `TS_AUTHKEY` from SSM `<prefix>/tailscale/auth_key`, only used if the node must log in again), `-hostname <desktop_tailnet_name> -state-dir /var/lib/tailnet-proxy -novnc http://127.0.0.1:6080 -agentd /run/agentd/agentd.sock -vnc 127.0.0.1:5900 -web /usr/local/share/agent-web [-allow <logins>] [-allow-tags tag:user-<user>]`. The web app's files come from role `web_app`, a dependency (also front-door's): `apps/web/public` copied to `/usr/local/share/agent-web`, root-owned.
   - **Hardening:** `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ReadWritePaths=/var/lib/tailnet-proxy -/run/agentd`, no capabilities, address families `AF_INET`, `AF_INET6`, `AF_UNIX`, `AF_NETLINK`.
 - **Allowlist:** `-allow` comes from SSM `<prefix>/tailscale/allowed_logins` (comma-separated Tailscale logins; kept out of git).
 - **A desktop on the desktops tailnet** (`desktop_tailnet: desktops`) reads its key from `<prefix>/tailscale/users/<user>/auth_key` only, and gets `-allow-tags tag:user-<user>` instead of a login allowlist. The role asserts the user's name first; a missing key fails the lookup. It never falls back to the operator's key, which would put it on the operator's personal tailnet.
@@ -454,10 +454,10 @@ A second Tailscale account of the operator's (`tzumby.github`), kept for testers
 | X display `:1` | Unix socket, cookie | `agent` (and root with the cookie) |
 | Chrome DevTools 9222 | 127.0.0.1 | agentd. Not `worker` (guard). The operator through `make cdp` (SSM) |
 | VNC 5900 | 127.0.0.1 | tailnet-proxy (tailnet :5900), SSM forwarding. Not `worker` |
-| noVNC 6080 | 127.0.0.1 | tailnet-proxy (tailnet :443), `make viewer`. Not `worker` |
+| noVNC 6080 | 127.0.0.1 | tailnet-proxy (tailnet :443, at `/viewer/`), `make viewer`. Not `worker` |
 | Squid 3128 | 127.0.0.1 | `worker` (its only way out) |
 | `/run/agentd/agentd.sock` | Unix socket | agentd, tailnet-proxy |
-| tailnet :443, :5900 | Tailscale (tsnet, userspace) | Allowed Tailscale logins only (§9) |
+| tailnet :443 (web app, API, viewer), :5900 | Tailscale (tsnet, userspace) | Allowed Tailscale logins only (§9) |
 | Inbound from the VPC or internet | none | Nothing: the security group has no inbound rules |
 
 On a customer deployment's desktop (§5.11), front-door and cloudflared replace tailnet-proxy: `/run/front-door/front.sock` (front-door, 0660 in a 0750 directory; cloudflared is in its group) is the only way in, and only for requests with a valid Access token. There's no tailnet and no raw VNC port.
@@ -1312,7 +1312,7 @@ Notifications to the iPhone go through a relay in our AWS account. The APNs key 
 
 | Listener | Serves |
 |---|---|
-| `:443` (TLS with Tailscale's certificate for the node's name) | `/api/*` → reverse proxy to `http://agentd` over `/run/agentd/agentd.sock`. `FlushInterval: -1`, so SSE streams live. Incoming `X-Tailscale-*` headers are deleted, then `X-Tailscale-User` (login) and `X-Tailscale-Node` (device name) are set from **WhoIs**. Everything else → noVNC (`127.0.0.1:6080`, the browser viewer); opening `/websockify` is logged |
+| `:443` (TLS with Tailscale's certificate for the node's name) | Package `door` (`services/front-door/door`, shared with front-door, §5.11), after the WhoIs check: the web app at `/` and `/assets/` (`-web`, role `web_app`); `/api/*` → reverse proxy to `http://agentd` over `/run/agentd/agentd.sock` (`FlushInterval: -1`, so SSE streams live), with incoming `X-Tailscale-*` and `X-Agent-*` headers deleted, then `X-Tailscale-User` (login) and `X-Tailscale-Node` (device name) set from **WhoIs**; `/session` (the login; no sign-out); noVNC at `/viewer/` and `/websockify` (opening it is logged). POST/PUT/DELETE and WebSockets from other sites' pages are refused; the apps send no `Origin` and pass |
 | `:5900` (TCP) | Raw VNC to `127.0.0.1:5900` for the native viewer. Plaintext RFB, inside WireGuard |
 
 - **Access:** every request and connection is checked with `LocalClient().WhoIs`.
@@ -1320,6 +1320,7 @@ Notifications to the iPhone go through a relay in our AWS account. The APNs key 
   - If the list is empty, whatever the tailnet's ACLs allow gets in.
   - agentd itself trusts the socket, not the header: `X-Tailscale-User` is for attribution (`by`) only.
 - **What's logged:** viewer and VNC sessions opened, closed or denied, with login and device.
+- **The web app on a tailnet:** from a computer or phone running Tailscale (the system app, signed in to the same tailnet with an allowed login), open `https://<hostname>.<tailnet>.ts.net/`. The iPhone and Mac apps' own nodes don't help a browser.
 - **Tailnet setup**, one time, in the Tailscale admin console:
   - MagicDNS and HTTPS certificates on;
   - the tag `tag:cloud-desktop` (owner `autogroup:admin`);

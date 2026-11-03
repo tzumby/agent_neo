@@ -1,5 +1,6 @@
 # tailnet-proxy: the desktop's only presence on your tailnet (tsnet). Serves
-# the agent's API, the noVNC viewer and raw VNC to allowed Tailscale logins.
+# the web app (role web_app, a dependency), the agent's API, the noVNC viewer
+# and raw VNC to allowed Tailscale logins.
 
 - name: Check this desktop's tailnet settings
   ansible.builtin.assert:

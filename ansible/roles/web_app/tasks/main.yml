@@ -1,0 +1,12 @@
+# The web app: static files, root-owned and read-only to the service that
+# serves them, since they're what people's browsers run. Served from disk, so
+# a change shows at the next page load without a restart.
+
+- name: Install the web app
+  ansible.builtin.copy:
+    src: "{{ web_app_src }}"
+    dest: "{{ web_app_dir }}/"
+    owner: root
+    group: root
+    mode: "0644"
+    directory_mode: "0755"

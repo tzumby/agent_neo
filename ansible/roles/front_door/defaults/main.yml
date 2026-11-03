@@ -5,9 +5,6 @@ front_door_agentd_socket: /run/agentd/agentd.sock
 # Where cloudflared connects: the customer's published application points at
 # unix:/run/front-door/front.sock (docs/customer-cloud.md). No TCP port.
 front_door_listen: unix:/run/front-door/front.sock
-# The web app (apps/web/public), served by front-door at / and /assets/.
-front_door_web_src: "{{ playbook_dir }}/../../apps/web/public/"
-front_door_web_dir: /usr/local/share/front-door/web
 
 # This desktop's own settings in SSM, which only it may read (Terraform's
 # desktop_identity own_parameters_path): team_domain, aud, allow, tunnel_token.

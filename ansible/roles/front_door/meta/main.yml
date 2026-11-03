@@ -1,0 +1,4 @@
+---
+# The web app, which front-door serves.
+dependencies:
+  - role: web_app

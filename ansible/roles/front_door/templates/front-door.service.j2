@@ -14,7 +14,7 @@ RuntimeDirectoryMode=0750
 # Its Access settings, from this desktop's own SSM path at each start (as
 # root: only root reaches the instance role).
 ExecStartPre=+/usr/local/sbin/front-door-settings front-door --path {{ front_door_parameters }} --region {{ front_door_region }}
-ExecStart=/usr/local/bin/front-door -config /run/front-door/access.json -listen {{ front_door_listen }} -novnc {{ front_door_novnc }} -agentd {{ front_door_agentd_socket }} -web {{ front_door_web_dir }}
+ExecStart=/usr/local/bin/front-door -config /run/front-door/access.json -listen {{ front_door_listen }} -novnc {{ front_door_novnc }} -agentd {{ front_door_agentd_socket }} -web {{ web_app_dir }}
 Restart=always
 RestartSec=15
 # It only needs the network (Access's signing keys), its socket and agentd's.

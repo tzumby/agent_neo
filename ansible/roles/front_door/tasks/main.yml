@@ -57,16 +57,6 @@
     mode: "0755"
   notify: Restart front-door
 
-# Root-owned and read-only to front-door: what people's browsers run.
-- name: Install the web app
-  ansible.builtin.copy:
-    src: "{{ front_door_web_src }}"
-    dest: "{{ front_door_web_dir }}/"
-    owner: root
-    group: root
-    mode: "0644"
-    directory_mode: "0755"
-
 - name: Install the settings fetcher
   ansible.builtin.copy:
     src: front-door-settings

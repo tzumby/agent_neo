@@ -4,10 +4,11 @@
 // process joins the tailnet: the rest of the VM, including commands run by the
 // agent, can't reach other tailnet devices or change Tailscale settings.
 //
-// On https://<hostname>.<tailnet>.ts.net (Tailscale certificate) it serves:
-//   - /api/*  the agent's API (agentd, on a Unix socket), with the caller's
-//     Tailscale identity in X-Tailscale-User / X-Tailscale-Node
-//   - anything else: the noVNC viewer (browser fallback)
+// On https://<hostname>.<tailnet>.ts.net (Tailscale certificate) it serves
+// what package door does, as front-door does for a customer deployment: the
+// web app (-web) at /, the agent's API (agentd, on a Unix socket) at /api/*
+// with the caller's Tailscale identity in X-Tailscale-User / X-Tailscale-Node,
+// and the noVNC viewer at /viewer/ (the web app's take-over).
 //
 // On port 5900 it forwards raw VNC to x11vnc, for the apps' native viewer.
 //
@@ -26,7 +27,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"slices"
 	"strings"
@@ -34,6 +34,8 @@ import (
 
 	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
+
+	"cloud-desktops/front-door/door"
 )
 
 type gate struct {
@@ -83,6 +85,7 @@ func main() {
 	vnc := flag.String("vnc", "127.0.0.1:5900", "x11vnc to forward port 5900 to")
 	allow := flag.String("allow", "", "comma-separated Tailscale login names allowed in (default: whoever the tailnet policy lets through)")
 	allowTags := flag.String("allow-tags", "", "comma-separated device tags allowed in, e.g. tag:user-alex (as well as -allow)")
+	web := flag.String("web", "", "the web app's directory (index.html, assets/); empty: none")
 	flag.Parse()
 
 	novncURL, err := url.Parse(*novnc)
@@ -119,50 +122,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("listening on 443: %v", err)
 	}
-	log.Printf("serving https://%s (api, noVNC) and port 5900 (VNC)", strings.Join(srv.CertDomains(), ", https://"))
-	log.Fatal(http.Serve(webLn, webHandler(g, novncURL, *agentd)))
-}
-
-func webHandler(g gate, novnc *url.URL, agentdSocket string) http.Handler {
-	viewer := httputil.NewSingleHostReverseProxy(novnc)
-	api := &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(&url.URL{Scheme: "http", Host: "agentd"})
-			pr.Out.Host = "agentd"
+	log.Printf("serving https://%s (web app, api, viewer) and port 5900 (VNC)", strings.Join(srv.CertDomains(), ", https://"))
+	log.Fatal(http.Serve(webLn, door.Handler(door.Config{
+		Identify: func(r *http.Request) (door.Caller, error) {
+			login, node, err := g.identity(r.Context(), r.RemoteAddr)
+			return door.Caller{Name: login, Headers: map[string]string{"X-Tailscale-User": login, "X-Tailscale-Node": node}}, err
 		},
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", agentdSocket)
-			},
-		},
-		FlushInterval: -1, // stream Server-Sent Events as they come
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		login, node, err := g.identity(r.Context(), r.RemoteAddr)
-		if err != nil {
-			log.Printf("denied %s %s to %q on %q: %v", r.Method, r.URL.Path, login, node, err)
-			http.Error(w, "not allowed", http.StatusForbidden)
-			return
-		}
-		if strings.HasPrefix(r.URL.Path, "/api/") {
-			// Only we set these; never trust a client's copy (nor of
-			// front-door's X-Agent-User, which agentd also reads).
-			for name := range r.Header {
-				lower := strings.ToLower(name)
-				if strings.HasPrefix(lower, "x-tailscale-") || strings.HasPrefix(lower, "x-agent-") {
-					r.Header.Del(name)
-				}
-			}
-			r.Header.Set("X-Tailscale-User", login)
-			r.Header.Set("X-Tailscale-Node", node)
-			api.ServeHTTP(w, r)
-			return
-		}
-		if r.URL.Path == "/websockify" {
-			log.Printf("viewer session opened by %s on %s", login, node)
-		}
-		viewer.ServeHTTP(w, r)
-	})
+		Agentd: *agentd,
+		NoVNC:  novncURL,
+		Web:    *web,
+		// Tailscale signs in the device: there's no signing out of the web app.
+	})))
 }
 
 func serveVNC(ln net.Listener, g gate, target string) {

@@ -99,8 +99,8 @@ Every apply and playbook run below needs the user's explicit OK on the plan firs
 
 - **First run:** an empty chat opens on Setup's four steps (`setup.js`), one open at a time:
   1. where updates go (Slack or Teams, through Updates);
-  2. Cloudflare (a read-only custom token: Account Analytics, Zone, Analytics, Firewall Services, all Read);
-  3. Datadog (the site, an API key and an application key with read scopes; the site goes in the keys' labels, which the agent sees, never their values);
+  2. Cloudflare: a read-only token. "Create the token in Cloudflare" opens Cloudflare's token template link (`/profile/api-tokens?permissionGroupKeys=…&name=Neo%20Agent`), with Account Analytics, Zone, Analytics and Firewall Services filled in, all Read. They're also listed to check and copy, since Cloudflare silently drops keys it doesn't know;
+  3. Datadog: the site first, then buttons straight to that site's `organization-settings/api-keys` and `…/application-keys` pages (`app.datadoghq.com` for US1, `app.datadoghq.eu` for EU, else the site), and the application key's read scopes listed to copy. The site goes in the keys' labels, which the agent sees, never their values;
   4. what it watches: suggested checks added in one go through `POST /api/v1/schedules`. They're the morning report, an hourly attack spike watch, an error spike watch every 30 minutes and a weekly summary. Their instructions post to the updates channel if one is set up by the time they run, so the order of the steps doesn't matter.
 
   A step is done when the desktop has what it needs (adding a channel on the Updates page returns to the guide), and the next one opens. Any step can be skipped ("no Datadog"): skips are kept on the desktop (`/api/v1/setup`), and a skipped step can be opened and done later. The guide ends on "All set" with a summary; a desktop set up before goes straight to the chat. The Setup page keeps the same steps, with "n of 4" (done or skipped) in the sidebar until they're all handled. The agent's skill `security-monitoring` says how to use what they set up.

@@ -129,7 +129,7 @@ store.subscribe(() => {
   const status = store.status;
   const name = status?.desktop || "Your desktop";
   $("#desk-name").textContent = name;
-  document.title = name;
+  document.title = status?.desktop ? `${status.desktop} – Neo Agent` : "Neo Agent";
   let [words, tone] = STAGES[status?.stage] || ["Ready", "idle"];
   if (store.connection === "connecting" && !status) [words, tone] = ["Connecting…", "idle"];
   if (store.connection === "offline") [words, tone] = ["Can't reach it", "problem"];

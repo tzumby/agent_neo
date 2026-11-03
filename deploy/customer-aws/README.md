@@ -1,6 +1,6 @@
-# Deploying the agent into your AWS account
+# Deploying Neo Agent into your AWS account
 
-The agent runs in a sandbox AWS account of yours that holds nothing else. It needs no connection to your other accounts or networks. It reaches your Cloudflare and Datadog APIs with read-only keys, Together for the model, and your app the way any visitor does. Your people reach it through Cloudflare Access, signed in with your identity provider.
+Neo Agent runs in a sandbox AWS account of yours that holds nothing else. It needs no connection to your other accounts or networks. It reaches your Cloudflare and Datadog APIs with read-only keys, Together for the model, and your app the way any visitor does. Your people reach it through Cloudflare Access, signed in with your identity provider.
 
 We deploy it with temporary access that you set up and remove. This folder is everything that access involves; please review it before you start.
 
@@ -61,7 +61,7 @@ In Cloudflare Zero Trust:
    - hostname: for example `agent.yourdomain.com`;
    - service type: **UNIX**;
    - path: `/run/front-door/front.sock`.
-3. **Access application.** Go to Access → Applications and add a self-hosted application for the same hostname. Give it a policy that allows your people through your identity provider, with MFA required. Then:
+3. **Access application.** Go to Access → Applications and add a self-hosted application for the same hostname, named Neo Agent. Give it a policy that allows your people through your identity provider, with MFA required. Then:
    - put the application's **AUD tag** in SSM as `/front-door/<env>/agent/aud`;
    - put your **team domain** (`<team>.cloudflareaccess.com`) in SSM as `/front-door/<env>/agent/team_domain`.
 4. **Optional allow list.** Put `/front-door/<env>/agent/allow` in SSM: emails and whole domains, comma-separated, for example `@yourdomain.com,contractor@example.com`. The desktop then also checks the list itself, on top of Access.

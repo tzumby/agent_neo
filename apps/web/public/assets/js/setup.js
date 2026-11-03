@@ -1,4 +1,4 @@
-// Setup: the security agent's first run. Four cards: where updates go
+// Setup: Neo Agent's first run. Four cards: where updates go
 // (Slack or Teams), Cloudflare, Datadog, and what it watches (scheduled
 // checks to add with one choice). Shown in an empty chat the first time
 // someone connects, and as the Setup page after that. Each card is done when
@@ -17,6 +17,32 @@ const DATADOG_SITES = [
   ["ap1.datadoghq.com", "AP1, Japan (ap1.datadoghq.com)"],
   ["ap2.datadoghq.com", "AP2, Australia (ap2.datadoghq.com)"],
 ];
+
+/** Cloudflare's read-only permissions, as its token page names them. */
+const CLOUDFLARE_PERMISSIONS = [
+  ["Account", "Account Analytics", "account_analytics"],
+  ["Zone", "Zone", "zone"],
+  ["Zone", "Analytics", "analytics"],
+  ["Zone", "Firewall Services", "firewall_services"],
+];
+// Cloudflare's token template link: the token page with these filled in.
+const CLOUDFLARE_TOKEN_URL = "https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys="
+  + encodeURIComponent(JSON.stringify(CLOUDFLARE_PERMISSIONS.map(([, , key]) => ({ key, type: "read" }))))
+  + "&accountId=*&zoneId=all&name=" + encodeURIComponent("Neo Agent");
+
+/** The application key's scopes: reading only. */
+const DATADOG_SCOPES = [
+  ["logs_read_data", "read logs"],
+  ["logs_read_index_data", "read logs from every index"],
+  ["metrics_read", "read metrics"],
+  ["monitors_read", "read monitors"],
+  ["events_read", "read events"],
+];
+
+/** The site's web app, where its settings pages are: US1 and EU differ from their site name. */
+function datadogApp(site) {
+  return site === "datadoghq.com" ? "app.datadoghq.com" : site === "datadoghq.eu" ? "app.datadoghq.eu" : site;
+}
 
 /** Example checks. `needs`: the sources they read. Where they post isn't
  * named: each run sees the channels set up by then, so the order of the steps
@@ -139,7 +165,7 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
     fill(el,
       intro
         ? h("div", { class: "setup-intro" },
-            h("h2", null, "Let's set up your security agent"),
+            h("h2", null, "Let's set up Neo Agent"),
             h("p", { class: "muted" }, "Connect what it watches and where it reports, one step at a time. Skip what you don't use; you can come back to any step under Setup."))
         : h("p", { class: "lede" }, handled === all.length
             ? "All set. Your agent reads your Cloudflare and Datadog with read-only keys kept on its desktop, checks them on a schedule, and posts what it finds. Open a step to change it."
@@ -234,9 +260,13 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
     const problem = h("p", { class: "error", hidden: true });
     const form = h("form", { class: "secret-form" },
       h("ol", { class: "steps" },
-        h("li", null, "At ", link("https://dash.cloudflare.com/profile/api-tokens", "Cloudflare's API tokens page"), ", choose Create Token, then Custom token."),
-        h("li", null, "Add these permissions, all Read: Account › Account Analytics, Zone › Zone, Zone › Analytics, Zone › Firewall Services."),
-        h("li", null, "Under resources, pick your account and the zones (sites) to watch. Create the token and paste it here.")),
+        h("li", null,
+          linkButton(CLOUDFLARE_TOKEN_URL, "Create the token in Cloudflare"),
+          h("span", { class: "block muted" }, "Cloudflare opens a new token named Neo Agent with these permissions filled in. Check they're all there:"),
+          copyList(CLOUDFLARE_PERMISSIONS.map(([scope, name]) => ({ text: name, note: `${scope}, Read` })))),
+        h("li", null, "Under Zone Resources, keep all zones or pick the sites to watch. Choose Continue to summary, then Create Token."),
+        h("li", null, "Copy the token Cloudflare shows (it's shown once) and paste it here.")),
+      h("p", { class: "muted" }, "If the page opens without the permissions: choose Create Token, then Custom token, and add the four above."),
       h("label", { class: "label" }, "API token", token),
       problem,
       h("p", { class: "card-note" }, icon("lock"), "Read-only: your agent can see your security events but can't change anything in Cloudflare."),
@@ -268,14 +298,31 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
     const appKey = h("input", { class: "field", type: "password", autocomplete: "off", spellcheck: "false", "aria-label": "Datadog application key" });
     const save = h("button", { class: "button button-primary", type: "submit" }, "Save the keys");
     const problem = h("p", { class: "error", hidden: true });
+    // Datadog's own pages for this site's keys: they follow the site chosen.
+    const apiPage = linkButton("", "Open API keys");
+    const appPage = linkButton("", "Open application keys");
+    const personal = h("a", { target: "_blank", rel: "noopener noreferrer" }, "Personal Settings");
+    const point = () => {
+      const app = datadogApp(site.value);
+      apiPage.href = `https://${app}/organization-settings/api-keys`;
+      appPage.href = `https://${app}/organization-settings/application-keys`;
+      personal.href = `https://${app}/personal-settings/application-keys`;
+    };
+    site.addEventListener("change", point);
+    point();
     const form = h("form", { class: "secret-form" },
       h("ol", { class: "steps" },
-        h("li", null, "Pick your Datadog site: it's in your Datadog address."),
-        h("li", null, "In Datadog, Organization Settings › API Keys: create one and paste it below."),
-        h("li", null, "Organization Settings › Application Keys: create one with the scopes logs_read_data, logs_read_index_data, metrics_read, monitors_read and events_read, and paste it below.")),
-      h("label", { class: "label" }, "Site", site),
-      h("label", { class: "label" }, "API key", apiKey),
-      h("label", { class: "label" }, "Application key", appKey),
+        h("li", null, "Pick your Datadog site: it's the address you sign in at.", h("label", { class: "label setup-inline" }, "Site", site)),
+        h("li", null,
+          apiPage,
+          h("span", { class: "block muted" }, "Choose New Key, name it Neo Agent, and copy the key."),
+          h("label", { class: "label setup-inline" }, "API key", apiKey)),
+        h("li", null,
+          appPage,
+          h("span", { class: "block muted" }, "Choose New Key, name it Neo Agent, and copy the key right away: Datadog shows it once. Then open the key, choose Edit Scopes, and add these (search for each):"),
+          copyList(DATADOG_SCOPES.map(([scope, what]) => ({ text: scope, note: what }))),
+          h("label", { class: "label setup-inline" }, "Application key", appKey))),
+      h("p", { class: "muted" }, "Those pages need Datadog admin rights. Without them, ask an admin for the API key, and create the application key under your ", personal, " instead."),
       problem,
       h("p", { class: "card-note" }, icon("lock"), "Read-only scopes: your agent can read logs, metrics and monitors but can't change anything in Datadog."),
       h("div", { class: "card-actions" }, save));
@@ -357,9 +404,54 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
     return h("div", { class: "card-actions card-actions-start" }, h("p", { class: "card-text muted" }, "Saved on your desktop."), ask);
   }
 
+  /** A button that opens someone else's page (Cloudflare, Datadog) in a new tab. */
+  function linkButton(href, text) {
+    return h("a", { class: "button setup-link", href, target: "_blank", rel: "noopener noreferrer" }, text, icon("external"));
+  }
+
   function link(href, text) {
     return h("a", { href, target: "_blank", rel: "noopener noreferrer" }, text, icon("external"));
   }
 
   return { enter: load, refresh: load };
+}
+
+/** Names to type or search for somewhere else (scopes, permissions): one per
+ * row, each with Copy, and Copy all. */
+export function copyList(items) {
+  const copied = (button, label) => (ok) => {
+    button.textContent = ok ? "Copied" : "Select and copy it";
+    setTimeout(() => (button.textContent = label), 1500);
+  };
+  const rows = items.map(({ text, note }) => {
+    const copy = h("button", { class: "link-button copy-one", type: "button", "aria-label": `Copy ${text}` }, "Copy");
+    copy.addEventListener("click", () => copyText(text).then(copied(copy, "Copy")));
+    return h("li", { class: "copy-row" }, h("code", null, text), note ? h("span", { class: "muted" }, note) : null, copy);
+  });
+  const all = h("button", { class: "link-button", type: "button" }, "Copy all");
+  all.addEventListener("click", () => copyText(items.map((i) => i.text).join("\n")).then(copied(all, "Copy all")));
+  return h("div", { class: "copy-list" }, h("ul", null, rows), h("div", { class: "copy-all" }, all));
+}
+
+/** Copies text; where the clipboard API is refused, the older way. Whether it worked. */
+export async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.className = "copy-scratch";
+    document.body.append(area);
+    area.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    }
+    area.remove();
+    return ok;
+  }
 }

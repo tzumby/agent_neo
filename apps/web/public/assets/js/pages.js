@@ -3,6 +3,7 @@
 
 import { busyButton, fill, h, icon, when } from "./dom.js";
 import { isValidName, normalizedName } from "./keys.js";
+import { copyList } from "./setup.js";
 
 // --- Desktop ---------------------------------------------------------------------
 
@@ -283,11 +284,11 @@ export function mountSettings(store, view, session) {
 // --- Updates: where the agent posts to Slack and Teams ----------------------------
 
 const SLACK_MANIFEST = `display_information:
-  name: Security agent
-  description: Posts updates from your agent's desktop to your channels.
+  name: Neo Agent
+  description: Posts updates from Neo Agent to your channels.
 features:
   bot_user:
-    display_name: Security agent
+    display_name: Neo Agent
     always_online: false
 oauth_config:
   scopes:
@@ -379,13 +380,18 @@ export function mountUpdates(store, view) {
               h("span", { class: "block muted" }, "Slack opens with the app's settings filled in. Pick your workspace, choose Next, check the summary, then Create.")),
             h("li", null, "Choose Install to Workspace, then Allow."),
             h("li", null, "Under OAuth & Permissions, copy the Bot User OAuth Token (it starts with xoxb-) and paste it below."),
-            h("li", null, "For a private channel, invite the app there first: /invite @Security agent.")),
+            h("li", null, "For a private channel, invite the app there first: /invite @Neo Agent.")),
           h("p", { class: "muted" },
             "If Slack shows its plain “Create new app” dialog instead: under From scratch, choose Paste a manifest, and paste it (",
             copy, "). The app only posts, so if Slack asks what it can respond to, add no events and continue."),
           h("details", { class: "instructions" },
             h("summary", null, "What the app can do"),
-            h("p", null, "Post messages (chat:write), including in public channels it hasn't been invited to (chat:write.public). It can't read messages, and nothing in Slack can call your desktop."),
+            h("p", null, "Only post. Its two scopes:"),
+            copyList([
+              { text: "chat:write", note: "post messages" },
+              { text: "chat:write.public", note: "post in public channels without being invited" },
+            ]),
+            h("p", null, "It can't read messages, and nothing in Slack can call your desktop. The whole manifest:"),
             h("pre", { class: "manifest" }, SLACK_MANIFEST)))
       : h("ol", { class: "steps" },
           h("li", null, "In the Teams channel, open its ⋯ menu and choose Workflows."),

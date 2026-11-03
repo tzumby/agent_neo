@@ -332,10 +332,10 @@ pub fn slack_payload(
         blocks.push(json!({"type": "section", "text": {"type": "mrkdwn", "text": part}}));
     }
     let footer = if link.is_empty() {
-        format!("Posted by your agent on {}.", slack_escape(desktop))
+        format!("Posted by Neo Agent on {}.", slack_escape(desktop))
     } else {
         format!(
-            "Posted by your agent on {}. <{link}/#/chat|Open the chat>",
+            "Posted by Neo Agent on {}. <{link}/#/chat|Open the chat>",
             slack_escape(desktop)
         )
     };
@@ -417,7 +417,7 @@ pub fn teams_payload(update: &Update, desktop: &str, link: &str) -> Value {
     }
     push_prose(&mut prose, &mut body);
     push_mono(&mut mono, &mut body);
-    body.push(json!({"type": "TextBlock", "text": format!("Posted by your agent on {desktop}."), "isSubtle": true, "size": "Small", "wrap": true}));
+    body.push(json!({"type": "TextBlock", "text": format!("Posted by Neo Agent on {desktop}."), "isSubtle": true, "size": "Small", "wrap": true}));
     let mut card = json!({
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",

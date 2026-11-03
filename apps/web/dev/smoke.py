@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 
 import websockets
@@ -39,8 +40,10 @@ class Page:
                     raise RuntimeError(f"{method}: {message['error']}")
                 return message.get("result", {})
 
-    async def js(self, expression):
-        result = await self.call("Runtime.evaluate", expression=expression, awaitPromise=True, returnByValue=True)
+    async def js(self, expression, gesture=False):
+        # gesture: as if the person clicked (the clipboard needs one).
+        result = await self.call("Runtime.evaluate", expression=expression, awaitPromise=True, returnByValue=True,
+                                 userGesture=gesture)
         if "exceptionDetails" in result:
             raise RuntimeError(result["exceptionDetails"].get("exception", {}).get("description", "error"))
         return result["result"].get("value")
@@ -112,9 +115,26 @@ async def main(out):
                 skip = f"(() => [...{g}.querySelectorAll('.setup-step.is-open button')].find(b => b.textContent === 'Skip this step').click())()"
                 await p.js(skip)
                 p.check(await p.until(f"{open_step} === 1 && {g}.querySelectorAll('.setup-step')[0].classList.contains('is-skipped')"), "a step can be skipped, and the next one opens")
+                # Cloudflare: its token page with the permissions filled in, and the permissions to copy.
+                cf_link = await p.js(f"[...{g}.querySelectorAll('.setup-step.is-open a')].find(a => a.textContent.includes('Create the token')).href")
+                keys = [k["key"] for k in json.loads(urllib.parse.parse_qs(urllib.parse.urlparse(cf_link).query)["permissionGroupKeys"][0])]
+                p.check(keys == ["account_analytics", "zone", "analytics", "firewall_services"], "Cloudflare's link fills in the four read permissions")
+                p.check(await p.js(f"{g}.querySelectorAll('.setup-step.is-open .copy-row').length") == 4, "…and lists them, each to copy")
+                # The clipboard needs a focused page, which a person's click gives; headless needs telling.
+                await p.call("Browser.grantPermissions", permissions=["clipboardReadWrite", "clipboardSanitizedWrite"], origin="http://127.0.0.1:8088")
+                await p.call("Emulation.setFocusEmulationEnabled", enabled=True)
+                await p.js(f"{g}.querySelector('.setup-step.is-open .copy-one').click()", gesture=True)
+                await asyncio.sleep(0.3)
+                p.check(await p.js("navigator.clipboard.readText().catch(() => '')", gesture=True) == "Account Analytics", "Copy puts it on the clipboard")
                 await p.js(f"""(() => {{ const f = {g}.querySelector('.setup-step.is-open form');
                     f.querySelector('[aria-label="Cloudflare API token"]').value = 'cf-test-token-123456789'; f.querySelector('button[type=submit]').click(); }})()""")
                 p.check(await p.until(f"{open_step} === 2 && {g}.querySelectorAll('.setup-step')[1].classList.contains('is-done')"), "saving Cloudflare's token goes on to the next step")
+                # Datadog: its key pages, on the site chosen; the scopes to copy.
+                pages = await p.js(f"""(() => {{ const s = {g}.querySelector('.setup-step.is-open [aria-label="Datadog site"]');
+                    s.value = 'datadoghq.eu'; s.dispatchEvent(new Event('change'));
+                    return [...{g}.querySelectorAll('.setup-step.is-open a.setup-link')].map(a => a.href); }})()""")
+                p.check(pages == ["https://app.datadoghq.eu/organization-settings/api-keys", "https://app.datadoghq.eu/organization-settings/application-keys"], "Datadog's key pages follow the site chosen")
+                p.check(await p.js(f"[...{g}.querySelectorAll('.setup-step.is-open .copy-row code')].map(c => c.textContent).join(',')") == "logs_read_data,logs_read_index_data,metrics_read,monitors_read,events_read", "…and its scopes are listed to copy")
                 await p.js(skip)
                 p.check(await p.until(f"{open_step} === 3"), "no Datadog: skipped, on to the checks")
                 buttons = await p.js(f"[...{g}.querySelectorAll('.setup-examples .list-row')].map(r => r.querySelector('.strong').textContent + ':' + r.querySelector('button').disabled)")

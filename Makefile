@@ -9,6 +9,19 @@ export AWS_PROFILE AWS_REGION
 TF_BOOTSTRAP := terraform -chdir=$(CURDIR)/terraform/bootstrap
 TF           := terraform -chdir=$(CURDIR)/terraform/envs/$(ENV)
 
+# Any other ENV is a customer's deployment, in their sandbox account
+# (docs/customer-cloud.md): its state bucket is in that account (the bootstrap
+# stack's workspace of the same name), and the AWS profile is named every
+# time, never the default.
+CUSTOMER   := $(filter-out dev,$(ENV))
+ACCOUNT_ID := $(if $(CUSTOMER),$(shell sed -n 's/^account_id *= *"\([0-9]*\)".*/\1/p' terraform/envs/$(ENV)/terraform.tfvars 2>/dev/null))
+BOOTSTRAP_WORKSPACE := $(or $(CUSTOMER),default)
+ifneq ($(CUSTOMER),)
+ifeq ($(AWS_PROFILE),default)
+$(error ENV=$(ENV) is a customer's account: name the AWS profile for it, e.g. AWS_PROFILE=$(ENV))
+endif
+endif
+
 # Instance to target with viewer/shell/logs/soak: the test desktop, or
 # DESKTOP=<name>'s (terraform output desktop_instance_ids).
 INSTANCE ?= $(if $(DESKTOP),$(shell $(TF) output -json desktop_instance_ids 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("$(DESKTOP)",""))'),$(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null))
@@ -19,19 +32,23 @@ PLAYBOOK_LIMIT = $(if $(LIMIT),--limit $(LIMIT),)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-reset agentd-logs tailnet-build tailnet-deploy tailscale-key tailscale-oauth apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac app-release-mac app-testflight new-desktop tester-link tailnet-rules cdp viewer shell
+.PHONY: help bootstrap init new-customer front-door-test front-door-build front-door-deploy plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-reset agentd-logs tailnet-build tailnet-deploy tailscale-key tailscale-oauth apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac app-release-mac app-testflight new-desktop tester-link tailnet-rules cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
 
 # --- Terraform ---------------------------------------------------------------
 
-bootstrap: ## Create the S3 state bucket (one time; local state)
+bootstrap: ## Create the S3 state bucket (one time per account; local state)
 	$(TF_BOOTSTRAP) init
-	$(TF_BOOTSTRAP) apply
+	$(TF_BOOTSTRAP) workspace select -or-create $(BOOTSTRAP_WORKSPACE)
+	$(TF_BOOTSTRAP) apply $(if $(CUSTOMER),-var account_id=$(or $(ACCOUNT_ID),$(error no account_id in terraform/envs/$(ENV)/terraform.tfvars)))
 
 init: ## terraform init the env against the state bucket
-	$(TF) init -backend-config="bucket=$$($(TF_BOOTSTRAP) output -raw state_bucket)" -backend-config="region=$(AWS_REGION)"
+	$(TF) init -backend-config="bucket=$$(TF_WORKSPACE=$(BOOTSTRAP_WORKSPACE) $(TF_BOOTSTRAP) output -raw state_bucket)" -backend-config="region=$(AWS_REGION)"
+
+new-customer: ## A customer deployment's Terraform env (no AWS calls): NAME=<name> ACCOUNT=<their sandbox account id>
+	scripts/new-customer-env.sh $(NAME) $(ACCOUNT)
 
 plan: ## terraform plan the env, saved to tfplan
 	$(TF) plan -out=tfplan
@@ -48,7 +65,7 @@ fmt: ## Format Terraform code
 lint: ## Check formatting, validate Terraform, syntax-check playbooks
 	terraform fmt -check -recursive terraform
 	$(TF) validate
-	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/tailnet-proxy.yml playbooks/agentd.yml
+	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/tailnet-proxy.yml playbooks/agentd.yml playbooks/front-door.yml
 
 # --- Ansible -----------------------------------------------------------------
 
@@ -112,6 +129,16 @@ agentd-logs: ## Show agentd's recent log
 tailnet-build: ## Build tailnet-proxy (tsnet) for the desktop (linux, DESKTOP_ARCH)
 	cd services/tailnet-proxy && CGO_ENABLED=0 GOOS=linux GOARCH=$(DESKTOP_ARCH) \
 	  go build -trimpath -ldflags "-s -w" -o build/tailnet-proxy-linux-$(DESKTOP_ARCH) .
+
+front-door-test: ## Vet and test front-door (a customer deployment's way in, behind Cloudflare Access)
+	cd services/front-door && go vet ./... && go test ./...
+
+front-door-build: ## Build front-door for the desktop (linux, DESKTOP_ARCH)
+	cd services/front-door && CGO_ENABLED=0 GOOS=linux GOARCH=$(DESKTOP_ARCH) \
+	  go build -trimpath -ldflags "-s -w" -o build/front-door-linux-$(DESKTOP_ARCH) .
+
+front-door-deploy: front-door-build ## Put a customer deployment's desktops behind Cloudflare: front-door and cloudflared; deploy agentd first (ENV=<customer>)
+	$(ANSIBLE_PLAYBOOK) playbooks/front-door.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
 gatewayd-test: ## Format check, clippy and unit tests for gatewayd (the attested model gateway)
 	cd services/gatewayd && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test

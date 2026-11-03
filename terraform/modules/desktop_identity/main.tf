@@ -19,8 +19,9 @@ data "aws_iam_policy_document" "ec2_assume" {
 }
 
 resource "aws_iam_role" "desktop" {
-  name               = var.role_name
-  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
+  name                 = var.role_name
+  assume_role_policy   = data.aws_iam_policy_document.ec2_assume.json
+  permissions_boundary = var.permissions_boundary
 
   tags = {
     User = var.user
@@ -52,6 +53,27 @@ resource "aws_iam_role_policy" "deny_secrets" {
   name   = "deny-project-secrets"
   role   = aws_iam_role.desktop.id
   policy = data.aws_iam_policy_document.deny_secrets.json
+}
+
+# Its own settings (a customer deployment's front door): read by root on the
+# desktop at each start of front-door and cloudflared, so the customer can
+# set or rotate them without us. SecureStrings use the aws/ssm key.
+data "aws_iam_policy_document" "own_parameters" {
+  count = var.own_parameters_path != "" ? 1 : 0
+
+  statement {
+    sid       = "OwnParameters"
+    actions   = ["ssm:GetParameter", "ssm:GetParameters"]
+    resources = ["arn:${data.aws_partition.current.partition}:ssm:*:${data.aws_caller_identity.current.account_id}:parameter${var.own_parameters_path}/*"]
+  }
+}
+
+resource "aws_iam_role_policy" "own_parameters" {
+  count = var.own_parameters_path != "" ? 1 : 0
+
+  name   = "own-parameters"
+  role   = aws_iam_role.desktop.id
+  policy = data.aws_iam_policy_document.own_parameters[0].json
 }
 
 resource "aws_iam_instance_profile" "desktop" {

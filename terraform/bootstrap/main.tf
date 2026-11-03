@@ -4,6 +4,8 @@
 
 provider "aws" {
   region = var.region
+  # A customer's account (its own workspace): only that account.
+  allowed_account_ids = var.account_id == "" ? null : [var.account_id]
 
   default_tags {
     tags = {

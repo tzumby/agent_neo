@@ -80,8 +80,9 @@ data "aws_iam_policy_document" "assume" {
 }
 
 resource "aws_iam_role" "gateway" {
-  name               = "${var.name}-model-gateway-instance"
-  assume_role_policy = data.aws_iam_policy_document.assume.json
+  name                 = "${var.name}-model-gateway-instance"
+  assume_role_policy   = data.aws_iam_policy_document.assume.json
+  permissions_boundary = var.permissions_boundary
 }
 
 data "aws_iam_policy_document" "gateway" {

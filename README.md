@@ -303,6 +303,10 @@ make destroy               # dev env. The state bucket is protected (prevent_des
 - [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'
   prompts and data unreadable to us: the attested gateway (built) and the plan for
   attested desktops that customers verify and approve updates for (§11).
+- [docs/customer-cloud.md](docs/customer-cloud.md): the agent in a customer's own
+  AWS sandbox account, reached through their Cloudflare Access (front-door), with
+  their Together key; [deploy/customer-aws/](deploy/customer-aws/README.md) is what
+  the customer reviews and runs to give us temporary, limited access (2026-11-03).
 - **No public IPs on desktops:** they sit in private subnets and reach the
   internet through a fck-nat instance (`enable_nat_instance`, a t4g.nano; switch
   to `enable_nat_gateway` when the product needs high availability). No inbound

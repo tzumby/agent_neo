@@ -17,6 +17,7 @@ __pycache__/
 
 # Go build output
 services/tailnet-proxy/build/
+services/front-door/build/
 
 # Rust build output
 services/agentd/target/

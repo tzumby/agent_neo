@@ -21,3 +21,8 @@ output "private_subnet_ids" {
 output "private_subnet_cidrs" {
   value = aws_subnet.private[*].cidr_block
 }
+
+output "nat_public_ips" {
+  description = "Where private subnets' traffic comes from on the internet (to allowlist)."
+  value       = concat(aws_eip.nat[*].public_ip, aws_eip.nat_instance[*].public_ip)
+}

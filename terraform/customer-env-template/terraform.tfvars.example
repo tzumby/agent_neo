@@ -1,0 +1,16 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+
+# The customer's sandbox account: plans against any other account fail.
+account_id = "123456789012"
+region     = "ca-central-1"
+
+desktops              = { agent = {} }
+desktop_instance_type = "t3a.medium"
+
+# The model gateway's image is built in this account: set
+# enable_image_builder = true and apply, run make gateway-image ENV=<env>,
+# put the AMI here and set enable_image_builder back to false.
+enable_image_builder = false
+gateway_ami          = ""
+
+model_daily_budget_usd = 20

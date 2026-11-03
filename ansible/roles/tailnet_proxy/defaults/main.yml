@@ -5,7 +5,7 @@ tailnet_proxy_novnc: http://127.0.0.1:6080
 tailnet_proxy_agentd_socket: /run/agentd/agentd.sock
 tailnet_proxy_vnc: 127.0.0.1:5900
 
-tailnet_proxy_ssm_prefix: /cloud-desktops/dev
+tailnet_proxy_ssm_prefix: "/cloud-desktops/{{ desktop_env | default('dev') }}"
 tailnet_proxy_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"
 
 # A desktop on the desktops tailnet (inventory: desktop_tailnet "desktops")

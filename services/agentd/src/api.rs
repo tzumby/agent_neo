@@ -1,5 +1,8 @@
-//! HTTP API for the apps. Only `tailnet-proxy` can reach it (Unix socket), and
-//! it sets `X-Tailscale-User` from the caller's Tailscale identity.
+//! HTTP API for the apps. Only the desktop's way in can reach it (Unix socket):
+//! `tailnet-proxy`, which sets `X-Tailscale-User` from the caller's Tailscale
+//! identity, or in a customer deployment `front-door`, which sets
+//! `X-Agent-User` from their Cloudflare Access sign-in. Each removes any copy
+//! the caller sent.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -58,10 +61,11 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .with_state(agent)
 }
 
+/// Who made the request, for attribution (`by`), as the proxy in front set it.
 fn caller(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-tailscale-user")
-        .and_then(|v| v.to_str().ok())
+    ["x-tailscale-user", "x-agent-user"]
+        .iter()
+        .find_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
         .map(String::from)
 }
 
@@ -846,6 +850,17 @@ async fn put_settings(State(agent): App, Json(body): Json<SettingsUpdate>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_caller_comes_from_either_proxy() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(caller(&headers), None);
+        headers.insert("x-agent-user", "me@acme.com".parse().unwrap());
+        assert_eq!(caller(&headers).as_deref(), Some("me@acme.com"));
+        // tailnet-proxy only strips its own headers, so its identity wins.
+        headers.insert("x-tailscale-user", "me@example.com".parse().unwrap());
+        assert_eq!(caller(&headers).as_deref(), Some("me@example.com"));
+    }
 
     fn with(change: impl FnOnce(&mut StageFacts)) -> &'static str {
         let mut facts = StageFacts::default();

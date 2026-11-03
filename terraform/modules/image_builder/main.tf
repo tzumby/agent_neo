@@ -22,8 +22,9 @@ data "aws_iam_policy_document" "assume" {
 }
 
 resource "aws_iam_role" "builder" {
-  name               = "${var.name}-image-builder"
-  assume_role_policy = data.aws_iam_policy_document.assume.json
+  name                 = "${var.name}-image-builder"
+  assume_role_policy   = data.aws_iam_policy_document.assume.json
+  permissions_boundary = var.permissions_boundary
 }
 
 resource "aws_iam_role_policy_attachment" "ssm" {

@@ -1,0 +1,265 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "NetworkAndInstancesInTheRegion",
+      "Effect": "Allow",
+      "Action": "ec2:*",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "ca-central-1" } }
+    },
+    {
+      "Sid": "SessionManagerAndParametersInTheRegion",
+      "Effect": "Allow",
+      "Action": ["ssm:*", "ssmmessages:*"],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "ca-central-1" } }
+    },
+    {
+      "Sid": "OnlyTheAgentsBuckets",
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::cloud-desktops-*", "arn:aws:s3:::cloud-desktops-*/*"]
+    },
+    {
+      "Sid": "ListBuckets",
+      "Effect": "Allow",
+      "Action": ["s3:ListAllMyBuckets", "s3:GetBucketLocation"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "OnlyTheAgentsTable",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:CreateTable",
+        "dynamodb:DeleteTable",
+        "dynamodb:DescribeTable",
+        "dynamodb:UpdateTable",
+        "dynamodb:DescribeTimeToLive",
+        "dynamodb:UpdateTimeToLive",
+        "dynamodb:DescribeContinuousBackups",
+        "dynamodb:TagResource",
+        "dynamodb:UntagResource",
+        "dynamodb:ListTagsOfResource"
+      ],
+      "Resource": "arn:aws:dynamodb:ca-central-1:*:table/cloud-desktops-*"
+    },
+    {
+      "Sid": "CreateDiskKeysTaggedForTheAgent",
+      "Effect": "Allow",
+      "Action": ["kms:CreateKey", "kms:TagResource"],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:RequestedRegion": "ca-central-1", "aws:RequestTag/Project": "cloud-desktops" }
+      }
+    },
+    {
+      "Sid": "ManageOnlyTheAgentsKeys",
+      "Effect": "Allow",
+      "Action": [
+        "kms:DescribeKey",
+        "kms:GetKeyPolicy",
+        "kms:GetKeyRotationStatus",
+        "kms:EnableKeyRotation",
+        "kms:ListResourceTags",
+        "kms:TagResource",
+        "kms:UntagResource",
+        "kms:UpdateKeyDescription",
+        "kms:ScheduleKeyDeletion"
+      ],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/Project": "cloud-desktops" } }
+    },
+    {
+      "Sid": "UseTheAgentsKeysForItsDisksOnly",
+      "Effect": "Allow",
+      "Action": [
+        "kms:CreateGrant",
+        "kms:Decrypt",
+        "kms:GenerateDataKeyWithoutPlaintext",
+        "kms:ReEncryptFrom",
+        "kms:ReEncryptTo"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/Project": "cloud-desktops",
+          "kms:ViaService": "ec2.ca-central-1.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "TheAgentsKeyAliases",
+      "Effect": "Allow",
+      "Action": ["kms:CreateAlias", "kms:DeleteAlias", "kms:UpdateAlias"],
+      "Resource": ["arn:aws:kms:ca-central-1:*:alias/cloud-desktops-*", "arn:aws:kms:ca-central-1:*:key/*"]
+    },
+    {
+      "Sid": "ListKeys",
+      "Effect": "Allow",
+      "Action": ["kms:ListKeys", "kms:ListAliases"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CreateInstanceRolesOnlyWithTheBoundary",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePermissionsBoundary"
+      ],
+      "Resource": "arn:aws:iam::*:role/cloud-desktops-*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PermissionsBoundary": "arn:aws:iam::${aws:PrincipalAccount}:policy/cloud-desktops-boundary"
+        }
+      }
+    },
+    {
+      "Sid": "AttachOnlySessionManager",
+      "Effect": "Deny",
+      "Action": ["iam:AttachRolePolicy", "iam:DetachRolePolicy"],
+      "Resource": "*",
+      "Condition": {
+        "ArnNotEquals": { "iam:PolicyARN": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" }
+      }
+    },
+    {
+      "Sid": "ManageTheInstanceRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:UpdateRoleDescription",
+        "iam:DeleteRole"
+      ],
+      "Resource": "arn:aws:iam::*:role/cloud-desktops-*"
+    },
+    {
+      "Sid": "TheirInstanceProfiles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:GetInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile",
+        "iam:TagInstanceProfile",
+        "iam:UntagInstanceProfile"
+      ],
+      "Resource": "arn:aws:iam::*:instance-profile/cloud-desktops-*"
+    },
+    {
+      "Sid": "PassTheInstanceRolesToEC2Only",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::*:role/cloud-desktops-*",
+      "Condition": { "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" } }
+    },
+    {
+      "Sid": "ReadTheBoundaryAndSessionManagerPolicies",
+      "Effect": "Allow",
+      "Action": ["iam:GetPolicy", "iam:GetPolicyVersion"],
+      "Resource": [
+        "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+        "arn:aws:iam::*:policy/cloud-desktops-boundary"
+      ]
+    },
+    {
+      "Sid": "NoReadingOrReplacingTheirSecretsAndAccessSettings",
+      "Effect": "Deny",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParameterHistory",
+        "ssm:PutParameter",
+        "ssm:DeleteParameter",
+        "ssm:DeleteParameters",
+        "ssm:LabelParameterVersion",
+        "ssm:AddTagsToResource",
+        "ssm:RemoveTagsFromResource"
+      ],
+      "Resource": [
+        "arn:aws:ssm:*:*:parameter/cloud-desktops/*/llm/*",
+        "arn:aws:ssm:*:*:parameter/front-door/*"
+      ]
+    },
+    {
+      "Sid": "NoReadingParametersByPath",
+      "Effect": "Deny",
+      "Action": "ssm:GetParametersByPath",
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoConnectionsToOtherNetworks",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:CreateVpcPeeringConnection",
+        "ec2:AcceptVpcPeeringConnection",
+        "ec2:CreateTransitGateway*",
+        "ec2:AcceptTransitGateway*",
+        "ec2:AssociateTransitGateway*",
+        "ec2:CreateVpnConnection",
+        "ec2:CreateVpnGateway",
+        "ec2:AttachVpnGateway",
+        "ec2:CreateCustomerGateway",
+        "ec2:CreateClientVpnEndpoint",
+        "ec2:CreateVpcEndpointServiceConfiguration",
+        "ec2:AcceptVpcEndpointConnections"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EndpointsToAWSServicesOnly",
+      "Effect": "Deny",
+      "Action": "ec2:CreateVpcEndpoint",
+      "Resource": "*",
+      "Condition": { "StringNotEquals": { "ec2:VpceServiceOwner": "amazon" } }
+    },
+    {
+      "Sid": "NothingSharedOutOfTheAccount",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:ModifySnapshotAttribute",
+        "ec2:ModifyImageAttribute",
+        "ec2:CreateInstanceExportTask",
+        "ec2:ExportImage",
+        "ec2:CreateStoreImageTask",
+        "ec2:DisableImageBlockPublicAccess",
+        "ec2:DisableSnapshotBlockPublicAccess",
+        "ebs:*",
+        "ram:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoOtherWaysIn",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:CreateKeyPair",
+        "ec2:ImportKeyPair",
+        "ec2:CreateInstanceConnectEndpoint",
+        "ec2:EnableSerialConsoleAccess",
+        "ec2:AssociateAddress",
+        "ec2:GetPasswordData",
+        "ec2-instance-connect:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoPublicAddressesOnInstances",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:*:*:network-interface/*",
+      "Condition": { "Bool": { "ec2:AssociatePublicIpAddress": "true" } }
+    }
+  ]
+}

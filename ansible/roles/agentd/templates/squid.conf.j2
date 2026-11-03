@@ -4,7 +4,7 @@
 # request logged to /var/log/squid/access.log.
 http_port 127.0.0.1:{{ agentd_egress_proxy_port }}
 
-acl allowed dstdomain {{ agentd_shell_allowed_domains | join(' ') }}
+acl allowed dstdomain {{ (agentd_shell_allowed_domains + agentd_shell_extra_domains) | join(' ') }}
 # Internal: this machine, the VPC, link-local (the metadata service), CGNAT
 # (Tailscale), private ranges. Checked on the resolved address, so a listed
 # name that resolves inside is refused too.

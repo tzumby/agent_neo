@@ -12,6 +12,11 @@ hostnames:
 keyed_groups:
   - key: ec2_tags.Role
     separator: ""
+  # How people reach it: access_tailnet (tailnet-proxy, our desktops) or
+  # access_cloudflare (front-door, a customer deployment:
+  # docs/customer-cloud.md).
+  - key: ec2_tags.Access | default('tailnet')
+    prefix: access
 compose:
   ansible_aws_ssm_instance_id: instance_id
   # Whose desktop, and which tailnet it joins (Terraform tags): "shared" is the
@@ -23,3 +28,7 @@ compose:
   desktop_owner: ec2_tags.User | default('')
   desktop_tailnet: ec2_tags.Tailnet | default('shared')
   desktop_tailnet_name: ec2_tags.TailnetName | default('cloud-desktop-dev')
+  # Its environment (Terraform's Env tag: dev, or a customer's), which picks
+  # its SSM paths, and its name in a customer deployment.
+  desktop_env: ec2_tags.Env | default('dev')
+  desktop_name: ec2_tags.DesktopName | default('')

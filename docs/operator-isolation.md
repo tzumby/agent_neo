@@ -2,6 +2,8 @@
 
 *Status: 2026-11-03. The attested gateway (§4) is built. Attested desktops (§5–§10) are planned, not built. Vendor facts were checked against the sources at the end on 2026-10-31 and 2026-11-03; anything not yet confirmed in practice is marked UNVERIFIED and has a check in §11.*
 
+*Customer deployments ([customer-cloud.md](customer-cloud.md)) change who "the operator" is. There the agent runs in the customer's own AWS account, and we have access only while they grant it. For them, the account boundary is the main guarantee, and this plan's sealed desktops (§6) become the way to update a desktop without giving us an access window. The design below is for desktops we host.*
+
 ## 1. Goal
 
 Users will care about who can read their prompts, context and memory. "We don't look" is a policy. The goal is for "we can't look" to hold **technically**, and for users to be able to check it.

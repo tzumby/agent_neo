@@ -41,6 +41,9 @@ agentd_shell_allowed_domains:
   - api.together.xyz
   # Nix: the binary cache, the flake registry, source tarballs.
   - .nixos.org
+# More hosts for some desktops (group_vars), e.g. a customer deployment's
+# Cloudflare and Datadog APIs.
+agentd_shell_extra_domains: []
 # Nix for the shell user (tasks/nix.yml): the release, its published SHA-256
 # per architecture, and the tools installed up front.
 agentd_nix_version: 2.35.4
@@ -58,11 +61,11 @@ agentd_shell_tool: "on"
 # Memory v2 (kinds, trust, retrieval, consolidation): "off" until it has been
 # tried on the dev desktop (docs/memory-v2.md §17).
 agentd_memory_v2: "off"
-agentd_desktop_name: "{{ desktop_tailnet_name | default('cloud-desktop-dev') }}"
+agentd_desktop_name: "{{ (desktop_name | default('', true)) or (desktop_tailnet_name | default('cloud-desktop-dev')) }}"
 
 # Overrides the approval rules built into agentd (list of {pattern, reason};
 # regex patterns without single quotes). Empty: use the built-in rules.
 agentd_dangerous: []
 
-agentd_ssm_prefix: /cloud-desktops/dev
+agentd_ssm_prefix: "/cloud-desktops/{{ desktop_env | default('dev') }}"
 agentd_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"

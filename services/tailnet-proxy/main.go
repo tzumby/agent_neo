@@ -145,9 +145,11 @@ func webHandler(g gate, novnc *url.URL, agentdSocket string) http.Handler {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			// Only we set these; never trust a client's copy.
+			// Only we set these; never trust a client's copy (nor of
+			// front-door's X-Agent-User, which agentd also reads).
 			for name := range r.Header {
-				if strings.HasPrefix(strings.ToLower(name), "x-tailscale-") {
+				lower := strings.ToLower(name)
+				if strings.HasPrefix(lower, "x-tailscale-") || strings.HasPrefix(lower, "x-agent-") {
 					r.Header.Del(name)
 				}
 			}

@@ -1,6 +1,6 @@
 # Architecture
 
-*Status: describes what's built and in the working tree on 2026-11-01. It covers agentd 0.15.0 (memory v2 phase 0 of [memory-v2.md](memory-v2.md); the dev desktop still runs 0.12.0 until the next deploy), gatewayd, the push relay, tailnet-proxy, the iPhone app, the Terraform `dev` environment and the Ansible roles. Plans that aren't built yet are marked **(planned)**. For why things are the way they are, see the design docs: [PLAN.MD](../PLAN.MD) (the original build plan), [native-app-plan.md](native-app-plan.md), [operator-isolation.md](operator-isolation.md), [agents-and-bots.md](agents-and-bots.md) and [agent-control.md](agent-control.md).*
+*Status: describes what's built and in the working tree on 2026-11-01. It covers agentd 0.15.0 (memory v2 phase 0 of [memory-v2.md](memory-v2.md); the dev desktop still runs 0.12.0 until the next deploy), gatewayd, the push relay, tailnet-proxy, the iPhone app, the Terraform `dev` environment and the Ansible roles. Customer deployments (the agent in a customer's own AWS account, reached through Cloudflare Access: the `customer` stack, front-door and the deployment kit) are in [customer-cloud.md](customer-cloud.md) and §5.11; none is applied yet. Plans that aren't built yet are marked **(planned)**. For why things are the way they are, see the design docs: [PLAN.MD](../PLAN.MD) (the original build plan), [native-app-plan.md](native-app-plan.md), [operator-isolation.md](operator-isolation.md), [customer-cloud.md](customer-cloud.md), [agents-and-bots.md](agents-and-bots.md) and [agent-control.md](agent-control.md).*
 
 ## Contents
 
@@ -117,13 +117,17 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
 | `terraform/modules/attested_gateway` | The gateway instance, its role, security group, usage table, SSM parameters |
 | `terraform/modules/image_builder` | Role and security group for the temporary image builder |
 | `terraform/modules/push_relay` | The relay Lambda, function URL, devices table |
-| `ansible/` | Inventory (aws_ec2 over SSM), playbooks, roles `common`, `desktop`, `agentd`, `tailnet_proxy` |
+| `terraform/stacks/customer` | A customer deployment's whole account: network with a NAT gateway, desktops, gateway, image builder; every role with the customer's boundary ([customer-cloud.md](customer-cloud.md)) |
+| `terraform/customer-env-template` | What `make new-customer` copies to `terraform/envs/<name>`: the account pinned, state in the customer's account |
+| `deploy/customer-aws/` | The customer's side: permissions boundary, deployer policy, SCP, RCP, `setup-access.sh`, the runbook |
+| `ansible/` | Inventory (aws_ec2 over SSM), playbooks, roles `common`, `desktop`, `agentd`, `tailnet_proxy`, `front_door` |
 | `services/agentd/` | The agent (Rust) and its skills |
 | `services/gatewayd/` | The attested model gateway (Rust) |
 | `services/push-relay/` | The push relay (Node.js) and its tests |
 | `services/tailnet-proxy/` | The tailnet node (Go, tsnet) |
+| `services/front-door/` | A customer deployment's way in: checks the Cloudflare Access token, then agentd's API or noVNC (Go) |
 | `images/gateway/` | The gateway's KIWI-NG image description (Amazon Linux 2023, attestable) |
-| `scripts/` | `put-secret.py`, `put-apns-key.py` (hidden input → SSM), `build-gateway-image.sh`, `browser.py` (drive the desktop's Chrome from the Mac over `make cdp`) |
+| `scripts/` | `put-secret.py`, `put-apns-key.py` (hidden input → SSM), `build-gateway-image.sh`, `new-customer-env.sh`, `customer-preflight.sh`, `browser.py` (drive the desktop's Chrome from the Mac over `make cdp`) |
 | `apps/apple/` | The iPhone and Mac apps (`CloudDesktop/`: shared screens, `iOS/`, `macOS/`), shared `DesktopKit` package, XcodeGen `project.yml`, scripts |
 
 ## 4. AWS infrastructure (Terraform)
@@ -206,6 +210,11 @@ Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0), `hashicorp/archiv
   - `ssm:PutParameter` on `<prefix>/gateway/images/*`;
   - a Deny on reading `<prefix>/*` parameters.
 - **Push relay Lambda role:** writes to its log group; `dynamodb:Query`/`PutItem`/`DeleteItem` on the devices table; `ssm:GetParameter` on the two APNs parameters.
+
+**In a customer deployment** (`stacks/customer`, [customer-cloud.md](customer-cloud.md)):
+- There's no fleet role and no push relay. Desktop roles are `cloud-desktops-<env>-desktop-<name>` (the gateway's prefix `cloud-desktops-<env>-desktop`).
+- Each desktop role also gets `own-parameters`: `ssm:GetParameter(s)` on `parameter/front-door/<env>/<name>/*` (`desktop_identity` `own_parameters_path`).
+- Every role carries the customer's permissions boundary `cloud-desktops-boundary` (the modules' `permissions_boundary`; `deploy/customer-aws/boundary.json`). The deployer policy lets us create roles only with it.
 - **No permission boundaries anywhere.** Trust policies carry no source conditions.
 
 ### 4.6 Encryption and keys
@@ -271,7 +280,8 @@ Each user's desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default,
   - Filters: `tag:Project = cloud-desktops` and running instances.
   - Hostnames are instance ids.
   - Groups come from the `Role` tag (`desktop`, `model-gateway`, `nat`). Every playbook targets only `desktop`; the Makefile's `LIMIT=<instance id>` or `DESKTOP=<name>` narrows it to one.
-  - Per-host variables from tags: `desktop_owner` (`User`: the person, not the Linux account `agent` that Chrome and the session run as), `desktop_tailnet` (`Tailnet`: `shared` or `own`, default `shared`) and `desktop_tailnet_name` (`TailnetName`, default `cloud-desktop-dev`), used for tailnet-proxy's hostname and parameters and agentd's `DESKTOP_NAME`.
+  - The `Access` tag adds `access_tailnet` (untagged: our desktops) or `access_cloudflare` (a customer deployment's, §5.11). The tailnet-proxy playbook runs on `desktop:!access_cloudflare`, the front-door playbook on `desktop:&access_cloudflare`.
+  - Per-host variables from tags: `desktop_owner` (`User`: the person, not the Linux account `agent` that Chrome and the session run as), `desktop_tailnet` (`Tailnet`: `shared` or `own`, default `shared`) and `desktop_tailnet_name` (`TailnetName`, default `cloud-desktop-dev`), used for tailnet-proxy's hostname and parameters and agentd's `DESKTOP_NAME`. Also `desktop_env` (`Env`, default `dev`), which picks the SSM prefix `/cloud-desktops/<env>` for agentd and tailnet-proxy, and `desktop_name` (`DesktopName`, a customer deployment's `DESKTOP_NAME`).
 - **Connection** (`group_vars/all.yml`):
   - `ansible_connection: amazon.aws.aws_ssm`, with file transfer through the SSM transfer bucket. The Makefile passes `ansible_aws_ssm_bucket_name` from the Terraform output.
   - `ansible_become_exe: sudo.ws`: Ubuntu 26.04's default `sudo-rs` swallows the SSM plugin's end-of-command marker, so every privileged task would hang.
@@ -282,6 +292,7 @@ Each user's desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default,
 | `playbooks/desktops.yml` | `common`, `desktop` (serial 10%, apt lock timeout 600 s) | `make desktop` |
 | `playbooks/agentd.yml` | `agentd` | `make agentd-deploy` (after `make agentd-build`) |
 | `playbooks/tailnet-proxy.yml` | `tailnet_proxy` | `make tailnet-deploy` (after agentd) |
+| `playbooks/front-door.yml` | `front_door` | `make front-door-deploy` (a customer deployment, after agentd) |
 | `playbooks/screenshot.yml` | inline: `scrot` on `:1` as root with the desktop's X cookie, fetched to `screenshots/<instance-id>.png` | `make screenshot` |
 
 For a fresh desktop, run them in this order: desktops, agentd, tailnet-proxy.
@@ -447,6 +458,26 @@ A second Tailscale account of the operator's (`tzumby.github`), kept for testers
 | `/run/agentd/agentd.sock` | Unix socket | agentd, tailnet-proxy |
 | tailnet :443, :5900 | Tailscale (tsnet, userspace) | Allowed Tailscale logins only (§9) |
 | Inbound from the VPC or internet | none | Nothing: the security group has no inbound rules |
+
+On a customer deployment's desktop (§5.11), front-door and cloudflared replace tailnet-proxy: `/run/front-door/front.sock` (front-door, 0660 in a 0750 directory; cloudflared is in its group) is the only way in, and only for requests with a valid Access token. There's no tailnet and no raw VNC port.
+
+### 5.11 Customer deployments: role `front_door`
+
+A customer deployment ([customer-cloud.md](customer-cloud.md)) runs `terraform/stacks/customer` in the customer's sandbox account. Its desktops are tagged `Access = cloudflare`, `DesktopName = <env>-<name>`, and get the role `front_door` instead of `tailnet_proxy`.
+
+- **front-door** (`services/front-door`, Go, `github.com/coreos/go-oidc/v3`):
+  - Every request needs `Cf-Access-Jwt-Assertion`. It's verified against `https://<team>/cdn-cgi/access/certs` (RS256), with the team as the issuer and the Access app's AUD tag as the audience, and it mustn't have expired.
+  - It must carry an `email`, which rules out service tokens, and the email must be on the optional allow list (emails or `@domain`).
+  - Then front-door deletes incoming `X-Agent-*` and `X-Tailscale-*`, the token and the `Cookie` header. `/api/*` goes to agentd's socket with `X-Agent-User` set to the email; everything else goes to noVNC.
+  - It listens only on a Unix socket or localhost (it refuses other addresses).
+  - Tests: `make front-door-test`, with a fake Access team, a fake agentd and a fake viewer.
+- **Units:**
+  - `front-door.service`: user `front-door` (groups `front-door`, `agentd`), `RuntimeDirectory=front-door` (0750), `Restart=always` every 15 s, sandboxed like tailnet-proxy.
+  - `cloudflared.service`: user `cloudflared` (in group `front-door`), `cloudflared --no-autoupdate tunnel run --token-file /run/cloudflared/token`.
+  - Before each start, `ExecStartPre=+/usr/local/sbin/front-door-settings` (Python, boto3, root: the instance role) reads the desktop's own `/front-door/<env>/<name>/*` from SSM into the unit's runtime directory (0400). Until the customer has set the parameters, it exits 1 and the unit tries again.
+- **cloudflared:** Cloudflare's GitHub `.deb`, version and SHA-256 pinned in the role's defaults (`front_door_cloudflared_version`, `front_door_cloudflared_sha256`).
+- **Egress:** `group_vars/access_cloudflare.yml` adds `api.cloudflare.com`, `.datadoghq.com` and `.datadoghq.eu` to the shell's Squid allowlist (`agentd_shell_extra_domains`).
+- **No secrets pass through Ansible:** the desktop fetches its own. The desktop role may read `/front-door/<env>/<name>/*` (`desktop_identity` `own_parameters_path`) and nothing under `/cloud-desktops/`.
 
 ## 6. agentd: the agent on each desktop
 
@@ -1659,6 +1690,8 @@ The same screens as the iPhone's, in Mac form:
 | `agentd-soak` | Memory v2 soak report for the desktop, read-only over SSM (`scripts/agentd-soak.py`): phase 6's exit criteria (effect failures, consolidation under the daily cap, consolidations that didn't finish, days of soak), then tasks, scheduled runs and costs by day, and counts from the journal. Only counts and costs leave the desktop. `SINCE=YYYY-MM-DD`, the day the soak started |
 | `gatewayd-test`, `gatewayd-build`, `gateway-image` | gatewayd tests; static arm64 build; build an attestable AMI and publish its measurements |
 | `tailnet-build`, `tailnet-deploy` | tailnet-proxy |
+| `front-door-test`, `front-door-build`, `front-door-deploy` | front-door (§5.11): vet and tests; static linux build for `DESKTOP_ARCH`; the `front_door` role on a customer deployment's desktops |
+| `new-customer` | `NAME=<env> ACCOUNT=<id>`: `terraform/envs/<env>` for a customer deployment from the template, the account in its gitignored tfvars. No AWS calls |
 | `llm-keys`, `tailscale-key`, `apns-key` | Store secrets in SSM from hidden input or a file |
 | `app-tailscalekit`, `app-test`, `app-sim`, `app-device`, `app-mac` | The apps: build TailscaleKit; DesktopKit tests; Simulator build; build, install and launch on the paired iPhone; build the Mac app, install it in /Applications and open it |
 | `app-release-mac`, `app-testflight` | The apps for others ([onboarding.md](onboarding.md)): the Mac app signed with Developer ID, notarized and stapled, in a signed, notarized DMG (`release-mac.sh`; notarytool profile `cloud-desktop-notary`); the iPhone app archived and uploaded to App Store Connect for TestFlight (`release-ios.sh`). Both build with `APS_ENVIRONMENT=production` and a new build number; the Mac archive with `ARCHS=arm64` for the packages too (TailscaleKit has no Intel slice) |
@@ -1668,7 +1701,7 @@ The same screens as the iPhone's, in Mac form:
 
 Desktops: `desktop`, `agentd-deploy`, `tailnet-deploy` and `screenshot` run on every running desktop unless `LIMIT=<instance id>` or `DESKTOP=<name>` names one; an unknown `DESKTOP` matches no host, never all of them. `viewer`, `cdp`, `shell`, `agentd-logs`, `agentd-soak` and `agentd-reset` take `DESKTOP=<name>` (default: the test desktop). `tailscale-oauth` stores the desktops tailnet's OAuth client; `tailnet-rules` writes its rules; `tester-link NAME=<name>` makes new setup links.
 
-`AWS_PROFILE` (default `default`) and `AWS_REGION` (default `ca-central-1`) are exported to every recipe. On macOS, Ansible runs with `no_proxy='*'` and `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`; otherwise forked workers crash in the system proxy lookup.
+`AWS_PROFILE` (default `default`) and `AWS_REGION` (default `ca-central-1`) are exported to every recipe. Any `ENV` other than `dev` is a customer deployment: the Makefile stops unless `AWS_PROFILE` is named, `bootstrap` works in the bootstrap stack's workspace `<env>` with `allowed_account_ids` set to the account in the env's tfvars, and `init` reads that workspace's bucket ([customer-cloud.md](customer-cloud.md) §4). On macOS, Ansible runs with `no_proxy='*'` and `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`; otherwise forked workers crash in the system proxy lookup.
 
 ### 13.2 Order for a new environment
 

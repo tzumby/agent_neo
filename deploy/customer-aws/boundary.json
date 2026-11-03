@@ -1,0 +1,78 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SessionManagerAgent",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:UpdateInstanceInformation",
+        "ssm:ListInstanceAssociations",
+        "ssm:ListAssociations",
+        "ssm:DescribeAssociation",
+        "ssm:GetDeployablePatchSnapshotForInstance",
+        "ssm:GetDocument",
+        "ssm:DescribeDocument",
+        "ssm:GetManifest",
+        "ssm:PutInventory",
+        "ssm:PutComplianceItems",
+        "ssm:PutConfigurePackageResult",
+        "ssm:UpdateAssociationStatus",
+        "ssm:UpdateInstanceAssociationStatus",
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel",
+        "ec2messages:AcknowledgeMessage",
+        "ec2messages:DeleteMessage",
+        "ec2messages:FailMessage",
+        "ec2messages:GetEndpoint",
+        "ec2messages:GetMessages",
+        "ec2messages:SendReply",
+        "s3:GetEncryptionConfiguration"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadTheirOwnSettings",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+      "Resource": [
+        "arn:aws:ssm:*:*:parameter/cloud-desktops/*",
+        "arn:aws:ssm:*:*:parameter/front-door/*"
+      ]
+    },
+    {
+      "Sid": "DecryptThoseThroughSSMOnly",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": { "StringLike": { "kms:ViaService": "ssm.*.amazonaws.com" } }
+    },
+    {
+      "Sid": "ModelGatewaySpend",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:*:*:table/cloud-desktops-*"
+    },
+    {
+      "Sid": "GatewayImageBuilder",
+      "Effect": "Allow",
+      "Action": [
+        "ebs:StartSnapshot",
+        "ebs:PutSnapshotBlock",
+        "ebs:CompleteSnapshot",
+        "ec2:RegisterImage",
+        "ec2:DescribeImages",
+        "ec2:DescribeSnapshots",
+        "ec2:CreateTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PublishGatewayImageMeasurements",
+      "Effect": "Allow",
+      "Action": ["ssm:PutParameter", "ssm:AddTagsToResource"],
+      "Resource": "arn:aws:ssm:*:*:parameter/cloud-desktops/*/gateway/images/*"
+    }
+  ]
+}

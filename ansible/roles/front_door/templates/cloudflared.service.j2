@@ -1,0 +1,32 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Cloudflare Tunnel to front-door, outbound only (cloudflared)
+Wants=network-online.target front-door.service
+After=network-online.target front-door.service
+# Until the customer has set the tunnel token, it keeps trying.
+StartLimitIntervalSec=0
+
+[Service]
+User=cloudflared
+Group=cloudflared
+# front-door's socket.
+SupplementaryGroups=front-door
+RuntimeDirectory=cloudflared
+RuntimeDirectoryMode=0700
+# The token, from this desktop's own SSM path at each start (as root), into
+# memory (/run) only: rotating it in Cloudflare and SSM takes effect at the
+# next start.
+ExecStartPre=+/usr/local/sbin/front-door-settings cloudflared --path {{ front_door_parameters }} --region {{ front_door_region }}
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run --token-file /run/cloudflared/token
+Restart=always
+RestartSec=15
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

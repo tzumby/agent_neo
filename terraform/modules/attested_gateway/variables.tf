@@ -60,3 +60,9 @@ variable "prices" {
 variable "daily_budget_usd" {
   type = number
 }
+
+variable "permissions_boundary" {
+  description = "Permissions boundary for the role (a customer deployment's: deploy/customer-aws). Null: none."
+  type        = string
+  default     = null
+}

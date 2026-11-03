@@ -1,0 +1,9 @@
+# A customer deployment's way in (docs/customer-cloud.md): front-door and
+# cloudflared on its desktops (EC2 tag Access = cloudflare). Needs the binary
+# from `make front-door-build`. Deploy agentd first. Reads no secrets: the
+# desktop fetches its own settings from SSM.
+- name: Deploy front-door and cloudflared
+  hosts: desktop:&access_cloudflare
+  become: true
+  roles:
+    - front_door

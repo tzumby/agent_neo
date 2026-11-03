@@ -838,6 +838,13 @@ The hardening follows moltis' container settings (MIT).
 
 **Commands starting with `sudo`** run as root in the same kind of unit without `--uid` or the hardening: approved root commands may need to change the system. They always ask first.
 
+**Refused outright, not even asked** (`guard.rs`; the model is told why, and nothing is shown):
+- a bare `sleep` or `date`, a piped install script, scheduling through the shell;
+- anything touching the egress controls: Squid (`/etc/squid`, `squid -k`, the service) or the guard firewall (`cloud-desktop-guard`, `guard.nft`, `/etc/cloud-desktops`). These stop injected instructions from sending data anywhere, so they're the deployment's (Ansible's `agentd_shell_allowed_domains`/`agentd_shell_extra_domains`), never the chat's;
+- Slack's or Teams' APIs and webhooks (updates go through `post_update`, §6.20).
+
+**A command that needs approval must come with a plain summary** (`guard::is_plain_summary`): present, not the command itself, no shell symbols or flags, and not starting with a program's name. Otherwise it isn't shown or logged, and the model is asked to call again with one (`SUMMARY_REFUSAL`). The card and its notification lead with it; the command is a tap away.
+
 **Output.**
 - stdout, then stderr, trimmed.
 - The model gets `exit code N` and the first 8,000 characters.
@@ -1155,7 +1162,7 @@ Side effects are stored first and done afterwards. Each is a row in `effects`, w
 The agent posts updates (what it found, what it did) to channels a person set up in the web app's **Updates** page, for scheduled reports above all. It doesn't drive Slack's website for this: browser writes wait for an approval, and a 3 a.m. report would wait for one.
 
 - **Destinations** (table `destinations`: name, kind, channel, link, created, by, last post, last error) are added only through the API, so only by a person. The model gets `post_update` and a line in its prompt listing them, by name, only when there's at least one; it can't add one or post anywhere else.
-  - **Slack:** a bot token (`xoxb-`) from an app the customer creates from `deploy/messaging/slack-app-manifest.yaml` (scopes `chat:write`, `chat:write.public`; no events, no Socket Mode), and a channel (`#name` or an ID). `chat.postMessage` returns the message's `ts`, so a follow-up (`thread`: an earlier update's id) goes in the first one's thread; follow-ups of follow-ups stay there.
+  - **Slack:** a bot token (`xoxb-`) from an app the customer creates from `deploy/messaging/slack-app-manifest.yaml` (scopes `chat:write`, `chat:write.public`; no events, no Socket Mode), and a channel (`#name` or an ID). The Updates page's "Create the Slack app" opens `api.slack.com/apps?new_app=1&manifest_yaml=…`, Slack's create-app flow with the manifest filled in; the fallback is Create New App → From scratch → Paste a manifest. `chat.postMessage` returns the message's `ts`, so a follow-up (`thread`: an earlier update's id) goes in the first one's thread; follow-ups of follow-ups stay there.
   - **Microsoft Teams:** a Workflows webhook URL ("Send webhook alerts to a channel"), https on `*.logic.azure.com` or `*.api.powerplatform.com`, port 443. The body is one Adaptive Card. No threads: a follow-up says what it follows. (Office 365 connectors were retired in May 2026, and Graph can't post to channels as an app.)
   - **Credentials** live in a store of their own (`<state>/destinations`, one 0600 file per destination, `DEST_<NAME>`), apart from saved keys: no command is ever given them. `emit()` redacts them like the keys, and errors are built without the URL (`reqwest::Error::without_url`).
   - `link`: the web app's own origin, sent by the web app when it saves one (https, or http on localhost), for "Open the chat" in each post.
@@ -1166,6 +1173,7 @@ The agent posts updates (what it found, what it did) to channels a person set up
   - Markdown becomes Slack mrkdwn (bold, italic, headings bold, • bullets, tables and code in code blocks, sections of at most 3,000 characters), or the card's TextBlocks (code and tables in monospace). Titles are cut at 150 characters, bodies at 6,000.
 - **Limits:** at most `POSTS_PER_HOUR` (20) posts per destination in a rolling hour, and the same title and body to the same destination is refused for six hours (table `posts`: id, destination, title, SHA-256, Slack `ts`, task, time).
 - **Sending:** `Poster`, a reqwest client with a 15 s timeout, no redirects, and https only (plain http only when `SLACK_API_URL` points at localhost, for `make web-dev` and the tests). Failures are said plainly (the app isn't in the channel, the token was revoked, the workflow was deleted), kept as the destination's last error, and logged as `update.failed`.
+- **Setting up is the user's:** with no destination, the prompt says so and sends the user to Updates. The shell can't reach Slack (Squid), and agentd refuses, even with approval, any command that calls Slack's or Teams' APIs (`guard::calls_messaging_api`) or touches the egress proxy or the guard firewall (`guard::touches_egress_policy`, §6.10).
 - **Approvals stay in the web app:** there are no buttons in Slack or Teams, which would need an inbound endpoint and would go around the planned passkey approvals.
 
 ## 7. The attested model gateway

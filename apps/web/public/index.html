@@ -28,6 +28,7 @@
       </div>
       <nav class="nav" aria-label="Pages">
         <a href="#/chat" data-view="chat">Chat <span class="badge" id="nav-chat-badge" hidden>Needs you</span></a>
+        <a href="#/setup" data-view="setup">Setup <span class="progress" id="nav-setup-progress" hidden></span></a>
         <a href="#/desktop" data-view="desktop">Desktop</a>
         <a href="#/schedules" data-view="schedules">Schedules</a>
         <a href="#/updates" data-view="updates">Updates</a>
@@ -59,11 +60,14 @@
           <div class="column">
             <div class="older" hidden><span class="spinner" aria-label="Loading earlier messages"></span></div>
             <div class="empty" hidden>
+              <div class="empty-setup" hidden></div>
+              <div class="empty-suggest">
               <h2>What should your agent look into?</h2>
               <div class="suggestions">
                 <button type="button" data-suggest="Summarize last night's Cloudflare security events: what was blocked, from where, and anything that got through.">Summarize last night's Cloudflare security events</button>
                 <button type="button" data-suggest="Check Datadog for error spikes in the last hour and tell me which endpoints they came from.">Check Datadog for error spikes in the last hour</button>
                 <button type="button" data-suggest="Every weekday at 8:00, send me a security report from Cloudflare and Datadog.">Set up a security report every weekday at 8:00</button>
+              </div>
               </div>
             </div>
             <ol class="rows" aria-live="polite"></ol>
@@ -90,6 +94,9 @@
         <div class="desk-frame"></div>
       </section>
 
+      <section class="view page" id="view-setup" aria-label="Setup" hidden>
+        <div class="page-column"><div class="page-body"></div></div>
+      </section>
       <section class="view page" id="view-schedules" aria-label="Schedules" hidden>
         <div class="page-column"><div class="page-body"></div></div>
       </section>

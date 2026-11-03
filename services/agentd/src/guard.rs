@@ -120,6 +120,117 @@ pub const PIPED_INSTALL_REFUSAL: &str = "not run: piping a downloaded script int
 pub const SHELL_SCHEDULE_REFUSAL: &str = "not run: don't schedule with the shell (crontab, at, systemd \
      timers); those run with no approvals and can't tell the user. Use schedule_task instead.";
 
+pub const EGRESS_REFUSAL: &str = "not run: the shell's internet access (the proxy's allowlist and the \
+     desktop's firewall) is part of the desktop's setup and can't be changed from here, even with the user's \
+     OK. If a job needs a host that's blocked, tell the user which one and why. To post to Slack or Teams, use \
+     post_update with a channel the user added under Updates in the web app.";
+
+/// The desktop's egress controls: Squid (its configuration or its control
+/// commands) and the guard firewall. Refused even with approval: they're
+/// what stops injected instructions from sending data anywhere.
+pub fn touches_egress_policy(command: &str) -> bool {
+    use std::sync::LazyLock;
+    static EGRESS: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\bsquid\b|/etc/squid|cloud-desktop-guard|guard\.nft|/etc/cloud-desktops\b")
+            .expect("valid regex")
+    });
+    EGRESS.is_match(command)
+}
+
+pub const MESSAGING_API_REFUSAL: &str = "not run: don't call Slack's or Teams' APIs from the shell. Post updates \
+     with post_update, to a channel the user added under Updates in the web app. If there's none, tell the user \
+     to add one there: the app walks them through it and sends a test. Never ask for a Slack token in the chat.";
+
+/// Slack's or Teams' APIs and webhooks from the shell: updates go through
+/// post_update and its checks (destinations.rs), never around them.
+pub fn calls_messaging_api(command: &str) -> bool {
+    use std::sync::LazyLock;
+    static MESSAGING: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?ix)
+            https?://([a-z0-9-]+\.)*slack\.com\b
+            | \b(curl|wget|http|xh)\b [^\n]* \bslack\.com\b
+            | ([a-z0-9-]+\.)+ (logic\.azure\.com|api\.powerplatform\.com|webhook\.office\.com)\b",
+        )
+        .expect("valid regex")
+    });
+    MESSAGING.is_match(command)
+}
+
+pub const SUMMARY_REFUSAL: &str = "not run: this command needs the user's OK, and their card shows your summary, \
+     not the command. Call run_shell again with the same command and a summary: what it does and why, in a few \
+     plain words for someone who doesn't read shell (like \"Install the jq tool\" or \"Delete last week's build \
+     files\"), with no commands, flags or symbols.";
+
+/// Whether a command's summary is plain words the user can decide on: not
+/// missing, not the command itself, no shell symbols or flags, and not
+/// starting with a program's name. A command that needs approval without one
+/// isn't shown to the user: the model is asked again.
+pub fn is_plain_summary(summary: Option<&str>, command: &str) -> bool {
+    use std::sync::LazyLock;
+    static SHELLISH: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"[|;$`<>{}\\]|&&|(^|\s)--?[A-Za-z]").expect("valid regex"));
+    const PROGRAMS: &[&str] = &[
+        "sudo",
+        "apt",
+        "apt-get",
+        "dpkg",
+        "sed",
+        "awk",
+        "grep",
+        "curl",
+        "wget",
+        "cat",
+        "echo",
+        "tee",
+        "chmod",
+        "chown",
+        "rm",
+        "mv",
+        "cp",
+        "ln",
+        "systemctl",
+        "journalctl",
+        "nft",
+        "iptables",
+        "squid",
+        "git",
+        "npm",
+        "npx",
+        "pip",
+        "uv",
+        "nix",
+        "docker",
+        "kill",
+        "pkill",
+        "bash",
+        "sh",
+        "python",
+        "python3",
+        "node",
+        "env",
+        "export",
+        "ls",
+        "cd",
+        "find",
+        "tar",
+        "unzip",
+        "make",
+        "cargo",
+        "go",
+        "jq",
+        "ssh",
+        "scp",
+    ];
+    let summary = summary.unwrap_or_default().trim();
+    let command = command.trim();
+    if summary.is_empty() || (command.len() >= 6 && summary.contains(command)) || SHELLISH.is_match(summary) {
+        return false;
+    }
+    let first = summary.split_whitespace().next().unwrap_or_default();
+    !PROGRAMS.contains(&first)
+}
+
 /// Scheduling through the shell: `crontab`, `at`/`batch`, or a systemd timer.
 pub fn is_shell_schedule(command: &str) -> bool {
     use std::sync::LazyLock;
@@ -256,6 +367,65 @@ impl LoopDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_egress_policy_and_messaging_apis_are_off_limits() {
+        for egress in [
+            "sudo sed -i 's/^acl allowed dstdomain/& .slack.com/' /etc/squid/squid.conf && sudo squid -k reconfigure",
+            "echo 'acl x dstdomain slack.com' | sudo tee -a /etc/squid/conf.d/slack.conf",
+            "sudo systemctl restart squid",
+            "sudo nft -f /etc/cloud-desktops/guard.nft",
+            "sudo systemctl stop cloud-desktop-guard",
+        ] {
+            assert!(touches_egress_policy(egress), "{egress}");
+        }
+        assert!(!touches_egress_policy("curl -s https://api.github.com/repos/x/y"));
+        for messaging in [
+            "curl -s -H \"Authorization: Bearer $SLACK_BOT_TOKEN\" https://slack.com/api/auth.test",
+            "curl -X POST https://hooks.slack.com/services/T0/B0/x -d '{}'",
+            "curl -sI slack.com",
+            "python3 -c 'import urllib.request; urllib.request.urlopen(\"https://api.slack.com/api/chat.postMessage\")'",
+            "curl -X POST 'https://prod-27.westus.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke'",
+        ] {
+            assert!(calls_messaging_api(messaging), "{messaging}");
+        }
+        for fine in [
+            "grep -c 'slack' access.log",
+            "curl -s https://api.cloudflare.com/client/v4/zones",
+        ] {
+            assert!(!calls_messaging_api(fine), "{fine}");
+        }
+    }
+
+    #[test]
+    fn a_card_needs_a_summary_in_plain_words() {
+        let command = "env | grep -i proxy; for h in github.com slack.com; do curl -sI https://$h; done";
+        assert!(is_plain_summary(
+            Some("Check which sites the shell can reach"),
+            command
+        ));
+        assert!(is_plain_summary(
+            Some("Install the jq tool"),
+            "sudo apt install -y jq"
+        ));
+        assert!(is_plain_summary(
+            Some("Delete ~/work/build, last week's build files"),
+            "rm -rf ~/work/build"
+        ));
+        for bad in [
+            None,
+            Some(""),
+            Some("  "),
+            Some(command),
+            Some("env | grep -i proxy"),
+            Some("sudo apt install jq"),
+            Some("Run rm -rf on the build folder"),
+            Some("apt install jq"),
+            Some("Set $PATH"),
+        ] {
+            assert!(!is_plain_summary(bad, command), "{bad:?}");
+        }
+    }
 
     #[test]
     fn piped_install_scripts_are_refused() {

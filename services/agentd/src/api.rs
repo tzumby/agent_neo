@@ -52,7 +52,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/memory/{id}/confirm", post(confirm_memory))
         .route("/api/v1/memory/{id}/approve", post(confirm_memory))
         .route("/api/v1/memory/{id}/history", get(memory_history))
-        .route("/api/v1/schedules", get(schedules))
+        .route("/api/v1/schedules", get(schedules).post(add_schedule))
         .route("/api/v1/schedules/{id}", delete(delete_schedule))
         .route("/api/v1/schedules/{id}/pause", post(pause_schedule))
         .route("/api/v1/schedules/{id}/resume", post(resume_schedule))
@@ -693,6 +693,35 @@ async fn memory_history(State(agent): App, Path(id): Path<i64>) -> Response {
     match memory::history(&agent.store, id) {
         Ok(changes) => Json(json!({"history": changes})).into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct NewSchedule {
+    name: String,
+    prompt: String,
+    cron: String,
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    utc_offset: Option<i64>,
+}
+
+/// A repeating schedule set up in the web app (Setup's examples).
+async fn add_schedule(State(agent): App, headers: HeaderMap, Json(body): Json<NewSchedule>) -> Response {
+    let clock = match (body.timezone.as_deref(), body.utc_offset) {
+        (Some(timezone), Some(offset)) => crate::clock::UserClock::from_app(timezone, offset),
+        _ => None,
+    };
+    match agent.add_user_schedule(
+        &body.name,
+        &body.prompt,
+        &body.cron,
+        clock.as_ref(),
+        caller(&headers),
+    ) {
+        Ok(schedule) => Json(json!({"schedule": schedule})).into_response(),
+        Err(problem) => error(StatusCode::BAD_REQUEST, &problem),
     }
 }
 

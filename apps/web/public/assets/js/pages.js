@@ -366,14 +366,26 @@ export function mountUpdates(store, view) {
       });
       return tab;
     });
-    const copy = h("button", { class: "link-button", type: "button" }, "Copy the manifest");
-    copy.addEventListener("click", () => navigator.clipboard?.writeText(SLACK_MANIFEST).then(() => (copy.textContent = "Copied")));
+    const copy = h("button", { class: "link-button", type: "button" }, "copy the manifest");
+    copy.addEventListener("click", () => navigator.clipboard?.writeText(SLACK_MANIFEST).then(() => (copy.textContent = "copied")));
+    // Slack's own link format: its create-app flow with this manifest filled in.
+    const create = `https://api.slack.com/apps?new_app=1&manifest_yaml=${encodeURIComponent(SLACK_MANIFEST)}`;
     const help = kind === "slack"
-      ? h("ol", { class: "steps" },
-          h("li", null, "At ", h("a", { href: "https://api.slack.com/apps", target: "_blank", rel: "noopener noreferrer" }, "api.slack.com/apps"), ", choose Create New App, then From a manifest, and paste this. ", copy),
-          h("li", null, "Install the app to your workspace."),
-          h("li", null, "Under OAuth & Permissions, copy the Bot User OAuth Token (it starts with xoxb-) and paste it below."),
-          h("li", null, "For a private channel, invite the app there first: /invite @Security agent."))
+      ? h("div", { class: "setup" },
+          h("ol", { class: "steps" },
+            h("li", null,
+              h("a", { class: "button", href: create, target: "_blank", rel: "noopener noreferrer" }, "Create the Slack app", icon("external")),
+              h("span", { class: "block muted" }, "Slack opens with the app's settings filled in. Pick your workspace, choose Next, check the summary, then Create.")),
+            h("li", null, "Choose Install to Workspace, then Allow."),
+            h("li", null, "Under OAuth & Permissions, copy the Bot User OAuth Token (it starts with xoxb-) and paste it below."),
+            h("li", null, "For a private channel, invite the app there first: /invite @Security agent.")),
+          h("p", { class: "muted" },
+            "If Slack shows its plain “Create new app” dialog instead: under From scratch, choose Paste a manifest, and paste it (",
+            copy, "). The app only posts, so if Slack asks what it can respond to, add no events and continue."),
+          h("details", { class: "instructions" },
+            h("summary", null, "What the app can do"),
+            h("p", null, "Post messages (chat:write), including in public channels it hasn't been invited to (chat:write.public). It can't read messages, and nothing in Slack can call your desktop."),
+            h("pre", { class: "manifest" }, SLACK_MANIFEST)))
       : h("ol", { class: "steps" },
           h("li", null, "In the Teams channel, open its ⋯ menu and choose Workflows."),
           h("li", null, "Pick “Send webhook alerts to a channel”, name it, and choose the team and channel."),
@@ -421,5 +433,11 @@ export function mountUpdates(store, view) {
     return form;
   }
 
-  return { enter: load };
+  return {
+    enter: load,
+    /** From Setup: Slack or Teams already chosen. */
+    choose(choice) {
+      kind = choice;
+    },
+  };
 }

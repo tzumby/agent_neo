@@ -5,6 +5,7 @@
 import { api } from "./api.js";
 import { mountChat } from "./chat.js";
 import { mountDesktop, mountKeys, mountSchedules, mountSettings, mountUpdates } from "./pages.js";
+import { mountSetup } from "./setup.js";
 import { Store } from "./store.js";
 
 const store = new Store(api);
@@ -15,6 +16,7 @@ const session = { email: "", sign_out: "" };
 
 const views = {
   chat: { el: $("#view-chat"), title: "Chat" },
+  setup: { el: $("#view-setup"), title: "Setup" },
   desktop: { el: $("#view-desktop"), title: "Desktop" },
   schedules: { el: $("#view-schedules"), title: "Schedules" },
   updates: { el: $("#view-updates"), title: "Updates" },
@@ -23,10 +25,34 @@ const views = {
 };
 
 const keys = mountKeys(store, views.keys.el);
+const updates = mountUpdates(store, views.updates.el);
+const openUpdates = (kind) => {
+  updates.choose(kind);
+  location.hash = "#/updates";
+};
+const openChat = () => (location.hash = "#/chat");
+// The Setup page, and the same cards in an empty chat until they're done.
+const showProgress = (done, total) => {
+  const progress = $("#nav-setup-progress");
+  progress.textContent = `${done} of ${total}`;
+  progress.hidden = done === total;
+};
+const setup = mountSetup(store, views.setup.el.querySelector(".page-body"), { openUpdates, openChat, onProgress: showProgress });
+const firstRun = mountSetup(store, $(".empty-setup"), {
+  openUpdates,
+  openChat,
+  intro: true,
+  onProgress: (done, total) => {
+    showProgress(done, total);
+    $(".empty-setup").hidden = done === total;
+    $(".empty-suggest").hidden = done !== total;
+  },
+});
 const pages = {
+  setup,
   desktop: mountDesktop(store, views.desktop.el),
   schedules: mountSchedules(store, views.schedules.el),
-  updates: mountUpdates(store, views.updates.el),
+  updates,
   keys,
   settings: mountSettings(store, views.settings.el, session),
 };
@@ -55,7 +81,10 @@ function route() {
   document.body.classList.remove("nav-open");
   current = next;
   pages[next]?.enter?.();
-  if (next === "chat") $(".composer textarea").focus({ preventScroll: true });
+  if (next === "chat") {
+    $(".composer textarea").focus({ preventScroll: true });
+    if (store.connection === "live") firstRun.refresh();
+  }
 }
 window.addEventListener("hashchange", route);
 $("#menu").addEventListener("click", () => document.body.classList.toggle("nav-open"));
@@ -73,6 +102,15 @@ const STAGES = {
   scheduled: ["A schedule is due", "idle"],
   idle: ["Ready", "idle"],
 };
+
+// The first-run cards, once the desktop answers.
+let setupLoaded = false;
+store.subscribe(() => {
+  if (!setupLoaded && store.connection === "live") {
+    setupLoaded = true;
+    firstRun.refresh();
+  }
+});
 
 store.subscribe(() => {
   const status = store.status;

@@ -150,6 +150,13 @@ an update. Only the user can add a destination, in the app."
     )
 }
 
+/// Added to the prompt when no destination is set up: the user does it in
+/// the web app, never the agent (and its shell can't reach Slack anyway).
+pub const NO_UPDATES_RULE: &str = "\n\n- Slack and Teams: no channel is set up for your updates yet. If the user \
+wants you to post to Slack or Teams, tell them to add the channel in the web app under Updates, which walks them \
+through creating the Slack app (or the Teams workflow) and sends a test. Don't set it up yourself: don't call \
+Slack's or Teams' APIs from the shell or the browser, and never ask for a token in the chat.";
+
 /// post_update, offered only when there are destinations: their names.
 pub fn post_update_tool(names: &[String]) -> Value {
     tool(

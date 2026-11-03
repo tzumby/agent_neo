@@ -942,6 +942,8 @@ impl Agent {
                 .map(|d| format!("- {}: {}\n", d.name, d.describe()))
                 .collect();
             prompt.push_str(&tools::updates_rule(&listing));
+        } else {
+            prompt.push_str(tools::NO_UPDATES_RULE);
         }
         state.messages[0] = json!({"role": "system", "content": prompt});
         let mut browser = Browser::new(self.cdp.clone(), state.allow_actions, self.policy.clone());
@@ -994,6 +996,14 @@ impl Agent {
                     }
                     Some(command) if name == "run_shell" && guard::is_shell_schedule(command) => {
                         Some(guard::SHELL_SCHEDULE_REFUSAL.to_string())
+                    }
+                    // Not even with approval: the egress controls, and Slack's or
+                    // Teams' APIs around post_update.
+                    Some(command) if name == "run_shell" && guard::touches_egress_policy(command) => {
+                        Some(guard::EGRESS_REFUSAL.to_string())
+                    }
+                    Some(command) if name == "run_shell" && guard::calls_messaging_api(command) => {
+                        Some(guard::MESSAGING_API_REFUSAL.to_string())
                     }
                     Some(command) if name == "run_shell" && guard::is_bare_date(command) => Some(format!(
                         "not run: you don't need the shell for the date. It's now {now} for the user; \
@@ -1760,6 +1770,58 @@ impl Agent {
         ))
     }
 
+    /// A repeating schedule a person sets up in the web app (Setup's
+    /// examples): the same limits as schedule_task, no card (they chose it).
+    /// The app sends its time zone, remembered as a message's is.
+    pub fn add_user_schedule(
+        &self,
+        name: &str,
+        prompt: &str,
+        cron: &str,
+        clock: Option<&UserClock>,
+        by: Option<String>,
+    ) -> Result<Value, String> {
+        let (name, prompt) = (name.trim(), prompt.trim());
+        if name.is_empty() || prompt.is_empty() || cron.trim().is_empty() {
+            return Err("a schedule needs a name, a prompt and when it runs".into());
+        }
+        let prompt: String = prompt.chars().take(SCHEDULE_PROMPT_MAX_CHARS).collect();
+        let name: String = name.chars().take(SCHEDULE_NAME_MAX_CHARS).collect();
+        let existing = self.store.schedules().map_err(|e| e.to_string())?;
+        if existing.len() >= schedule::MAX_SCHEDULES {
+            return Err(format!(
+                "there are already {} schedules; cancel one first",
+                schedule::MAX_SCHEDULES
+            ));
+        }
+        if existing.iter().any(|s| s.name == name) {
+            return Err(format!("there's already a schedule named “{name}”"));
+        }
+        if let Some(clock) = clock {
+            self.set_user_clock(clock);
+        }
+        let timezone = self.user_clock().timezone;
+        let timing = schedule::plan(Some(cron.trim()), None, &timezone, jiff::Timestamp::now())?;
+        let saved = self
+            .store
+            .add_schedule(&name, &prompt, timing.cron.as_deref(), &timezone, timing.next_run)
+            .map_err(|e| e.to_string())?;
+        self.store
+            .set_schedule_origin(saved.id, &self.policy_version(), "user")
+            .map_err(|e| e.to_string())?;
+        let saved = self
+            .store
+            .schedule(saved.id)
+            .map_err(|e| e.to_string())?
+            .unwrap_or(saved);
+        self.schedules_changed.notify_one();
+        let mut event = schedule::json(&saved);
+        event["by"] = json!(by);
+        self.emit("schedule.created", event.clone());
+        tracing::info!(schedule = saved.id, by = ?by, "schedule created in the app");
+        Ok(event)
+    }
+
     /// Asks the user for a key or token: the task parks while they paste it
     /// into the app (or decline), and resumes knowing only its name.
     fn request_secret(
@@ -1874,6 +1936,11 @@ impl Agent {
         } else {
             None
         };
+        // The user decides on the model's plain words, so a card isn't shown
+        // without them: the model is asked again (nothing is logged or shown).
+        if reason.is_some() && resumed.is_none() && !guard::is_plain_summary(summary, command) {
+            return Ok(guard::SUMMARY_REFUSAL.to_string());
+        }
         // A resumed command's terminal card is already showing, waiting on the approval.
         if resumed.is_none() {
             self.emit(
@@ -2552,6 +2619,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_command_without_plain_words_is_sent_back_not_shown() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        for summary in [None, Some("sudo apt install jq"), Some("env | grep -i proxy")] {
+            let reply = agent
+                .run_shell(
+                    "t5",
+                    "sudo apt install -y jq",
+                    summary,
+                    &[],
+                    10,
+                    false,
+                    None,
+                    &mut cancel,
+                )
+                .await
+                .unwrap();
+            assert!(
+                reply.starts_with("not run: this command needs the user's OK"),
+                "{reply}"
+            );
+        }
+        // Nothing reached the user: no card, not even the command.
+        assert!(events(&agent, "shell").is_empty() && events(&agent, "approval.requested").is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_command_card_leads_with_plain_words() {
         let (agent, dir) = test_agent();
         let (_stop, mut cancel) = watch::channel(false);
@@ -3068,5 +3163,56 @@ mod destination_tests {
             !events.contains("webhooksecretvalue") && events.contains("update.failed"),
             "{events}"
         );
+    }
+}
+
+#[cfg(test)]
+mod setup_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn the_app_sets_up_schedules_within_the_same_limits() {
+        let (agent, dir) = test_agent();
+        let clock = UserClock::from_app("America/Toronto", -18000).unwrap();
+        let made = agent
+            .add_user_schedule(
+                "Morning security report",
+                "Summarize the last 24 hours of Cloudflare security events.",
+                "0 8 * * 1-5",
+                Some(&clock),
+                Some("me@acme.com".into()),
+            )
+            .unwrap();
+        assert_eq!(made["name"], "Morning security report");
+        assert_eq!(made["timezone"], "America/Toronto");
+        assert_eq!(
+            agent.user_clock().timezone,
+            "America/Toronto",
+            "remembered, as a message's is"
+        );
+        let too_often = agent
+            .add_user_schedule("Every minute", "x", "* * * * *", None, None)
+            .unwrap_err();
+        assert!(too_often.contains("15 minutes"), "{too_often}");
+        assert!(
+            agent
+                .add_user_schedule("Morning security report", "y", "0 9 * * *", None, None)
+                .unwrap_err()
+                .contains("already")
+        );
+        assert!(
+            agent
+                .add_user_schedule("Bad", "y", "not a cron", None, None)
+                .is_err()
+        );
+        assert!(agent.add_user_schedule("", "y", "0 9 * * *", None, None).is_err());
+        assert_eq!(agent.store.schedules().unwrap().len(), 1);
+        let created = agent.store.events_after(0, 100).unwrap();
+        assert!(
+            created
+                .iter()
+                .any(|e| e.kind == "schedule.created" && e.data["by"] == "me@acme.com")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

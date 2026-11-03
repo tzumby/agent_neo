@@ -92,9 +92,36 @@ async def main(out):
             await p.call("Page.navigate", url=APP)
             p.check(await p.until("document.querySelector('#view-chat').classList.contains('is-ready')"), "the chat opens")
             p.check(await p.js("document.documentElement.dataset.theme") == "light", "light by default")
-            at_end = await p.js("(() => { const s = document.querySelector('.chat-scroll'); return s.scrollHeight - s.scrollTop - s.clientHeight < 80; })()")
-            p.check(at_end, "at its end, as it appears")
+            rows = await p.js("document.querySelectorAll('.rows > li').length")
+            if rows:
+                at_end = await p.js("(() => { const s = document.querySelector('.chat-scroll'); return s.scrollHeight - s.scrollTop - s.clientHeight < 80; })()")
+                p.check(at_end, "at its end, as it appears")
+            else:
+                await asyncio.sleep(0.5)
+                p.check(await p.js("document.querySelector('.chat-scroll').scrollTop") == 0, "an empty chat opens at the top of its guide")
             p.check(await p.js("document.querySelector('#who').textContent") == "you@example.com", "signed in as the Access user")
+
+            # First run: the setup cards in the empty chat (a fresh desktop only).
+            fresh = await p.until("!document.querySelector('.empty-setup').hidden && !!document.querySelector('.empty-setup .setup-step')", 5)
+            if fresh:
+                p.check(await p.js("document.querySelectorAll('.empty-setup .setup-step').length") == 4, "a fresh desktop opens on the four setup steps")
+                await p.shot(f"{out}/smoke-setup.png")
+                await p.js("""(() => { const f = [...document.querySelectorAll('.empty-setup form')].find(f => f.querySelector('[aria-label="Cloudflare API token"]'));
+                    f.querySelector('[aria-label="Cloudflare API token"]').value = 'cf-test-token-123456789'; f.querySelector('button[type=submit]').click(); })()""")
+                p.check(await p.until("document.querySelectorAll('.empty-setup .setup-step.is-done').length >= 1"), "Cloudflare's token is saved from its card")
+                await p.js("""(() => { const f = [...document.querySelectorAll('.empty-setup form')].find(f => f.querySelector('[aria-label="Datadog API key"]'));
+                    f.querySelector('[aria-label="Datadog site"]').value = 'datadoghq.eu';
+                    f.querySelector('[aria-label="Datadog API key"]').value = 'dd-api-key-test-1234';
+                    f.querySelector('[aria-label="Datadog application key"]').value = 'dd-app-key-test-5678';
+                    f.querySelector('button[type=submit]').click(); })()""")
+                p.check(await p.until("document.querySelectorAll('.empty-setup .setup-step.is-done').length >= 2"), "Datadog's keys are saved from its card")
+                await p.js("[...document.querySelectorAll('.empty-setup .setup-examples .list-row')].find(r => r.textContent.includes('Attack spike watch')).querySelector('button').click()")
+                p.check(await p.until("[...document.querySelectorAll('.empty-setup .setup-examples button')].some(b => b.textContent === 'Added')"), "a suggested check is added in one go")
+                schedules = await p.js("fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules.map(s => s.name + '|' + s.description))")
+                p.check(any(s.startswith("Attack spike watch|") for s in schedules), "…as a schedule on the desktop")
+                labels = await p.js("fetch('/api/v1/secrets').then(r => r.json()).then(d => d.secrets.map(s => s.label))")
+                p.check("Datadog API key (site datadoghq.eu)" in labels, "the Datadog site is in the keys' labels, for the agent")
+                p.check(await p.js("!document.body.innerHTML.includes('dd-api-key-test') && !document.body.innerHTML.includes('cf-test-token')"), "no key is on the page")
 
             rows = await p.js("document.querySelectorAll('.rows > li').length")
             await p.js("""(() => { const t = document.querySelector('.composer textarea');
@@ -165,6 +192,10 @@ async def main(out):
                 await asyncio.sleep(0.8)
                 await p.shot(f"{out}/smoke-{page}.png")
             p.check(await p.js("!!document.querySelector('.desk-frame iframe')"), "the desktop view embeds the viewer")
+            await p.js("location.hash = '#/setup'")
+            p.check(await p.until("document.querySelectorAll('#view-setup .setup-step').length === 4"), "the Setup page lists the four steps")
+            if fresh:
+                p.check(await p.until("document.querySelectorAll('#view-setup .setup-step.is-done').length === 4 && document.querySelector('#nav-setup-progress').hidden"), "…all done after this run")
             await p.js("location.hash = '#/settings'")
             await p.until("!!document.querySelector('#view-settings select')")
             set_theme = """(value) => { const s = [...document.querySelectorAll('#view-settings select')]

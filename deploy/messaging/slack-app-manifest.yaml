@@ -1,9 +1,12 @@
 # The Slack app the agent posts updates with (docs/architecture.md §6.20).
-# The customer creates it in their workspace: api.slack.com/apps → Create New
-# App → From a manifest → this. Install it, then copy the Bot User OAuth Token
-# (xoxb-…) into the agent's web app: Updates → Add Slack. They own the app and
-# can remove it at any time. Posting only: no reading, no events, no Socket
-# Mode, nothing that calls in. The web app shows this same text to copy.
+# The customer creates it in their workspace, from the web app's Updates page:
+# "Create the Slack app" opens api.slack.com/apps?new_app=1&manifest_yaml=…
+# with this filled in (pick the workspace, Next, Create). Without the link:
+# Create New App → From scratch → Paste a manifest → this. Then Install to
+# Workspace, and copy the Bot User OAuth Token (xoxb-…) into Updates. They own
+# the app and can remove it at any time. Posting only: no reading, no events
+# (if Slack asks what it can respond to, add none), no Socket Mode, nothing
+# that calls in. Keep in step with SLACK_MANIFEST in apps/web/public/assets/js/pages.js.
 display_information:
   name: Security agent
   description: Posts updates from your agent's desktop to your channels.

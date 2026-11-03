@@ -12,7 +12,12 @@ pub struct Config {
     pub listen: String,
     /// Only for local development: on desktops, model calls go through the
     /// model gateway and no key is here. Never printed (Debug shows [REDACTED]).
-    pub together_api_key: Option<SecretString>,
+    /// LLM_API_KEY, else TOGETHER_API_KEY.
+    pub api_key: Option<SecretString>,
+    /// Only for local development, with the key above: an OpenAI-compatible
+    /// chat completions URL (default Together's; the evals use Bedrock's).
+    /// Ignored when GATEWAY_URL is set: the gateway is then the only way out.
+    pub llm_url: String,
     /// The attested model gateway (https://<address>:8443). When set, model
     /// calls go only there, after its attestation checks out.
     pub gateway_url: String,
@@ -23,6 +28,8 @@ pub struct Config {
     /// For the identity proof (STS in this region).
     pub aws_region: String,
     pub model: String,
+    /// Memory tidy-up's model when the user hasn't picked one.
+    pub consolidation_model: String,
     pub cdp_url: String,
     pub state_dir: PathBuf,
     pub workdir: PathBuf,
@@ -84,9 +91,11 @@ impl Config {
                 .or_else(|| kv.get(key).cloned())
                 .unwrap_or_else(|| default.to_string())
         };
-        let together_api_key = get("TOGETHER_API_KEY", "");
+        let api_key = Some(get("LLM_API_KEY", ""))
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| get("TOGETHER_API_KEY", ""));
         let gateway_url = get("GATEWAY_URL", "");
-        if together_api_key.is_empty() && gateway_url.is_empty() {
+        if api_key.is_empty() && gateway_url.is_empty() {
             bail!("set GATEWAY_URL (or TOGETHER_API_KEY for local development)");
         }
         let gateway_measurements = if gateway_url.is_empty() {
@@ -97,12 +106,14 @@ impl Config {
         };
         Ok(Self {
             listen: get("LISTEN", "unix:/run/agentd/agentd.sock"),
-            together_api_key: (!together_api_key.is_empty()).then(|| together_api_key.into()),
+            api_key: (!api_key.is_empty()).then(|| api_key.into()),
+            llm_url: get("LLM_URL", crate::llm::TOGETHER_URL),
             gateway_url,
             gateway_measurements,
             gateway_audience: get("GATEWAY_AUDIENCE", "cloud-desktops/model-gateway"),
             aws_region: get("AWS_REGION", "ca-central-1"),
             model: get("MODEL", "zai-org/GLM-5.3"),
+            consolidation_model: get("CONSOLIDATION_MODEL", crate::consolidate::DEFAULT_MODEL),
             cdp_url: get("CDP_URL", "http://127.0.0.1:9222"),
             state_dir: get("STATE_DIR", "/var/lib/agentd").into(),
             workdir: get("WORKDIR", "/home/worker/work").into(),

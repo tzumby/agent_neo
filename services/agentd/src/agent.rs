@@ -368,7 +368,7 @@ impl Agent {
             // On by default: writing and sending in the browser ask first.
             allow_actions: get("allow_actions").as_deref() != Some("false"),
             memory_consolidation: crate::consolidate::mode(&self.store).name().to_string(),
-            memory_consolidation_model: crate::consolidate::model(&self.store),
+            memory_consolidation_model: crate::consolidate::model(&self.store, &self.cfg.consolidation_model),
             memory_consolidation_daily_cap_usd: crate::consolidate::daily_cap(&self.store),
         }
     }
@@ -2171,12 +2171,14 @@ pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
     std::fs::create_dir_all(dir.join("images")).unwrap();
     let cfg = Config {
         listen: "127.0.0.1:0".into(),
-        together_api_key: Some("test-key-not-used".to_string().into()),
+        api_key: Some("test-key-not-used".to_string().into()),
+        llm_url: crate::llm::TOGETHER_URL.into(),
         gateway_url: String::new(),
         gateway_measurements: Vec::new(),
         gateway_audience: String::new(),
         aws_region: "ca-central-1".into(),
         model: "zai-org/GLM-5.3".into(),
+        consolidation_model: crate::consolidate::DEFAULT_MODEL.into(),
         cdp_url: "http://127.0.0.1:1".into(),
         state_dir: dir.clone(),
         workdir: dir.clone(),

@@ -466,7 +466,10 @@ A second Tailscale account of the operator's (`tzumby.github`), kept for testers
 | `GATEWAY_AUDIENCE` | `cloud-desktops/model-gateway` | Signed into the desktop's identity proofs |
 | `AWS_REGION` | `ca-central-1` | For STS identity proofs |
 | `TOGETHER_API_KEY` | (none) | Local development only; held as `secrecy::SecretString`, never printed |
+| `LLM_URL` | Together's chat completions URL | Local development only (ignored with `GATEWAY_URL`): another OpenAI-compatible endpoint, such as Bedrock's for the evals |
+| `LLM_API_KEY` | `TOGETHER_API_KEY` | Local development only: the key for `LLM_URL` |
 | `MODEL` | `zai-org/GLM-5.3` | Default model (the app can change it) |
+| `CONSOLIDATION_MODEL` | `zai-org/GLM-5.3-Flash` | Memory tidy-up's model until the user picks one (the evals set it for Bedrock) |
 | `CDP_URL` | `http://127.0.0.1:9222` | Chrome DevTools endpoint |
 | `STATE_DIR` | `/var/lib/agentd` | SQLite, images, saved keys |
 | `WORKDIR` | `/home/worker/work` | Where shell commands start |
@@ -1651,7 +1654,7 @@ The same screens as the iPhone's, in Mac form:
 | `galaxy` | Ansible collections (`amazon.aws` 11.x, `community.general` ≥ 12) |
 | `desktop` | `common` + `desktop` roles on running desktops |
 | `agentd-test`, `agentd-build`, `agentd-deploy`, `agentd-logs` | agentd: fmt/clippy/tests; static build for `DESKTOP_ARCH`; deploy (copies the database first when the version changes); `journalctl -u agentd` over SSM |
-| `agentd-evals` | Memory evals on the Mac: a local agentd against Together, headless Chrome, shell tool off, 41 scripted conversations with assertions (scheduled runs, restarts, real consolidations) (`services/agentd/evals`; results in [memory-v2.md](memory-v2.md) §19). Reports recall@8, the false-memory rate, staleness, the `report_outcome` missing rate and cost per scenario; `--compare OLD NEW` lines two result files up. About $0.30 a run; `MEMORY_V2=on\|off`, `SCENARIO=a,b` |
+| `agentd-evals` | Memory evals on the Mac: a local agentd against Together, headless Chrome, shell tool off, 41 scripted conversations with assertions (scheduled runs, restarts, real consolidations) (`services/agentd/evals`; results in [memory-v2.md](memory-v2.md) §19). Reports recall@8, the false-memory rate, staleness, the `report_outcome` missing rate and cost per scenario; `--compare OLD NEW` lines two result files up. About $0.30 a run; `MEMORY_V2=on\|off`, `SCENARIO=a,b`, `MODEL=id`; `PROVIDER=bedrock [BEDROCK_REGION=us-east-1]` runs against Bedrock's OpenAI-compatible endpoint with a short-term Bedrock key from your AWS credentials, tidy-up on the same model (for comparing models only: desktops call Together through the gateway) |
 | `agentd-soak` | Memory v2 soak report for the desktop, read-only over SSM (`scripts/agentd-soak.py`): phase 6's exit criteria (effect failures, consolidation under the daily cap, consolidations that didn't finish, days of soak), then tasks, scheduled runs and costs by day, and counts from the journal. Only counts and costs leave the desktop. `SINCE=YYYY-MM-DD`, the day the soak started |
 | `gatewayd-test`, `gatewayd-build`, `gateway-image` | gatewayd tests; static arm64 build; build an attestable AMI and publish its measurements |
 | `tailnet-build`, `tailnet-deploy` | tailnet-proxy |

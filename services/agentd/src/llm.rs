@@ -1,6 +1,7 @@
 //! Together AI chat completions (OpenAI-compatible API): through the attested
 //! model gateway (production: the desktop holds no API key), or directly with
-//! a key (local development).
+//! a key (local development: Together, or another OpenAI-compatible endpoint
+//! at LLM_URL, such as Bedrock's for the evals).
 
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use crate::gateway::AttestedGateway;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const API_URL: &str = "https://api.together.ai/v1/chat/completions";
+pub const TOGETHER_URL: &str = "https://api.together.ai/v1/chat/completions";
 const RETRYABLE: [u16; 5] = [429, 500, 502, 503, 504];
 /// Never wait longer than this between retries, whatever Retry-After says.
 const MAX_RETRY_DELAY_SECS: u64 = 30;
@@ -27,6 +28,10 @@ pub fn prices(model: &str) -> Option<(f64, f64, f64)> {
         "moonshotai/Kimi-K3" => Some((3.00, 0.30, 15.00)),
         "deepseek-ai/DeepSeek-V4-Pro-0813" => Some((1.32, 0.13, 3.96)),
         "deepseek-ai/DeepSeek-V4.1-Flash-1017" => Some((0.30, 0.006, 1.20)),
+        // Bedrock us-east-1 (AWS Price List, 2026-11-02; no cached-input
+        // price). Only for the evals (LLM_URL): not in KNOWN_MODELS, and the
+        // gateway calls Together.
+        "zai.glm-4.7-flash" => Some((0.07, 0.07, 0.40)),
         _ => None,
     }
 }
@@ -72,6 +77,7 @@ enum Backend {
     Direct {
         http: reqwest::Client,
         api_key: SecretString,
+        url: String,
     },
 }
 
@@ -87,13 +93,17 @@ impl Together {
                 cfg.gateway_measurements.clone(),
                 Duration::from_secs(200),
             )?))
-        } else if let Some(api_key) = cfg.together_api_key.clone() {
+        } else if let Some(api_key) = cfg.api_key.clone() {
             let http = reqwest::Client::builder()
                 // Cloudflare in front of the API rejects some default User-Agents (error 1010).
                 .user_agent("cloud-desktops-agentd/0.1")
                 .timeout(Duration::from_secs(180))
                 .build()?;
-            Backend::Direct { http, api_key }
+            Backend::Direct {
+                http,
+                api_key,
+                url: cfg.llm_url.clone(),
+            }
         } else {
             bail!("set GATEWAY_URL (or TOGETHER_API_KEY for local development)");
         };
@@ -103,8 +113,8 @@ impl Together {
     async fn send(&self, body: &Value) -> Result<reqwest::Response> {
         match &self.backend {
             Backend::Attested(gateway) => gateway.chat(&serde_json::to_vec(body)?).await,
-            Backend::Direct { http, api_key } => Ok(http
-                .post(API_URL)
+            Backend::Direct { http, api_key, url } => Ok(http
+                .post(url)
                 .bearer_auth(api_key.expose_secret())
                 .json(body)
                 .send()

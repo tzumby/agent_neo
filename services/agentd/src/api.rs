@@ -552,7 +552,11 @@ async fn consolidation(State(agent): App) -> Response {
     if !agent.cfg.memory_v2 {
         return v2_off();
     }
-    Json(crate::consolidate::stats(&agent.store)).into_response()
+    Json(crate::consolidate::stats(
+        &agent.store,
+        &agent.cfg.consolidation_model,
+    ))
+    .into_response()
 }
 
 /// Memory v2's endpoints answer this while the flag is off.

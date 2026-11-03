@@ -1,17 +1,21 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = ["aws-bedrock-token-generator==1.1.0"]
 # ///
 """Memory evals for agentd (docs/memory-v2.md §16): scripted conversations
 against a local agentd that calls Together directly, with assertions.
 
-    make agentd-evals [MEMORY_V2=on|off] [SCENARIO=name]
+    make agentd-evals [MEMORY_V2=on|off] [SCENARIO=name] [MODEL=id]
+    make agentd-evals MODEL=zai.glm-4.7-flash PROVIDER=bedrock [BEDROCK_REGION=us-east-1]
     evals/run.py --compare OLD.json NEW.json
 
 Each scenario runs against a fresh agentd: its own state directory, headless
 Chrome with a throwaway profile, the shell tool OFF (commands would run on
-this Mac), and TOGETHER_API_KEY from the environment. Steps:
+this Mac), and TOGETHER_API_KEY from the environment. With --provider
+bedrock, agentd calls Bedrock's OpenAI-compatible endpoint instead, with a
+short-term Bedrock API key made from your AWS credentials, and memory tidy-up
+uses the same model (CONSOLIDATION_MODEL). Steps:
 
     {"say": "..."}                 a message; waits for the task to end, which
                                    must be done (or one of "ok_status": [...]).
@@ -121,7 +125,7 @@ def wait_until(check, timeout: float, what: str):
 class Desktop:
     """A local agentd with its own headless Chrome and state."""
 
-    def __init__(self, agentd: Path, memory_v2: str, model: str, key: str):
+    def __init__(self, agentd: Path, memory_v2: str, model: str, llm: dict):
         self.dir = Path(tempfile.mkdtemp(prefix="agentd-eval-"))
         self.binary = agentd
         cdp, port = free_port(), free_port()
@@ -135,7 +139,7 @@ class Desktop:
         self.env = {
             "PATH": os.environ.get("PATH", ""),
             "HOME": str(self.dir),
-            "TOGETHER_API_KEY": key,
+            **llm,
             "LISTEN": f"127.0.0.1:{port}",
             "STATE_DIR": str(self.dir / "state"),
             "CDP_URL": f"http://127.0.0.1:{cdp}",
@@ -423,10 +427,10 @@ def errands(count: int, shift: int) -> list[tuple[str, str]]:
     return tasks
 
 
-def run(scenario: dict, args, key: str) -> dict:
+def run(scenario: dict, args, llm: dict) -> dict:
     started = time.time()
     v2 = args.memory_v2 == "on"
-    desktop = Desktop(args.agentd, args.memory_v2, args.model, key)
+    desktop = Desktop(args.agentd, args.memory_v2, args.model, llm)
     result = {
         "name": scenario["name"], "measures": scenario.get("measures"), "passed": True, "problems": [],
         "steps": 0, "cost": 0.0, "tasks": [], "recalled": [], "scheduled_runs": 0, "outcome_missing": 0,
@@ -582,11 +586,34 @@ def compare(old_path: Path, new_path: Path):
     print(f"\n{regressions} scenario(s) worse")
 
 
+def bedrock(region: str, model: str) -> dict:
+    """agentd's settings for Bedrock's OpenAI-compatible endpoint. The key is
+    a short-term Bedrock API key signed with your AWS credentials (the AWS
+    profile's; it needs bedrock:CallWithBearerToken and InvokeModel), valid
+    for 4 hours, and never printed. Memory tidy-up uses the same model, so
+    every model call of the run goes to it."""
+    from datetime import timedelta
+
+    from aws_bedrock_token_generator import provide_token
+
+    try:
+        key = provide_token(region=region, expiry=timedelta(hours=4))
+    except (RuntimeError, ValueError) as err:
+        sys.exit(f"No Bedrock key: {err}")
+    return {
+        "LLM_URL": f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1/chat/completions",
+        "LLM_API_KEY": key,
+        "CONSOLIDATION_MODEL": model,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--agentd", type=Path, help="the agentd binary to test")
     parser.add_argument("--memory-v2", choices=["on", "off"], default="off")
     parser.add_argument("--model", default="zai-org/GLM-5.3")
+    parser.add_argument("--provider", choices=["together", "bedrock"], default="together")
+    parser.add_argument("--region", default="us-east-1", help="Bedrock's region (--provider bedrock)")
     parser.add_argument("--scenario", default="", help="run only these (comma-separated)")
     parser.add_argument("--keep", action="store_true", help="keep a failed scenario's state and logs")
     parser.add_argument("--compare", nargs=2, type=Path, metavar=("OLD", "NEW"), help="compare two result files")
@@ -597,9 +624,12 @@ def main():
         return
     if not args.agentd:
         sys.exit("--agentd is required")
-    key = os.environ.get("TOGETHER_API_KEY", "")
-    if not key:
-        sys.exit("TOGETHER_API_KEY isn't set (make agentd-evals reads it from SSM)")
+    if args.provider == "bedrock":
+        llm = bedrock(args.region, args.model)
+    else:
+        llm = {"TOGETHER_API_KEY": os.environ.get("TOGETHER_API_KEY", "")}
+        if not llm["TOGETHER_API_KEY"]:
+            sys.exit("TOGETHER_API_KEY isn't set (make agentd-evals reads it from SSM)")
     if not Path(CHROME).exists():
         sys.exit(f"Chrome isn't at {CHROME}")
     scenarios = json.loads((HERE / "scenarios.json").read_text())
@@ -612,7 +642,7 @@ def main():
     results = []
     for scenario in scenarios:
         print(f"… {scenario['name']}", flush=True)
-        result = run(scenario, args, key)
+        result = run(scenario, args, llm)
         results.append(result)
         mark = "pass" if result["passed"] else "FAIL"
         print(f"{mark} {result['name']}: {result['steps']} steps, {result['seconds']}s, ${result['cost']:.4f}")
@@ -631,7 +661,8 @@ def main():
 
     passed = sum(r["passed"] for r in results)
     cost = sum(r["cost"] for r in results)
-    print(f"\n{passed}/{len(results)} passed, ${cost:.4f}, MEMORY_V2={args.memory_v2}, {args.model}")
+    where = f" on Bedrock {args.region}" if args.provider == "bedrock" else ""
+    print(f"\n{passed}/{len(results)} passed, ${cost:.4f}, MEMORY_V2={args.memory_v2}, {args.model}{where}")
     numbers = rates(results)
     print_rates(numbers)
     out = HERE / "results"
@@ -639,7 +670,9 @@ def main():
     stamp = time.strftime("%Y%m%dT%H%M%S")
     path = out / f"{stamp}-memory-v2-{args.memory_v2}.json"
     path.write_text(json.dumps(
-        {"memory_v2": args.memory_v2, "model": args.model, "rates": numbers, "results": results}, indent=2
+        {"memory_v2": args.memory_v2, "model": args.model, "provider": args.provider,
+         **({"region": args.region} if args.provider == "bedrock" else {}),
+         "rates": numbers, "results": results}, indent=2
     ))
     print(f"results: {path}")
 

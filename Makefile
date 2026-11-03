@@ -90,12 +90,13 @@ agentd-build: ## Build agentd for the desktop (static linux binary for DESKTOP_A
 agentd-deploy: agentd-build ## Install agentd on running desktops (LIMIT= or DESKTOP= for one)
 	$(ANSIBLE_PLAYBOOK) playbooks/agentd.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
-agentd-evals: ## Memory evals on this Mac against Together (cents per scenario): MEMORY_V2=on|off SCENARIO=name MODEL=id
+agentd-evals: ## Memory evals on this Mac (cents per scenario): MEMORY_V2=on|off SCENARIO=name MODEL=id PROVIDER=together|bedrock
 	cd services/agentd && cargo build --quiet
-	TOGETHER_API_KEY="$${TOGETHER_API_KEY:-$$(aws ssm get-parameter --name /cloud-desktops/$(ENV)/llm/together_api_key \
-	  --with-decryption --query Parameter.Value --output text)}" \
+	$(if $(filter bedrock,$(PROVIDER)),,TOGETHER_API_KEY="$${TOGETHER_API_KEY:-$$(aws ssm get-parameter --name /cloud-desktops/$(ENV)/llm/together_api_key \
+	  --with-decryption --query Parameter.Value --output text)}") \
 	  services/agentd/evals/run.py --agentd services/agentd/target/debug/agentd \
-	  --memory-v2 $(or $(MEMORY_V2),off) $(if $(SCENARIO),--scenario $(SCENARIO)) $(if $(MODEL),--model $(MODEL))
+	  --memory-v2 $(or $(MEMORY_V2),off) $(if $(SCENARIO),--scenario $(SCENARIO)) $(if $(MODEL),--model $(MODEL)) \
+	  $(if $(PROVIDER),--provider $(PROVIDER)) $(if $(BEDROCK_REGION),--region $(BEDROCK_REGION))
 
 agentd-soak: ## Memory v2 soak report for the desktop (read-only): SINCE=YYYY-MM-DD, the day the soak started
 	scripts/agentd-soak.py $(INSTANCE) $(if $(SINCE),--since $(SINCE))

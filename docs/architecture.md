@@ -125,7 +125,8 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
 | `services/gatewayd/` | The attested model gateway (Rust) |
 | `services/push-relay/` | The push relay (Node.js) and its tests |
 | `services/tailnet-proxy/` | The tailnet node (Go, tsnet) |
-| `services/front-door/` | A customer deployment's way in: checks the Cloudflare Access token, then agentd's API or noVNC (Go) |
+| `services/front-door/` | A customer deployment's way in: checks the Cloudflare Access token, then the web app, agentd's API or noVNC (Go); `devedge/` stands in for Access on a Mac |
+| `apps/web/` | The web app for customer deployments (`public/`: static HTML, CSS, ES modules), its tests and the Mac dev stack (`dev/`) |
 | `images/gateway/` | The gateway's KIWI-NG image description (Amazon Linux 2023, attestable) |
 | `scripts/` | `put-secret.py`, `put-apns-key.py` (hidden input → SSM), `build-gateway-image.sh`, `new-customer-env.sh`, `customer-preflight.sh`, `browser.py` (drive the desktop's Chrome from the Mac over `make cdp`) |
 | `apps/apple/` | The iPhone and Mac apps (`CloudDesktop/`: shared screens, `iOS/`, `macOS/`), shared `DesktopKit` package, XcodeGen `project.yml`, scripts |
@@ -468,7 +469,13 @@ A customer deployment ([customer-cloud.md](customer-cloud.md)) runs `terraform/s
 - **front-door** (`services/front-door`, Go, `github.com/coreos/go-oidc/v3`):
   - Every request needs `Cf-Access-Jwt-Assertion`. It's verified against `https://<team>/cdn-cgi/access/certs` (RS256), with the team as the issuer and the Access app's AUD tag as the audience, and it mustn't have expired.
   - It must carry an `email`, which rules out service tokens, and the email must be on the optional allow list (emails or `@domain`).
-  - Then front-door deletes incoming `X-Agent-*` and `X-Tailscale-*`, the token and the `Cookie` header. `/api/*` goes to agentd's socket with `X-Agent-User` set to the email; everything else goes to noVNC.
+  - Then front-door deletes incoming `X-Agent-*` and `X-Tailscale-*`, the token and the `Cookie` header. It routes:
+    - `/api/*` to agentd's socket, with `X-Agent-User` set to the email;
+    - `/session` to `{email, sign_out}`;
+    - `/viewer/*` to noVNC, with the prefix removed, framed only by the app (`X-Frame-Options: SAMEORIGIN`);
+    - `/websockify` to noVNC's stream;
+    - `/` and `/assets/*` to the web app (`-web`, [customer-cloud.md](customer-cloud.md) §6), under a CSP that allows only this host, with `frame-ancestors 'none'`, `nosniff` and `no-cache`. Nothing else is served.
+  - POST, PUT and DELETE must come from the app's own pages (`http.CrossOriginProtection`: `Sec-Fetch-Site`, or `Origin` against `Host`). So must WebSocket handshakes (`Origin`'s host equal to `Host`).
   - It listens only on a Unix socket or localhost (it refuses other addresses).
   - Tests: `make front-door-test`, with a fake Access team, a fake agentd and a fake viewer.
 - **Units:**
@@ -1690,7 +1697,8 @@ The same screens as the iPhone's, in Mac form:
 | `agentd-soak` | Memory v2 soak report for the desktop, read-only over SSM (`scripts/agentd-soak.py`): phase 6's exit criteria (effect failures, consolidation under the daily cap, consolidations that didn't finish, days of soak), then tasks, scheduled runs and costs by day, and counts from the journal. Only counts and costs leave the desktop. `SINCE=YYYY-MM-DD`, the day the soak started |
 | `gatewayd-test`, `gatewayd-build`, `gateway-image` | gatewayd tests; static arm64 build; build an attestable AMI and publish its measurements |
 | `tailnet-build`, `tailnet-deploy` | tailnet-proxy |
-| `front-door-test`, `front-door-build`, `front-door-deploy` | front-door (§5.11): vet and tests; static linux build for `DESKTOP_ARCH`; the `front_door` role on a customer deployment's desktops |
+| `front-door-test`, `front-door-build`, `front-door-deploy` | front-door (§5.11): vet and tests; static linux build for `DESKTOP_ARCH`; the `front_door` role on a customer deployment's desktops (with the web app, copied to `/usr/local/share/front-door/web`) |
+| `web-test`, `web-dev`, `web-smoke` | The web app ([customer-cloud.md](customer-cloud.md) §6): node unit tests; the whole stack on the Mac with a scripted model and a stand-in for Access (http://127.0.0.1:8088/); a headless-Chrome click-through against it |
 | `new-customer` | `NAME=<env> ACCOUNT=<id>`: `terraform/envs/<env>` for a customer deployment from the template, the account in its gitignored tfvars. No AWS calls |
 | `llm-keys`, `tailscale-key`, `apns-key` | Store secrets in SSM from hidden input or a file |
 | `app-tailscalekit`, `app-test`, `app-sim`, `app-device`, `app-mac` | The apps: build TailscaleKit; DesktopKit tests; Simulator build; build, install and launch on the paired iPhone; build the Mac app, install it in /Applications and open it |

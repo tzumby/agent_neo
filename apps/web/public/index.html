@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>Your desktop</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/assets/fonts/archivo-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script type="module" src="/assets/js/main.js"></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="side" aria-label="Your desktop">
+      <div class="desk" id="desk" data-tone="idle">
+        <svg class="seal" viewBox="0 0 32 32" aria-hidden="true">
+          <path class="seal-body" d="M16 1.5l3.1 2.6 4-.6 1.6 3.7 3.7 1.6-.6 4 2.6 3.2-2.6 3.1.6 4-3.7 1.6-1.6 3.7-4-.6L16 30.5l-3.1-2.6-4 .6-1.6-3.7-3.7-1.6.6-4L1.5 16l2.6-3.1-.6-4 3.7-1.6 1.6-3.7 4 .6z"/>
+          <path class="seal-mark" d="M10.5 16.4l3.8 3.8 7.4-8"/>
+        </svg>
+        <div class="desk-words">
+          <strong id="desk-name">Your desktop</strong>
+          <span id="desk-stage">Connecting…</span>
+        </div>
+      </div>
+      <nav class="nav" aria-label="Pages">
+        <a href="#/chat" data-view="chat">Chat <span class="badge" id="nav-chat-badge" hidden>Needs you</span></a>
+        <a href="#/desktop" data-view="desktop">Desktop</a>
+        <a href="#/schedules" data-view="schedules">Schedules</a>
+        <a href="#/keys" data-view="keys">Keys and tokens</a>
+        <a href="#/settings" data-view="settings">Settings</a>
+      </nav>
+      <div class="side-foot">
+        <span id="who" class="who"></span>
+        <a id="sign-out" href="/cdn-cgi/access/logout">Sign out</a>
+      </div>
+    </aside>
+    <div class="scrim" id="scrim"></div>
+
+    <div class="main">
+      <header class="top">
+        <button class="icon-button" id="menu" type="button" aria-label="Pages">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        </button>
+        <h1 id="view-title">Chat</h1>
+        <span class="top-stage" id="top-stage" hidden></span>
+      </header>
+      <div class="offline" id="offline" role="status" hidden>
+        <span id="offline-text">Can't reach your desktop.</span> Trying again…
+      </div>
+
+      <section class="view chat" id="view-chat" aria-label="Chat">
+        <div class="splash" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div class="chat-scroll">
+          <div class="column">
+            <div class="older" hidden><span class="spinner" aria-label="Loading earlier messages"></span></div>
+            <div class="empty" hidden>
+              <h2>What should your agent look into?</h2>
+              <div class="suggestions">
+                <button type="button" data-suggest="Summarize last night's Cloudflare security events: what was blocked, from where, and anything that got through.">Summarize last night's Cloudflare security events</button>
+                <button type="button" data-suggest="Check Datadog for error spikes in the last hour and tell me which endpoints they came from.">Check Datadog for error spikes in the last hour</button>
+                <button type="button" data-suggest="Every weekday at 8:00, send me a security report from Cloudflare and Datadog.">Set up a security report every weekday at 8:00</button>
+              </div>
+            </div>
+            <ol class="rows" aria-live="polite"></ol>
+            <div class="working" role="status" aria-label="Working" hidden><span></span><span></span><span></span></div>
+          </div>
+        </div>
+        <form class="composer">
+          <div class="column">
+            <p class="key-note" role="alert" hidden></p>
+            <div class="box">
+              <textarea rows="1" placeholder="Ask your agent" aria-label="Message to your agent"></textarea>
+              <div class="box-foot">
+                <select class="model" aria-label="Model" hidden></select>
+                <button class="send" type="submit" aria-label="Send" disabled></button>
+              </div>
+            </div>
+            <p class="fine">Messages go to the AI model and stay in this chat. Save keys under Keys and tokens instead.</p>
+          </div>
+        </form>
+      </section>
+
+      <section class="view desktop" id="view-desktop" aria-label="Desktop" hidden>
+        <div class="desk-bar"></div>
+        <div class="desk-frame"></div>
+      </section>
+
+      <section class="view page" id="view-schedules" aria-label="Schedules" hidden>
+        <div class="page-column"><div class="page-body"></div></div>
+      </section>
+      <section class="view page" id="view-keys" aria-label="Keys and tokens" hidden>
+        <div class="page-column"><div class="page-body"></div></div>
+      </section>
+      <section class="view page" id="view-settings" aria-label="Settings" hidden>
+        <div class="page-column"><div class="page-body"></div></div>
+      </section>
+    </div>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

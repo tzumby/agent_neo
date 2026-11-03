@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,7 +111,7 @@ func TestOnlyValidAccessTokensGetIn(t *testing.T) {
 	tm := newTeam(t)
 	socket, novnc, got := backends(t)
 	g := newGate(context.Background(), Config{TeamDomain: tm.server.URL, AUD: "app-aud", Allow: []string{"@acme.com", "Contractor@Example.com"}})
-	front := httptest.NewServer(handler(g, novnc, socket))
+	front := httptest.NewServer(handler(g, novnc, socket, ""))
 	t.Cleanup(front.Close)
 
 	otherKey, _ := rsa.GenerateKey(rand.Reader, 2048)
@@ -130,19 +131,22 @@ func TestOnlyValidAccessTokensGetIn(t *testing.T) {
 		path   string
 		status int
 		user   string
+		// The path the backend sees, when it isn't path.
+		backend string
 	}{
-		{"a person at the customer's domain", tm.token(t, tm.key, tm.claims("me@acme.com")), "/api/v1/events", 200, "me@acme.com"},
-		{"a listed email, any case", tm.token(t, tm.key, tm.claims("contractor@example.com")), "/api/v1/events", 200, "contractor@example.com"},
-		{"the viewer", tm.token(t, tm.key, tm.claims("me@acme.com")), "/vnc.html", 200, ""},
-		{"no token", "", "/api/v1/events", 403, ""},
-		{"not a token", "nonsense", "/api/v1/events", 403, ""},
-		{"signed by someone else", tm.token(t, otherKey, tm.claims("me@acme.com")), "/api/v1/events", 403, ""},
-		{"expired", tm.token(t, tm.key, expired), "/api/v1/events", 403, ""},
-		{"for another Access app", tm.token(t, tm.key, wrongAud), "/api/v1/events", 403, ""},
-		{"from another team", tm.token(t, tm.key, wrongIss), "/api/v1/events", 403, ""},
-		{"a service token", tm.token(t, tm.key, service), "/api/v1/events", 403, ""},
-		{"not on the allow list", tm.token(t, tm.key, tm.claims("someone@gmail.com")), "/api/v1/events", 403, ""},
-		{"a look-alike domain", tm.token(t, tm.key, tm.claims("me@notacme.com")), "/api/v1/events", 403, ""},
+		{"a person at the customer's domain", tm.token(t, tm.key, tm.claims("me@acme.com")), "/api/v1/events", 200, "me@acme.com", ""},
+		{"a listed email, any case", tm.token(t, tm.key, tm.claims("contractor@example.com")), "/api/v1/events", 200, "contractor@example.com", ""},
+		{"the viewer", tm.token(t, tm.key, tm.claims("me@acme.com")), "/viewer/vnc.html", 200, "", "/vnc.html"},
+		{"the viewer's stream", tm.token(t, tm.key, tm.claims("me@acme.com")), "/websockify", 200, "", ""},
+		{"no token", "", "/api/v1/events", 403, "", ""},
+		{"not a token", "nonsense", "/api/v1/events", 403, "", ""},
+		{"signed by someone else", tm.token(t, otherKey, tm.claims("me@acme.com")), "/api/v1/events", 403, "", ""},
+		{"expired", tm.token(t, tm.key, expired), "/api/v1/events", 403, "", ""},
+		{"for another Access app", tm.token(t, tm.key, wrongAud), "/api/v1/events", 403, "", ""},
+		{"from another team", tm.token(t, tm.key, wrongIss), "/api/v1/events", 403, "", ""},
+		{"a service token", tm.token(t, tm.key, service), "/api/v1/events", 403, "", ""},
+		{"not on the allow list", tm.token(t, tm.key, tm.claims("someone@gmail.com")), "/api/v1/events", 403, "", ""},
+		{"a look-alike domain", tm.token(t, tm.key, tm.claims("me@notacme.com")), "/api/v1/events", 403, "", ""},
 	}
 	for _, c := range cases {
 		req, _ := http.NewRequest("GET", front.URL+c.path, nil)
@@ -166,7 +170,11 @@ func TestOnlyValidAccessTokensGetIn(t *testing.T) {
 			continue
 		}
 		s := <-got
-		if s.path != c.path || s.user != c.user || s.jwt != "" || s.cookie != "" {
+		want := c.path
+		if c.backend != "" {
+			want = c.backend
+		}
+		if s.path != want || s.user != c.user || s.jwt != "" || s.cookie != "" {
 			t.Errorf("%s: backend saw %+v", c.name, s)
 		}
 	}
@@ -203,5 +211,97 @@ func TestSettings(t *testing.T) {
 			t.Errorf("socket mode %v", info.Mode().Perm())
 		}
 		ln.Close()
+	}
+}
+
+func TestWebAppSessionAndOtherSites(t *testing.T) {
+	tm := newTeam(t)
+	socket, novnc, got := backends(t)
+	web := t.TempDir()
+	os.MkdirAll(filepath.Join(web, "assets"), 0o755)
+	os.WriteFile(filepath.Join(web, "index.html"), []byte("<!doctype html><title>app</title>"), 0o644)
+	os.WriteFile(filepath.Join(web, "assets", "app.css"), []byte("body{}"), 0o644)
+	g := newGate(context.Background(), Config{TeamDomain: tm.server.URL, AUD: "app-aud"})
+	front := httptest.NewServer(handler(g, novnc, socket, web))
+	t.Cleanup(front.Close)
+	token := tm.token(t, tm.key, tm.claims("me@acme.com"))
+	host := front.Listener.Addr().String()
+
+	do := func(method, path string, headers map[string]string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(method, front.URL+path, nil)
+		req.Header.Set("Cf-Access-Jwt-Assertion", token)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	// The page and its files, with the policy; nothing else of the folder.
+	page := do("GET", "/", nil)
+	body, _ := io.ReadAll(page.Body)
+	if page.StatusCode != 200 || !strings.Contains(string(body), "<title>app</title>") ||
+		!strings.Contains(page.Header.Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Errorf("/: %d %q %q", page.StatusCode, body, page.Header.Get("Content-Security-Policy"))
+	}
+	if r := do("GET", "/assets/app.css", nil); r.StatusCode != 200 {
+		t.Errorf("/assets/app.css: %d", r.StatusCode)
+	}
+	for _, path := range []string{"/assets/", "/index.html.bak", "/vnc.html", "/../main.go"} {
+		if r := do("GET", path, nil); r.StatusCode != 404 {
+			t.Errorf("%s: %d, want 404", path, r.StatusCode)
+		}
+	}
+	if r := do("GET", "/", nil); r.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("no nosniff")
+	}
+
+	// Who's signed in.
+	var session map[string]string
+	_ = json.NewDecoder(do("GET", "/session", nil).Body).Decode(&session)
+	if session["email"] != "me@acme.com" || session["sign_out"] != "/cdn-cgi/access/logout" {
+		t.Errorf("/session = %v", session)
+	}
+
+	// Changes only from the app's own pages.
+	if r := do("POST", "/api/v1/stop", map[string]string{"Sec-Fetch-Site": "cross-site"}); r.StatusCode != 403 {
+		t.Errorf("a cross-site POST: %d, want 403", r.StatusCode)
+	}
+	if r := do("POST", "/api/v1/stop", map[string]string{"Origin": "https://evil.example"}); r.StatusCode != 403 {
+		t.Errorf("a POST from another origin: %d, want 403", r.StatusCode)
+	}
+	if r := do("POST", "/api/v1/stop", map[string]string{"Sec-Fetch-Site": "same-origin"}); r.StatusCode != 200 {
+		t.Errorf("the app's own POST: %d", r.StatusCode)
+	} else if s := <-got; s.path != "/api/v1/stop" {
+		t.Errorf("agentd saw %+v", s)
+	}
+
+	// The viewer's WebSocket only from the app's pages.
+	upgrade := map[string]string{"Upgrade": "websocket", "Connection": "Upgrade"}
+	foreign := map[string]string{"Origin": "https://evil.example"}
+	for k, v := range upgrade {
+		foreign[k] = v
+	}
+	if r := do("GET", "/websockify", foreign); r.StatusCode != 403 {
+		t.Errorf("a WebSocket from another site: %d, want 403", r.StatusCode)
+	}
+	own := map[string]string{"Origin": "http://" + host}
+	for k, v := range upgrade {
+		own[k] = v
+	}
+	if r := do("GET", "/websockify", own); r.StatusCode == 403 {
+		t.Error("the app's own WebSocket was refused")
+	} else {
+		<-got
+	}
+	if r := do("GET", "/viewer/vnc.html", nil); r.Header.Get("X-Frame-Options") != "SAMEORIGIN" {
+		t.Error("the viewer can be framed by other sites")
+	} else {
+		<-got
 	}
 }

@@ -8,9 +8,15 @@
 // tag), not expired, for a person (an email), and on the -allow list if there
 // is one. A wrong Access setting in Cloudflare (the hostname left unprotected,
 // say) then fails closed. It serves:
-//   - /api/*  agentd's API (its Unix socket), with the caller's email in
+//   - /api/*       agentd's API (its Unix socket), with the caller's email in
 //     X-Agent-User
-//   - anything else: the noVNC viewer
+//   - /session     who's signed in, for the web app
+//   - /viewer/*    the noVNC viewer (take over), and /websockify, its stream
+//   - / and /assets/*  the web app (-web), with a strict Content-Security-Policy
+//
+// Requests that change something must come from the web app's own pages
+// (Sec-Fetch-Site or Origin), and so must the viewer's WebSocket: another
+// site can't use the person's Cloudflare session to act on the desktop.
 //
 // It listens on localhost or a Unix socket only; the VM has no inbound port.
 // Its settings (team domain, AUD tag, allow list) come from -config, a JSON
@@ -135,8 +141,51 @@ func admits(email string, allow []string) bool {
 	})
 }
 
-// handler checks every request, then sends it to agentd or the viewer.
-func handler(g gate, novnc *url.URL, agentdSocket string) http.Handler {
+// The web app's pages may load only their own files and talk only to this
+// host; nothing may frame them.
+const webPolicy = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; " +
+	"font-src 'self'; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; " +
+	"form-action 'self'; object-src 'none'"
+
+// webApp serves the web app: / is its page, /assets/* its files. No
+// directory listings, nothing else.
+func webApp(dir string) http.Handler {
+	files := http.FileServer(http.Dir(dir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && (!strings.HasPrefix(r.URL.Path, "/assets/") || strings.HasSuffix(r.URL.Path, "/")) {
+			http.NotFound(w, r)
+			return
+		}
+		h := w.Header()
+		h.Set("Content-Security-Policy", webPolicy)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Cache-Control", "no-cache") // small files; revalidated, so a deploy shows at once
+		files.ServeHTTP(w, r)
+	})
+}
+
+// sameSiteSocket says whether a WebSocket handshake comes from this host's
+// own pages. Browsers always send Origin on one; another site's page opening
+// the viewer's stream with the person's cookies is refused.
+func sameSiteSocket(r *http.Request) bool {
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return true
+	}
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" {
+		return false
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // not a browser, so no borrowed session; it still needed a token
+	}
+	u, err := url.Parse(origin)
+	return err == nil && u.Host == r.Host
+}
+
+// handler checks every request, then sends it to agentd, the viewer or the
+// web app (webDir; empty: none).
+func handler(g gate, novnc *url.URL, agentdSocket, webDir string) http.Handler {
 	viewer := httputil.NewSingleHostReverseProxy(novnc)
 	api := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -150,7 +199,11 @@ func handler(g gate, novnc *url.URL, agentdSocket string) http.Handler {
 		},
 		FlushInterval: -1, // stream Server-Sent Events as they come
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var web http.Handler = http.NotFoundHandler()
+	if webDir != "" {
+		web = webApp(webDir)
+	}
+	routes := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		who, err := g.identity(r)
 		if err != nil {
 			log.Printf("denied %s %s to %q: %v", r.Method, r.URL.Path, who, err)
@@ -167,16 +220,35 @@ func handler(g gate, novnc *url.URL, agentdSocket string) http.Handler {
 		}
 		r.Header.Del("Cf-Access-Jwt-Assertion")
 		r.Header.Del("Cookie")
-		if strings.HasPrefix(r.URL.Path, "/api/") {
-			r.Header.Set("X-Agent-User", who)
-			api.ServeHTTP(w, r)
+		if !sameSiteSocket(r) {
+			log.Printf("denied a WebSocket to %s from %q", who, r.Header.Get("Origin"))
+			http.Error(w, "not allowed", http.StatusForbidden)
 			return
 		}
-		if r.URL.Path == "/websockify" {
+		switch path := r.URL.Path; {
+		case strings.HasPrefix(path, "/api/"):
+			r.Header.Set("X-Agent-User", who)
+			api.ServeHTTP(w, r)
+		case path == "/session":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			_ = json.NewEncoder(w).Encode(map[string]string{"email": who, "sign_out": "/cdn-cgi/access/logout"})
+		case path == "/websockify":
 			log.Printf("viewer session opened by %s", who)
+			viewer.ServeHTTP(w, r)
+		case path == "/viewer":
+			http.Redirect(w, r, "/viewer/", http.StatusFound)
+		case strings.HasPrefix(path, "/viewer/"):
+			// Framed by the web app only.
+			w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+			w.Header().Set("Content-Security-Policy", "frame-ancestors 'self'")
+			http.StripPrefix("/viewer", viewer).ServeHTTP(w, r)
+		default:
+			web.ServeHTTP(w, r)
 		}
-		viewer.ServeHTTP(w, r)
 	})
+	// POST, PUT, DELETE… only from this host's own pages.
+	return http.NewCrossOriginProtection().Handler(routes)
 }
 
 // listen opens "unix:/path" or "host:port" (localhost only).
@@ -205,6 +277,7 @@ func main() {
 	address := flag.String("listen", "127.0.0.1:8080", "where cloudflared connects: localhost host:port or unix:/path")
 	novnc := flag.String("novnc", "http://127.0.0.1:6080", "noVNC/websockify to proxy to")
 	agentd := flag.String("agentd", "/run/agentd/agentd.sock", "agentd's Unix socket")
+	web := flag.String("web", "", "the web app's directory (index.html, assets/); empty: none")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -222,7 +295,7 @@ func main() {
 	g := newGate(context.Background(), cfg)
 	log.Printf("serving %s for Access team %s (allow list: %d entries)", *address, issuer(cfg.TeamDomain), len(cfg.Allow))
 	srv := &http.Server{
-		Handler:           handler(g, novncURL, *agentd),
+		Handler:           handler(g, novncURL, *agentd, *web),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Fatal(srv.Serve(ln))

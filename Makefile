@@ -32,7 +32,7 @@ PLAYBOOK_LIMIT = $(if $(LIMIT),--limit $(LIMIT),)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init new-customer front-door-test front-door-build front-door-deploy plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-reset agentd-logs tailnet-build tailnet-deploy tailscale-key tailscale-oauth apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac app-release-mac app-testflight new-desktop tester-link tailnet-rules cdp viewer shell
+.PHONY: help bootstrap init new-customer web-test web-dev web-smoke front-door-test front-door-build front-door-deploy plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-reset agentd-logs tailnet-build tailnet-deploy tailscale-key tailscale-oauth apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac app-release-mac app-testflight new-desktop tester-link tailnet-rules cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -129,6 +129,15 @@ agentd-logs: ## Show agentd's recent log
 tailnet-build: ## Build tailnet-proxy (tsnet) for the desktop (linux, DESKTOP_ARCH)
 	cd services/tailnet-proxy && CGO_ENABLED=0 GOOS=linux GOARCH=$(DESKTOP_ARCH) \
 	  go build -trimpath -ldflags "-s -w" -o build/tailnet-proxy-linux-$(DESKTOP_ARCH) .
+
+web-test: ## Unit tests for the web app's chat rules, Markdown and key detector (node)
+	node --test apps/web/test/*.test.mjs
+
+web-dev: ## The web app on this Mac, end to end: agentd with a scripted model, front-door, a stand-in for Cloudflare Access (http://127.0.0.1:8088/)
+	apps/web/dev/run.sh
+
+web-smoke: ## Click through the web app in headless Chrome (with make web-dev running)
+	uv run -q --with websockets apps/web/dev/smoke.py $(or $(OUT),/tmp)
 
 front-door-test: ## Vet and test front-door (a customer deployment's way in, behind Cloudflare Access)
 	cd services/front-door && go vet ./... && go test ./...

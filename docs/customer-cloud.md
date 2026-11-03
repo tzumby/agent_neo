@@ -1,6 +1,6 @@
 # Customer deployments: the agent in the customer's own AWS account
 
-*Status, 2026-11-03: slice 1 below is built and tested locally (the deployment kit, the Terraform stack, front-door and its Ansible role). Nothing has been applied to any account yet. The web app, passkeys and web notifications are planned.*
+*Status, 2026-11-03: slices 1 and 2 below are built and tested locally: the deployment kit, the Terraform stack, front-door and its Ansible role, and the web app (§7). Nothing has been applied to any account yet. Passkeys and web notifications are planned.*
 
 A customer deployment runs the agent in a **sandbox AWS account of the customer's**, with nothing else of theirs in it, instead of in our account. We set it up with temporary access that they control and remove. People reach the desktop through **Cloudflare Access and Tunnel** in the customer's own Cloudflare account, signed in with their identity provider. Model calls go through the model gateway using the **customer's own Together key**. The first customer runs on AWS, `ca-central-1`; Google Cloud and Azure come later, as their own stacks.
 
@@ -28,7 +28,7 @@ person ──► Cloudflare edge: Access (their IdP + MFA) ──► Tunnel
 │  private subnet, no inbound, no public IPs               ▼                                │
 │  ┌─ desktop (t3a.medium) ────────────────────────────────────────────────────────────┐   │
 │  │ cloudflared ──► /run/front-door/front.sock ──► front-door (checks the Access JWT)  │   │
-│  │                     /api/* ──► agentd.sock       everything else ──► noVNC          │   │
+│  │        / and /assets/* ──► the web app   /api/* ──► agentd.sock   /viewer/ ──► noVNC  │   │
 │  │ agentd ──► model gateway (attested, c7g.medium) ──► Together (their key)           │   │
 │  │ shell (Squid allowlist: + api.cloudflare.com, Datadog)                             │   │
 │  └──────────────────────────────────────────────────────────────────────────────────┘   │
@@ -44,7 +44,8 @@ person ──► Cloudflare edge: Access (their IdP + MFA) ──► Tunnel
 | Preflight | `scripts/customer-preflight.sh` | Read-only check with our sign-in: the right account, the region, instance types offered, dry runs of what the SCPs might block, the boundary exists |
 | Stack | `terraform/stacks/customer` | VPC with a NAT gateway (never fck-nat: no third-party image, no instance with a public address), a desktop security group with no inbound rules, the transfer bucket, a KMS key, role and instance per desktop, the image builder (only while it runs) and the attested gateway. Every role gets the customer's boundary |
 | Per-customer env | `terraform/envs/<name>`, made by `make new-customer NAME= ACCOUNT=` from `terraform/customer-env-template` | `allowed_account_ids` pinned to their account (from its gitignored `terraform.tfvars`), state in their account (the bootstrap stack's workspace `<name>`), tags `Project = cloud-desktops`, `Env = <name>` |
-| front-door | `services/front-door` (Go) | Replaces tailnet-proxy on these desktops. It verifies `Cf-Access-Jwt-Assertion` against the team's keys (RS256, issuer = team domain, audience = the app's AUD tag, not expired), requires an email (rejects service tokens) and applies an optional allow list. Then it strips `X-Agent-*`, `X-Tailscale-*`, the token and cookies, and forwards `/api/*` to agentd with `X-Agent-User`, and anything else to noVNC. It listens only on a Unix socket or localhost |
+| Web app | `apps/web` (§6) | The chat and its pages, served by front-door |
+| front-door | `services/front-door` (Go) | Replaces tailnet-proxy on these desktops. Serves the web app, `/session` and the viewer at `/viewer/`. It verifies `Cf-Access-Jwt-Assertion` against the team's keys (RS256, issuer = team domain, audience = the app's AUD tag, not expired), requires an email (rejects service tokens) and applies an optional allow list. Then it strips `X-Agent-*`, `X-Tailscale-*`, the token and cookies, and forwards `/api/*` to agentd with `X-Agent-User`, and anything else to noVNC. It listens only on a Unix socket or localhost |
 | Ansible | role `front_door`, `playbooks/front-door.yml`; inventory groups `access_cloudflare` / `access_tailnet` from the `Access` tag; `group_vars/access_cloudflare.yml` | Installs front-door, cloudflared (pinned GitHub `.deb`, SHA-256 from the release) and the settings fetcher, and adds the Cloudflare and Datadog APIs to the shell's egress allowlist. The tailnet-proxy playbook skips these desktops |
 | agentd | `api.rs` `caller()` | Reads `X-Agent-User` when there's no `X-Tailscale-User`. tailnet-proxy now strips `X-Agent-*` too |
 
@@ -73,7 +74,7 @@ Every apply and playbook run below needs the user's explicit OK on the plan firs
    - `make desktop ENV=… AWS_PROFILE=…`
    - `make agentd-deploy …`
    - `make front-door-deploy …`
-7. With the customer: they sign in at the hostname, and the noVNC desktop appears (the web app replaces it, slice 2).
+7. With the customer: they sign in at the hostname and the web app opens on the chat.
 
 ## 5. Slices
 
@@ -85,19 +86,37 @@ Every apply and playbook run below needs the user's explicit OK on the plan firs
    - front-door and its tests;
    - the `front_door` role;
    - environment-aware Ansible.
-2. **Web app** (next; needed before the customer uses it day to day). A chat like the iPhone app's, served by front-door at `/`:
-   - conversation, live updates over SSE, approvals, take over (noVNC moves to `/viewer/`);
-   - keys and tokens (where the customer enters the read-only Cloudflare and Datadog keys);
-   - schedules.
-
-   It talks to the same agentd API. It follows the chat rules the apps follow: only the conversation, dots while working, opens at the bottom.
+2. **Built: the web app** (§7): the chat, cards, taking over, schedules, keys and tokens, and settings, served by front-door.
 3. **Passkeys.** WebAuthn in agentd:
    - each person registers a passkey at first sign-in;
    - approving a risky action, or a change to keys and settings, needs a passkey assertion whose challenge is the approval card's hash. Then Cloudflare, or anyone with the Access session, can't approve in their name.
 4. **Notifications:** Web Push (payloads encrypted to the browser, RFC 8291), or a Slack/email nudge with a link back, for approvals and reports.
 5. **Updates without an access window:** the customer approves a signed release in the web app (operator-isolation.md §6.5, adapted).
 
-## 6. Unverified, to check on the first deployment
+## 6. The web app
+
+`apps/web/public`: static HTML, CSS and ES modules, with no build step, no dependencies and no third-party requests (Archivo and Martian Mono are self-hosted). front-door serves it from the desktop, at `/` and `/assets/`. So the code people's browsers run is the code deployed to their desktop, not something we can change from a server of ours.
+
+- **Pages:** Chat, Desktop (taking over: noVNC at `/viewer/` in a frame), Schedules (pause, resume, cancel), Keys and tokens (add, replace, delete; values never shown; Cloudflare and Datadog suggested), and Settings (model, Browser actions, version, who's signed in, sign out through `/cdn-cgi/access/logout`). The sidebar shows the desktop's stage; on a phone it's a drawer, and what needs you shows in the top bar.
+- **The chat follows the apps' rules.** `timeline.js` is a port of DesktopKit's `ChatTimeline`: messages, answers, pictures, scheduled runs as reports (quiet runs folded), and cards only while they wait. Nothing of the agent's steps, just three dots while it works. `store.js` ports `ChatStore`: the newest page first, so the chat opens at its end (after the fonts load, with no jump), older pages as you scroll up without moving what's on screen, then live events over SSE (fetch, resuming after the last seq, 60 s idle timeout). **A change to one port belongs in the other.**
+- **Cards:**
+  - Needs your OK (summary, reason, outside-content warning, the command on request);
+  - Write this? / Write and send this? / Press …? / Click this?;
+  - Schedule this?;
+  - key requests (saved straight to the desktop, Continue when it was busy);
+  - Action needed (Skip, I'm done, Take over).
+- **A key pasted into the composer** (`keys.js`, the apps' formats) is held back. You can save it under Keys and tokens instead, and the message keeps `$NAME`, or send it anyway.
+- **Safety in the browser:**
+  - Markdown is parsed to a tree and built with text nodes only (`markdown.js`). Raw HTML stays text, only http(s) and mailto links work, and images become links.
+  - Pictures load only from `/api/v1/images/`.
+  - The CSP allows nothing but this host, and nothing may frame the app.
+  - front-door refuses POST/PUT/DELETE from other sites (`http.CrossOriginProtection`) and the viewer's WebSocket from other origins, so a page elsewhere can't ride the person's Access session.
+- **Tests:**
+  - `make web-test`: node's test runner, for the chat's rules, Markdown and the key detector.
+  - `make web-dev`: the whole stack on a Mac, with no AWS: agentd with a scripted model (`apps/web/dev/fake_llm.py`), a headless Chrome for it, front-door serving `apps/web/public`, and `services/front-door/devedge` signing you in the way Access would. Open http://127.0.0.1:8088/.
+  - `make web-smoke`: with `web-dev` running, clicks through it in headless Chrome. It checks that a message is sent and answered, that the chat opens at its end, that a pasted key is caught and saved, that a card is answered and the pages open.
+
+## 7. Unverified, to check on the first deployment
 
 - **The tunnel's UNIX service type.** That the Cloudflare dashboard accepts a published application with service type UNIX for a remotely managed tunnel. Cloudflare's docs list `unix:` among the origin types but don't say so for dashboard-managed tunnels. If not, set `front_door_listen: 127.0.0.1:<port>` and add the port to `agentd_guarded_ports`. front-door still checks every token.
 - **Missing deployer permissions.** The first apply may need read actions the deployer policy lacks (Terraform refresh calls). Add them to `deployer-policy.json` and record why.

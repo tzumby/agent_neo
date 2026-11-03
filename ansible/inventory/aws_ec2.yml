@@ -18,6 +18,8 @@ compose:
   # operator's personal tailnet; "desktops" is the desktops tailnet, where its
   # user's devices join with setup links (scripts/tailnet.py). Untagged: the
   # operator's test desktop.
-  desktop_user: ec2_tags.User | default('')
+  # The person, not the Linux account: the desktop role's desktop_user (the
+  # account Chrome and the session run as, "agent") must keep its default.
+  desktop_owner: ec2_tags.User | default('')
   desktop_tailnet: ec2_tags.Tailnet | default('shared')
   desktop_tailnet_name: ec2_tags.TailnetName | default('cloud-desktop-dev')

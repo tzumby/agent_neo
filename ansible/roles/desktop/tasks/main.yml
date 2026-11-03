@@ -84,6 +84,19 @@
     create_home: true
   register: desktop_user_info
 
+# A desktop first set up while the inventory's desktop_user was its person's
+# name (now desktop_owner) runs as that account, which owns the home. Hand
+# the home to this one, or Chrome can't open its profile once the units below
+# switch to it (their restart comes after this, in the handlers).
+- name: Find who owns the agent user's home
+  ansible.builtin.stat:
+    path: "{{ desktop_home }}"
+  register: desktop_home_stat
+
+- name: Give the agent user its home
+  ansible.builtin.command: chown -R {{ desktop_user }}:{{ desktop_user }} {{ desktop_home }}
+  when: desktop_home_stat.stat.pw_name != desktop_user
+
 # Other local users (the agent's shell user) can't read the Chrome profile or
 # the X cookie.
 - name: Keep the agent user's home private

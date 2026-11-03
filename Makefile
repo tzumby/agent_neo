@@ -19,7 +19,7 @@ PLAYBOOK_LIMIT = $(if $(LIMIT),--limit $(LIMIT),)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-logs tailnet-build tailnet-deploy tailscale-key tailscale-oauth apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac app-release-mac app-testflight new-desktop tester-link tailnet-rules cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-reset agentd-logs tailnet-build tailnet-deploy tailscale-key tailscale-oauth apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac app-release-mac app-testflight new-desktop tester-link tailnet-rules cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -100,6 +100,10 @@ agentd-evals: ## Memory evals on this Mac (cents per scenario): MEMORY_V2=on|off
 
 agentd-soak: ## Memory v2 soak report for the desktop (read-only): SINCE=YYYY-MM-DD, the day the soak started
 	scripts/agentd-soak.py $(INSTANCE) $(if $(SINCE),--since $(SINCE))
+
+agentd-reset: ## Wipe a desktop clean: agentd's chat, memories, schedules, keys, and Chrome's cookies and profile (asks first): DESKTOP=name FILES=1 KEEP_COPY=1 RESTORE=1 DRY_RUN=1
+	scripts/agentd-reset.py $(or $(INSTANCE),no-desktop-named-$(DESKTOP)) $(if $(FILES),--files) $(if $(KEEP_COPY),--keep-copy) \
+	  $(if $(RESTORE),--restore) $(if $(DRY_RUN),--dry-run)
 
 agentd-logs: ## Show agentd's recent log
 	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \

@@ -15,8 +15,8 @@ tailnet_proxy_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', defaul
 tailnet_proxy_desktops_tailnet: "{{ (desktop_tailnet | default('shared')) == 'desktops' }}"
 tailnet_proxy_params: >-
   {{ tailnet_proxy_ssm_prefix ~ '/tailscale'
-     ~ (('/users/' ~ desktop_user) if tailnet_proxy_desktops_tailnet | bool else '') }}
-tailnet_proxy_allow_tags: "{{ ('tag:user-' ~ desktop_user) if tailnet_proxy_desktops_tailnet | bool else '' }}"
+     ~ (('/users/' ~ desktop_owner) if tailnet_proxy_desktops_tailnet | bool else '') }}
+tailnet_proxy_allow_tags: "{{ ('tag:user-' ~ desktop_owner) if tailnet_proxy_desktops_tailnet | bool else '' }}"
 
 # On the operator's tailnet: Tailscale login names let in (comma-separated),
 # from SSM so they stay out of git. Empty or missing: anyone the tailnet

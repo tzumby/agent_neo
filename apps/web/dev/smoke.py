@@ -48,8 +48,11 @@ class Page:
     async def until(self, expression, seconds=10):
         deadline = time.time() + seconds
         while time.time() < deadline:
-            if await self.js(expression):
-                return True
+            try:
+                if await self.js(expression):
+                    return True
+            except RuntimeError:
+                pass  # the page isn't there yet (still loading)
             await asyncio.sleep(0.2)
         return False
 
@@ -68,19 +71,27 @@ async def main(out):
                                "--no-first-run", "--window-size=1280,900", "about:blank"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        for _ in range(50):
+        # Chrome answers before its first page exists (and a previous run's may
+        # still be closing): wait for a page.
+        target = None
+        for _ in range(100):
             try:
                 targets = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json"))
-                break
-            except OSError:
-                time.sleep(0.2)
-        target = next(t for t in targets if t["type"] == "page")
+                target = next((t for t in targets if t["type"] == "page"), None)
+                if target:
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.2)
+        if not target:
+            raise SystemExit("headless Chrome didn't start")
         async with websockets.connect(target["webSocketDebuggerUrl"], max_size=50_000_000) as ws:
             p = Page(ws)
             await p.call("Page.enable")
             await p.call("Runtime.enable")
             await p.call("Page.navigate", url=APP)
             p.check(await p.until("document.querySelector('#view-chat').classList.contains('is-ready')"), "the chat opens")
+            p.check(await p.js("document.documentElement.dataset.theme") == "light", "light by default")
             at_end = await p.js("(() => { const s = document.querySelector('.chat-scroll'); return s.scrollHeight - s.scrollTop - s.clientHeight < 80; })()")
             p.check(at_end, "at its end, as it appears")
             p.check(await p.js("document.querySelector('#who').textContent") == "you@example.com", "signed in as the Access user")
@@ -106,6 +117,39 @@ async def main(out):
             p.check(await p.js("!document.body.textContent.includes('ghp_')"), "its value is nowhere on the page")
             await p.shot(f"{out}/smoke-keys.png")
 
+            # Updates: add Slack (the stand-in), its test arrives, then the agent posts.
+            def slack_posts():
+                return json.load(urllib.request.urlopen("http://127.0.0.1:8091/slack-posts"))
+            before = len(slack_posts())
+            await p.js("location.hash = '#/updates'")
+            p.check(await p.until("!!document.querySelector('#view-updates form')"), "the updates page opens")
+            await p.js("""(() => { const f = document.querySelector('#view-updates form');
+                const set = (label, v) => { const i = f.querySelector(`[aria-label="${label}"]`); i.value = v; };
+                set('Name', 'security'); set('Slack channel', '#security'); set('Bot token', 'xoxb-test-token-12345');
+                f.querySelector('button[type=submit]').click(); })()""")
+            p.check(await p.until("[...document.querySelectorAll('#view-updates .list-row')].some(r => r.textContent.includes('Slack #security'))"), "Slack is added")
+            for _ in range(50):
+                if len(slack_posts()) > before:
+                    break
+                await asyncio.sleep(0.2)
+            p.check(len(slack_posts()) == before + 1, "its test post reached Slack")
+            p.check(await p.js("!document.body.innerHTML.includes('xoxb-test-token')"), "the token is nowhere on the page")
+            await p.shot(f"{out}/smoke-updates.png")
+            await p.js("location.hash = '#/chat'")
+            await p.until("!document.querySelector('#view-chat').hidden")
+            await p.js("""(() => { const t = document.querySelector('.composer textarea');
+                t.value = 'Post an update about the login abuse'; t.dispatchEvent(new Event('input')); })()""")
+            await p.js("document.querySelector('.composer .send').click()")
+            p.check(await p.until("[...document.querySelectorAll('.row-agent')].some(r => r.textContent.includes('posted to security'))", 15), "the agent posts an update")
+            for _ in range(50):
+                if len(slack_posts()) > before + 1:
+                    break
+                await asyncio.sleep(0.2)
+            posted = slack_posts()[-1]
+            text = json.dumps(posted)
+            p.check(len(slack_posts()) == before + 2 and posted["channel"] == "#security", "…to #security")
+            p.check("hxxps://bad[.]example[.]net" in text and "https://bad" not in text and posted["unfurl_links"] is False, "…with its links defanged")
+
             # A card the desktop doesn't know (a sample one): it expires.
             await p.js("location.hash = '#/chat'")
             await p.until("!document.querySelector('#view-chat').hidden")
@@ -121,6 +165,13 @@ async def main(out):
                 await asyncio.sleep(0.8)
                 await p.shot(f"{out}/smoke-{page}.png")
             p.check(await p.js("!!document.querySelector('.desk-frame iframe')"), "the desktop view embeds the viewer")
+            await p.js("location.hash = '#/settings'")
+            await p.until("!!document.querySelector('#view-settings select')")
+            set_theme = """(value) => { const s = [...document.querySelectorAll('#view-settings select')]
+                .find(e => [...e.options].some(o => o.value === 'system')); s.value = value; s.dispatchEvent(new Event('change')); }"""
+            await p.js(f"({set_theme})('dark')")
+            p.check(await p.js("document.documentElement.dataset.theme") == "dark", "Dark can be chosen in Settings")
+            await p.js(f"({set_theme})('light')")
             p.check(await p.js("document.querySelector('.settings-group select') === null || true"), "settings render")
             return p.failed
     finally:

@@ -4,7 +4,7 @@
 
 import { api } from "./api.js";
 import { mountChat } from "./chat.js";
-import { mountDesktop, mountKeys, mountSchedules, mountSettings } from "./pages.js";
+import { mountDesktop, mountKeys, mountSchedules, mountSettings, mountUpdates } from "./pages.js";
 import { Store } from "./store.js";
 
 const store = new Store(api);
@@ -17,6 +17,7 @@ const views = {
   chat: { el: $("#view-chat"), title: "Chat" },
   desktop: { el: $("#view-desktop"), title: "Desktop" },
   schedules: { el: $("#view-schedules"), title: "Schedules" },
+  updates: { el: $("#view-updates"), title: "Updates" },
   keys: { el: $("#view-keys"), title: "Keys and tokens" },
   settings: { el: $("#view-settings"), title: "Settings" },
 };
@@ -25,6 +26,7 @@ const keys = mountKeys(store, views.keys.el);
 const pages = {
   desktop: mountDesktop(store, views.desktop.el),
   schedules: mountSchedules(store, views.schedules.el),
+  updates: mountUpdates(store, views.updates.el),
   keys,
   settings: mountSettings(store, views.settings.el, session),
 };

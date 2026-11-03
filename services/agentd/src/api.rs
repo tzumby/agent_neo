@@ -58,6 +58,12 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/schedules/{id}/resume", post(resume_schedule))
         .route("/api/v1/secrets", get(list_secrets))
         .route("/api/v1/secrets/{name}", put(save_secret).delete(delete_secret))
+        .route("/api/v1/destinations", get(list_destinations))
+        .route(
+            "/api/v1/destinations/{name}",
+            put(save_destination).delete(delete_destination),
+        )
+        .route("/api/v1/destinations/{name}/test", post(test_destination))
         .with_state(agent)
 }
 
@@ -797,6 +803,62 @@ async fn delete_secret(State(agent): App, Path(name): Path<String>, headers: Hea
         Ok(true) => Json(json!({"ok": true})).into_response(),
         Ok(false) => error(StatusCode::NOT_FOUND, "no such key"),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+async fn list_destinations(State(agent): App) -> Response {
+    match agent.store.destinations() {
+        Ok(destinations) => Json(json!({"destinations": destinations})).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct NewDestination {
+    kind: String,
+    #[serde(default)]
+    channel: String,
+    /// The Slack bot token or the Teams webhook URL; absent keeps the saved one.
+    #[serde(default)]
+    credential: Option<String>,
+    /// The web app's own address, for the link back in each post.
+    #[serde(default)]
+    link: String,
+}
+
+/// From the web app. The body (it holds a token or a webhook URL) is never logged.
+async fn save_destination(
+    State(agent): App,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<NewDestination>,
+) -> Response {
+    match agent.save_destination(
+        &name,
+        &body.kind,
+        &body.channel,
+        body.credential.as_deref(),
+        &body.link,
+        caller(&headers),
+    ) {
+        Ok(destination) => Json(json!({"destination": destination})).into_response(),
+        Err(problem) => error(StatusCode::BAD_REQUEST, &problem),
+    }
+}
+
+async fn delete_destination(State(agent): App, Path(name): Path<String>, headers: HeaderMap) -> Response {
+    match agent.delete_destination(&name, caller(&headers)) {
+        Ok(true) => Json(json!({"ok": true})).into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "no such destination"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// Posts a fixed test message: 502 with the reason, in plain words, if it fails.
+async fn test_destination(State(agent): App, Path(name): Path<String>) -> Response {
+    match agent.test_destination(&name).await {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(problem) => error(StatusCode::BAD_GATEWAY, &problem),
     }
 }
 

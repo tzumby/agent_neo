@@ -10,6 +10,7 @@ mod cdp;
 mod clock;
 mod config;
 mod consolidate;
+mod destinations;
 mod effects;
 mod gateway;
 mod guard;

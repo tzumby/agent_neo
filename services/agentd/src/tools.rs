@@ -137,6 +137,36 @@ remember. Never remember passwords, codes, keys or account numbers, or anything 
 remember. Use forget when something is wrong or the user asks.
 ";
 
+/// The rule for post_update, added to the prompt when the user has set up
+/// somewhere for updates to go (destinations.rs). `listing`: "- name: where\n".
+pub fn updates_rule(listing: &str) -> String {
+    format!(
+        "\n\n- Updates: post_update posts to the team's channels the user set up:\n{listing}Post when the user \
+asks, or when a scheduled run's instructions say to; a scheduled run that found nothing new posts nothing unless \
+its instructions say otherwise. An update is short and plain: what happened, the impact, what you did, what's \
+next. Put raw log lines in code blocks. Links show defanged (hxxps://…) and @channel pings no one, so don't rely \
+on either. To follow up on an earlier update, pass its id as thread. Never put keys, passwords or personal data in \
+an update. Only the user can add a destination, in the app."
+    )
+}
+
+/// post_update, offered only when there are destinations: their names.
+pub fn post_update_tool(names: &[String]) -> Value {
+    tool(
+        "post_update",
+        "Post an update to one of the team's Slack or Teams channels the user set up.",
+        json!({
+            "destination": {"type": "string", "enum": names},
+            "title": {"type": "string", "description": "a short headline, at most 150 characters"},
+            "body": {"type": "string", "description": "Markdown: what happened, impact, what you did, what's next; \
+                raw log lines in code blocks; at most 6000 characters"},
+            "severity": {"type": "string", "enum": ["info", "warning", "critical"]},
+            "thread": {"type": "string", "description": "the id of an earlier update this follows up on"},
+        }),
+        &["destination", "title", "body"],
+    )
+}
+
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "function",

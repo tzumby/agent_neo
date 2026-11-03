@@ -1,6 +1,6 @@
 # Architecture
 
-*Status: describes what's built and in the working tree on 2026-11-01. It covers agentd 0.15.0 (memory v2 phase 0 of [memory-v2.md](memory-v2.md); the dev desktop still runs 0.12.0 until the next deploy), gatewayd, the push relay, tailnet-proxy, the iPhone app, the Terraform `dev` environment and the Ansible roles. Customer deployments (the agent in a customer's own AWS account, reached through Cloudflare Access: the `customer` stack, front-door and the deployment kit) are in [customer-cloud.md](customer-cloud.md) and §5.11; none is applied yet. Plans that aren't built yet are marked **(planned)**. For why things are the way they are, see the design docs: [PLAN.MD](../PLAN.MD) (the original build plan), [native-app-plan.md](native-app-plan.md), [operator-isolation.md](operator-isolation.md), [customer-cloud.md](customer-cloud.md), [agents-and-bots.md](agents-and-bots.md) and [agent-control.md](agent-control.md).*
+*Status: describes what's built and in the working tree on 2026-11-01, plus customer deployments and updates to Slack and Teams (agentd 0.15.3, §6.20) on 2026-11-03. It covers agentd 0.15.0 (memory v2 phase 0 of [memory-v2.md](memory-v2.md); the dev desktop still runs 0.12.0 until the next deploy), gatewayd, the push relay, tailnet-proxy, the iPhone app, the Terraform `dev` environment and the Ansible roles. Customer deployments (the agent in a customer's own AWS account, reached through Cloudflare Access: the `customer` stack, front-door and the deployment kit) are in [customer-cloud.md](customer-cloud.md) and §5.11; none is applied yet. Plans that aren't built yet are marked **(planned)**. For why things are the way they are, see the design docs: [PLAN.MD](../PLAN.MD) (the original build plan), [native-app-plan.md](native-app-plan.md), [operator-isolation.md](operator-isolation.md), [customer-cloud.md](customer-cloud.md), [agents-and-bots.md](agents-and-bots.md) and [agent-control.md](agent-control.md).*
 
 ## Contents
 
@@ -622,6 +622,10 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/secrets` | Saved keys: name, label, created, updated, last used. **Never values** |
 | PUT | `/api/v1/secrets/{name}` | `{value, label?, approval?}`. Saves or replaces a key. With `approval`, resumes the task whose request card asked for exactly this key. Returns `{secret, resumed, busy}`. The body is never logged |
 | DELETE | `/api/v1/secrets/{name}` | Delete a key |
+| GET | `/api/v1/destinations` | Where updates go (§6.20): name, kind, channel, link, created, by, last post, last error. **Never the token or URL** |
+| PUT | `/api/v1/destinations/{name}` | `{kind: slack\|teams, channel, credential?, link}`. Adds or changes one; without `credential` the saved one stays. 400 with the reason in plain words. The body is never logged |
+| DELETE | `/api/v1/destinations/{name}` | Removes it and its credential |
+| POST | `/api/v1/destinations/{name}/test` | Posts a fixed test message (outside the rate limit); 502 with Slack's or Teams' reason in plain words |
 
 **`stage`** is one word for what the desktop needs, from the first matching row:
 
@@ -666,6 +670,8 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 | `memory.superseded` / `memory.updated` | `id`, `by_id` / `id`, `version`; with `by` (`agent`, `user:<login>`) | Memory v2: a memory replaced by a newer one; a user's edit. (`memory.pending` went in 0.15.2) |
 | `schedule.created` / `schedule.updated` / `schedule.deleted` | The schedule (`schedule::json`), `task`, `by`, `done` | Schedule changes. `done` marks a one-time schedule that has run |
 | `secret.saved` / `secret.deleted` | `name`, `label`, `by` | Key changes (never values) |
+| `destination.saved` / `destination.deleted` | `name`, `kind`, `channel`, `by` | Where updates go changed (never the token or URL) |
+| `update.posted` / `update.failed` | `task`, `destination`, `id`, `title`, `thread` / `error` | post_update went out, or why it didn't (§6.20). Not in the chat |
 | `settings` | `{model, allow_actions}` | Settings changed |
 
 ### 6.6 Task lifecycle
@@ -756,6 +762,7 @@ For each tool call:
 | `read_skill` | `name` | Returns a skill's Markdown (§6.16) | No |
 | `run_shell` | `command`, `summary` (what it does in plain words, for the approval card), `timeout` (120 s; 1–900), `secrets` | Runs bash as `worker` (§6.10) | `sudo …`, dangerous patterns, and data-out after outside content |
 | `request_secret` | `name`, `label`, `why`, `how`, `url`, `replace` | Asks the user for an API key or token (§6.15) | Always: it's a card with a secure field |
+| `post_update` | `destination` (one of those set up), `title`, `body` (Markdown), `severity` (`info`, `warning`, `critical`), `thread` | Posts to a Slack or Teams channel the user set up (§6.20). Offered only when there's at least one | No: only to destinations a person added, through agentd's content checks and rate limit |
 | `report_outcome` (memory v2, scheduled runs only) | `outcome` (result, nothing, blocked), `summary` (≤ 180 characters) | Ends a scheduled run. `result` pushes the summary, `blocked` pushes "<name>: needs you", `nothing` pushes nothing and leaves a quiet row in the chat (§6.17) | No |
 
 The shell tools (`run_shell`, `request_secret`) exist only when `SHELL_TOOL=on`; `read_skill` only when there are skills.
@@ -1142,6 +1149,24 @@ Side effects are stored first and done afterwards. Each is a row in `effects`, w
   - `purge`, daily: hard-deletes memories deleted more than 30 days ago, with their search entries and the text in their history;
   - `consolidate` (key `main`): memory consolidation (§6.13). It's re-enqueued by each finished task, waits while a task runs, and fails over to retries if the model's answer is invalid twice;
   - `push`: a notification (§6.17). It's done at once when no relay is configured.
+
+### 6.20 Updates to Slack and Teams (`destinations.rs`)
+
+The agent posts updates (what it found, what it did) to channels a person set up in the web app's **Updates** page, for scheduled reports above all. It doesn't drive Slack's website for this: browser writes wait for an approval, and a 3 a.m. report would wait for one.
+
+- **Destinations** (table `destinations`: name, kind, channel, link, created, by, last post, last error) are added only through the API, so only by a person. The model gets `post_update` and a line in its prompt listing them, by name, only when there's at least one; it can't add one or post anywhere else.
+  - **Slack:** a bot token (`xoxb-`) from an app the customer creates from `deploy/messaging/slack-app-manifest.yaml` (scopes `chat:write`, `chat:write.public`; no events, no Socket Mode), and a channel (`#name` or an ID). `chat.postMessage` returns the message's `ts`, so a follow-up (`thread`: an earlier update's id) goes in the first one's thread; follow-ups of follow-ups stay there.
+  - **Microsoft Teams:** a Workflows webhook URL ("Send webhook alerts to a channel"), https on `*.logic.azure.com` or `*.api.powerplatform.com`, port 443. The body is one Adaptive Card. No threads: a follow-up says what it follows. (Office 365 connectors were retired in May 2026, and Graph can't post to channels as an app.)
+  - **Credentials** live in a store of their own (`<state>/destinations`, one 0600 file per destination, `DEST_<NAME>`), apart from saved keys: no command is ever given them. `emit()` redacts them like the keys, and errors are built without the URL (`reqwest::Error::without_url`).
+  - `link`: the web app's own origin, sent by the web app when it saves one (https, or http on localhost), for "Open the chat" in each post.
+- **Content checks**, whatever the model asks, because what it reports often comes from logs, which attackers write:
+  - Markdown links become "text (url)", and every URL is **defanged** (`hxxps://evil[.]com/x`): readable, never clickable.
+  - `@channel`, `@here`, `@everyone` and `@all` get a word joiner after the `@`, so nobody is pinged. Slack's `&`, `<` and `>` are escaped (no `<!channel>`, `<@U…>` or `<url|text>`), with `link_names: false` and link and media previews off.
+  - Well-known key formats and card numbers are **cut out** (`secrets::scrub_keys`: "[removed: a GitHub token]"), not refused, so a fake token planted in a log can't stop an alert. agentd's password check isn't used here: "password spraying from 203.0.113.5" is an ordinary sentence in a security report.
+  - Markdown becomes Slack mrkdwn (bold, italic, headings bold, • bullets, tables and code in code blocks, sections of at most 3,000 characters), or the card's TextBlocks (code and tables in monospace). Titles are cut at 150 characters, bodies at 6,000.
+- **Limits:** at most `POSTS_PER_HOUR` (20) posts per destination in a rolling hour, and the same title and body to the same destination is refused for six hours (table `posts`: id, destination, title, SHA-256, Slack `ts`, task, time).
+- **Sending:** `Poster`, a reqwest client with a 15 s timeout, no redirects, and https only (plain http only when `SLACK_API_URL` points at localhost, for `make web-dev` and the tests). Failures are said plainly (the app isn't in the channel, the token was revoked, the workflow was deleted), kept as the destination's last error, and logged as `update.failed`.
+- **Approvals stay in the web app:** there are no buttons in Slack or Teams, which would need an inbound endpoint and would go around the planned passkey approvals.
 
 ## 7. The attested model gateway
 

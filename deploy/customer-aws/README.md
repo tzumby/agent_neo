@@ -100,6 +100,11 @@ We go through these in order. You can watch each step in CloudTrail.
    3. Reboot the desktop from the EC2 console. It fetches its settings at each start.
 3. **Check for outside access:** run `./setup-access.sh check`, and expect nothing.
 4. **Start using the agent**, and enter its read-only Cloudflare and Datadog keys in the agent's web app. Anything you put on the desktop from now on is out of our reach.
+5. **Choose where its updates go**, under Updates in the web app:
+   - **Slack:** create an app from the manifest shown there (also `deploy/messaging/slack-app-manifest.yaml`: post-only, nothing calls in), install it, and paste its bot token.
+   - **Teams:** add the "Send webhook alerts to a channel" workflow to the channel, and paste its URL. Give the workflow a co-owner.
+
+   Each is tested as you add it. The agent can post only where you add, and its posts can't ping @channel or carry clickable links.
 
 ## What we can and can't do
 

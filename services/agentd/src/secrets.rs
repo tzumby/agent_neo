@@ -144,6 +144,36 @@ pub fn looks_like_secret(text: &str) -> Option<&'static str> {
     None
 }
 
+/// Text for others to read (a post to Slack or Teams) with well-known key
+/// formats and card numbers cut out, and what was cut. Removed rather than
+/// refused: text from logs is attacker-controlled, and a planted fake token
+/// mustn't be able to stop an alert going out.
+pub fn scrub_keys(text: &str) -> (String, Vec<&'static str>) {
+    let mut out = text.to_string();
+    let mut removed = Vec::new();
+    for (re, what) in KEY_FORMATS.iter() {
+        if re.is_match(&out) {
+            out = re.replace_all(&out, format!("[removed: {what}]")).into_owned();
+            removed.push(*what);
+        }
+    }
+    let cards: Vec<String> = DIGIT_RUN
+        .find_iter(&out)
+        .map(|run| run.as_str().to_string())
+        .filter(|run| {
+            let digits: Vec<u32> = run.chars().filter_map(|c| c.to_digit(10)).collect();
+            (13..=19).contains(&digits.len()) && luhn(&digits)
+        })
+        .collect();
+    for card in &cards {
+        out = out.replace(card.as_str(), "[removed: a card number]");
+    }
+    if !cards.is_empty() {
+        removed.push("a card number");
+    }
+    (out, removed)
+}
+
 /// Why a name can't be used, if it can't.
 pub fn check_name(name: &str) -> Result<(), String> {
     if !NAME.is_match(name) {
@@ -226,6 +256,16 @@ impl Secrets {
     /// The file systemd loads the key from (LoadCredential).
     pub fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    /// A saved value, for agentd's own use (never the model's).
+    pub fn get(&self, name: &str) -> Option<String> {
+        self.values
+            .read()
+            .unwrap()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
     }
 
     pub fn has(&self, name: &str) -> bool {

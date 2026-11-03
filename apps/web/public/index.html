@@ -3,12 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="color-scheme" content="light dark">
+  <meta name="color-scheme" content="light">
   <meta name="referrer" content="no-referrer">
   <title>Your desktop</title>
   <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
   <link rel="preload" href="/assets/fonts/archivo-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/assets/app.css">
+  <!-- Before the first paint: the theme chosen in Settings (light unless chosen). -->
+  <script src="/assets/js/theme.js"></script>
   <script type="module" src="/assets/js/main.js"></script>
 </head>
 <body>
@@ -28,6 +30,7 @@
         <a href="#/chat" data-view="chat">Chat <span class="badge" id="nav-chat-badge" hidden>Needs you</span></a>
         <a href="#/desktop" data-view="desktop">Desktop</a>
         <a href="#/schedules" data-view="schedules">Schedules</a>
+        <a href="#/updates" data-view="updates">Updates</a>
         <a href="#/keys" data-view="keys">Keys and tokens</a>
         <a href="#/settings" data-view="settings">Settings</a>
       </nav>
@@ -88,6 +91,9 @@
       </section>
 
       <section class="view page" id="view-schedules" aria-label="Schedules" hidden>
+        <div class="page-column"><div class="page-body"></div></div>
+      </section>
+      <section class="view page" id="view-updates" aria-label="Updates" hidden>
         <div class="page-column"><div class="page-body"></div></div>
       </section>
       <section class="view page" id="view-keys" aria-label="Keys and tokens" hidden>

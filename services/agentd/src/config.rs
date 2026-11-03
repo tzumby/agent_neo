@@ -54,6 +54,9 @@ pub struct Config {
     /// Memory v2 (docs/memory-v2.md): kinds, trust, retrieval, consolidation.
     /// Off: the v1 memory path, on the v2 schema (which is always migrated).
     pub memory_v2: bool,
+    /// Slack's Web API (destinations.rs). Local development only points it
+    /// at a stand-in; plain http is then allowed for posts.
+    pub slack_api: String,
 }
 
 fn read_kv(path: &Path, into: &mut HashMap<String, String>) -> Result<()> {
@@ -129,6 +132,7 @@ impl Config {
             desktop_name: get("DESKTOP_NAME", "cloud-desktop"),
             push_relay_url: get("PUSH_RELAY_URL", ""),
             memory_v2: get("MEMORY_V2", "off") == "on",
+            slack_api: get("SLACK_API_URL", "https://slack.com/api"),
         })
     }
 }

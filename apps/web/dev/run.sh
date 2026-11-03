@@ -38,7 +38,7 @@ pids+=($!)
 env -i PATH="$PATH" HOME="$work/home" LISTEN="unix:$sock" STATE_DIR="$work/state" \
   CDP_URL=http://127.0.0.1:9333 RUN_AS= SHELL_TOOL=off POLICY=/nonexistent SKILLS_DIR=/nonexistent \
   MODEL=zai-org/GLM-5.3 LLM_URL=http://127.0.0.1:8091/v1/chat/completions LLM_API_KEY=dev \
-  MEMORY_V2=on DESKTOP_NAME=acme-agent RUST_LOG=agentd=info \
+  MEMORY_V2=on DESKTOP_NAME=acme-agent RUST_LOG=agentd=info SLACK_API_URL=http://127.0.0.1:8091/api \
   services/agentd/target/debug/agentd >"$work/agentd.log" 2>&1 &
 pids+=($!)
 "$work/devedge" -write-config "$work/access.json" >"$work/devedge.log" 2>&1 &
@@ -52,5 +52,6 @@ done
 pids+=($!)
 
 echo "The web app: http://127.0.0.1:8088/  (logs in $work; Ctrl-C stops it)"
-echo "Try: a question; \"sign in\" (Action needed); \"schedule a report\" (a run in a minute); \"slow\"."
+echo "Try: a question; \"sign in\" (Action needed); \"schedule a report\" (a run in two minutes); \"slow\";"
+echo "     after adding Slack under Updates (any xoxb-… token), \"post an update\". Slack's stand-in: http://127.0.0.1:8091/slack-posts"
 wait

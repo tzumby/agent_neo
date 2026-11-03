@@ -240,6 +240,19 @@ export function mountSettings(store, view, session) {
     };
     model.addEventListener("change", save);
     actions.addEventListener("change", save);
+    let current = "light";
+    try {
+      current = localStorage.getItem("theme") || "light";
+    } catch {}
+    const theme = h("select", { class: "field" },
+      [["light", "Light"], ["dark", "Dark"], ["system", "Match this device"]].map(([value, label]) =>
+        h("option", { value, selected: value === current }, label)));
+    theme.addEventListener("change", () => {
+      try {
+        localStorage.setItem("theme", theme.value);
+      } catch {}
+      window.applyTheme?.();
+    });
     fill(body,
       h("section", { class: "settings-group" },
         h("h2", { class: "page-h2" }, "Agent"),
@@ -247,6 +260,10 @@ export function mountSettings(store, view, session) {
         h("label", { class: "toggle" }, actions,
           h("span", null, h("span", { class: "strong" }, "Browser actions"),
             h("span", { class: "muted block" }, "Lets the agent click, type and press keys in your desktop's browser. It still asks you before anything that sends or changes things. Off, it only reads pages.")))),
+      h("section", { class: "settings-group" },
+        h("h2", { class: "page-h2" }, "Appearance"),
+        h("label", { class: "label" }, "Theme", theme),
+        h("p", { class: "muted" }, "Kept in this browser only.")),
       h("section", { class: "settings-group" },
         h("h2", { class: "page-h2" }, "Desktop"),
         h("dl", { class: "facts" },
@@ -258,6 +275,150 @@ export function mountSettings(store, view, session) {
         session.sign_out
           ? h("a", { class: "button", href: session.sign_out }, "Sign out")
           : h("p", { class: "muted" }, "Signed in by this device's Tailscale. To sign out, log out of Tailscale.")));
+  }
+
+  return { enter: load };
+}
+
+// --- Updates: where the agent posts to Slack and Teams ----------------------------
+
+const SLACK_MANIFEST = `display_information:
+  name: Security agent
+  description: Posts updates from your agent's desktop to your channels.
+features:
+  bot_user:
+    display_name: Security agent
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - chat:write.public
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
+`;
+
+export function mountUpdates(store, view) {
+  const body = view.querySelector(".page-body");
+  let kind = "slack";
+
+  async function load() {
+    let destinations = [];
+    let problem = null;
+    try {
+      destinations = await store.api.destinations();
+    } catch (error) {
+      problem = error.message;
+    }
+    fill(body,
+      h("p", { class: "lede" }, "Channels in Slack or Microsoft Teams where your agent posts updates: what it found, and what it did. It can post only where you add here; links in its posts are defanged and @channel pings no one."),
+      problem ? h("p", { class: "error" }, `Couldn't load them: ${problem}`) : null,
+      destinations.length ? h("ul", { class: "list" }, destinations.map(row)) : h("p", { class: "muted" }, "Nowhere yet."),
+      addForm(destinations.length === 0));
+  }
+
+  function row(d) {
+    const test = h("button", { class: "button", type: "button" }, "Send a test");
+    const remove = h("button", { class: "button button-quiet", type: "button" }, "Remove");
+    test.addEventListener("click", () => busyButton(test, async () => {
+      try {
+        await store.api.testDestination(d.name);
+        store.notice(`Sent a test to ${d.name}.`);
+      } catch (error) {
+        store.notice(`The test didn't go through: ${error.message}`);
+      }
+      await load();
+    }));
+    remove.addEventListener("click", () => busyButton(remove, async () => {
+      if (!confirm(`Remove ${d.name}? The agent won't post there any more.`)) return;
+      try {
+        await store.api.deleteDestination(d.name);
+      } catch (error) {
+        store.notice(error.message);
+      }
+      await load();
+    }));
+    const where = d.kind === "slack" ? `Slack ${d.channel}` : "A Microsoft Teams channel";
+    const state = d.last_error
+      ? h("p", { class: "error" }, d.last_error)
+      : h("p", { class: "muted" }, d.last_post ? `Last posted ${when(d.last_post * 1000)}` : "Nothing posted yet");
+    return h("li", { class: "list-row" },
+      h("div", { class: "list-main" },
+        h("p", { class: "strong" }, d.name),
+        h("p", null, where),
+        state),
+      h("div", { class: "list-actions" }, test, remove));
+  }
+
+  function addForm(first) {
+    const name = h("input", { class: "field mono", value: first ? "security" : "", placeholder: "security", "aria-label": "Name" });
+    const channel = h("input", { class: "field", placeholder: "#security", "aria-label": "Slack channel" });
+    const credential = h("input", { class: "field", type: "password", autocomplete: "off", spellcheck: "false" });
+    const problem = h("p", { class: "error", hidden: true });
+    const save = h("button", { class: "button button-primary", type: "submit" }, "Add and send a test");
+    const tabs = ["slack", "teams"].map((k) => {
+      const tab = h("button", { class: "chip", type: "button", "aria-pressed": String(k === kind) }, k === "slack" ? "Slack" : "Microsoft Teams");
+      tab.addEventListener("click", () => {
+        kind = k;
+        load();
+      });
+      return tab;
+    });
+    const copy = h("button", { class: "link-button", type: "button" }, "Copy the manifest");
+    copy.addEventListener("click", () => navigator.clipboard?.writeText(SLACK_MANIFEST).then(() => (copy.textContent = "Copied")));
+    const help = kind === "slack"
+      ? h("ol", { class: "steps" },
+          h("li", null, "At ", h("a", { href: "https://api.slack.com/apps", target: "_blank", rel: "noopener noreferrer" }, "api.slack.com/apps"), ", choose Create New App, then From a manifest, and paste this. ", copy),
+          h("li", null, "Install the app to your workspace."),
+          h("li", null, "Under OAuth & Permissions, copy the Bot User OAuth Token (it starts with xoxb-) and paste it below."),
+          h("li", null, "For a private channel, invite the app there first: /invite @Security agent."))
+      : h("ol", { class: "steps" },
+          h("li", null, "In the Teams channel, open its ⋯ menu and choose Workflows."),
+          h("li", null, "Pick “Send webhook alerts to a channel”, name it, and choose the team and channel."),
+          h("li", null, "Copy the URL it shows and paste it below."),
+          h("li", null, "In Workflows, add a co-owner, so it keeps posting if you leave."));
+    const fields = kind === "slack"
+      ? [h("label", { class: "label" }, "Channel", channel), h("label", { class: "label" }, "Bot token", credential)]
+      : [h("label", { class: "label" }, "Workflow URL", credential)];
+    credential.setAttribute("aria-label", kind === "slack" ? "Bot token" : "Workflow URL");
+    const form = h("form", { class: "key-form" },
+      h("h2", { class: "page-h2" }, "Add a channel"),
+      h("div", { class: "chips" }, tabs),
+      help,
+      h("label", { class: "label" }, "Name the agent uses", name),
+      fields,
+      problem,
+      h("p", { class: "card-note" }, icon("lock"), "Kept only on your desktop, apart from the agent's keys: no command it runs can read it."),
+      h("div", { class: "card-actions" }, save));
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const n = name.value.trim().toLowerCase();
+      if (!n) return name.focus();
+      if (!credential.value.trim()) return credential.focus();
+      busyButton(save, async () => {
+        problem.hidden = true;
+        try {
+          await store.api.saveDestination(n, {
+            kind, channel: channel.value.trim(), credential: credential.value.trim(), link: location.origin,
+          });
+        } catch (error) {
+          problem.hidden = false;
+          problem.textContent = error.message;
+          return;
+        }
+        credential.value = "";
+        try {
+          await store.api.testDestination(n);
+          store.notice(`Added ${n}, and sent it a test.`);
+        } catch (error) {
+          store.notice(`Added ${n}, but the test didn't go through: ${error.message}`);
+        }
+        await load();
+      });
+    });
+    return form;
   }
 
   return { enter: load };

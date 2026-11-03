@@ -1,0 +1,23 @@
+# The Slack app the agent posts updates with (docs/architecture.md §6.20).
+# The customer creates it in their workspace: api.slack.com/apps → Create New
+# App → From a manifest → this. Install it, then copy the Bot User OAuth Token
+# (xoxb-…) into the agent's web app: Updates → Add Slack. They own the app and
+# can remove it at any time. Posting only: no reading, no events, no Socket
+# Mode, nothing that calls in. The web app shows this same text to copy.
+display_information:
+  name: Security agent
+  description: Posts updates from your agent's desktop to your channels.
+features:
+  bot_user:
+    display_name: Security agent
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      # Post, and in public channels without being invited first.
+      - chat:write
+      - chat:write.public
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

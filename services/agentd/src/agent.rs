@@ -17,6 +17,7 @@ use crate::browser::Browser;
 use crate::cdp::Cdp;
 use crate::clock::UserClock;
 use crate::config::Config;
+use crate::destinations::{self, Destination, Kind, Poster, Severity, Update};
 use crate::guard;
 use crate::llm::{self, Together, Usage, truncate};
 use crate::memory;
@@ -27,7 +28,7 @@ use crate::schedule;
 use crate::secrets::{self, Secrets};
 use crate::shell::{KeyFile, Shell, split_sudo};
 use crate::skills::Skills;
-use crate::store::{Event, Pending, Schedule, SecretInfo, Store};
+use crate::store::{Event, Pending, Post, Schedule, SecretInfo, Store};
 use crate::tools;
 
 const HISTORY_LIMIT: i64 = 20;
@@ -224,6 +225,10 @@ pub struct Agent {
     /// Keys and tokens the user saved; their values are redacted from
     /// everything the model, the apps and notifications see.
     pub secrets: Secrets,
+    /// Destinations' bot tokens and webhook URLs (destinations.rs): a store
+    /// of their own, given to no command, redacted like the keys.
+    pub destination_credentials: Secrets,
+    poster: Poster,
     /// The event seq of the tool call being run (a memory's source).
     step_seq: AtomicI64,
 }
@@ -270,9 +275,17 @@ impl Agent {
             tracing::info!("push notifications on (relay)");
         }
         let secrets = Secrets::open(&cfg.state_dir.join("secrets")).context("opening the saved keys")?;
+        let destination_credentials = Secrets::open(&cfg.state_dir.join("destinations"))
+            .context("opening the destinations' credentials")?;
+        // Plain http only for a stand-in Slack in local development or tests.
+        let local =
+            cfg.slack_api.starts_with("http://127.0.0.1") || cfg.slack_api.starts_with("http://localhost");
+        let poster = Poster::with(&cfg.slack_api, !local)?;
         let agent = Self {
             push,
             secrets,
+            destination_credentials,
+            poster,
             llm: Together::new(&cfg)?,
             cdp: Cdp::new(&cfg.cdp_url)?,
             shell: Shell {
@@ -325,8 +338,10 @@ impl Agent {
         if let Some(object) = data.as_object_mut() {
             object.entry("agent").or_insert_with(|| json!("main"));
         }
-        // No saved key's value reaches the log or the apps.
+        // No saved key's value reaches the log or the apps, nor a
+        // destination's token or URL.
         self.secrets.redact_json(&mut data);
+        self.destination_credentials.redact_json(&mut data);
         match self.store.append_event(kind, &data) {
             Ok(event) => {
                 let seq = event.seq;
@@ -912,7 +927,8 @@ impl Agent {
         } else {
             self.memory_prompt()
         };
-        let prompt = tools::system_prompt(
+        let destinations = self.store.destinations().unwrap_or_default();
+        let mut prompt = tools::system_prompt(
             self.cfg.shell_tool,
             &now,
             &memories,
@@ -920,17 +936,30 @@ impl Agent {
             &self.keys_prompt(),
             self.cfg.memory_v2,
         );
+        if !destinations.is_empty() {
+            let listing: String = destinations
+                .iter()
+                .map(|d| format!("- {}: {}\n", d.name, d.describe()))
+                .collect();
+            prompt.push_str(&tools::updates_rule(&listing));
+        }
         state.messages[0] = json!({"role": "system", "content": prompt});
         let mut browser = Browser::new(self.cdp.clone(), state.allow_actions, self.policy.clone());
         browser
             .attach(self.store.setting("tab_target")?.as_deref())
             .await?;
-        let schemas = tools::schemas(
+        let mut schemas = tools::schemas(
             self.cfg.shell_tool,
             !self.skills.is_empty(),
             self.cfg.memory_v2,
             self.cfg.memory_v2 && state.scheduled.is_some(),
         );
+        if !destinations.is_empty()
+            && let Some(list) = schemas.as_array_mut()
+        {
+            let names: Vec<String> = destinations.iter().map(|d| d.name.clone()).collect();
+            list.push(tools::post_update_tool(&names));
+        }
         let mut cancel = self.cancel.subscribe();
         // A second receiver, to interrupt model calls and browser actions.
         let mut stop = self.cancel.subscribe();
@@ -1468,6 +1497,10 @@ impl Agent {
                 .await
             }
             "request_secret" if self.cfg.shell_tool => self.request_secret(task_id, args, tainted, resumed),
+            "post_update" => {
+                self.acted(task_id);
+                Ok(self.post_update(Some(task_id), args).await)
+            }
             _ => Ok(format!("error: unknown tool {name}")),
         }
     }
@@ -2050,6 +2083,247 @@ impl Agent {
         Ok(removed || recorded)
     }
 
+    // --- Updates to Slack and Teams (destinations.rs) ------------------------------
+
+    /// Adds or changes a destination from the web app. The credential (a
+    /// Slack bot token, a Teams webhook URL) is kept apart from saved keys
+    /// and never shown again; without one, the saved one stays.
+    pub fn save_destination(
+        &self,
+        name: &str,
+        kind: &str,
+        channel: &str,
+        credential: Option<&str>,
+        link: &str,
+        by: Option<String>,
+    ) -> Result<Destination, String> {
+        destinations::check_name(name)?;
+        let kind = Kind::parse(kind).ok_or("kind is slack or teams")?;
+        let existing = self.store.destination(name).map_err(|e| e.to_string())?;
+        let all = self.store.destinations().map_err(|e| e.to_string())?;
+        if existing.is_none() && all.len() >= destinations::MAX_DESTINATIONS {
+            return Err(format!(
+                "there are already {} destinations; remove one first",
+                destinations::MAX_DESTINATIONS
+            ));
+        }
+        let credential = credential.map(str::trim).filter(|c| !c.is_empty());
+        let key = destinations::credential_name(name);
+        let changes_kind = existing.as_ref().is_some_and(|d| d.kind != kind);
+        if credential.is_none() && (!self.destination_credentials.has(&key) || changes_kind) {
+            return Err(match kind {
+                Kind::Slack => "paste the Slack app's bot token (xoxb-…)".into(),
+                Kind::Teams => "paste the Teams workflow's URL".into(),
+            });
+        }
+        let channel = match kind {
+            Kind::Slack => destinations::check_slack(channel, credential)?,
+            Kind::Teams => {
+                if let Some(url) = credential {
+                    destinations::check_teams(url)?;
+                }
+                String::new()
+            }
+        };
+        let destination = Destination {
+            name: name.to_string(),
+            kind,
+            channel,
+            link: destinations::check_link(link.trim())?,
+            created: existing.as_ref().map_or_else(unix_now, |d| d.created),
+            by: existing.as_ref().map_or(by.clone(), |d| d.by.clone()),
+            last_post: existing.as_ref().and_then(|d| d.last_post),
+            last_error: None,
+        };
+        if let Some(credential) = credential {
+            secrets::check_value(credential)?;
+            self.destination_credentials
+                .put(&key, credential)
+                .map_err(|e| format!("couldn't save it: {e}"))?;
+        }
+        self.store
+            .save_destination(&destination)
+            .map_err(|e| e.to_string())?;
+        tracing::info!(name, kind = kind.as_str(), by = ?by, "destination saved");
+        self.emit(
+            "destination.saved",
+            json!({"name": name, "kind": kind.as_str(), "channel": destination.channel, "by": by}),
+        );
+        Ok(destination)
+    }
+
+    pub fn delete_destination(&self, name: &str, by: Option<String>) -> Result<bool> {
+        let removed = self.store.delete_destination(name)?;
+        self.destination_credentials
+            .remove(&destinations::credential_name(name))?;
+        if removed {
+            tracing::info!(name, by = ?by, "destination removed");
+            self.emit("destination.deleted", json!({"name": name, "by": by}));
+        }
+        Ok(removed)
+    }
+
+    /// "Send a test message" in the web app: one fixed update, outside the
+    /// rate limit and the record.
+    pub async fn test_destination(&self, name: &str) -> Result<(), String> {
+        let destination = self
+            .store
+            .destination(name)
+            .map_err(|e| e.to_string())?
+            .ok_or("no such destination")?;
+        let body = format!("Updates from {} will appear here.", self.cfg.desktop_name);
+        let update = Update {
+            title: "Your agent can post here",
+            body: &body,
+            severity: Severity::Info,
+            follows: None,
+        };
+        let result = self.deliver(&destination, &update, None).await.map(|_| ());
+        let _ = self
+            .store
+            .destination_result(name, unix_now(), result.as_ref().err().map(String::as_str));
+        result
+    }
+
+    /// Sends one update; Slack's message ts when there is one.
+    async fn deliver(
+        &self,
+        d: &Destination,
+        update: &Update<'_>,
+        thread_ts: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let credential = self
+            .destination_credentials
+            .get(&destinations::credential_name(&d.name))
+            .ok_or("its token or URL is missing: set it up again in the app")?;
+        match d.kind {
+            Kind::Slack => {
+                let payload = destinations::slack_payload(
+                    &d.channel,
+                    update,
+                    &self.cfg.desktop_name,
+                    &d.link,
+                    thread_ts,
+                );
+                self.poster.slack(&credential, &payload).await.map(Some)
+            }
+            Kind::Teams => {
+                let payload = destinations::teams_payload(update, &self.cfg.desktop_name, &d.link);
+                self.poster.teams(&credential, &payload).await.map(|()| None)
+            }
+        }
+    }
+
+    /// The post_update tool. Whatever the model asks: only a destination a
+    /// person set up, the content checks of destinations.rs, at most
+    /// POSTS_PER_HOUR an hour, and never the same update twice in a row.
+    pub async fn post_update(&self, task: Option<&str>, args: &Value) -> String {
+        let name = args["destination"].as_str().unwrap_or_default().trim();
+        let Ok(Some(destination)) = self.store.destination(name) else {
+            let names: Vec<String> = self
+                .store
+                .destinations()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
+            return format!(
+                "not posted: there's no destination {name:?} (there are: {}). Only the user can add one, in the app",
+                if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(", ")
+                }
+            );
+        };
+        let title = args["title"].as_str().unwrap_or_default().trim();
+        let body = args["body"].as_str().unwrap_or_default().trim();
+        if title.is_empty() || body.is_empty() {
+            return "not posted: an update needs a title and a body".into();
+        }
+        let now = unix_now();
+        let recent = self.store.posts_since(name, now - 3600).unwrap_or(0);
+        if recent >= destinations::POSTS_PER_HOUR {
+            return format!(
+                "not posted: {recent} updates went to {name} in the last hour, the limit. Put what's left into one \
+                 update later"
+            );
+        }
+        let digest = aws_lc_rs::digest::digest(
+            &aws_lc_rs::digest::SHA256,
+            format!("{name}\n{title}\n{body}").as_bytes(),
+        );
+        let hash = crate::attest::hex(digest.as_ref());
+        if let Ok(Some(at)) = self
+            .store
+            .same_post_since(name, &hash, now - destinations::DEDUPE_SECS)
+        {
+            return format!(
+                "not posted: the same update went to {name} {} minutes ago",
+                (now - at) / 60
+            );
+        }
+        let thread = match args["thread"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+            None => None,
+            Some(id) => match self.store.post(id) {
+                Ok(Some(post)) if post.destination == name => Some(post),
+                _ => {
+                    return format!(
+                        "not posted: there's no earlier update {id} in {name}; post without thread"
+                    );
+                }
+            },
+        };
+        let update = Update {
+            title,
+            body,
+            severity: Severity::parse(args["severity"].as_str()),
+            follows: thread.as_ref().map(|p| p.title.as_str()),
+        };
+        let parent_ts = thread.as_ref().and_then(|p| p.ts.clone());
+        match self.deliver(&destination, &update, parent_ts.as_deref()).await {
+            Ok(ts) => {
+                let id = short_id();
+                let post = Post {
+                    id: id.clone(),
+                    destination: name.to_string(),
+                    title: title.chars().take(destinations::MAX_TITLE).collect(),
+                    hash,
+                    // A follow-up stays in the first update's thread.
+                    ts: parent_ts.or(ts),
+                    task: task.map(String::from),
+                    created: now,
+                };
+                if let Err(err) = self.store.record_post(&post) {
+                    tracing::warn!(%err, "couldn't record a post");
+                }
+                let _ = self.store.destination_result(name, now, None);
+                self.emit(
+                    "update.posted",
+                    json!({"task": task, "destination": name, "id": id, "title": post.title, "thread": thread.map(|p| p.id)}),
+                );
+                let follow = match destination.kind {
+                    Kind::Slack => format!("To follow up in its thread, pass thread: {id}."),
+                    Kind::Teams => {
+                        format!("Teams has no threads: a follow-up with thread: {id} says what it follows.")
+                    }
+                };
+                format!(
+                    "posted to {name} ({}) as update {id}. {follow}",
+                    destination.describe()
+                )
+            }
+            Err(problem) => {
+                let _ = self.store.destination_result(name, now, Some(&problem));
+                self.emit(
+                    "update.failed",
+                    json!({"task": task, "destination": name, "error": problem}),
+                );
+                format!("not posted to {name}: {problem}. Tell the user; don't try again more than once.")
+            }
+        }
+    }
+
     /// Resumes the task that asked for this key, now that it's saved. Only a
     /// request for this very key: never another kind of approval.
     pub fn answer_secret_request(
@@ -2167,6 +2441,12 @@ fn approval_push(task_id: &str, id: &str, details: &Value) -> Push {
 /// An agent on a scratch state directory: no Chrome, no relay, no model
 /// calls unless a task runs.
 pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
+    test_agent_with("https://slack.com/api")
+}
+
+#[cfg(test)]
+/// test_agent, posting to a stand-in Slack (plain http on localhost).
+pub(crate) fn test_agent_with(slack_api: &str) -> (Arc<Agent>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("agentd-agent-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(dir.join("images")).unwrap();
     let cfg = Config {
@@ -2194,6 +2474,7 @@ pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
         desktop_name: "test-desktop".into(),
         push_relay_url: String::new(),
         memory_v2: true,
+        slack_api: slack_api.into(),
     };
     (Arc::new(Agent::new(cfg).unwrap()), dir)
 }
@@ -2464,5 +2745,328 @@ mod tests {
             &command,
             &json!({"kind": "shell", "command": "sudo rm -rf /", "task": "t1"})
         ));
+    }
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use std::sync::Mutex;
+
+    use axum::Router;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+
+    use super::*;
+
+    /// What the stand-ins for Slack and Teams were sent: (path, auth, body).
+    type Seen = Arc<Mutex<Vec<(String, String, Value)>>>;
+
+    /// Slack's chat.postMessage (#private answers not_in_channel) and a Teams
+    /// webhook, on localhost.
+    async fn stand_ins() -> (String, Seen) {
+        let seen: Seen = Arc::default();
+        let (slack, teams) = (seen.clone(), seen.clone());
+        let app = Router::new()
+            .route(
+                "/api/chat.postMessage",
+                post(move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let seen = slack.clone();
+                    async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let n = {
+                            let mut seen = seen.lock().unwrap();
+                            seen.push(("slack".into(), auth, body.clone()));
+                            seen.len()
+                        };
+                        if body["channel"] == "#private" {
+                            axum::Json(json!({"ok": false, "error": "not_in_channel"}))
+                        } else {
+                            axum::Json(json!({"ok": true, "ts": format!("1700000000.00010{n}")}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/teams",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let seen = teams.clone();
+                    async move {
+                        seen.lock().unwrap().push(("teams".into(), String::new(), body));
+                        axum::http::StatusCode::ACCEPTED
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen)
+    }
+
+    fn all_events(agent: &Agent) -> String {
+        serde_json::to_string(
+            &agent
+                .store
+                .events_after(0, 10_000)
+                .unwrap()
+                .iter()
+                .map(|e| (&e.kind, &e.data))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_valid_destinations_are_saved() {
+        let (agent, _dir) = test_agent();
+        let save = |kind: &str, channel: &str, cred: Option<&str>| {
+            agent.save_destination(
+                "security",
+                kind,
+                channel,
+                cred,
+                "https://agent.acme.com/#/chat",
+                Some("me@acme.com".into()),
+            )
+        };
+        assert!(save("email", "#security", Some("xoxb-1")).is_err());
+        assert!(
+            save("slack", "#security", None)
+                .unwrap_err()
+                .contains("bot token")
+        );
+        assert!(
+            save("slack", "#security", Some("xoxp-a-user-token"))
+                .unwrap_err()
+                .contains("xoxb-")
+        );
+        assert!(
+            save("teams", "", Some("https://evil.example/hook"))
+                .unwrap_err()
+                .contains("Workflows")
+        );
+        let saved = save("slack", "Security", Some("xoxb-123-456-secretvalue")).unwrap();
+        assert_eq!(
+            (saved.channel.as_str(), saved.link.as_str()),
+            ("#security", "https://agent.acme.com")
+        );
+        // A change without a token keeps the saved one; to Teams it needs a URL.
+        assert!(save("slack", "#alerts", None).is_ok());
+        assert!(save("teams", "", None).is_err());
+        assert!(
+            agent
+                .save_destination("Bad Name", "slack", "#x", Some("xoxb-1-2-3456"), "", None)
+                .is_err()
+        );
+        let events = all_events(&agent);
+        assert!(
+            events.contains("destination.saved") && !events.contains("secretvalue"),
+            "{events}"
+        );
+        assert!(agent.delete_destination("security", None).unwrap());
+        assert!(
+            !agent
+                .destination_credentials
+                .has(&destinations::credential_name("security"))
+        );
+    }
+
+    #[tokio::test]
+    async fn posts_go_to_slack_in_threads_once_and_within_the_limit() {
+        let (base, seen) = stand_ins().await;
+        let (agent, _dir) = test_agent_with(&format!("{base}/api"));
+        agent
+            .save_destination(
+                "security",
+                "slack",
+                "#security",
+                Some("xoxb-123-456-secretvalue"),
+                "https://agent.acme.com",
+                None,
+            )
+            .unwrap();
+        let first = agent
+            .post_update(
+                Some("t1"),
+                &json!({"destination": "security", "title": "Credential stuffing on /api/login", "severity": "critical",
+                        "body": "**312** bursts from https://evil.example.com <!channel> token ghp_abcdefghijklmnopqrstuvwxyz0123456789"}),
+            )
+            .await;
+        assert!(
+            first.starts_with("posted to security (Slack #security) as update "),
+            "{first}"
+        );
+        let id = first
+            .split_whitespace()
+            .find(|w| w.len() == 13 && w.ends_with('.'))
+            .map(|w| w.trim_end_matches('.'))
+            .unwrap()
+            .to_string();
+        {
+            let seen = seen.lock().unwrap();
+            let (_, auth, body) = &seen[0];
+            assert_eq!(auth, "Bearer xoxb-123-456-secretvalue");
+            let text = body.to_string();
+            assert!(
+                text.contains("hxxps://evil[.]example[.]com") && !text.contains("https://evil"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("<!channel>") && !text.contains("ghp_abc"),
+                "{text}"
+            );
+            assert_eq!(body["unfurl_links"], false);
+        }
+        // A follow-up goes into the first post's thread, and so does a follow-up of that one.
+        let second = agent
+            .post_update(Some("t2"), &json!({"destination": "security", "title": "Blocked", "body": "Rule tightened.", "thread": id}))
+            .await;
+        assert!(second.starts_with("posted"), "{second}");
+        let second_id = second
+            .split_whitespace()
+            .find(|w| w.len() == 13 && w.ends_with('.'))
+            .unwrap()
+            .trim_end_matches('.')
+            .to_string();
+        agent
+            .post_update(None, &json!({"destination": "security", "title": "Quiet again", "body": "No more bursts.", "thread": second_id}))
+            .await;
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[1].2["thread_ts"], "1700000000.000101");
+            assert_eq!(seen[2].2["thread_ts"], "1700000000.000101");
+        }
+        // The same update again, an unknown destination, a thread from nowhere.
+        let again = agent
+            .post_update(None, &json!({"destination": "security", "title": "Blocked", "body": "Rule tightened.", "thread": id}))
+            .await;
+        assert!(again.contains("the same update went"), "{again}");
+        assert!(
+            agent
+                .post_update(
+                    None,
+                    &json!({"destination": "attacker", "title": "x", "body": "y"})
+                )
+                .await
+                .contains("no destination")
+        );
+        assert!(
+            agent
+                .post_update(
+                    None,
+                    &json!({"destination": "security", "title": "x", "body": "y", "thread": "nope"})
+                )
+                .await
+                .contains("no earlier update")
+        );
+        // At most POSTS_PER_HOUR an hour.
+        for n in 3..destinations::POSTS_PER_HOUR {
+            let reply = agent
+                .post_update(
+                    None,
+                    &json!({"destination": "security", "title": format!("n{n}"), "body": "b"}),
+                )
+                .await;
+            assert!(reply.starts_with("posted"), "{reply}");
+        }
+        let over = agent
+            .post_update(
+                None,
+                &json!({"destination": "security", "title": "one more", "body": "b"}),
+            )
+            .await;
+        assert!(over.contains("the limit"), "{over}");
+        let events = all_events(&agent);
+        assert!(events.contains("update.posted") && !events.contains("secretvalue"));
+    }
+
+    #[tokio::test]
+    async fn slack_s_refusal_is_said_plainly_and_kept() {
+        let (base, _seen) = stand_ins().await;
+        let (agent, _dir) = test_agent_with(&format!("{base}/api"));
+        agent
+            .save_destination("private", "slack", "#private", Some("xoxb-1-2-3456789"), "", None)
+            .unwrap();
+        let reply = agent
+            .post_update(
+                None,
+                &json!({"destination": "private", "title": "t", "body": "b"}),
+            )
+            .await;
+        assert!(
+            reply.contains("isn't in #private") && reply.contains("invite"),
+            "{reply}"
+        );
+        let d = agent.store.destination("private").unwrap().unwrap();
+        assert!(d.last_error.unwrap().contains("invite") && d.last_post.is_none());
+        assert!(
+            agent
+                .test_destination("private")
+                .await
+                .unwrap_err()
+                .contains("invite")
+        );
+    }
+
+    #[tokio::test]
+    async fn teams_gets_a_card_and_its_url_stays_secret() {
+        let (base, seen) = stand_ins().await;
+        let (agent, _dir) = test_agent_with(&format!("{base}/api"));
+        // The stand-in isn't on Microsoft's hosts, so it's put in as saving would.
+        let url = format!("{base}/teams?sig=webhooksecretvalue");
+        agent
+            .store
+            .save_destination(&Destination {
+                name: "ops".into(),
+                kind: Kind::Teams,
+                channel: String::new(),
+                link: "https://agent.acme.com".into(),
+                created: 0,
+                by: None,
+                last_post: None,
+                last_error: None,
+            })
+            .unwrap();
+        agent
+            .destination_credentials
+            .put(&destinations::credential_name("ops"), &url)
+            .unwrap();
+        let first = agent
+            .post_update(
+                Some("t1"),
+                &json!({"destination": "ops", "title": "Spike", "body": "A spike.\n```\nGET /x 429\n```"}),
+            )
+            .await;
+        assert!(
+            first.starts_with("posted to ops (a Microsoft Teams channel)"),
+            "{first}"
+        );
+        assert!(agent.test_destination("ops").await.is_ok());
+        let card = seen.lock().unwrap()[0].2["attachments"][0]["content"].clone();
+        assert_eq!(card["type"], "AdaptiveCard");
+        assert!(card.to_string().contains("GET /x 429"));
+        // A failure's message wouldn't carry the URL either.
+        agent
+            .destination_credentials
+            .put(
+                &destinations::credential_name("ops"),
+                "http://127.0.0.1:9/teams?sig=webhooksecretvalue",
+            )
+            .unwrap();
+        let failed = agent
+            .post_update(None, &json!({"destination": "ops", "title": "t2", "body": "b2"}))
+            .await;
+        assert!(
+            failed.starts_with("not posted") && !failed.contains("webhooksecretvalue"),
+            "{failed}"
+        );
+        let events = all_events(&agent);
+        assert!(
+            !events.contains("webhooksecretvalue") && events.contains("update.failed"),
+            "{events}"
+        );
     }
 }

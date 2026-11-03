@@ -39,30 +39,30 @@
   --sans: "Archivo", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "Martian Mono", ui-monospace, "SF Mono", Menlo, monospace;
   --column: 46rem;
-  color-scheme: light dark;
+  color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0c1e28;
-    --surface: #122a37;
-    --inset: #0f2430;
-    --bubble: #1b3a4a;
-    --ink: #e6ecea;
-    --ink-2: #c9d4d6;
-    --slate: #93a7af;
-    --rule: #24414f;
-    --signal: #ff6a33;
-    --signal-text: #ff8d61;
-    --signal-wash: #3a2219;
-    --ok: #5cc195;
-    --problem: #ff7a6e;
-    --side: #081720;
-    --side-hover: #12293a;
-    --code-bg: #071219;
-    --primary-bg: #e6ecea;
-    --primary-text: #0f2633;
-  }
+/* Dark, when chosen in Settings (theme.js sets data-theme). */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0c1e28;
+  --surface: #122a37;
+  --inset: #0f2430;
+  --bubble: #1b3a4a;
+  --ink: #e6ecea;
+  --ink-2: #c9d4d6;
+  --slate: #93a7af;
+  --rule: #24414f;
+  --signal: #ff6a33;
+  --signal-text: #ff8d61;
+  --signal-wash: #3a2219;
+  --ok: #5cc195;
+  --problem: #ff7a6e;
+  --side: #081720;
+  --side-hover: #12293a;
+  --code-bg: #071219;
+  --primary-bg: #e6ecea;
+  --primary-text: #0f2633;
 }
 
 * { box-sizing: border-box; }
@@ -340,3 +340,7 @@ kbd { font: 600 0.85em var(--mono); border: 1px solid var(--slate); border-radiu
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
   .splash span, .working span { opacity: 0.6; }
 }
+
+/* Updates: setup steps, and the Slack / Teams choice */
+.steps { margin: 0; padding-left: 1.3rem; display: flex; flex-direction: column; gap: 0.35rem; color: var(--ink-2); }
+.chip[aria-pressed="true"] { background: var(--primary-bg); color: var(--primary-text); border-color: var(--primary-bg); }

@@ -57,6 +57,10 @@ export const api = {
   saveSecret: (name, value, label, approval) =>
     request("PUT", `/api/v1/secrets/${enc(name)}`, { value, label, ...(approval ? { approval } : {}) }),
   deleteSecret: (name) => request("DELETE", `/api/v1/secrets/${enc(name)}`, {}),
+  destinations: async () => (await request("GET", "/api/v1/destinations")).destinations,
+  saveDestination: (name, body) => request("PUT", `/api/v1/destinations/${enc(name)}`, body),
+  deleteDestination: (name) => request("DELETE", `/api/v1/destinations/${enc(name)}`, {}),
+  testDestination: (name) => request("POST", `/api/v1/destinations/${enc(name)}/test`, {}),
 };
 
 /**

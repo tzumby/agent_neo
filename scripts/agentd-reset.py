@@ -12,7 +12,8 @@ Over SSM, with agentd and Chrome stopped, it deletes:
 - agentd's database: the chat, every task and scheduled run, memories,
   schedules and settings (the model and tidy-up go back to their defaults),
   and the copies of it made before upgrades (agentd.db.pre-*);
-- the screenshots the agent sent and its saved keys;
+- the screenshots the agent sent, its saved keys, and where its updates go
+  (the Slack and Teams channels, with their bot tokens and webhook URLs);
 - Chrome's whole profile: cookies and every sign-in, site data (local
   storage, IndexedDB), history, tabs and cache; and the Downloads folder.
 Then Chrome and agentd start again, empty. --files also empties the shell
@@ -48,7 +49,7 @@ STATE = "/var/lib/agentd"
 WORK = "/home/worker/work"
 ARCHIVE = "/var/lib/agentd-reset"
 # What agentd keeps (agent.rs: Agent::new; main.rs). Anything else is left alone.
-KNOWN = ["agentd.db", "agentd.db-wal", "agentd.db-shm", "images", "secrets"]
+KNOWN = ["agentd.db", "agentd.db-wal", "agentd.db-shm", "images", "secrets", "destinations"]
 action, files = sys.argv[1], "--files" in sys.argv
 
 def unit(prop, name="chrome"):
@@ -130,6 +131,7 @@ def counts():
         "db_copies": len(glob.glob(os.path.join(STATE, "agentd.db.pre-*"))),
         "images": entries(os.path.join(STATE, "images")),
         "saved_keys": entries(os.path.join(STATE, "secrets")),
+        "destinations": entries(os.path.join(STATE, "destinations")),
         "work_files": files_under(WORK),
         "unknown": sorted(
             name for name in (os.listdir(STATE) if os.path.isdir(STATE) else [])
@@ -301,6 +303,8 @@ def describe(c: dict, files: bool) -> list[str]:
         lines.append(count(c["images"], "screenshot", "screenshots"))
     if c["saved_keys"]:
         lines.append(count(c["saved_keys"], "saved key", "saved keys"))
+    if c.get("destinations"):
+        lines.append(count(c["destinations"], "Slack or Teams channel", "Slack or Teams channels") + " for updates, with their tokens")
     if c["chrome"] and (c["profile_mb"] or c["cookies"]):
         lines.append(
             f"Chrome's profile ({c['profile_mb']:,} MB): {count(c['cookies'], 'cookie', 'cookies')}, every sign-in, "

@@ -18,12 +18,12 @@ const DATADOG_SITES = [
   ["ap2.datadoghq.com", "AP2, Australia (ap2.datadoghq.com)"],
 ];
 
-/** Example checks. `needs`: the sources they read. `post`: where to post, if anywhere. */
-function examples(post, datadog) {
-  const postIt = post ? ` Post it with post_update to ${post}: severity warning if something needs action, info otherwise.` : "";
-  const alert = post
-    ? ` post a short alert with post_update to ${post}: what happened, from where, and what you'd do. If nothing stands out, post nothing and answer in one line.`
-    : " say so in a short alert: what happened, from where, and what you'd do. If nothing stands out, answer in one line.";
+/** Example checks. `needs`: the sources they read. Where they post isn't
+ * named: each run sees the channels set up by then, so the order of the steps
+ * doesn't matter. */
+function examples(datadog) {
+  const postIt = " If a channel is set up for updates, post the report there with post_update: severity warning if something needs action, info otherwise.";
+  const alert = " post a short alert with post_update to the updates channel (if none is set up, say it here): what happened, from where, and what you'd do. If nothing stands out, post nothing and answer in one line.";
   return [
     {
       name: "Morning security report",
@@ -60,19 +60,27 @@ function examples(post, datadog) {
   ];
 }
 
-export function mountSetup(store, el, { openUpdates, openChat, intro = false, onProgress = () => {} }) {
-  let state = { destinations: [], keys: new Set(), schedules: [] };
+export function mountSetup(store, el, { openUpdates, openChat, intro = false, onProgress = () => {}, onComplete = () => {} }) {
+  // The first-run guide ends on "All set" once someone has gone through it;
+  // a desktop set up before goes straight to the chat.
+  let wasIncomplete = false;
+  let finished = false;
+  let state = { destinations: [], keys: new Set(), schedules: [], skipped: new Set() };
+  // A step someone opened by hand (-1: none); null: the next one to do.
+  let open = null;
 
   async function load() {
     try {
-      const [destinations, secrets, schedules] = await Promise.all([
+      const [destinations, secrets, schedules, setup] = await Promise.all([
         store.api.destinations().catch(() => []),
         store.api.secrets(),
         store.api.schedules(),
+        store.api.setup().catch(() => ({ skipped: [] })),
       ]);
-      state = { destinations, keys: new Set(secrets.map((s) => s.name)), schedules };
+      state = { destinations, keys: new Set(secrets.map((s) => s.name)), schedules, skipped: new Set(setup.skipped) };
     } catch (error) {
-      fill(el, h("p", { class: "error" }, `Couldn't load your setup: ${error.message}`));
+      if (intro) onComplete(); // the chat, without the guide
+      else fill(el, h("p", { class: "error" }, `Couldn't load your setup: ${error.message}`));
       return;
     }
     render();
@@ -85,28 +93,115 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
     watching: () => state.schedules.length > 0,
   };
 
+  const STEPS = [
+    { id: "updates", title: "Choose where updates go", body: () => updatesCard(),
+      doneText: () => state.destinations.map((d) => (d.kind === "slack" ? `Slack ${d.channel}` : "Teams")).join(", ") },
+    { id: "cloudflare", title: "Connect Cloudflare", body: () => cloudflareCard(), doneText: () => "Token saved" },
+    { id: "datadog", title: "Connect Datadog", body: () => datadogCard(), doneText: () => "Keys saved" },
+    { id: "watching", title: "Choose what it watches", body: () => watchCard(),
+      doneText: () => (state.schedules.length === 1 ? "1 check" : `${state.schedules.length} checks`) },
+  ];
+
+  function steps() {
+    return STEPS.map((s) => {
+      const done = has[s.id]();
+      return { ...s, done, skipped: !done && state.skipped.has(s.id) };
+    });
+  }
+
   function render() {
-    const done = ["updates", "cloudflare", "datadog", "watching"].filter((step) => has[step]()).length;
-    onProgress(done, 4);
+    const all = steps();
+    const handled = all.filter((s) => s.done || s.skipped).length;
+    onProgress(handled, all.length);
+    if (handled < all.length) wasIncomplete = true;
+    if (intro && handled === all.length) {
+      if (!wasIncomplete || finished) {
+        onComplete();
+        return;
+      }
+      const start = h("button", { class: "button button-primary", type: "button" }, "Start using your agent");
+      start.addEventListener("click", () => {
+        finished = true;
+        onComplete();
+        openChat();
+      });
+      fill(el,
+        h("div", { class: "setup-intro" },
+          h("h2", null, "All set"),
+          h("p", { class: "muted" }, "Your agent is ready. You can change any of this under Setup.")),
+        h("ul", { class: "setup-summary" }, all.map((s) =>
+          h("li", null, h("span", { class: s.done ? "setup-ok" : "muted" }, s.done ? "✓" : "–"), " ", s.title, h("span", { class: "muted" }, `: ${s.done ? s.doneText() : "skipped"}`)))),
+        h("div", { class: "card-actions card-actions-start" }, start));
+      return;
+    }
+    const next = all.findIndex((s) => !s.done && !s.skipped);
+    const shown = open ?? next;
     fill(el,
       intro
         ? h("div", { class: "setup-intro" },
             h("h2", null, "Let's set up your security agent"),
-            h("p", { class: "muted" }, "Connect what it watches and where it reports. Each step takes a few minutes, and you can come back to them under Setup."))
-        : h("p", { class: "lede" }, `${done} of 4 done. Your agent reads your Cloudflare and Datadog with read-only keys kept on its desktop, checks them on a schedule, and posts what it finds.`),
-      h("ol", { class: "setup-steps" },
-        step("Choose where updates go", has.updates(), updatesCard()),
-        step("Connect Cloudflare", has.cloudflare(), cloudflareCard()),
-        step("Connect Datadog", has.datadog(), datadogCard()),
-        step("Choose what it watches", has.watching(), watchCard())));
+            h("p", { class: "muted" }, "Connect what it watches and where it reports, one step at a time. Skip what you don't use; you can come back to any step under Setup."))
+        : h("p", { class: "lede" }, handled === all.length
+            ? "All set. Your agent reads your Cloudflare and Datadog with read-only keys kept on its desktop, checks them on a schedule, and posts what it finds. Open a step to change it."
+            : `${handled} of ${all.length} done. Your agent reads your Cloudflare and Datadog with read-only keys kept on its desktop, checks them on a schedule, and posts what it finds.`),
+      h("ol", { class: "setup-steps" }, all.map((s, i) => stepItem(s, i, i === shown, i === next, all))));
   }
 
-  function step(title, done, body) {
-    return h("li", { class: done ? "setup-step is-done" : "setup-step" },
-      h("div", { class: "setup-mark", "aria-hidden": "true" }, done ? "✓" : ""),
-      h("section", { class: "card setup-card", "aria-label": title },
-        h("h3", { class: "card-title" }, title, done ? h("span", { class: "tag" }, "Done") : null),
-        body));
+  function stepItem(s, i, isOpen, isNext, all) {
+    const status = s.done ? s.doneText() : s.skipped ? "Skipped" : isNext ? "Next" : "";
+    const head = h("button", { class: "setup-head", type: "button", "aria-expanded": String(isOpen) },
+      h("span", { class: "card-title" }, s.title),
+      h("span", { class: "setup-status" }, status));
+    head.addEventListener("click", () => {
+      open = isOpen ? -1 : i;
+      render();
+    });
+    const classes = ["setup-step", s.done && "is-done", s.skipped && "is-skipped", isOpen && "is-open"].filter(Boolean).join(" ");
+    return h("li", { class: classes },
+      h("div", { class: "setup-mark", "aria-hidden": "true" }, s.done ? "✓" : s.skipped ? "–" : ""),
+      h("section", { class: "card setup-card", "aria-label": s.title },
+        head,
+        isOpen ? h("div", { class: "setup-body" }, s.body()) : null,
+        isOpen ? foot(s, i, all) : null));
+  }
+
+  /** Under the open step: skip it, keep it skipped, or go on to the next one. */
+  function foot(s, i, all) {
+    const later = all.slice(i + 1).some((t) => !t.done && !t.skipped);
+    if (s.done) {
+      if (s.id === "watching" || !later) return null;
+      const next = h("button", { class: "button button-primary", type: "button" }, "Next step");
+      next.addEventListener("click", () => {
+        open = null;
+        render();
+      });
+      return h("div", { class: "setup-foot" }, next);
+    }
+    if (s.skipped) {
+      const keep = h("button", { class: "link-button", type: "button" }, "Keep it skipped");
+      keep.addEventListener("click", () => {
+        open = null;
+        render();
+      });
+      return h("div", { class: "setup-foot" }, h("span", { class: "muted" }, "Skipped for now."), keep);
+    }
+    const skip = h("button", { class: "link-button", type: "button" }, "Skip this step");
+    skip.addEventListener("click", () => busyButton(skip, async () => {
+      try {
+        await store.api.saveSetup([...state.skipped, s.id]);
+      } catch (error) {
+        store.notice(`Couldn't skip it: ${error.message}`);
+        return;
+      }
+      await advance();
+    }));
+    return h("div", { class: "setup-foot" }, skip);
+  }
+
+  /** A step is done: on to the next one to do. */
+  async function advance() {
+    open = null;
+    await load();
   }
 
   function saveKey(name, value, label) {
@@ -122,8 +217,8 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
     }
     const slack = h("button", { class: "button button-primary", type: "button" }, "Set up Slack");
     const teams = h("button", { class: "button", type: "button" }, "Set up Microsoft Teams");
-    slack.addEventListener("click", () => openUpdates("slack"));
-    teams.addEventListener("click", () => openUpdates("teams"));
+    slack.addEventListener("click", () => openUpdates("slack", advance));
+    teams.addEventListener("click", () => openUpdates("teams", advance));
     return [
       h("p", { class: "card-text" }, "A channel where your agent posts its reports and alerts. It can post only where you add."),
       h("div", { class: "card-actions card-actions-start" }, slack, teams),
@@ -153,7 +248,7 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
         try {
           await saveKey(CLOUDFLARE_KEY, token.value.trim(), "Cloudflare API token (read-only)");
           token.value = "";
-          await load();
+          await advance();
         } catch (error) {
           problem.hidden = false;
           problem.textContent = `Couldn't save it: ${error.message}`;
@@ -195,7 +290,7 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
           await saveKey("DD_APP_KEY", appKey.value.trim(), `Datadog application key (site ${site.value})`);
           apiKey.value = "";
           appKey.value = "";
-          await load();
+          await advance();
         } catch (error) {
           problem.hidden = false;
           problem.textContent = `Couldn't save them: ${error.message}`;
@@ -208,10 +303,11 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
   // --- 4. Scheduled checks -------------------------------------------------------
 
   function watchCard() {
-    const post = state.destinations[0]?.name || "";
+    const destination = state.destinations[0];
+    const post = destination ? (destination.kind === "slack" ? `Slack ${destination.channel}` : "your Teams channel") : "";
     const sources = { cloudflare: has.cloudflare(), datadog: has.datadog() };
     const names = new Set(state.schedules.map((s) => s.name));
-    const list = examples(post, sources.datadog).map((example) => {
+    const list = examples(sources.datadog).map((example) => {
       const added = names.has(example.name);
       const missing = example.needs.filter((source) => !sources[source]);
       const add = h("button", { class: "button", type: "button", disabled: added || missing.length > 0 }, added ? "Added" : "Add");
@@ -224,6 +320,7 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
             timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
             utc_offset: -new Date().getTimezoneOffset() * 60,
           });
+          open = STEPS.findIndex((t) => t.id === "watching");
           await load();
         } catch (error) {
           store.notice(`Couldn't add it: ${error.message}`);
@@ -240,9 +337,12 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
           h("details", { class: "instructions" }, h("summary", null, "What it does"), h("p", null, example.prompt))),
         h("div", { class: "list-actions" }, add));
     });
+    if (!sources.cloudflare && !sources.datadog) {
+      return h("p", { class: "card-text" }, "These checks read Cloudflare or Datadog: connect one of them first, or skip this step and ask your agent for checks in the chat.");
+    }
     return [
       h("p", { class: "card-text" }, post
-        ? `Checks your agent runs on its own, posting to ${post}. Each run costs a little in model calls; you can pause or cancel them under Schedules.`
+        ? `Checks your agent runs on its own, posting what it finds to ${post}. Each run costs a little in model calls; you can pause or cancel them under Schedules.`
         : "Checks your agent runs on its own, reporting in the chat (and in Slack or Teams once you add a channel). You can pause or cancel them under Schedules."),
       h("ul", { class: "list setup-examples" }, list),
     ];
@@ -261,5 +361,5 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
     return h("a", { href, target: "_blank", rel: "noopener noreferrer" }, text, icon("external"));
   }
 
-  return { enter: load, refresh: load, complete: () => ["updates", "cloudflare", "datadog", "watching"].every((s) => has[s]()) };
+  return { enter: load, refresh: load };
 }

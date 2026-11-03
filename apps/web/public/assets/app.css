@@ -364,3 +364,15 @@ kbd { font: 600 0.85em var(--mono); border: 1px solid var(--slate); border-radiu
 .setup-examples .list-row:last-child { border-bottom: 0; }
 .empty .empty-setup { padding-bottom: 1rem; }
 .empty:has(.empty-setup:not([hidden])) { padding-top: 2.5rem; }
+
+/* Setup as steps: one open at a time */
+.setup-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; width: 100%; padding: 0; border: 0; background: none; text-align: left; cursor: pointer; }
+.setup-status { color: var(--slate); font-size: 0.88rem; white-space: nowrap; }
+.setup-step:not(.is-done):not(.is-skipped) .setup-status { color: var(--signal-text); font-weight: 600; }
+.setup-step:not(.is-open) .setup-card { padding-top: 0.85rem; padding-bottom: 0.85rem; }
+.setup-body { display: flex; flex-direction: column; gap: 0.6rem; }
+.setup-foot { display: flex; align-items: center; justify-content: flex-end; gap: 0.8rem; border-top: 1px solid var(--rule); padding-top: 0.7rem; }
+.setup-step.is-skipped .setup-mark { background: var(--inset); }
+.setup-step.is-skipped:not(.is-open) .card-title { color: var(--slate); }
+.setup-summary { list-style: none; margin: 0 0 1.2rem; padding: 0; display: flex; flex-direction: column; gap: 0.35rem; }
+.setup-ok { color: var(--ok); font-weight: 700; }

@@ -101,26 +101,46 @@ async def main(out):
                 p.check(await p.js("document.querySelector('.chat-scroll').scrollTop") == 0, "an empty chat opens at the top of its guide")
             p.check(await p.js("document.querySelector('#who').textContent") == "you@example.com", "signed in as the Access user")
 
-            # First run: the setup cards in the empty chat (a fresh desktop only).
+            # First run: the setup steps in the empty chat, one at a time (a fresh desktop only).
             fresh = await p.until("!document.querySelector('.empty-setup').hidden && !!document.querySelector('.empty-setup .setup-step')", 5)
             if fresh:
-                p.check(await p.js("document.querySelectorAll('.empty-setup .setup-step').length") == 4, "a fresh desktop opens on the four setup steps")
+                g = "document.querySelector('.empty-setup')"
+                open_step = f"[...{g}.querySelectorAll('.setup-step')].findIndex(s => s.classList.contains('is-open'))"
+                p.check(await p.js(f"{g}.querySelectorAll('.setup-step').length") == 4 and await p.js(open_step) == 0,
+                        "a fresh desktop opens on the first of four steps, and only that one")
                 await p.shot(f"{out}/smoke-setup.png")
-                await p.js("""(() => { const f = [...document.querySelectorAll('.empty-setup form')].find(f => f.querySelector('[aria-label="Cloudflare API token"]'));
-                    f.querySelector('[aria-label="Cloudflare API token"]').value = 'cf-test-token-123456789'; f.querySelector('button[type=submit]').click(); })()""")
-                p.check(await p.until("document.querySelectorAll('.empty-setup .setup-step.is-done').length >= 1"), "Cloudflare's token is saved from its card")
-                await p.js("""(() => { const f = [...document.querySelectorAll('.empty-setup form')].find(f => f.querySelector('[aria-label="Datadog API key"]'));
+                skip = f"(() => [...{g}.querySelectorAll('.setup-step.is-open button')].find(b => b.textContent === 'Skip this step').click())()"
+                await p.js(skip)
+                p.check(await p.until(f"{open_step} === 1 && {g}.querySelectorAll('.setup-step')[0].classList.contains('is-skipped')"), "a step can be skipped, and the next one opens")
+                await p.js(f"""(() => {{ const f = {g}.querySelector('.setup-step.is-open form');
+                    f.querySelector('[aria-label="Cloudflare API token"]').value = 'cf-test-token-123456789'; f.querySelector('button[type=submit]').click(); }})()""")
+                p.check(await p.until(f"{open_step} === 2 && {g}.querySelectorAll('.setup-step')[1].classList.contains('is-done')"), "saving Cloudflare's token goes on to the next step")
+                await p.js(skip)
+                p.check(await p.until(f"{open_step} === 3"), "no Datadog: skipped, on to the checks")
+                buttons = await p.js(f"[...{g}.querySelectorAll('.setup-examples .list-row')].map(r => r.querySelector('.strong').textContent + ':' + r.querySelector('button').disabled)")
+                p.check("Attack spike watch:false" in buttons and "Error spike watch:true" in buttons, "checks that need Datadog wait for it")
+                await p.js(f"[...{g}.querySelectorAll('.setup-examples .list-row')].find(r => r.textContent.includes('Attack spike watch')).querySelector('button').click()")
+                p.check(await p.until(f"{g}.textContent.includes('All set') && !!{g}.querySelector('.setup-summary')"), "the guide ends on All set")
+                setup = await p.js("fetch('/api/v1/setup').then(r => r.json())")
+                p.check(sorted(setup["skipped"]) == ["datadog", "updates"], "the skipped steps are kept on the desktop")
+                schedules = await p.js("fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules.map(s => s.name))")
+                p.check("Attack spike watch" in schedules, "the check is a schedule on the desktop")
+                await p.js(f"[...{g}.querySelectorAll('button')].find(b => b.textContent === 'Start using your agent').click()")
+                p.check(await p.until("document.querySelector('.empty-setup').hidden && !document.querySelector('.empty-suggest').hidden"), "Start using your agent: the chat")
+                # A skipped step, set up after all, from the Setup page.
+                await p.js("location.hash = '#/setup'")
+                await p.until("document.querySelectorAll('#view-setup .setup-step').length === 4")
+                await p.js("document.querySelectorAll('#view-setup .setup-step')[2].querySelector('.setup-head').click()")
+                await p.js("""(() => { const f = document.querySelector('#view-setup .setup-step.is-open form');
                     f.querySelector('[aria-label="Datadog site"]').value = 'datadoghq.eu';
                     f.querySelector('[aria-label="Datadog API key"]').value = 'dd-api-key-test-1234';
                     f.querySelector('[aria-label="Datadog application key"]').value = 'dd-app-key-test-5678';
                     f.querySelector('button[type=submit]').click(); })()""")
-                p.check(await p.until("document.querySelectorAll('.empty-setup .setup-step.is-done').length >= 2"), "Datadog's keys are saved from its card")
-                await p.js("[...document.querySelectorAll('.empty-setup .setup-examples .list-row')].find(r => r.textContent.includes('Attack spike watch')).querySelector('button').click()")
-                p.check(await p.until("[...document.querySelectorAll('.empty-setup .setup-examples button')].some(b => b.textContent === 'Added')"), "a suggested check is added in one go")
-                schedules = await p.js("fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules.map(s => s.name + '|' + s.description))")
-                p.check(any(s.startswith("Attack spike watch|") for s in schedules), "…as a schedule on the desktop")
+                p.check(await p.until("document.querySelectorAll('#view-setup .setup-step')[2].classList.contains('is-done')"), "a skipped step can still be done later")
                 labels = await p.js("fetch('/api/v1/secrets').then(r => r.json()).then(d => d.secrets.map(s => s.label))")
                 p.check("Datadog API key (site datadoghq.eu)" in labels, "the Datadog site is in the keys' labels, for the agent")
+                await p.js("location.hash = '#/chat'")
+                await p.until("!document.querySelector('#view-chat').hidden")
                 p.check(await p.js("!document.body.innerHTML.includes('dd-api-key-test') && !document.body.innerHTML.includes('cf-test-token')"), "no key is on the page")
 
             rows = await p.js("document.querySelectorAll('.rows > li').length")
@@ -195,7 +215,7 @@ async def main(out):
             await p.js("location.hash = '#/setup'")
             p.check(await p.until("document.querySelectorAll('#view-setup .setup-step').length === 4"), "the Setup page lists the four steps")
             if fresh:
-                p.check(await p.until("document.querySelectorAll('#view-setup .setup-step.is-done').length === 4 && document.querySelector('#nav-setup-progress').hidden"), "…all done after this run")
+                p.check(await p.until("document.querySelectorAll('#view-setup .setup-step.is-done').length === 4 && document.querySelector('#nav-setup-progress').hidden"), "…all done after this run (Slack added since)")
             await p.js("location.hash = '#/settings'")
             await p.until("!!document.querySelector('#view-settings select')")
             set_theme = """(value) => { const s = [...document.querySelectorAll('#view-settings select')]

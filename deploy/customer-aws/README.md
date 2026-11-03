@@ -99,7 +99,12 @@ We go through these in order. You can watch each step in CloudTrail.
    2. Update `/front-door/<env>/agent/tunnel_token`.
    3. Reboot the desktop from the EC2 console. It fetches its settings at each start.
 3. **Check for outside access:** run `./setup-access.sh check`, and expect nothing.
-4. **Start using the agent**, and enter its read-only Cloudflare and Datadog keys in the agent's web app. Anything you put on the desktop from now on is out of our reach.
+4. **Start using the agent.** The web app opens on Setup:
+   - its read-only Cloudflare token and Datadog keys, with the exact permissions to choose;
+   - where its updates go;
+   - which checks it runs on its own.
+
+   Anything you put on the desktop from now on is out of our reach.
 5. **Choose where its updates go**, under Updates in the web app:
    - **Slack:** choose "Create the Slack app". It opens Slack with our manifest filled in (also `deploy/messaging/slack-app-manifest.yaml`: post-only, nothing calls in). Pick your workspace and create it, install it to the workspace, and paste its bot token. Without the link, use Create New App → From scratch → Paste a manifest. The app needs no events.
    - **Teams:** add the "Send webhook alerts to a channel" workflow to the channel, and paste its URL. Give the workflow a co-owner.

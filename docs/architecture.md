@@ -483,7 +483,7 @@ A customer deployment ([customer-cloud.md](customer-cloud.md)) runs `terraform/s
   - `cloudflared.service`: user `cloudflared` (in group `front-door`), `cloudflared --no-autoupdate tunnel run --token-file /run/cloudflared/token`.
   - Before each start, `ExecStartPre=+/usr/local/sbin/front-door-settings` (Python, boto3, root: the instance role) reads the desktop's own `/front-door/<env>/<name>/*` from SSM into the unit's runtime directory (0400). Until the customer has set the parameters, it exits 1 and the unit tries again.
 - **cloudflared:** Cloudflare's GitHub `.deb`, version and SHA-256 pinned in the role's defaults (`front_door_cloudflared_version`, `front_door_cloudflared_sha256`).
-- **Egress:** `group_vars/access_cloudflare.yml` adds `api.cloudflare.com`, `.datadoghq.com` and `.datadoghq.eu` to the shell's Squid allowlist (`agentd_shell_extra_domains`).
+- **Egress:** like every desktop's (`group_vars/desktop.yml`), the shell may reach `api.cloudflare.com`, `.datadoghq.com` and `.datadoghq.eu` through Squid (`agentd_shell_extra_domains`), for security monitoring.
 - **No secrets pass through Ansible:** the desktop fetches its own. The desktop role may read `/front-door/<env>/<name>/*` (`desktop_identity` `own_parameters_path`) and nothing under `/cloud-desktops/`.
 
 ## 6. agentd: the agent on each desktop
@@ -617,6 +617,8 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | PATCH | `/api/v1/memory/{id}` | Memory v2: `{text?, kind?, valid_until?, importance?, expected_version}`. 409 with the current memory if it changed meanwhile. The text goes through the secret filter, and the memory becomes user-stated |
 | GET | `/api/v1/memory/{id}/history` | Memory v2: its `memory_events`, newest first |
 | GET | `/api/v1/schedules` | Schedules, each with its plain-language description |
+| POST | `/api/v1/schedules` | `{name, prompt, cron, timezone?, utc_offset?}`: a repeating schedule set up in the web app (Setup's suggested checks). The same limits as `schedule_task` (25 at most, every 15 minutes at most), no card, origin `user`; a name already used is refused; the time zone is remembered as a message's is |
+| GET, PUT | `/api/v1/setup` | `{steps, skipped}`: the web app's Setup steps (`updates`, `cloudflare`, `datadog`, `watching`) and those someone skipped (setting `setup_skipped`), for every browser of the desktop. PUT `{skipped}` replaces the list; an unknown step is 400 |
 | DELETE | `/api/v1/schedules/{id}` | Cancel |
 | POST | `/api/v1/schedules/{id}/pause`, `/resume` | A resumed schedule picks up from now. A one-time schedule whose time has passed: 409 |
 | GET | `/api/v1/secrets` | Saved keys: name, label, created, updated, last used. **Never values** |
@@ -1110,6 +1112,7 @@ The model therefore never sees a value, even if a command prints one or the user
 | `python` | uv projects, scripts, Python versions |
 | `node` | npm/pnpm/yarn, global CLIs in `~/.npm-global`, no long-running servers between commands |
 | `git-github` | Cloning, branches, commits. A GitHub token via `request_secret`, with a pre-filled fine-grained token URL (`/settings/personal-access-tokens/new?name=…&expires_in=90&contents=write&pull_requests=write`) and steps. A git credential helper that reads `$GITHUB_TOKEN` from the environment (nothing on disk). gh reading `GITHUB_TOKEN`. What 401 and 403 mean |
+| `security-monitoring` | Cloudflare security events (zones, GraphQL `firewallEventsAdaptiveGroups`/`firewallEventsAdaptive`) and Datadog logs (validate, `logs/events/search`, `logs/analytics/aggregate`) with the keys saved in Setup (`CLOUDFLARE_API_TOKEN`; `DD_API_KEY`/`DD_APP_KEY`, the site in their label), the token permissions and scopes to ask for, logs as attacker-written, staying read-only, and how reports and alerts read and when to post them |
 | `opencode` | Installing opencode from Nix; a Together key via `request_secret`; config without the key (`togetherai/…` reads `TOGETHER_API_KEY`); `opencode run --dir … "…"` with the key; why `--auto` is risky |
 
 ### 6.17 Notifications

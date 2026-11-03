@@ -233,6 +233,9 @@ pub struct Agent {
     step_seq: AtomicI64,
 }
 
+/// The web app's Setup steps (apps/web/public/assets/js/setup.js), in order.
+pub const SETUP_STEPS: &[&str] = &["updates", "cloudflare", "datadog", "watching"];
+
 fn short_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
 }
@@ -1770,6 +1773,43 @@ impl Agent {
         ))
     }
 
+    /// The web app's Setup steps someone chose to skip (no Datadog, say), for
+    /// every browser of this desktop. Only the steps it knows.
+    pub fn setup_skipped(&self) -> Vec<String> {
+        self.store
+            .setting("setup_skipped")
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|step| SETUP_STEPS.contains(&step.as_str()))
+            .collect()
+    }
+
+    pub fn set_setup_skipped(&self, skipped: &[String], by: Option<String>) -> Result<Vec<String>, String> {
+        let mut steps: Vec<String> = Vec::new();
+        for step in skipped.iter().map(|s| s.trim()) {
+            if !SETUP_STEPS.contains(&step) {
+                return Err(format!(
+                    "there's no setup step {step:?} (the steps: {})",
+                    SETUP_STEPS.join(", ")
+                ));
+            }
+            if !steps.iter().any(|s| s == step) {
+                steps.push(step.to_string());
+            }
+        }
+        self.store
+            .set_setting(
+                "setup_skipped",
+                &serde_json::to_string(&steps).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        tracing::info!(skipped = ?steps, by = ?by, "setup steps skipped");
+        Ok(steps)
+    }
+
     /// A repeating schedule a person sets up in the web app (Setup's
     /// examples): the same limits as schedule_task, no card (they chose it).
     /// The app sends its time zone, remembered as a message's is.
@@ -3213,6 +3253,40 @@ mod setup_schedule_tests {
                 .iter()
                 .any(|e| e.kind == "schedule.created" && e.data["by"] == "me@acme.com")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod setup_skip_tests {
+    use super::*;
+
+    #[test]
+    fn skipped_setup_steps_are_kept_for_every_browser() {
+        let (agent, dir) = test_agent();
+        assert!(agent.setup_skipped().is_empty());
+        let skipped = [
+            "datadog".to_string(),
+            "datadog".to_string(),
+            "updates".to_string(),
+        ];
+        assert_eq!(
+            agent.set_setup_skipped(&skipped, None).unwrap(),
+            ["datadog", "updates"]
+        );
+        assert_eq!(agent.setup_skipped(), ["datadog", "updates"]);
+        assert!(
+            agent
+                .set_setup_skipped(&["email".to_string()], None)
+                .unwrap_err()
+                .contains("no setup step")
+        );
+        assert_eq!(
+            agent.setup_skipped(),
+            ["datadog", "updates"],
+            "a refused change changes nothing"
+        );
+        assert!(agent.set_setup_skipped(&[], None).unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

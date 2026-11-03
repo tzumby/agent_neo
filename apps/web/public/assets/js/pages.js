@@ -303,6 +303,7 @@ settings:
 export function mountUpdates(store, view) {
   const body = view.querySelector(".page-body");
   let kind = "slack";
+  let afterAdd = null;
 
   async function load() {
     let destinations = [];
@@ -427,6 +428,12 @@ export function mountUpdates(store, view) {
         } catch (error) {
           store.notice(`Added ${n}, but the test didn't go through: ${error.message}`);
         }
+        if (afterAdd) {
+          const back = afterAdd;
+          afterAdd = null;
+          back();
+          return;
+        }
         await load();
       });
     });
@@ -435,9 +442,10 @@ export function mountUpdates(store, view) {
 
   return {
     enter: load,
-    /** From Setup: Slack or Teams already chosen. */
-    choose(choice) {
+    /** From Setup: Slack or Teams already chosen, and where to go once one is added. */
+    choose(choice, onAdded) {
       kind = choice;
+      afterAdd = onAdded || null;
     },
   };
 }

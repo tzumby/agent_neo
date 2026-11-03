@@ -26,8 +26,14 @@ const views = {
 
 const keys = mountKeys(store, views.keys.el);
 const updates = mountUpdates(store, views.updates.el);
-const openUpdates = (kind) => {
-  updates.choose(kind);
+// From Setup: Updates with Slack or Teams chosen; back to the guide (in the
+// chat or on the Setup page) once a channel is added, on its next step.
+const openUpdates = (kind, onAdded) => {
+  const back = location.hash || "#/chat";
+  updates.choose(kind, async () => {
+    location.hash = back;
+    await onAdded?.();
+  });
   location.hash = "#/updates";
 };
 const openChat = () => (location.hash = "#/chat");
@@ -44,8 +50,15 @@ const firstRun = mountSetup(store, $(".empty-setup"), {
   intro: true,
   onProgress: (done, total) => {
     showProgress(done, total);
-    $(".empty-setup").hidden = done === total;
-    $(".empty-suggest").hidden = done !== total;
+    if (done < total) {
+      $(".empty-setup").hidden = false;
+      $(".empty-suggest").hidden = true;
+    }
+  },
+  // Gone through (or set up before): the chat's usual suggestions.
+  onComplete: () => {
+    $(".empty-setup").hidden = true;
+    $(".empty-suggest").hidden = false;
   },
 });
 const pages = {

@@ -1,7 +1,8 @@
 //! Settings that don't affect what the gateway can see, from the instance's
 //! user data (JSON, set by Terraform): who may call, where usage goes, prices,
-//! the budget. What does matter (the provider's address, what's logged, the
-//! TLS key and attestation) is compiled in, so it's covered by attestation.
+//! the budget, where to publish the certificate. What does matter (the
+//! provider's address, what's logged, the TLS key and attestation) is compiled
+//! in, so it's covered by the image's measurements.
 
 use std::collections::HashMap;
 
@@ -22,6 +23,10 @@ pub struct Config {
     pub usage_table: String,
     /// The SSM SecureString holding the provider's API key.
     pub key_parameter: String,
+    /// The SSM String parameter this boot's certificate fingerprint goes to,
+    /// for desktops that pin it instead of attesting the gateway. Empty: none.
+    #[serde(default)]
+    pub certificate_parameter: String,
     pub daily_budget_usd: f64,
     /// Model → [input, cached input, output] in USD per million tokens. Only
     /// these models are allowed.

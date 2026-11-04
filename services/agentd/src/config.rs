@@ -18,11 +18,13 @@ pub struct Config {
     /// chat completions URL (default Together's; the evals use Bedrock's).
     /// Ignored when GATEWAY_URL is set: the gateway is then the only way out.
     pub llm_url: String,
-    /// The attested model gateway (https://<address>:8443). When set, model
-    /// calls go only there, after its attestation checks out.
+    /// The model gateway (https://<address>:8443). When set, model calls go
+    /// only there, over a connection pinned to its certificate.
     pub gateway_url: String,
-    /// The gateway images agentd accepts (attest.rs: parse_measurements).
-    pub gateway_measurements: Vec<crate::attest::Measurements>,
+    /// How agentd knows the gateway's certificate (gateway.rs): the images it
+    /// accepts (GATEWAY_MEASUREMENTS), else the SSM parameter gatewayd
+    /// publishes it to (GATEWAY_CERTIFICATE_PARAMETER).
+    pub gateway_trust: crate::gateway::Trust,
     /// Signed into this desktop's identity proofs for the gateway.
     pub gateway_audience: String,
     /// For the identity proof (STS in this region).
@@ -109,18 +111,20 @@ impl Config {
         if api_key.is_empty() && gateway_url.is_empty() {
             bail!("set GATEWAY_URL (or TOGETHER_API_KEY for local development)");
         }
-        let gateway_measurements = if gateway_url.is_empty() {
-            Vec::new()
+        let gateway_trust = if gateway_url.is_empty() {
+            crate::gateway::Trust::Attested(Vec::new())
         } else {
-            crate::attest::parse_measurements(&get("GATEWAY_MEASUREMENTS", ""))
-                .context("GATEWAY_MEASUREMENTS")?
+            crate::gateway::Trust::parse(
+                &get("GATEWAY_MEASUREMENTS", ""),
+                &get("GATEWAY_CERTIFICATE_PARAMETER", ""),
+            )?
         };
         Ok(Self {
             listen: get("LISTEN", "unix:/run/agentd/agentd.sock"),
             api_key: (!api_key.is_empty()).then(|| api_key.into()),
             llm_url: get("LLM_URL", crate::llm::TOGETHER_URL),
             gateway_url,
-            gateway_measurements,
+            gateway_trust,
             gateway_audience: get("GATEWAY_AUDIENCE", "cloud-desktops/model-gateway"),
             aws_region: get("AWS_REGION", "ca-central-1"),
             model: get("MODEL", "zai-org/GLM-5.3"),

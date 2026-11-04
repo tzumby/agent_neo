@@ -12,5 +12,9 @@ desktop_instance_type = "t3a.medium"
 # put the AMI here and set enable_image_builder back to false.
 enable_image_builder = false
 gateway_ami          = ""
+# Desktops pin the certificate the gateway publishes (a t4g.micro). true:
+# they check its attestation instead (a c7g.medium, which the guardrails must
+# then allow).
+gateway_attested = false
 
 model_daily_budget_usd = 20

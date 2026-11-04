@@ -23,6 +23,16 @@ pub fn binding(cert_der: &[u8]) -> Vec<u8> {
     binding
 }
 
+/// The SHA-256 of the certificate's DER in lowercase hex: what the gateway
+/// publishes for desktops that pin it without attesting (agentd: gateway.rs).
+pub fn fingerprint(cert_der: &[u8]) -> String {
+    digest(&SHA256, cert_der)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// A caller's nonce: 16 to 64 bytes, sent as hex.
 pub fn parse_nonce(hex: &str) -> Option<Vec<u8>> {
     if !hex.len().is_multiple_of(2) || !(32..=128).contains(&hex.len()) {
@@ -87,5 +97,21 @@ mod tests {
         assert_eq!(parse_nonce(&"ab".repeat(65)), None); // too long
         assert_eq!(parse_nonce(&"zz".repeat(16)), None);
         assert_eq!(parse_nonce("é"), None);
+    }
+
+    #[test]
+    fn the_fingerprint_is_the_bound_hash_in_hex() {
+        let fingerprint = fingerprint(b"certificate");
+        assert_eq!(fingerprint.len(), 64);
+        assert!(
+            fingerprint
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        let bound: String = binding(b"certificate")[BINDING_PREFIX.len()..]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(fingerprint, bound);
     }
 }

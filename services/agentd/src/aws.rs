@@ -1,11 +1,12 @@
-//! Calls to our Lambda function URLs (the push relay, the model gateway) as
-//! this desktop: SigV4-signed with the instance role's credentials from the
-//! metadata service, so the desktop holds no keys of ours. Also the identity
-//! proof for the attested model gateway (a signed STS GetCallerIdentity).
+//! Calls to our Lambda function URLs (the push relay) as this desktop:
+//! SigV4-signed with the instance role's credentials from the metadata
+//! service, so the desktop holds no keys of ours. Also the identity proof for
+//! the model gateway (a signed STS GetCallerIdentity), and reading the
+//! gateway's published certificate from SSM.
 
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
 use aws_sigv4::sign::v4;
@@ -57,7 +58,9 @@ impl FunctionUrl {
         let headers = signed_headers(
             &self.role.credentials().await?,
             &self.region,
+            "lambda",
             &url,
+            &[("content-type", "application/json")],
             body,
             SystemTime::now(),
         )?;
@@ -118,12 +121,14 @@ impl InstanceRole {
     }
 }
 
-/// The SigV4 headers (authorization, x-amz-date, x-amz-security-token) for a
-/// JSON POST to a Lambda function URL.
+/// A POST's headers: `headers`, then the SigV4 ones (authorization,
+/// x-amz-date, x-amz-security-token) for `service`.
 fn signed_headers(
     credentials: &Credentials,
     region: &str,
+    service: &str,
     url: &str,
+    headers: &[(&str, &str)],
     body: &[u8],
     time: SystemTime,
 ) -> Result<Vec<(String, String)>> {
@@ -131,15 +136,17 @@ fn signed_headers(
     let params = v4::SigningParams::builder()
         .identity(&identity)
         .region(region)
-        .name("lambda")
+        .name(service)
         .time(time)
         .settings(SigningSettings::default())
         .build()?
         .into();
-    let content_type = [("content-type", "application/json")];
-    let signable = SignableRequest::new("POST", url, content_type.into_iter(), SignableBody::Bytes(body))?;
+    let signable = SignableRequest::new("POST", url, headers.iter().copied(), SignableBody::Bytes(body))?;
     let (instructions, _) = sign(signable, &params)?.into_parts();
-    let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
+    let mut headers: Vec<(String, String)> = headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
     headers.extend(
         instructions
             .headers()
@@ -148,13 +155,55 @@ fn signed_headers(
     Ok(headers)
 }
 
+/// An SSM String parameter's value, read with the instance role (the model
+/// gateway's published certificate: gateway.rs).
+pub async fn ssm_parameter(
+    client: &reqwest::Client,
+    role: &InstanceRole,
+    region: &str,
+    name: &str,
+) -> Result<String> {
+    let url = format!("https://ssm.{region}.amazonaws.com/");
+    let body = serde_json::to_vec(&serde_json::json!({ "Name": name }))?;
+    let headers = signed_headers(
+        &role.credentials().await?,
+        region,
+        "ssm",
+        &url,
+        &SSM_GET_PARAMETER,
+        &body,
+        SystemTime::now(),
+    )?;
+    let mut request = client.post(&url).body(body);
+    for (header, value) in headers {
+        request = request.header(header, value);
+    }
+    let response = request.send().await.context("reaching SSM")?;
+    let status = response.status();
+    let answer: serde_json::Value = response.json().await.unwrap_or_default();
+    ensure!(
+        status.is_success(),
+        "reading {name}: {status} {}",
+        answer["__type"].as_str().unwrap_or_default()
+    );
+    answer["Parameter"]["Value"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| anyhow!("{name} has no value"))
+}
+
+const SSM_GET_PARAMETER: [(&str, &str); 2] = [
+    ("content-type", "application/x-amz-json-1.1"),
+    ("x-amz-target", "AmazonSSM.GetParameter"),
+];
+
 /// Signed into identity proofs (gatewayd: identity.rs), with the gateway's
 /// audience value, so a proof only works at that gateway.
 pub const AUDIENCE_HEADER: &str = "x-cloud-desktops-audience";
 const STS_BODY: &str = "Action=GetCallerIdentity&Version=2011-06-15";
 const STS_CONTENT_TYPE: &str = "application/x-www-form-urlencoded; charset=utf-8";
 
-/// This desktop's identity proof for the attested model gateway: the signed
+/// This desktop's identity proof for the model gateway: the signed
 /// headers of an STS GetCallerIdentity request (base64 JSON). The gateway
 /// sends the request to STS and learns which role session made it.
 pub fn sts_proof(
@@ -219,7 +268,9 @@ mod tests {
         let headers = signed_headers(
             &credentials,
             "ca-central-1",
+            "lambda",
             "https://abc.lambda-url.ca-central-1.on.aws/notify",
+            &[("content-type", "application/json")],
             br#"{"title":"x"}"#,
             time,
         )
@@ -238,6 +289,36 @@ mod tests {
         );
         assert_eq!(get("x-amz-security-token"), Some("session"));
         assert_eq!(get("x-amz-date"), Some("20231114T221320Z"));
+    }
+
+    #[test]
+    fn signs_ssm_reads_with_their_target() {
+        let credentials = Credentials::new("AKIDEXAMPLE", "secret", Some("session".into()), None, "test");
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let headers = signed_headers(
+            &credentials,
+            "ca-central-1",
+            "ssm",
+            "https://ssm.ca-central-1.amazonaws.com/",
+            &SSM_GET_PARAMETER,
+            br#"{"Name":"/x"}"#,
+            time,
+        )
+        .unwrap();
+        let get = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
+        let auth = get("authorization").unwrap();
+        assert!(
+            auth.starts_with(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231114/ca-central-1/ssm/aws4_request"
+            ),
+            "{auth}"
+        );
+        assert!(
+            auth.contains("SignedHeaders=content-type;host;x-amz-date;x-amz-security-token;x-amz-target"),
+            "{auth}"
+        );
+        assert_eq!(get("x-amz-target"), Some("AmazonSSM.GetParameter"));
+        assert_eq!(get("content-type"), Some("application/x-amz-json-1.1"));
     }
 
     #[test]

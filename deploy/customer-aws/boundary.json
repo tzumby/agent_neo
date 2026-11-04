@@ -38,6 +38,7 @@
       "Action": ["ssm:GetParameter", "ssm:GetParameters"],
       "Resource": [
         "arn:aws:ssm:*:*:parameter/cloud-desktops/*",
+        "arn:aws:ssm:*:*:parameter/cloud-desktops-shared/*",
         "arn:aws:ssm:*:*:parameter/front-door/*"
       ]
     },
@@ -67,6 +68,12 @@
         "ec2:CreateTags"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "PublishGatewayCertificate",
+      "Effect": "Allow",
+      "Action": "ssm:PutParameter",
+      "Resource": "arn:aws:ssm:*:*:parameter/cloud-desktops-shared/*/gateway/certificate"
     },
     {
       "Sid": "PublishGatewayImageMeasurements",

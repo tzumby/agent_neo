@@ -2784,7 +2784,7 @@ pub(crate) fn test_agent_with(slack_api: &str) -> (Arc<Agent>, std::path::PathBu
         api_key: Some("test-key-not-used".to_string().into()),
         llm_url: crate::llm::TOGETHER_URL.into(),
         gateway_url: String::new(),
-        gateway_measurements: Vec::new(),
+        gateway_trust: crate::gateway::Trust::Attested(Vec::new()),
         gateway_audience: String::new(),
         aws_region: "ca-central-1".into(),
         model: "zai-org/GLM-5.3".into(),

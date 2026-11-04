@@ -37,6 +37,11 @@ variable "gateway_ami" {
   default = ""
 }
 
+variable "gateway_attested" {
+  type    = bool
+  default = false
+}
+
 variable "model_daily_budget_usd" {
   type    = number
   default = 20

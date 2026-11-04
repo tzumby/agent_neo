@@ -73,9 +73,10 @@ module "push_relay" {
   source_dir          = "${path.root}/../../../services/push-relay/src"
 }
 
-# The attested model gateway (docs/operator-isolation.md): gatewayd on an
-# image nobody can log into. Desktops send prompts only after checking its
-# measurements, which the image build published for that image.
+# The model gateway: gatewayd on an image nobody can log into, holding the
+# Together key. Desktops send prompts only to its pinned certificate: the one
+# it publishes to SSM at boot, or (gateway_attested) the one its attestation
+# names, checked against the measurements the image build published.
 module "image_builder" {
   source = "../../modules/image_builder"
   count  = var.enable_image_builder ? 1 : 0
@@ -86,7 +87,7 @@ module "image_builder" {
 }
 
 data "aws_ssm_parameter" "gateway_measurements" {
-  count = var.gateway_ami != "" ? 1 : 0
+  count = var.gateway_ami != "" && var.gateway_attested ? 1 : 0
   name  = "/${var.project}/${var.env}/gateway/images/${var.gateway_ami}"
 }
 
@@ -99,20 +100,23 @@ moved {
 module "attested_gateway" {
   source = "../../modules/attested_gateway"
 
-  name                = local.name
-  ami                 = var.gateway_ami
-  measurements        = var.gateway_ami != "" ? data.aws_ssm_parameter.gateway_measurements[0].value : ""
-  vpc_id              = module.network.vpc_id
-  subnet_id           = module.network.private_subnet_ids[0]
-  private_ip          = cidrhost(module.network.private_subnet_cidrs[0], 10)
-  desktop_sg_id       = module.security.desktop_sg_id
-  desktop_role_prefix = local.desktop_role_prefix
-  audience            = "${local.name}/model-gateway"
-  ssm_prefix          = "/${var.project}/${var.env}"
-  daily_budget_usd    = var.model_daily_budget_usd
+  name                  = local.name
+  ami                   = var.gateway_ami
+  attested              = var.gateway_attested
+  measurements          = one(data.aws_ssm_parameter.gateway_measurements[*].value)
+  certificate_parameter = "/${var.project}-shared/${var.env}/gateway/certificate"
+  vpc_id                = module.network.vpc_id
+  subnet_id             = module.network.private_subnet_ids[0]
+  private_ip            = cidrhost(module.network.private_subnet_cidrs[0], 10)
+  desktop_sg_id         = module.security.desktop_sg_id
+  desktop_role_prefix   = local.desktop_role_prefix
+  audience              = "${local.name}/model-gateway"
+  ssm_prefix            = "/${var.project}/${var.env}"
+  daily_budget_usd      = var.model_daily_budget_usd
   # The models allowed through the gateway, with Together's serverless prices
   # (agentd's llm.rs has the same). In the instance's user data: a change
-  # replaces the gateway instance (same image), and desktops attest it again.
+  # replaces the gateway instance (same image), and desktops pin its new
+  # certificate.
   prices = {
     "zai-org/GLM-5.3"                      = [1.40, 0.26, 4.40]
     "zai-org/GLM-5.3-Flash"                = [0.15, 0.03, 0.50]

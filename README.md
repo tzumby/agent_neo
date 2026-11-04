@@ -4,7 +4,7 @@ Always-on Linux desktops (XFCE + Google Chrome; x86_64 by default, `desktop_arch
 See [PLAN.MD](PLAN.MD) for the full design and milestones.
 
 **Current state:** one test desktop, configured by Ansible over SSM, runs Chrome
-on a virtual display with **agentd** (the agent), an attested model gateway, a
+on a virtual display with **agentd** (the agent), a model gateway that holds the model key, a
 push relay, and iPhone and Mac apps that reach the desktop over your tailnet. No
 Packer, launch template, data volume or control plane yet. The full picture is in
 [docs/architecture.md](docs/architecture.md).
@@ -301,7 +301,7 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   their devices (no Tailscale account), the notarized Mac app and the iPhone app
   through TestFlight (2026-11-02).
 - [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'
-  prompts and data unreadable to us: the attested gateway (built) and the plan for
+  prompts and data unreadable to us: the attested gateway (built, off by default) and the plan for
   attested desktops that customers verify and approve updates for (§11).
 - [docs/customer-cloud.md](docs/customer-cloud.md): the agent in a customer's own
   AWS sandbox account, reached through their Cloudflare Access (front-door), with
@@ -329,7 +329,7 @@ make destroy               # dev env. The state bucket is protected (prevent_des
   (your tailnet), nothing else. The control-plane milestone brings its own
   per-session auth.
 - Cost while step 1 is up: one t3a.medium desktop (~$0.042/h in ca-central-1) with a
-  20 GB gp3 volume, the attested gateway (c7g.medium, ~$0.040/h), plus the shared
+  20 GB gp3 volume, the model gateway (t4g.micro, ~$0.0092/h), plus the shared
   fck-nat t4g.nano and its Elastic IP.
 - Desktops are x86_64 (`desktop_arch = "amd64"`): many Linux desktop apps (Slack,
   Zoom, Discord) ship only for it. arm64 (Graviton) is ~13% cheaper and still

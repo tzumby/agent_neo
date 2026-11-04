@@ -1,6 +1,6 @@
 # Keeping user data from the operator: design and plan
 
-*Status: 2026-11-03. The attested gateway (§4) is built. Attested desktops (§5–§10) are planned, not built. Vendor facts were checked against the sources at the end on 2026-10-31 and 2026-11-03; anything not yet confirmed in practice is marked UNVERIFIED and has a check in §11.*
+*Status: 2026-11-04. The attested gateway (§4) is built, and switched off by default since 2026-11-04 (§4). Attested desktops (§5–§10) are planned, not built. Vendor facts were checked against the sources at the end on 2026-10-31 and 2026-11-03; anything not yet confirmed in practice is marked UNVERIFIED and has a check in §11.*
 
 *Customer deployments ([customer-cloud.md](customer-cloud.md)) change who "the operator" is. There the agent runs in the customer's own AWS account, and we have access only while they grant it. For them, the account boundary is the main guarantee, and this plan's sealed desktops (§6) become the way to update a desktop without giving us an access window. The design below is for desktops we host.*
 
@@ -53,6 +53,8 @@ The same block is used twice: for the gateway (§4) and for the desktop (§5–�
 
 ## 4. Attested model gateway (built)
 
+**Off by default since 2026-11-04** (`gateway_attested = false`, in dev and in customer deployments). Desktops instead pin the certificate the gateway publishes to SSM at boot, and the gateway runs on a t4g.micro ($6.72/month) instead of a c7g.medium ($28.84). In dev we have root on the desktops over SSM, so attesting the gateway to them proved nothing to anyone. In a customer's account, it would only keep out the customer's own admins. Attested desktops would turn it back on: `gateway_attested = true` brings back the c7g.medium and everything below.
+
 ```
 agentd ──TLS, pinned to the attested certificate──► gatewayd (attested EC2) ──TLS──► Together
 ```
@@ -80,7 +82,7 @@ The details are in `architecture.md` §7. In short:
 
   It then pins that certificate. If any check fails, nothing is sent; there's no fallback.
 - **The Together key** comes from SSM at startup and stays in memory. Gating it behind KMS wouldn't protect prompts: a changed gateway fails agentd's checks with or without it.
-- **Fixed in code, not yet in an image:** only one attestation runs at a time. `/dev/tpm0` takes one opener, so a second request at the same moment failed with a 500 (seen on 2026-11-03). This ships with the next image (slice G1).
+- **Fixed in code:** only one attestation runs at a time. `/dev/tpm0` takes one opener, so a second request at the same moment failed with a 500 (seen on 2026-11-03). Images built since 2026-11-04 (gatewayd 0.2.0) have it.
 - **Open:** the trusted measurements reach agentd from SSM through Ansible, so the operator chooses them. On attested desktops they're part of the desktop image and change only with the customer's approval (§6.1, §8).
 
 ## 5. Decisions for attested desktops

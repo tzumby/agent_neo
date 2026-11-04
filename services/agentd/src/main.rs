@@ -105,16 +105,16 @@ async fn serve_until_stopped(
     Ok(())
 }
 
-/// `agentd --check-gateway` (as the agentd user): checks the attested model
-/// gateway the way a model call would, without sending a prompt.
+/// `agentd --check-gateway` (as the agentd user): checks the model gateway
+/// the way a model call would, without sending a prompt.
 async fn check_gateway() -> Result<()> {
     let cfg = config::Config::load()?;
     anyhow::ensure!(!cfg.gateway_url.is_empty(), "GATEWAY_URL isn't set");
-    let gateway = gateway::AttestedGateway::new(
+    let gateway = gateway::ModelGateway::new(
         &cfg.gateway_url,
         &cfg.aws_region,
         &cfg.gateway_audience,
-        cfg.gateway_measurements,
+        cfg.gateway_trust,
         std::time::Duration::from_secs(30),
     )?;
     println!("{}: {}", cfg.gateway_url, gateway.check().await?);

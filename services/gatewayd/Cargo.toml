@@ -1,6 +1,6 @@
 [package]
 name = "gatewayd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Attested model gateway: forwards desktops' model calls to the provider, from an image the operator can't log into"
 publish = false

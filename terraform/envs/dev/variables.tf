@@ -159,7 +159,13 @@ variable "enable_image_builder" {
 }
 
 variable "gateway_ami" {
-  description = "Attested gateway image from scripts/build-gateway-image.sh. Empty: no attested gateway yet."
+  description = "Model gateway image from scripts/build-gateway-image.sh. Empty: no gateway yet."
   type        = string
   default     = ""
+}
+
+variable "gateway_attested" {
+  description = "Desktops check the gateway's NitroTPM attestation (a c7g.medium, about $29/month) instead of pinning the certificate it publishes to SSM (a t4g.micro, about $7/month)."
+  type        = bool
+  default     = false
 }

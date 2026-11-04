@@ -6,7 +6,7 @@ We deploy it with temporary access that you set up and remove. This folder is ev
 
 | File | What it is |
 |---|---|
-| `boundary.json` | The **permissions boundary**: the most any role our deployment creates can ever do. Session Manager's agent, reading the agent's own settings, the model gateway's spend table, and building the gateway's image. No IAM, no access to anything else |
+| `boundary.json` | The **permissions boundary**: the most any role our deployment creates can ever do. Session Manager's agent, reading the agent's own settings, the model gateway's spend table and publishing its certificate, and building the gateway's image. No IAM, no access to anything else |
 | `deployer-policy.json` | **What we can do** while our access is on: EC2, Session Manager and SSM parameters in `ca-central-1`; buckets, a table, keys and roles named `cloud-desktops-*`, roles only with the boundary. It explicitly can't read or replace your secrets, connect the account to other networks, share disks or images out of it, give instances public addresses, or open other ways in (key pairs, serial console, Instance Connect) |
 | `scp-guardrails.json` | **A service control policy** for the account, if it's in your AWS Organization. It applies to everyone in the account, us included, and nothing inside the account can change it. One region only, audit stays on (CloudTrail, Config, GuardDuty, Access Analyzer), no IAM users or access keys, no connections to other networks, nothing shared out, no public addresses on instances, only the agent's instance types, the boundary can't be changed |
 | `rcp-no-outside-access.json` | **A resource control policy**, also for an Organization account: nothing outside your organization can assume a role in the account or use its buckets, keys or secrets. AWS services acting for the account still can. Replace `o-REPLACE-WITH-YOUR-ORG-ID` |
@@ -17,16 +17,16 @@ We deploy it with temporary access that you set up and remove. This folder is ev
 A VPC with private subnets and an AWS NAT gateway: everything leaves through one fixed IP, which you can allowlist. There are no inbound ports and no public addresses on instances. Inside it:
 
 - **The agent's desktop:** Ubuntu with Chrome, the agent (agentd) and `cloudflared`, on its own role, with its disk encrypted with its own KMS key.
-- **The model gateway:** a read-only image nobody can log into. It holds your Together key and enforces a daily spend limit.
+- **The model gateway:** a read-only image nobody can log into. It holds your Together key and enforces a daily spend limit. It publishes its TLS certificate's fingerprint to an SSM parameter at each boot, and the desktop talks only to the gateway holding that certificate. Only the gateway's role, and your account's admins, can change that parameter.
 
-It costs about $100 a month in AWS charges (desktop t3a.medium, NAT gateway, gateway c7g.medium, disks, the fixed IP, KMS), plus your Together usage.
+It costs about $78 a month in AWS charges (desktop t3a.medium, NAT gateway, gateway t4g.micro, disks, the fixed IP, KMS), plus your Together usage.
 
 ## Before we start
 
 Check the sandbox's own rules with us. A sandbox meant for short experiments can get in the way of an agent that's always on:
 
 - [ ] **Cleanup:** the account isn't on a lease or a cleanup schedule (AWS Innovation Sandbox, aws-nuke) that would wipe it.
-- [ ] **Allowed services:** its policies allow an internet gateway and NAT gateway, an Elastic IP, KMS keys, IAM roles, and the instance types t3a.medium, c7g.medium and t4g.xlarge (a temporary image builder).
+- [ ] **Allowed services:** its policies allow an internet gateway and NAT gateway, an Elastic IP, KMS keys, IAM roles, and the instance types t3a.medium, t4g.micro and t4g.xlarge (a temporary image builder).
 - [ ] **Region:** `ca-central-1` is allowed.
 - [ ] **Budget actions:** any budget that stops resources sits well above about $150 a month.
 

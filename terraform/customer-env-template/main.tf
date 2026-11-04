@@ -11,5 +11,6 @@ module "customer" {
   desktop_instance_type  = var.desktop_instance_type
   enable_image_builder   = var.enable_image_builder
   gateway_ami            = var.gateway_ami
+  gateway_attested       = var.gateway_attested
   model_daily_budget_usd = var.model_daily_budget_usd
 }

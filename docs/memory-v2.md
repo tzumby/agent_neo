@@ -15,7 +15,7 @@ Rules for Claude Code while implementing:
 - Work phase by phase (§18), one PR per phase. `make agentd-test` (fmt, clippy `-D warnings`, tests) is green at every commit.
 - Every schema change is additive (`ADD COLUMN`, `CREATE TABLE`). Never drop, rename or re-type anything 0.14.0 reads.
 - The harness enforces rules, not the prompt. Every MUST below is a code check in agentd with a unit test; prompt text is guidance only.
-- No new network paths. Model calls go through the attested gateway as today. No memory content ever reaches an AWS-side store, the push relay, or the journal.
+- No new network paths. Model calls go through the model gateway as today. No memory content ever reaches an AWS-side store, the push relay, or the journal.
 - No embeddings, no vector extension, no new crates beyond §20.
 - Where this plan conflicts with the code you find, keep the code's behaviour, finish the phase, and list the conflict in the PR description. Do not invent a third option silently.
 - Update `docs/architecture.md` (§6.3, §6.4, §6.5, §6.8, §6.13, §6.14, §6.17) in the same PR as the code it describes.

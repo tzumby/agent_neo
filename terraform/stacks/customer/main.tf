@@ -65,6 +65,9 @@ module "desktop_fleet" {
 # --- The model gateway ---------------------------------------------------------
 # Holds the customer's Together key (they add it to SSM after our access is
 # off; gatewayd retries until it's there), so it never reaches the desktop.
+# Desktops pin the certificate it publishes to SSM: in the customer's own
+# account, its admins are the only ones who could change that, and attesting
+# wouldn't keep them out of their own desktop anyway (gateway_attested).
 
 module "image_builder" {
   source = "../../modules/image_builder"
@@ -77,26 +80,28 @@ module "image_builder" {
 }
 
 data "aws_ssm_parameter" "gateway_measurements" {
-  count = var.gateway_ami != "" ? 1 : 0
+  count = var.gateway_ami != "" && var.gateway_attested ? 1 : 0
   name  = "/cloud-desktops/${var.env}/gateway/images/${var.gateway_ami}"
 }
 
 module "attested_gateway" {
   source = "../../modules/attested_gateway"
 
-  name                 = local.name
-  ami                  = var.gateway_ami
-  measurements         = var.gateway_ami != "" ? data.aws_ssm_parameter.gateway_measurements[0].value : ""
-  vpc_id               = module.network.vpc_id
-  subnet_id            = module.network.private_subnet_ids[0]
-  private_ip           = cidrhost(module.network.private_subnet_cidrs[0], 10)
-  desktop_sg_id        = aws_security_group.desktop.id
-  desktop_role_prefix  = local.desktop_role_prefix
-  audience             = "${local.name}/model-gateway"
-  ssm_prefix           = "/cloud-desktops/${var.env}"
-  daily_budget_usd     = var.model_daily_budget_usd
-  prices               = var.model_prices
-  permissions_boundary = var.permissions_boundary
+  name                  = local.name
+  ami                   = var.gateway_ami
+  attested              = var.gateway_attested
+  measurements          = one(data.aws_ssm_parameter.gateway_measurements[*].value)
+  certificate_parameter = "/cloud-desktops-shared/${var.env}/gateway/certificate"
+  vpc_id                = module.network.vpc_id
+  subnet_id             = module.network.private_subnet_ids[0]
+  private_ip            = cidrhost(module.network.private_subnet_cidrs[0], 10)
+  desktop_sg_id         = aws_security_group.desktop.id
+  desktop_role_prefix   = local.desktop_role_prefix
+  audience              = "${local.name}/model-gateway"
+  ssm_prefix            = "/cloud-desktops/${var.env}"
+  daily_budget_usd      = var.model_daily_budget_usd
+  prices                = var.model_prices
+  permissions_boundary  = var.permissions_boundary
 }
 
 # --- Desktops ------------------------------------------------------------------

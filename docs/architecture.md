@@ -10,7 +10,7 @@
 4. [AWS infrastructure (Terraform)](#4-aws-infrastructure-terraform)
 5. [The desktop VM](#5-the-desktop-vm)
 6. [agentd: the agent on each desktop](#6-agentd-the-agent-on-each-desktop)
-7. [The attested model gateway](#7-the-attested-model-gateway)
+7. [The model gateway](#7-the-model-gateway)
 8. [The push relay](#8-the-push-relay)
 9. [tailnet-proxy: the desktop on the user's tailnet](#9-tailnet-proxy-the-desktop-on-the-users-tailnet)
 10. [The iPhone and Mac apps](#10-the-iphone-and-mac-apps)
@@ -33,7 +33,7 @@ The pieces:
   - the agent's shell commands as `worker`, in hardened systemd units behind an egress allowlist;
   - **tailnet-proxy**, the desktop's only presence on the user's Tailscale network.
 - **agentd** (Rust): the model loop, browser tools over Chrome's DevTools Protocol, a shell tool, approvals that park and resume, memory, scheduled tasks, saved keys, and the HTTP + SSE API the app uses. All of the user's agent state lives on the VM, in `/var/lib/agentd`.
-- **The attested model gateway** (Rust, `gatewayd`): one c7g.medium running a read-only image that nobody can log into. It holds the Together AI key and forwards desktops' model calls. agentd verifies its NitroTPM attestation and pins its TLS certificate before sending a prompt.
+- **The model gateway** (Rust, `gatewayd`): one t4g.micro running a read-only image that nobody can log into. It holds the Together AI key and forwards desktops' model calls. agentd pins its TLS certificate before sending a prompt: the one the gateway publishes to SSM at boot, or, when `gateway_attested` is on, the one its NitroTPM attestation names (that needs a c7g.medium).
 - **The push relay** (Node.js Lambda): the only holder of the APNs key. Desktops call it with their IAM identity to notify the devices registered through them.
 - **The iPhone and Mac apps** (SwiftUI; iOS 26, macOS 15.6): each runs its own userspace Tailscale node (TailscaleKit), finds the desktop by its tag, streams agentd's event log into a chat, and shows the screen over VNC for take-over. They share their screens (§10).
 - **The model provider**: Together AI (serverless; zero data retention on). The default model is `zai-org/GLM-5.3`, which is text-only. The agent reads pages through the accessibility tree and text, not screenshots.
@@ -54,7 +54,7 @@ The pieces:
   └────────▲─────────┘   │   └───┼───────────────────────────────────────────────────────────────────────────┘ │
            │             └───────┼─────────────────────────────────────────────────────────────────────────────┘
   ┌────────┴─────────┐           │ SigV4 (instance role)              ┌──────────────────────────────┐
-  │ push relay       │◄──────────┤                                    │ attested gateway (c7g)       │
+  │ push relay       │◄──────────┤                                    │ model gateway (t4g.micro)    │
   │ Lambda + URL     │           └── pinned TLS + STS proof :8443 ───►│ gatewayd ─► Together AI      │
   │ DynamoDB devices │                                                │ read-only, no login          │
   └──────────────────┘                                                └──────────────────────────────┘
@@ -90,7 +90,7 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
    - Desktops are denied our SSM parameters.
    - Logs carry metadata only.
 6. **Operator-blind is the goal** (`operator-isolation.md`): users' prompts and data should be unreadable to us.
-   - **Built:** the attested gateway. Prompts leave the desktop only to an image we can't log into, and agentd verifies it.
+   - **Built:** the model gateway. Prompts leave the desktop only to an image nobody can log into. agentd can also verify which image by attestation (`gateway_attested`, §7), but that's off: we have root on our own desktops anyway, and in a customer's account it would only keep out the customer's own admins.
    - **Not built:** an attested desktop. Today the operator has root on desktops through SSM.
 7. **The agent acts only with the user's approval for anything consequential.**
    - Sending, writing, deleting, buying, running as root, sending data out after reading outside content, scheduling after outside content.
@@ -114,7 +114,7 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
 | `terraform/modules/iam` | The fleet desktop role |
 | `terraform/modules/desktop_identity` | One desktop's own role and instance profile |
 | `terraform/modules/desktop_fleet` | The SSM file-transfer bucket |
-| `terraform/modules/attested_gateway` | The gateway instance, its role, security group, usage table, SSM parameters |
+| `terraform/modules/attested_gateway` | The gateway instance, its role, security group, usage table, SSM parameters (including the one it publishes its certificate to). Named for when it always attested |
 | `terraform/modules/image_builder` | Role and security group for the temporary image builder |
 | `terraform/modules/push_relay` | The relay Lambda, function URL, devices table |
 | `terraform/stacks/customer` | A customer deployment's whole account: network with a NAT gateway, desktops, gateway, image builder; every role with the customer's boundary ([customer-cloud.md](customer-cloud.md)) |
@@ -122,7 +122,7 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
 | `deploy/customer-aws/` | The customer's side: permissions boundary, deployer policy, SCP, RCP, `setup-access.sh`, the runbook |
 | `ansible/` | Inventory (aws_ec2 over SSM), playbooks, roles `common`, `desktop`, `agentd`, `tailnet_proxy`, `front_door` |
 | `services/agentd/` | The agent (Rust) and its skills |
-| `services/gatewayd/` | The attested model gateway (Rust) |
+| `services/gatewayd/` | The model gateway (Rust) |
 | `services/push-relay/` | The push relay (Node.js) and its tests |
 | `services/tailnet-proxy/` | The tailnet node (Go, tsnet) |
 | `services/front-door/` | A customer deployment's way in: checks the Cloudflare Access token, then the web app, agentd's API or noVNC (Go). `door/` is those routes and protections, shared with tailnet-proxy; `devedge/` stands in for Access on a Mac |
@@ -251,7 +251,7 @@ Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0), `hashicorp/archiv
 | Instance | Type | Where | Image | Notes |
 |---|---|---|---|---|
 | Test desktop | t3a.medium (`desktop_instance_type`; `cpu_credits = unlimited`) | Private subnet 1 | Latest Canonical Ubuntu 26.04 for `desktop_arch` (amd64 default, arm64 supported) | No key pair, no user data, IMDSv2 (hop limit 1), 20 GiB gp3 encrypted with the user's key, the user's instance profile, `Role=desktop`. AMI changes are ignored (Ansible updates in place). Precondition: a NAT is enabled |
-| Attested gateway | c7g.medium | Private subnet 1, fixed IP 10.40.16.10 | `gateway_ami` (built by `make gateway-image`) | Needs the AMI's measurements in SSM. User data = gatewayd's JSON config; changing it replaces the instance, which gets a new TLS key |
+| Model gateway | t4g.micro (c7g.medium with `gateway_attested`) | Private subnet 1, fixed IP 10.40.16.10 | `gateway_ami` (built by `make gateway-image`) | With `gateway_attested`, needs the AMI's measurements in SSM. User data = gatewayd's JSON config; changing it replaces the instance, which gets a new TLS key and publishes its fingerprint |
 | fck-nat | t4g.nano | Public subnet 1 | fck-nat AL2023 | EIP on its ENI |
 | Image builder | t4g.xlarge | Private subnet 1 | AL2023 arm64 | Temporary: launched and terminated by the build script; the module is enabled only between builds |
 
@@ -514,8 +514,9 @@ A customer deployment ([customer-cloud.md](customer-cloud.md)) runs `terraform/s
 | Key | Default | Meaning |
 |---|---|---|
 | `LISTEN` | `unix:/run/agentd/agentd.sock` | Unix socket in production; `127.0.0.1:8765` in local development |
-| `GATEWAY_URL` | (none) | The attested gateway, `https://<ip>:8443`. Required unless `TOGETHER_API_KEY` is set (local development only) |
-| `GATEWAY_MEASUREMENTS` | (none) | The gateway images agentd accepts (PCR values; `attest::parse_measurements`) |
+| `GATEWAY_URL` | (none) | The model gateway, `https://<ip>:8443`. Required unless `TOGETHER_API_KEY` is set (local development only) |
+| `GATEWAY_MEASUREMENTS` | (none) | The gateway images agentd accepts (PCR values; `attest::parse_measurements`). When set, agentd attests the gateway and ignores the parameter below |
+| `GATEWAY_CERTIFICATE_PARAMETER` | (none) | Without measurements: the SSM parameter gatewayd publishes its certificate's fingerprint to, which agentd pins. One of the two is required with `GATEWAY_URL` |
 | `GATEWAY_AUDIENCE` | `cloud-desktops/model-gateway` | Signed into the desktop's identity proofs |
 | `AWS_REGION` | `ca-central-1` | For STS identity proofs |
 | `TOGETHER_API_KEY` | (none) | Local development only; held as `secrecy::SecretString`, never printed |
@@ -561,7 +562,7 @@ A customer deployment ([customer-cloud.md](customer-cloud.md)) runs `terraform/s
 | `agent.rs` | Tasks: start, run loop, tool dispatch, approvals and parking, resume, finish, stop, recovery; memory, schedule and key tools; redaction hooks |
 | `tools.rs` | The system prompt and the tool schemas the model sees |
 | `llm.rs` | Chat-completions client (gateway or Together directly), `KNOWN_MODELS`, reasoning handling, usage and cost, `truncate` |
-| `gateway.rs`, `attest.rs`, `aws.rs` | The attested gateway client: attestation verification, certificate pinning, STS identity proofs (§7.4) |
+| `gateway.rs`, `attest.rs`, `aws.rs` | The gateway client: certificate pinning (from the published fingerprint or an attestation), attestation verification, STS identity proofs, reading SSM (§7.4) |
 | `browser.rs`, `cdp.rs` | Browser tools over the Chrome DevTools Protocol (§6.9) |
 | `shell.rs` | Running commands in hardened transient systemd units (§6.10) |
 | `policy.rs` | Approval rules for commands, clicks, typing and keys (§6.11) |
@@ -1228,9 +1229,19 @@ Scheduled checks are what a monitoring agent is for, and nobody watches them. Th
 
 What a schedule that runs without asking still allows: data to the other hosts on the allowlist (with an account of whoever's), since only Cloudflare's and Datadog's keys are pinned. In a chat nothing changes: commands go to Squid directly and ask as in §6.11.
 
-## 7. The attested model gateway
+## 7. The model gateway
 
-Desktops hold no model-provider key. Every model call goes to **gatewayd**, a small Rust service on its own instance. It runs an image nobody can log into, and agentd verifies that image cryptographically before sending a prompt. The design and the reasoning are in `docs/operator-isolation.md`; this section describes what's built.
+Desktops hold no model-provider key. Every model call goes to **gatewayd**, a small Rust service on its own instance. It runs an image nobody can log into, so a prompt-injected agent can't leak the key, and it enforces the model allowlist and the daily budget.
+
+agentd sends prompts only over TLS pinned to the gateway's certificate. It learns which certificate in one of two ways, set per environment by `gateway_attested`:
+
+| | Published (default) | Attested |
+|---|---|---|
+| How agentd knows the certificate | gatewayd writes its fingerprint to an SSM parameter at boot; agentd reads it | The gateway's NitroTPM attestation names it and shows an approved image (§7.4) |
+| Who could point desktops elsewhere | Whoever can write that parameter: the account's admins and the gateway's role | Nobody, short of AWS |
+| Instance | t4g.micro, $6.72/month | c7g.medium, $28.84/month: attestation fails on burstable types (§7.2) |
+
+Attesting is off in dev and in customer deployments. In dev we have root on the desktops over SSM, so proving the gateway's image to them proves nothing to anyone. In a customer's account, its admins are the only ones who could change the parameter, and they control their desktop anyway. Attesting stays available for sealed desktops (`docs/operator-isolation.md`), which would need it. The design and the reasoning are there; this section describes what's built.
 
 ### 7.1 The image (`images/gateway`)
 
@@ -1259,23 +1270,25 @@ Desktops hold no model-provider key. Every model call goes to **gatewayd**, a sm
 ### 7.2 The instance (Terraform `attested_gateway`)
 
 - **Instance:**
-  - `c7g.medium` by default: NitroTPM attestation fails on burstable t3 and t4g, whose TPM NV index is too small;
+  - `t4g.micro` by default (1 GiB; gatewayd is a small proxy). With `attested`, `c7g.medium`: NitroTPM attestation fails on burstable t3 and t4g, whose TPM holds 2 KiB per NV index where `nitro-tpm-attest` needs 8 KiB ([aws/NitroTPM-Tools#7](https://github.com/aws/NitroTPM-Tools/issues/7), still open on 2026-11-04). Both types have NitroTPM and UEFI, so the same image boots on either;
   - a fixed private IP (`cidrhost(private subnet, 10)`, 10.40.16.10 in dev), no public IP;
   - IMDSv2 only (hop limit 1), an encrypted gp3 root.
 - **Configuration:** the user data is gatewayd's JSON:
   - `account_id`, `desktop_role_prefix`, `audience`;
-  - `usage_table`, `key_parameter`;
+  - `usage_table`, `key_parameter`, `certificate_parameter`;
   - `daily_budget_usd` (default $20);
   - `prices`: model → `[input, cached, output]` USD per 1M tokens. Its keys are the model allowlist.
 - **Security group:** in 8443 from the desktop security group only; out 443.
-- **IAM:** `ssm:GetParameter` on `<prefix>/llm/together_api_key`; `dynamodb:GetItem`/`UpdateItem` on the usage table.
+- **IAM:** `ssm:GetParameter` on `<prefix>/llm/together_api_key`; `dynamodb:GetItem`/`UpdateItem` on the usage table; `ssm:PutParameter` on its certificate parameter.
+- **The certificate parameter:** `/cloud-desktops-shared/<env>/gateway/certificate`, a String that Terraform creates as `pending` and then leaves alone. It's outside `/cloud-desktops/`, which desktop roles are denied, so desktops can read it through `AmazonSSMManagedInstanceCore` (and, in customer accounts, the boundary's `ReadTheirOwnSettings`). Besides the account's admins, only the gateway's role may write it.
 - **Usage table:** DynamoDB `<name>-model-usage`, key `(desktop, day)`, server-side encrypted, items expire after 90 days.
-- **Published to desktops** through SSM: `<prefix>/gateway/url` (`https://<ip>:8443`), `/gateway/measurements` and `/gateway/audience`.
+- **Published to desktops** through SSM, for Ansible: `<prefix>/gateway/url` (`https://<ip>:8443`), `/gateway/audience`, and either `/gateway/measurements` (attested) or `/gateway/certificate_parameter` (published).
 
 ### 7.3 gatewayd
 
-- **TLS:** at boot, gatewayd makes a fresh self-signed certificate and key (`rcgen`, name `model-gateway.cloud-desktops.internal`). They're held in memory only and served on `0.0.0.0:8443`. It also computes the certificate's binding: `"cloud-desktops/model-gateway/tls-cert-sha256:" || SHA-256(cert DER)`.
-- **Provider key:** read once from SSM (`WithDecryption`) with the instance role, then held in memory as a `SecretString`. (A doc comment in `main.rs` says KMS releases it only to the image; that's not implemented, and `operator-isolation.md` explains why it isn't needed: KMS gating wouldn't protect prompts.)
+- **TLS:** at boot, gatewayd makes a fresh self-signed certificate and key (`rcgen`, name `model-gateway.cloud-desktops.internal`). They're held in memory only and served on `0.0.0.0:8443`. It also computes the certificate's binding for attestation, `"cloud-desktops/model-gateway/tls-cert-sha256:" || SHA-256(cert DER)`, and its fingerprint: the same SHA-256 in lowercase hex.
+- **Publishing the certificate:** when `certificate_parameter` is set, a background task writes the fingerprint there (`PutParameter` with `Overwrite`). It retries every 2 s at first, backing off to every 60 s, until SSM accepts it. It's set in both modes; attested desktops ignore it.
+- **Provider key:** read once from SSM (`WithDecryption`) with the instance role, then held in memory as a `SecretString`. KMS doesn't release it only to the image; `operator-isolation.md` explains why that isn't needed: KMS gating wouldn't protect prompts.
 - **Routes:**
 
 | Route | Auth | What it does |
@@ -1305,9 +1318,16 @@ Desktops hold no model-provider key. Every model call goes to **gatewayd**, a sm
   4. **Forward.** The body goes byte for byte to the compiled-in `https://api.together.ai/v1/chat/completions` with the bearer key. Nothing else from the desktop is forwarded, and the timeout is 180 s. The provider's status and body come back unchanged, with `Retry-After`.
   5. **Meter.** On success, `ADD cost, input_tokens, output_tokens, calls` on `(desktop, day)`. Cost uses the configured prices, with cached input at the cached price.
   6. **Log** one metadata line: desktop, model, status, ms, tokens, cost. Never the prompt or the answer.
-- **Compiled in, so it's covered by the measurements:** the provider URL, logging, TLS and attestation behaviour. Only accounting settings come from user data.
+- **Compiled in, so it's covered by the measurements:** the provider URL, logging, TLS and attestation behaviour. Only accounting settings and the certificate parameter's name come from user data.
 
 ### 7.4 How agentd verifies the gateway (`gateway.rs`, `attest.rs`, `aws.rs`)
+
+`Trust::parse` picks the mode. If `GATEWAY_MEASUREMENTS` is set, agentd attests. Otherwise `GATEWAY_CERTIFICATE_PARAMETER` must name an SSM parameter (a leading `/`, then letters, digits and `/_.-`). With neither, agentd doesn't start. Bad measurements are an error, never a fallback to the parameter.
+
+**The published certificate.**
+1. agentd reads the parameter with a SigV4-signed SSM `GetParameter` (its instance role, `aws::ssm_parameter`, 10 s timeout).
+2. The value must be 64 hex digits. Anything else, such as Terraform's `pending`, means nothing has been published, and nothing is sent: "couldn't read the model gateway's published certificate, so nothing was sent".
+3. It pins that hash with the same `PinnedCert` client as below.
 
 **Attesting.**
 1. **Probe:** agentd connects with a TLS client that accepts any certificate but records the SHA-256 of the one it saw. It sends a fresh random 32-byte nonce: `GET /attestation?nonce=…` (20 s timeout).
@@ -1326,7 +1346,7 @@ Desktops hold no model-provider key. Every model call goes to **gatewayd**, a sm
 
 **Calls.**
 - Each call carries a fresh STS proof (`x-desktop-identity`), reused for up to 4 minutes.
-- The pin is re-attested every hour, and once on a connection failure (a rebooted gateway has a new certificate).
+- The pin is renewed every hour (attested again, or the parameter read again), and once on a connection failure (a rebooted gateway has a new certificate). If the gateway has just restarted and hasn't published yet, that call fails and `llm.rs` retries it.
 - If attestation fails, **nothing is sent**: "the model gateway didn't prove it's running the published image, so nothing was sent". There's no fallback.
 
 **Retries** (`llm.rs`):
@@ -1348,7 +1368,7 @@ Desktops hold no model-provider key. Every model call goes to **gatewayd**, a sm
 | `deepseek-ai/DeepSeek-V4-Pro-0813` | 1.32 | 0.13 | 3.96 | Pinned snapshot; `reasoning_content` dropped |
 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | 0.30 | 0.006 | 1.20 | Pinned snapshot; `reasoning_content` dropped |
 
-- **Adding a model** takes three places: `prices` and `KNOWN_MODELS` in `llm.rs`, and the gateway's `prices` in `terraform/envs/dev/main.tf`. The gateway's prices are in its user data, so changing them replaces the gateway instance (same image), and desktops attest the new one when their pinned certificate stops working.
+- **Adding a model** takes three places: `prices` and `KNOWN_MODELS` in `llm.rs`, and the gateway's `prices` in `terraform/envs/dev/main.tf`. The gateway's prices are in its user data, so changing them replaces the gateway instance (same image), and desktops pin the new one's certificate when theirs stops working.
 - **The apps** list `known_models` from `/status` by readable name (`ModelName`): "DeepSeek V4.1 Flash", with no provider and no snapshot date.
 - **Checked:** both DeepSeek models passed two memory evals on 2026-11-02: a remembered fact recalled in a later task, and a scheduled check reporting a result. V4.1 Flash cost $0.004 for both, V4 Pro $0.018. Together has no non-Flash V4.1; V4 Pro is DeepSeek's larger model there.
 
@@ -1643,7 +1663,7 @@ The same screens as the iPhone's, in Mac form:
    - answers 202.
 2. Each model turn:
    - agentd builds the request: system prompt, last 20 history entries, the conversation so far;
-   - **attests the gateway** if it has no pin yet or the pin is over an hour old;
+   - **pins the gateway's certificate** (reading the published one, or attesting) if it has no pin yet or the pin is over an hour old;
    - signs a fresh STS proof and POSTs over the pinned TLS connection.
 3. gatewayd:
    - checks the proof with STS;
@@ -1731,8 +1751,8 @@ The same screens as the iPhone's, in Mac form:
 | agentd ↔ the agent's commands | `agentd` vs `worker` | Unix users and file modes (`/var/lib/agentd` 0700, socket 0660 in a 0750 directory); hardened systemd units; the guard firewall (no DevTools, VNC, noVNC, IMDS or DNS for `worker`); the Squid allowlist; no sudo for `worker` |
 | agentd ↔ the browser | `agentd` vs `agent` | agentd reaches Chrome only over CDP on localhost. The Chrome profile and X cookie are private to `agent`. `open_url` refuses internal addresses and `file:` |
 | The model ↔ the desktop | The model's tool calls | agentd's tool layer: approvals, gates, refusals, the step budget, redaction. The model never sees secrets |
-| Desktop ↔ model provider | agentd, gatewayd, Together | Attestation and certificate pinning (agentd verifies the gateway image), STS identity proofs, the model allowlist, the daily budget. Together ZDR |
-| Operator ↔ user data | Us vs users | Today: the gateway (no login, measured) and keeping content out of logs. The desktop is still readable by the operator (root over SSM) until attested desktops (planned) |
+| Desktop ↔ model provider | agentd, gatewayd, Together | Certificate pinning (the fingerprint the gateway publishes, or its attestation), STS identity proofs, the model allowlist, the daily budget. Together ZDR |
+| Operator ↔ user data | Us vs users | Today: the gateway (no login; desktops check its image only with `gateway_attested`) and keeping content out of logs. The desktop is still readable by the operator (root over SSM) until attested desktops (planned) |
 
 ### 12.2 Where each kind of data lives
 
@@ -1743,7 +1763,7 @@ The same screens as the iPhone's, in Mac form:
 | Screenshots | `/var/lib/agentd/images` | agentd; root; the app (over the tailnet) |
 | Logged-in sessions (cookies) | `/home/agent/chrome-profile` | `agent` (Chrome); agentd through CDP; root |
 | The agent's files | `/home/worker` | `worker`; root |
-| Prompts and answers in transit | TLS from agentd to the attested gateway, then TLS to Together | The gateway's memory (no login, logs metadata only); Together (ZDR) |
+| Prompts and answers in transit | Pinned TLS from agentd to the gateway, then TLS to Together | The gateway's memory (no login, logs metadata only); Together (ZDR) |
 | Model usage | DynamoDB usage table | The operator (metadata: desktop, day, tokens, cost) |
 | Notification text | The relay Lambda, Apple APNs, the phone | The operator could see it in transit (logs hold counts only) |
 | Device tokens | DynamoDB devices table | The operator |
@@ -1833,7 +1853,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 | Item | Approx. |
 |---|---|
 | Desktop t3a.medium + 20 GB gp3 | $0.042/h ≈ $31/month + storage |
-| Attested gateway c7g.medium | $0.040/h ≈ $29/month (shared by all desktops) |
+| Model gateway t4g.micro | $0.0092/h ≈ $6.72/month (shared by all desktops; a c7g.medium at $0.0395/h ≈ $29 with `gateway_attested`) |
 | fck-nat t4g.nano + Elastic IP | ≈ $3 + $3.60/month |
 | Lambda, DynamoDB, S3, SSM | Pennies at this scale |
 | Model usage | Per task. GLM-5.3 at $1.40/$0.26/$4.40 per 1M tokens (input/cached/output); a browsing task is usually cents. Shown per task in the app |
@@ -1842,8 +1862,8 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 110 unit tests (plus a 5,000-memory speed test run on demand): memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text notification bodies, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the app's filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
-| gatewayd | Attestation binding and nonces, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
+| agentd | 139 unit tests (plus a 5,000-memory speed test run on demand): memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text notification bodies, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the app's filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning (attested and published fingerprints, and which setting wins), SigV4 for SSM reads, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
+| gatewayd | Attestation binding and nonces, the published certificate fingerprint, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
 | DesktopKit | 32 tests (§10.8): also setup links and setup codes read from pictures |
 
@@ -1859,7 +1879,7 @@ PLAN.MD was the starting plan. What changed, and why:
 | Control plane (FastAPI on EC2 behind an ALB) runs the agent loop and proxies the viewer | Not built. The app talks to the desktop directly over the user's tailnet | Only one user so far. A control plane and gateway for users without Tailscale come later |
 | Viewer via the control plane with signed tokens | noVNC and raw VNC through tailnet-proxy (login allowlist); a native VNC view in the app | Tailscale gives identity and encryption |
 | Packer-baked AMIs, launch template, data volume, DynamoDB `desktops` table | Ansible on a plain Ubuntu AMI; the test desktop and testers' desktops from Terraform (`desktops`, `scripts/new-desktop.sh`); no data volume yet | Built incrementally; the attested-desktop design will replace Packer with attestable images |
-| Claude computer-use agent loop | Model-agnostic loop on Together (GLM-5.3 default) through an attested gateway | No dependency on one vendor; operator-blind goal |
+| Claude computer-use agent loop | Model-agnostic loop on Together (GLM-5.3 default) through the model gateway | No dependency on one vendor; operator-blind goal |
 | Per-desktop bearer tokens | Tailscale identity + Unix socket; IAM roles for desktop → AWS services | No shared secrets to manage |
 | Telegram bot / Python desktop agent (earlier iterations) | Retired 2026-10-31 | Replaced by agentd and the app |
 
@@ -1873,8 +1893,9 @@ Found while writing this document. None of them is a known exploit; most are dri
 - The single fck-nat instance serves both AZs: a single point of failure.
 - Desktop egress at the security-group level is open (all protocols); only `worker` is restricted, and that's done on the host.
 - The gateway's budget is a pre-check (concurrent calls can overshoot), and there's no per-minute rate limit.
-- `/attestation` is unauthenticated, though only desktops can reach it, and only one runs at a time.
-- The running gateway image (Oct 31) still allows 2 attestations at once; a second one at the same moment fails with a 500 (`/dev/tpm0` busy). agentd's retry hides it on model calls. Fixed in gatewayd, not yet in a built image.
+- With `gateway_attested` off (dev and customers today), anyone who can write `/cloud-desktops-shared/<env>/gateway/certificate` could point desktops at a server of their own: the account's admins, or code running as the gateway's role. In dev that's us, and we have root on the desktops anyway; in a customer's account, it's their admins.
+- `/attestation` is unauthenticated, though only desktops can reach it, and only one runs at a time. On a t4g it always fails (500), harmlessly: nothing asks for it.
+- The gateway image from Oct 31 allows 2 attestations at once; a second one at the same moment fails with a 500 (`/dev/tpm0` busy). Fixed since in gatewayd (one at a time); it only matters with `gateway_attested`.
 - UNVERIFIED: with Secure Boot off, systemd may take extra kernel command-line options from the `SystemdOptions` EFI variable, which isn't measured. If it does, `systemd.debug_shell` would give a root shell on the gateway's serial console in a correctly measured boot. Test D4 in `operator-isolation.md` §11 checks it; the fix would ship in the next gateway image.
 - Both the gateway and the relay trust desktop role names by prefix. Anyone who can create IAM roles could mint a matching one. Only operators can, but it matters for the operator-blind goal.
 - agentd retries the gateway's budget 429 and usage 503 up to 6 times. Network-error backoff isn't capped at 30 s.

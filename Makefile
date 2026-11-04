@@ -149,13 +149,13 @@ front-door-build: ## Build front-door for the desktop (linux, DESKTOP_ARCH)
 front-door-deploy: front-door-build ## Put a customer deployment's desktops behind Cloudflare: front-door and cloudflared; deploy agentd first (ENV=<customer>)
 	$(ANSIBLE_PLAYBOOK) playbooks/front-door.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
-gatewayd-test: ## Format check, clippy and unit tests for gatewayd (the attested model gateway)
+gatewayd-test: ## Format check, clippy and unit tests for gatewayd (the model gateway)
 	cd services/gatewayd && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 
 gatewayd-build: ## Build gatewayd for the gateway image (static linux/arm64 binary)
 	cd services/gatewayd && cargo zigbuild --release --target aarch64-unknown-linux-musl
 
-gateway-image: gatewayd-build ## Build the attested gateway image (AMI) on a temporary builder; prints the AMI and its measurements
+gateway-image: gatewayd-build ## Build the model gateway's image (AMI) on a temporary builder; prints the AMI and its measurements
 	ENV=$(ENV) scripts/build-gateway-image.sh
 
 apns-key: ## Store the APNs push key in SSM: make apns-key FILE=AuthKey_XXXXXXXXXX.p8 KEY_ID=XXXXXXXXXX

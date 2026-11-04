@@ -4,21 +4,32 @@ variable "name" {
 }
 
 variable "ami" {
-  description = "An attested gateway image (scripts/build-gateway-image.sh). Empty: no gateway instance."
+  description = "A gateway image (scripts/build-gateway-image.sh). Empty: no gateway instance."
   type        = string
   default     = ""
+}
+
+variable "attested" {
+  description = "Desktops check the gateway's NitroTPM attestation against var.measurements (needs a type that can attest: c7g.medium). False: they pin the certificate it publishes to var.certificate_parameter."
+  type        = bool
+  default     = false
 }
 
 variable "measurements" {
-  description = "The image's boot measurements, \"4=<hex>,12=<hex>\" (published by the image build). Desktops accept only these."
+  description = "The image's boot measurements, \"4=<hex>,12=<hex>\" (published by the image build). With attested, desktops accept only these."
   type        = string
   default     = ""
 }
 
-variable "instance_type" {
-  description = "Not burstable (t3/t4g): their NitroTPM holds 2 KiB per NV index, and nitro-tpm-attest needs 8 KiB (aws/NitroTPM-Tools#7)."
+variable "certificate_parameter" {
+  description = "SSM parameter gatewayd publishes its certificate's fingerprint to. Outside the project prefix desktops are denied, e.g. /cloud-desktops-shared/<env>/gateway/certificate."
   type        = string
-  default     = "c7g.medium"
+}
+
+variable "instance_type" {
+  description = "Null: t4g.micro, or c7g.medium when attested (burstable types' NitroTPM holds 2 KiB per NV index and nitro-tpm-attest needs 8 KiB: aws/NitroTPM-Tools#7)."
+  type        = string
+  default     = null
 }
 
 variable "vpc_id" {

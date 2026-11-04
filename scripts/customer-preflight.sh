@@ -15,6 +15,9 @@ tfvars=terraform/envs/$env/terraform.tfvars
 want=$(sed -n 's/^account_id *= *"\([0-9]*\)".*/\1/p' "$tfvars")
 desktop_type=$(sed -n 's/^desktop_instance_type *= *"\(.*\)".*/\1/p' "$tfvars")
 desktop_type=${desktop_type:-t3a.medium}
+# The gateway: a t4g.micro, or a c7g.medium if it attests (gateway_attested).
+gateway_type=t4g.micro
+grep -q '^gateway_attested *= *true' "$tfvars" && gateway_type=c7g.medium
 failed=0
 ok() { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s\n' "$1"; failed=1; }
@@ -25,7 +28,7 @@ got=$(aws sts get-caller-identity --query Account --output text)
 aws ec2 describe-availability-zones --region "$region" >/dev/null 2>&1 && ok "$region usable" || bad "$region: can't even list its zones"
 
 echo "Instance types offered in $region"
-for type in "$desktop_type" c7g.medium t4g.xlarge; do
+for type in "$desktop_type" "$gateway_type" t4g.xlarge; do
   zones=$(aws ec2 describe-instance-type-offerings --region "$region" --location-type availability-zone \
     --filters "Name=instance-type,Values=$type" --query 'length(InstanceTypeOfferings)' --output text)
   [ "${zones:-0}" -ge 2 ] && ok "$type in $zones zones" || bad "$type in ${zones:-0} zones (2 needed)"
@@ -51,9 +54,9 @@ dry "allocate the NAT's fixed address" ec2 allocate-address --domain vpc
 ubuntu=$(aws ec2 describe-images --region "$region" --owners 099720109477 \
   --filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-*-26.04-amd64-server-*' \
   --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text)
-for type in "$desktop_type" c7g.medium; do
+for type in "$desktop_type" "$gateway_type"; do
   image=$ubuntu
-  [ "$type" = c7g.medium ] && image=$(aws ssm get-parameter --region "$region" \
+  [ "$type" = "$gateway_type" ] && image=$(aws ssm get-parameter --region "$region" \
     --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 --query Parameter.Value --output text)
   dry "launch a $type (no public address)" ec2 run-instances --image-id "$image" --instance-type "$type" \
     --network-interfaces 'DeviceIndex=0,AssociatePublicIpAddress=false'

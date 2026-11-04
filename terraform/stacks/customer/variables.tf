@@ -75,6 +75,12 @@ variable "gateway_ami" {
   default     = ""
 }
 
+variable "gateway_attested" {
+  description = "Desktops check the gateway's NitroTPM attestation (a c7g.medium, about $29/month; the guardrails must allow it) instead of pinning the certificate it publishes to SSM (a t4g.micro, about $7/month)."
+  type        = bool
+  default     = false
+}
+
 variable "model_daily_budget_usd" {
   description = "Model spend allowed per desktop per day (UTC), enforced by the gateway, on the customer's Together key."
   type        = number

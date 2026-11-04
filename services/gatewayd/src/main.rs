@@ -1,11 +1,13 @@
-//! gatewayd: the attested model gateway. Desktops send their model calls here;
-//! it checks which desktop is calling (its instance role, through STS), keeps
-//! the daily budget, adds the provider key and forwards the call to Together.
+//! gatewayd: the model gateway. Desktops send their model calls here; it
+//! checks which desktop is calling (its instance role, through STS), keeps the
+//! daily budget, adds the provider key and forwards the call to Together.
 //!
-//! It runs only in an attested image: read-only root, no SSH, no SSM, no user
-//! scripts. Desktops check its attestation document before sending anything,
-//! and KMS releases the provider key only to that image. It never logs or
-//! stores prompts or answers, only who called, which model, tokens and cost.
+//! It runs only in its own image: read-only root, no SSH, no SSM, no user
+//! scripts, so the provider key never reaches a desktop. Before sending
+//! anything, desktops either check its attestation document (on an instance
+//! type that can attest) or pin the certificate it publishes to SSM at boot.
+//! It never logs or stores prompts or answers, only who called, which model,
+//! tokens and cost.
 
 mod attest;
 mod aws;
@@ -35,8 +37,8 @@ use crate::aws::Aws;
 use crate::config::Config;
 use crate::identity::Identities;
 
-/// Where model calls go. Part of the attested binary: changing it changes the
-/// image's measurements, which desktops and KMS would refuse.
+/// Where model calls go. Compiled in: changing it changes the image's
+/// measurements, which desktops that attest the gateway would refuse.
 const PROVIDER: &str = "https://api.together.ai/v1/chat/completions";
 const LISTEN: &str = "0.0.0.0:8443";
 const MAX_BODY: usize = 8 * 1024 * 1024;
@@ -69,10 +71,11 @@ async fn main() -> Result<()> {
         .context("getting the provider key")?;
 
     // A fresh TLS key each boot, never written to disk. Desktops pin the
-    // certificate that the attestation document names.
+    // certificate that the attestation document names, or the one published.
     let tls = rcgen::generate_simple_self_signed(vec!["model-gateway.cloud-desktops.internal".to_string()])?;
     let cert = tls.cert.der().to_vec();
     let binding = attest::binding(&cert);
+    let fingerprint = attest::fingerprint(&cert);
     let rustls =
         axum_server::tls_rustls::RustlsConfig::from_der(vec![cert], tls.signing_key.serialize_der()).await?;
 
@@ -91,6 +94,9 @@ async fn main() -> Result<()> {
         aws,
         cfg,
     });
+    if !gateway.cfg.certificate_parameter.is_empty() {
+        tokio::spawn(publish_certificate(gateway.clone(), fingerprint));
+    }
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/attestation", get(attestation))
@@ -106,6 +112,36 @@ async fn main() -> Result<()> {
         .serve(app.into_make_service())
         .await?;
     Ok(())
+}
+
+/// Publishes this boot's certificate fingerprint, for desktops that pin it
+/// instead of attesting (agentd: GATEWAY_CERTIFICATE_PARAMETER). Until it's
+/// there, they refuse this gateway, so it retries until SSM takes it.
+async fn publish_certificate(gateway: Arc<Gateway>, fingerprint: String) {
+    let parameter = &gateway.cfg.certificate_parameter;
+    let mut wait = Duration::from_secs(2);
+    loop {
+        let put = gateway
+            .aws
+            .call(
+                "ssm",
+                &gateway.cfg.region,
+                "AmazonSSM.PutParameter",
+                &json!({"Name": parameter, "Value": fingerprint, "Type": "String", "Overwrite": true}),
+            )
+            .await;
+        match put {
+            Ok(_) => {
+                tracing::info!(%parameter, certificate = %&fingerprint[..16], "published the certificate");
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(%parameter, error = %err, "can't publish the certificate yet");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(60));
+            }
+        }
+    }
 }
 
 /// The provider's API key, from SSM, held in memory only. GATEWAYD_KEY_FILE

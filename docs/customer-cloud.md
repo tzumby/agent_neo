@@ -17,7 +17,7 @@ The customer-facing side of this, including what they set up, in what order and 
 | Push notifications | Our relay (APNs) | None yet: the web app's own notifications are planned |
 | What they trust us for | Everything | The code we deploy, and us during access windows |
 
-So for this customer, the strongest statement is about the account boundary, not attestation: "It runs in your account. We have no access once you remove it, and your CloudTrail shows everything we did while we had it." The attested gateway stays: it costs nothing extra to build, and it's still how the desktop knows the gateway is running our image. Sealed desktops ([operator-isolation.md](operator-isolation.md) §6) become the way to update a desktop **without** an access window.
+So for this customer, the strongest statement is about the account boundary, not attestation: "It runs in your account. We have no access once you remove it, and your CloudTrail shows everything we did while we had it." The gateway stays, since it keeps their Together key off the desktop, but it doesn't attest here (`gateway_attested = false`). The desktop pins the certificate the gateway publishes to SSM, which only the gateway's role and their own admins can change. Attesting would only keep those admins out, in their own account, and it needs a c7g.medium ($29/month) where a t4g.micro ($7) will do. Sealed desktops ([operator-isolation.md](operator-isolation.md) §6) become the way to update a desktop **without** an access window.
 
 ## 2. How it fits together
 
@@ -29,7 +29,7 @@ person ──► Cloudflare edge: Access (their IdP + MFA) ──► Tunnel
 │  ┌─ desktop (t3a.medium) ────────────────────────────────────────────────────────────┐   │
 │  │ cloudflared ──► /run/front-door/front.sock ──► front-door (checks the Access JWT)  │   │
 │  │        / and /assets/* ──► the web app   /api/* ──► agentd.sock   /viewer/ ──► noVNC  │   │
-│  │ agentd ──► model gateway (attested, c7g.medium) ──► Together (their key)           │   │
+│  │ agentd ──► model gateway (t4g.micro) ──► Together (their key)                      │   │
 │  │ shell (Squid allowlist: + api.cloudflare.com, Datadog)                             │   │
 │  └──────────────────────────────────────────────────────────────────────────────────┘   │
 │  NAT gateway (one fixed IP, which they allowlist for the agent's testing)               │
@@ -58,6 +58,8 @@ None of these are in git, Terraform state or Ansible. The customer sets them; we
 | `/cloud-desktops/<env>/llm/together_api_key` | SecureString | gatewayd, at start (it retries until the key exists; rotating it means rebooting the gateway) |
 | `/front-door/<env>/<desktop>/tunnel_token` | SecureString | `front-door-settings cloudflared`, as root, at each start of cloudflared → `/run/cloudflared/token` (0400 cloudflared) |
 | `/front-door/<env>/<desktop>/team_domain`, `…/aud`, `…/allow` (optional) | String | `front-door-settings front-door` → `/run/front-door/access.json` (0400 front-door) |
+
+One more parameter isn't the customer's to set: `/cloud-desktops-shared/<env>/gateway/certificate` (String), which gatewayd writes at each boot and agentd reads to pin the gateway's certificate. Only the gateway's role (and their admins) may write it.
 
 The desktop's role may read only its own `/front-door/<env>/<desktop>/*` (Terraform `desktop_identity` `own_parameters_path`), and never `/cloud-desktops/*`. Both units retry every 15 seconds until their parameters exist, so the customer can add them in any order. To change them later, they reboot the desktop.
 

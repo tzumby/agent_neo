@@ -15,11 +15,11 @@
 
 **What it costs you:**
 - their instance (`desktop_instance_type`, a t3a.medium like yours) and its 20 GB disk;
-- their model use. It goes through the attested gateway on your Together account, and is capped at `model_daily_budget_usd` per desktop per day ($20 unless you changed it). Lower the cap first if that's too much: it applies to every desktop.
+- their model use. It goes through the model gateway on your Together account, and is capped at `model_daily_budget_usd` per desktop per day ($20 unless you changed it). Lower the cap first if that's too much: it applies to every desktop.
 
 **What to tell them:**
 - **You can get into their VM.** You administer it over SSM as root, so their desktop isn't private from you yet (operator-blind isn't built). You and Claude only look at counts and versions on it, never chats or memories (the project's rule).
-- **Where their prompts go:** through the attested gateway to Together, with zero data retention on.
+- **Where their prompts go:** through the model gateway to Together, with zero data retention on.
 - **Passwords:** they sign in to sites themselves through Take over, and the agent never stores passwords.
 
 **Who does what:**

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentd"
-version = "0.15.8"
+version = "0.15.9"
 dependencies = [
  "anyhow",
  "aws-credential-types",

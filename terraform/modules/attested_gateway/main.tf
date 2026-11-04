@@ -1,8 +1,14 @@
-# The attested model gateway (services/gatewayd): an instance from an image
-# nobody can log into (no SSH, SSM or user scripts; read-only root), whose
-# measurements desktops check before sending it a prompt. Its settings come
-# from user data, which gatewayd reads itself (there's no cloud-init); none
-# of them changes what it can see.
+# The model gateway (services/gatewayd): an instance from an image nobody can
+# log into (no SSH, SSM or user scripts; read-only root), so the provider key
+# never reaches a desktop. Desktops pin its TLS certificate before sending it
+# a prompt, from one of two places (var.attested):
+# - its NitroTPM attestation, checked against the image's measurements. Only
+#   non-burstable types can attest, hence a c7g.medium;
+# - the fingerprint gatewayd publishes to an SSM parameter at boot, which
+#   trusts whoever can write that parameter (the account's admins). Any type
+#   will do, hence a t4g.micro.
+# Its settings come from user data, which gatewayd reads itself (there's no
+# cloud-init); none of them changes what it can see.
 
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
@@ -12,6 +18,9 @@ locals {
   ssm_arn       = "arn:${data.aws_partition.current.partition}:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter"
   key_parameter = "${var.ssm_prefix}/llm/together_api_key"
   enabled       = var.ami != ""
+  # NitroTPM attestation needs 8 KiB per NV index; burstable types (t3, t4g)
+  # hold 2 KiB (aws/NitroTPM-Tools#7).
+  instance_type = coalesce(var.instance_type, var.attested ? "c7g.medium" : "t4g.micro")
 }
 
 # Per desktop and day: calls, tokens and cost (gatewayd's daily budget).
@@ -98,6 +107,13 @@ data "aws_iam_policy_document" "gateway" {
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
     resources = [aws_dynamodb_table.usage.arn]
   }
+
+  # This boot's certificate fingerprint, for desktops that pin it.
+  statement {
+    sid       = "PublishCertificate"
+    actions   = ["ssm:PutParameter"]
+    resources = ["${local.ssm_arn}${var.certificate_parameter}"]
+  }
 }
 
 resource "aws_iam_role_policy" "gateway" {
@@ -115,7 +131,7 @@ resource "aws_instance" "gateway" {
   count = local.enabled ? 1 : 0
 
   ami                         = var.ami
-  instance_type               = var.instance_type
+  instance_type               = local.instance_type
   subnet_id                   = var.subnet_id
   private_ip                  = var.private_ip
   associate_public_ip_address = false
@@ -135,13 +151,14 @@ resource "aws_instance" "gateway" {
 
   # gatewayd's settings (services/gatewayd/src/config.rs).
   user_data = jsonencode({
-    account_id          = data.aws_caller_identity.current.account_id
-    desktop_role_prefix = var.desktop_role_prefix
-    audience            = var.audience
-    usage_table         = aws_dynamodb_table.usage.name
-    key_parameter       = local.key_parameter
-    daily_budget_usd    = var.daily_budget_usd
-    prices              = var.prices
+    account_id            = data.aws_caller_identity.current.account_id
+    desktop_role_prefix   = var.desktop_role_prefix
+    audience              = var.audience
+    usage_table           = aws_dynamodb_table.usage.name
+    key_parameter         = local.key_parameter
+    certificate_parameter = var.certificate_parameter
+    daily_budget_usd      = var.daily_budget_usd
+    prices                = var.prices
   })
   user_data_replace_on_change = true
 
@@ -152,14 +169,15 @@ resource "aws_instance" "gateway" {
 
   lifecycle {
     precondition {
-      condition     = var.measurements != ""
-      error_message = "A gateway image needs its measurements (published by scripts/build-gateway-image.sh)."
+      condition     = !var.attested || var.measurements != ""
+      error_message = "An attested gateway needs its image's measurements (published by scripts/build-gateway-image.sh)."
     }
   }
 }
 
 # What desktops need (the agentd role reads these): where the gateway is,
-# which images to accept, and the audience to sign for.
+# how to know its certificate (the images to accept, or where it's
+# published), and the audience to sign for.
 resource "aws_ssm_parameter" "url" {
   count = local.enabled ? 1 : 0
 
@@ -169,11 +187,36 @@ resource "aws_ssm_parameter" "url" {
 }
 
 resource "aws_ssm_parameter" "measurements" {
-  count = local.enabled ? 1 : 0
+  count = local.enabled && var.attested ? 1 : 0
 
   name  = "${var.ssm_prefix}/gateway/measurements"
   type  = "String"
   value = var.measurements
+}
+
+resource "aws_ssm_parameter" "certificate_parameter" {
+  count = local.enabled && !var.attested ? 1 : 0
+
+  name  = "${var.ssm_prefix}/gateway/certificate_parameter"
+  type  = "String"
+  value = var.certificate_parameter
+}
+
+# Where gatewayd publishes its certificate's fingerprint at each boot. Outside
+# the project's prefix, so desktops may read it (their roles are denied
+# everything under it); the gateway's role is the only one allowed to write it.
+resource "aws_ssm_parameter" "certificate" {
+  count = local.enabled ? 1 : 0
+
+  name        = var.certificate_parameter
+  description = "SHA-256 of the model gateway's TLS certificate (hex), written by gatewayd at boot"
+  type        = "String"
+  # Until the gateway's first boot. agentd pins nothing but a fingerprint.
+  value = "pending"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
 }
 
 resource "aws_ssm_parameter" "audience" {

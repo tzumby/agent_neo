@@ -44,7 +44,30 @@ pub fn system_prompt(
     skills: &str,
     keys: &str,
     memory_v2: bool,
+    // The approvals setting: only root commands ask (else risky actions do too).
+    ask_only_root: bool,
 ) -> String {
+    let asks = if ask_only_root {
+        "Those wait for the user's approval; if one is denied, don't look for a workaround. Other commands \
+         run straight away."
+    } else {
+        "Those, and other risky commands, wait for the user's approval; if one is denied, don't look for a \
+         workaround."
+    };
+    let browser_rule = if ask_only_root {
+        "- Browser changes (typing on a page, pressing Enter, clicking Send, Delete and the like) go ahead \
+    without asking, unless read-only mode blocks them; if one is blocked, don't look for another way; say what \
+    you would have done. They act in the user's logged-in accounts, so make only the changes the user asked \
+    for. When asked to draft something, type it but don't send it; send only when the user asked you to send.\n"
+            .to_string()
+    } else {
+        "- Browser changes (typing on a page, pressing Enter, clicking Send, Delete and the like) wait for the \
+    user's approval, or are blocked in read-only mode. If one is denied or blocked, don't look for another \
+    way; say what you would have done. When asked to draft something, type it but don't send it; send only \
+when the user asked you to send. To send a message, type it into the message field; the user's approval \
+of the text also covers sending it with Enter or Send right after, so they're asked once.\n"
+            .to_string()
+    };
     let shell_rule = if shell {
         let saved = if keys.is_empty() {
             "No keys are saved yet.".to_string()
@@ -53,8 +76,7 @@ pub fn system_prompt(
         };
         format!(
             "- Shell: run_shell runs bash as its own user in ~/work. Commands that start with sudo run \
-             as root. Those, and other risky commands, wait for the user's approval; if one is denied, don't \
-             look for a workaround. The shell reaches the internet only through a proxy that allows package \
+             as root. {asks} The shell reaches the internet only through a proxy that allows package \
              registries and code hosts; if a host is blocked, tell the user rather than working around it. \
              Install software the way the install-software skill says (Nix first); never pipe a downloaded \
              script into a shell (curl | bash is refused).
@@ -97,12 +119,7 @@ a role, a name and a ref. click and type_text take a ref (preferred), or a role 
     tab\"). Always use needs_user for this, never a text reply: needs_user shows the user the tab and lets \
     them take over the screen, while a text reply ends the task. Never type passwords or codes yourself. \
 After the user takes over, they tell you to continue or to skip.
-- Browser changes (typing on a page, pressing Enter, clicking Send, Delete and the like) wait for the \
-    user's approval, or are blocked in read-only mode. If one is denied or blocked, don't look for another \
-    way; say what you would have done. When asked to draft something, type it but don't send it; send only \
-when the user asked you to send. To send a message, type it into the message field; the user's approval \
-of the text also covers sending it with Enter or Send right after, so they're asked once.
-- Opening a page, clicking and pressing keys already wait for the page to load and stop changing \
+{browser_rule}- Opening a page, clicking and pressing keys already wait for the page to load and stop changing \
     before they return. If something you expect isn't there yet, use wait_for with the text you expect. \
 Never use the shell to sleep or wait for the browser.
 - Use show_screenshot when seeing the page would help the user.
@@ -415,7 +432,7 @@ mod tests {
     #[test]
     fn memory_v2_puts_its_rules_and_notes_at_the_end() {
         let block = "## Your rules and the user's preferences\n- #1 [rule · 2026-10-03 · user said] Reply in English\n";
-        let v2 = system_prompt(true, "now", block, "- python: uv\n", "", true);
+        let v2 = system_prompt(true, "now", block, "- python: uv\n", "", true, false);
         assert!(!v2.contains("- Memory: use remember"));
         let skills = v2.find("- python: uv").unwrap();
         let rules = v2.find("## Memory\nYou have a long-term memory").unwrap();
@@ -429,9 +446,24 @@ mod tests {
             "- python: uv\n",
             "",
             false,
+            false,
         );
         assert!(v1.contains("- Memory: use remember") && !v1.contains("## Memory"));
         assert!(v1.find("What you remember").unwrap() < v1.find("- python: uv").unwrap());
+    }
+
+    #[test]
+    fn the_prompt_says_what_asks() {
+        let root = system_prompt(true, "now", "", "", "", true, true);
+        assert!(
+            root.contains("Other commands run straight away") && root.contains("go ahead without asking")
+        );
+        assert!(!root.contains("other risky commands, wait"));
+        let risky = system_prompt(true, "now", "", "", "", true, false);
+        assert!(
+            risky.contains("other risky commands, wait")
+                && risky.contains("wait for the user's approval, or")
+        );
     }
 
     #[test]

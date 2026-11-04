@@ -243,6 +243,14 @@ async def main(out):
             await p.js(f"({set_theme})('dark')")
             p.check(await p.js("document.documentElement.dataset.theme") == "dark", "Dark can be chosen in Settings")
             await p.js(f"({set_theme})('light')")
+            p.check(await p.js("document.querySelector('input[name=approvals]:checked')?.value") == "root",
+                    "Approvals: only root commands ask by default")
+            await p.js("document.querySelector('input[name=approvals][value=risky]').click()")
+            p.check(await p.until("fetch('/api/v1/status', {credentials: 'same-origin'}).then(r => r.json()).then(s => s.settings.approvals).then(a => a === 'risky')"), "…and risky actions can be chosen")
+            p.check(await p.until("document.querySelector('input[name=approvals]:checked')?.value === 'risky'"),
+                    "…and the page shows it")
+            await p.js("document.querySelector('input[name=approvals][value=root]').click()")
+            p.check(await p.until("fetch('/api/v1/status', {credentials: 'same-origin'}).then(r => r.json()).then(s => s.settings.approvals).then(a => a === 'root')"), "…and back")
             p.check(await p.js("document.querySelector('.settings-group select') === null || true"), "settings render")
             return p.failed
     finally:

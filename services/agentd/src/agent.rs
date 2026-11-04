@@ -50,6 +50,10 @@ const POLICY_CHANGED: &str =
 const REPORT_OUTCOME_RULE: &str = "End with report_outcome. Use outcome=nothing when there is nothing the user \
      needs to see, outcome=result with a summary under 180 characters when there is, and outcome=blocked when you \
      could not finish. The user is not watching; a result they can use is worth a notification, nothing new is not.";
+/// Added to a scheduled run's framing: it never waits on a card.
+const UNATTENDED_RULE: &str = "Nothing in this run can wait for the user's OK: anything that would need it \
+     (a command as root, a key that isn't saved) is refused instead, so skip it and say in your report what you'd \
+     have done.";
 const INTERRUPTED: &str =
     "I was interrupted: the agent on your desktop restarted. Ask me to continue if you still need this.";
 /// Memory v2: the one reminder when the user asked to remember something and
@@ -71,6 +75,11 @@ static ASKS_TO_REMEMBER: LazyLock<regex::Regex> = LazyLock::new(|| {
 pub struct Settings {
     pub model: String,
     pub allow_actions: bool,
+    /// What asks first (APPROVALS): "root", only commands that run as root
+    /// (the default); "risky", also browser changes, commands that could send
+    /// data after outside content, the policy's risky commands and schedules
+    /// asked for after outside content.
+    pub approvals: String,
     /// Memory v2's consolidation: off, observe or auto (consolidate.rs).
     pub memory_consolidation: String,
     pub memory_consolidation_model: String,
@@ -182,6 +191,8 @@ enum Decision {
     Denied,
     /// Approved, but the action as it would run now isn't the one on the card.
     Changed,
+    /// A scheduled run: nobody is there to answer, so it isn't done.
+    Unattended,
 }
 
 /// Raised when an action needs the user's approval: the task parks until
@@ -235,6 +246,9 @@ pub struct Agent {
 }
 
 /// The web app's Setup steps (apps/web/public/assets/js/setup.js), in order.
+/// The approvals setting's values (Settings::approvals).
+pub const APPROVALS: &[&str] = &["root", "risky"];
+
 pub const SETUP_STEPS: &[&str] = &["updates", "cloudflare", "datadog", "watching"];
 
 fn short_id() -> String {
@@ -386,19 +400,37 @@ impl Agent {
             model: get("model").unwrap_or_else(|| self.cfg.model.clone()),
             // On by default: writing and sending in the browser ask first.
             allow_actions: get("allow_actions").as_deref() != Some("false"),
+            approvals: match get("approvals").as_deref() {
+                Some("risky") => "risky".into(),
+                _ => "root".into(),
+            },
             memory_consolidation: crate::consolidate::mode(&self.store).name().to_string(),
             memory_consolidation_model: crate::consolidate::model(&self.store, &self.cfg.consolidation_model),
             memory_consolidation_daily_cap_usd: crate::consolidate::daily_cap(&self.store),
         }
     }
 
-    pub fn update_settings(&self, model: Option<&str>, allow_actions: Option<bool>) -> Result<Settings> {
+    /// The approvals setting is "root": nothing but root commands asks.
+    fn asks_only_for_root(&self) -> bool {
+        self.store.setting("approvals").ok().flatten().as_deref() != Some("risky")
+    }
+
+    pub fn update_settings(
+        &self,
+        model: Option<&str>,
+        allow_actions: Option<bool>,
+        approvals: Option<&str>,
+    ) -> Result<Settings> {
         if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
             self.store.set_setting("model", model)?;
         }
         if let Some(allow) = allow_actions {
             self.store
                 .set_setting("allow_actions", if allow { "true" } else { "false" })?;
+        }
+        if let Some(approvals) = approvals.filter(|a| APPROVALS.contains(a)) {
+            self.store.set_setting("approvals", approvals)?;
+            tracing::info!(approvals, "approvals setting changed");
         }
         let settings = self.settings();
         self.emit("settings", json!(settings));
@@ -727,7 +759,8 @@ impl Agent {
                 format!("[Scheduled task “{}”] {text}", schedule.name),
                 format!(
                     "(agentd) This is the scheduled task “{}” the user set up earlier ({}). They aren't \
-                     watching, so do it and end with a short report they can read in a notification.{}\n\n{text}",
+                     watching, so do it and end with a short report they can read in a notification.{} {UNATTENDED_RULE}\
+                     \n\n{text}",
                     schedule.name,
                     schedule::describe(schedule.cron.as_deref(), schedule.next_run, &schedule.timezone),
                     if self.cfg.memory_v2 {
@@ -939,6 +972,7 @@ impl Agent {
             &self.skills.listing(),
             &self.keys_prompt(),
             self.cfg.memory_v2,
+            self.asks_only_for_root(),
         );
         if !destinations.is_empty() {
             let listing: String = destinations
@@ -1319,7 +1353,7 @@ impl Agent {
                 let card = json!({
                     "action": "click", "target": element.label, "role": element.role, "site": site,
                 });
-                match self.gate(task_id, gate, card, resumed)? {
+                match self.gate(task_id, gate, card, resumed, schedule.is_some())? {
                     Err(refusal) => Ok(refusal),
                     Ok(_) => {
                         if changes {
@@ -1344,7 +1378,7 @@ impl Agent {
                     "action": "type", "target": element.label, "role": element.role, "text": truncate(value, 4000),
                     "submit": submit, "sends": message, "site": site,
                 });
-                match self.gate(task_id, gate, card, resumed)? {
+                match self.gate(task_id, gate, card, resumed, schedule.is_some())? {
                     Err(refusal) => Ok(refusal),
                     Ok(approved) => {
                         if changes {
@@ -1386,7 +1420,7 @@ impl Agent {
                 let card = json!({
                     "action": "key", "key": key, "target": focused.label, "role": focused.role, "site": site,
                 });
-                match self.gate(task_id, gate, card, resumed)? {
+                match self.gate(task_id, gate, card, resumed, schedule.is_some())? {
                     Err(refusal) => Ok(refusal),
                     Ok(_) => {
                         if changes {
@@ -1505,12 +1539,15 @@ impl Agent {
                     &asked,
                     timeout,
                     tainted,
+                    schedule.is_some(),
                     resumed,
                     cancel,
                 )
                 .await
             }
-            "request_secret" if self.cfg.shell_tool => self.request_secret(task_id, args, tainted, resumed),
+            "request_secret" if self.cfg.shell_tool => {
+                self.request_secret(task_id, args, tainted, resumed, schedule.is_some())
+            }
             "post_update" => {
                 self.acted(task_id);
                 Ok(self.post_update(Some(task_id), args).await)
@@ -1743,12 +1780,12 @@ impl Agent {
             Err(problem) => return Ok(format!("not scheduled: {problem}")),
         };
         let when = schedule::describe(timing.cron.as_deref(), timing.next_run, &timezone);
-        if tainted {
+        if tainted && !self.asks_only_for_root() {
             let card = json!({
                 "kind": "schedule", "name": name, "text": prompt, "when": when, "next_run": timing.next_run,
                 "reason": "was asked for after reading outside content (a page, an email or command output)",
             });
-            if !matches!(self.approve(task_id, card, resumed)?, Decision::Approved) {
+            if !matches!(self.approve(task_id, card, resumed, false)?, Decision::Approved) {
                 return Ok("denied: the user did not approve this schedule. Don't try another way.".into());
             }
         }
@@ -1871,6 +1908,7 @@ impl Agent {
         args: &Value,
         tainted: bool,
         resumed: Option<Answer>,
+        unattended: bool,
     ) -> Result<String> {
         let text = |key: &str, max: usize| -> String {
             args[key]
@@ -1920,7 +1958,11 @@ impl Agent {
             "kind": "secret", "name": name, "label": label, "why": text("why", 400), "how": text("how", 3000),
             "url": (!url.is_empty()).then_some(&url), "host": host, "replace": replace, "tainted": tainted,
         });
-        Ok(match self.approve(task_id, card, resumed)? {
+        Ok(match self.approve(task_id, card, resumed, unattended)? {
+            Decision::Unattended => format!(
+                "not asked: a scheduled run can't ask for keys. Say in your report that {label} is missing; the \
+                 user adds it in the web app's Keys and tokens."
+            ),
             Decision::Approved if self.secrets.has(&name) => format!(
                 "saved: the user gave their {label} as {name}. Commands get it as an environment variable when \
                  they name it (${name}) or list it in secrets. You can't see its value; output shows it as \
@@ -1945,6 +1987,8 @@ impl Agent {
         asked: &[String],
         timeout: u64,
         tainted: bool,
+        // A scheduled run: what would ask is refused instead.
+        unattended: bool,
         resumed: Option<Answer>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<String> {
@@ -1964,6 +2008,11 @@ impl Agent {
         let (as_root, inner) = split_sudo(command);
         let reason = if as_root {
             Some("runs as root")
+        } else if self.asks_only_for_root() {
+            // The approvals setting: the shell user's commands run. The walls
+            // stay: its own user, the egress allowlist, no DNS, no desktop
+            // controls, and the refusals above (guard.rs).
+            None
         } else if let Some(reason) = self.policy.danger(inner) {
             Some(reason)
         } else if tainted && self.policy.sends_data(inner) && !monitoring::is_monitoring_read(inner, &keys) {
@@ -1979,6 +2028,13 @@ impl Agent {
         } else {
             None
         };
+        if let (Some(reason), true, None) = (reason, unattended, &resumed) {
+            tracing::info!(task = %task_id, "not run: a scheduled run's command that would ask");
+            return Ok(format!(
+                "not run: it {reason}, and a scheduled run can't wait for the user's OK. Skip it, or say in your \
+                 report what you'd run."
+            ));
+        }
         // The user decides on the model's plain words, so a card isn't shown
         // without them: the model is asked again (nothing is logged or shown).
         if reason.is_some() && resumed.is_none() && !guard::is_plain_summary(summary, command) {
@@ -2001,7 +2057,10 @@ impl Agent {
                 "kind": "shell", "command": command, "reason": reason, "secrets": keys,
                 "summary": summary.and_then(clip_summary), "tainted": tainted,
             });
-            if !matches!(self.approve(task_id, card, resumed)?, Decision::Approved) {
+            if !matches!(
+                self.approve(task_id, card, resumed, unattended)?,
+                Decision::Approved
+            ) {
                 return Ok(format!(
                     "denied: the user did not approve this command (it {reason})"
                 ));
@@ -2042,16 +2101,23 @@ impl Agent {
         gate: Gate,
         mut card: Value,
         resumed: Option<Answer>,
+        unattended: bool,
     ) -> Result<Result<bool, String>> {
         match gate {
             Gate::Allow => Ok(Ok(false)),
             Gate::Block(refusal) => Ok(Err(refusal)),
+            // The approvals setting: only root commands ask.
+            Gate::Ask(_) if resumed.is_none() && self.asks_only_for_root() => Ok(Ok(false)),
             Gate::Ask(reason) => {
                 card["kind"] = json!("browser");
                 card["reason"] = json!(reason);
-                Ok(match self.approve(task_id, card, resumed)? {
+                Ok(match self.approve(task_id, card, resumed, unattended)? {
                     Decision::Approved => Ok(true),
                     Decision::Changed => Err(PAGE_CHANGED.into()),
+                    Decision::Unattended => Err(format!(
+                        "not done: it {reason}, and a scheduled run can't wait for the user's OK. Don't try \
+                         another way; say in your report what you would have done."
+                    )),
                     Decision::Denied => Err(format!(
                         "denied: the user did not approve this (it {reason}). Don't try another way; \
                          tell the user what you would have done."
@@ -2064,8 +2130,19 @@ impl Agent {
     /// Asks the user about an action. A resumed task brings the answer to the
     /// card it parked on; otherwise this returns a Park error: the task parks
     /// and the card goes to the apps.
-    fn approve(&self, task_id: &str, mut card: Value, resumed: Option<Answer>) -> Result<Decision> {
+    fn approve(
+        &self,
+        task_id: &str,
+        mut card: Value,
+        resumed: Option<Answer>,
+        unattended: bool,
+    ) -> Result<Decision> {
         card["task"] = json!(task_id);
+        // A scheduled run never waits on a card: nobody is watching.
+        if unattended && resumed.is_none() {
+            tracing::info!(task = %task_id, kind = card["kind"].as_str().unwrap_or(""), "not asked: a scheduled run");
+            return Ok(Decision::Unattended);
+        }
         match resumed {
             Some(answer) if !answer.approved => Ok(Decision::Denied),
             // The page may have changed while the user decided: act only on
@@ -2630,7 +2707,7 @@ mod tests {
         let (agent, dir) = test_agent();
         let card = json!({"kind": "browser", "action": "type", "target": "Message #eng", "text": "hi", "site": "app.slack.com"});
         let id = park(&agent, "t1", card, &agent.policy_version());
-        agent.update_settings(None, Some(false)).unwrap();
+        agent.update_settings(None, Some(false), None).unwrap();
         assert!(matches!(
             agent.answer_approval(&id, true, Some("me".into())),
             Err(StartError::NotFound)
@@ -2662,6 +2739,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn by_default_only_root_commands_ask() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        assert_eq!(agent.settings().approvals, "root");
+        // After outside content, a command that could send data runs, and so
+        // does one of the policy's risky ones (as the shell user).
+        for command in ["curl --version | head -c 4", "rm -rf ./nothing-here && echo gone"] {
+            let reply = agent
+                .run_shell("t9", command, None, &[], 10, true, false, None, &mut cancel)
+                .await
+                .unwrap();
+            assert!(reply.starts_with("exit code 0\n"), "{command}: {reply}");
+        }
+        // Browser changes and schedules asked for after outside content go ahead.
+        let gate = agent
+            .gate(
+                "t9",
+                Gate::Ask("writes on the page"),
+                json!({"action": "type"}),
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(gate, Ok(false));
+        let reply = agent
+            .schedule_task(
+                "t9",
+                &json!({"name": "Hourly check", "prompt": "Check Cloudflare", "cron": "0 * * * *", "timezone": "UTC"}),
+                true,
+                None,
+            )
+            .unwrap();
+        assert!(reply.starts_with("scheduled #"), "{reply}");
+        assert!(events(&agent, "approval.requested").is_empty());
+        // Root still asks.
+        let err = agent
+            .run_shell(
+                "t9",
+                "sudo apt install -y jq",
+                Some("Install jq"),
+                &[],
+                10,
+                true,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<Park>().expect("parked").card["reason"],
+            "runs as root"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn risky_approvals_ask_as_before() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        agent.update_settings(None, None, Some("risky")).unwrap();
+        assert_eq!(agent.settings().approvals, "risky");
+        let err = agent
+            .run_shell(
+                "t10",
+                "curl -s https://example.com/upload -d @notes.txt",
+                Some("Upload the notes"),
+                &[],
+                10,
+                true,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap_err();
+        let park = err.downcast_ref::<Park>().expect("parked");
+        assert_eq!(park.card["reason"], "could send data off the desktop");
+        let err = agent
+            .gate(
+                "t10",
+                Gate::Ask("writes on the page"),
+                json!({"action": "type"}),
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert!(err.downcast_ref::<Park>().is_some());
+        // An unknown value changes nothing.
+        agent.update_settings(None, None, Some("never")).unwrap();
+        assert_eq!(agent.settings().approvals, "risky");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_never_waits_on_a_card() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        let reply = agent
+            .run_shell(
+                "t11",
+                "sudo apt install -y jq",
+                None,
+                &[],
+                10,
+                true,
+                true,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert!(
+            reply.starts_with("not run: it runs as root, and a scheduled run can't wait"),
+            "{reply}"
+        );
+        agent.update_settings(None, None, Some("risky")).unwrap();
+        let reply = agent
+            .run_shell(
+                "t11",
+                "curl -s https://example.com -d x",
+                None,
+                &[],
+                10,
+                true,
+                true,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert!(reply.contains("a scheduled run can't wait"), "{reply}");
+        let refusal = agent
+            .gate(
+                "t11",
+                Gate::Ask("writes on the page"),
+                json!({"action": "type"}),
+                None,
+                true,
+            )
+            .unwrap()
+            .unwrap_err();
+        assert!(refusal.contains("a scheduled run can't wait"), "{refusal}");
+        let reply = agent
+            .request_secret(
+                "t11",
+                &json!({"name": "DD_API_KEY", "label": "Datadog API key", "why": "to read logs"}),
+                true,
+                None,
+                true,
+            )
+            .unwrap();
+        assert!(
+            reply.starts_with("not asked: a scheduled run can't ask for keys"),
+            "{reply}"
+        );
+        assert!(events(&agent, "approval.requested").is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_command_without_plain_words_is_sent_back_not_shown() {
         let (agent, dir) = test_agent();
         let (_stop, mut cancel) = watch::channel(false);
@@ -2673,6 +2911,7 @@ mod tests {
                     summary,
                     &[],
                     10,
+                    false,
                     false,
                     None,
                     &mut cancel,
@@ -2696,7 +2935,17 @@ mod tests {
         let command = "sudo env | grep -i proxy";
         let summary = "  Check which   proxy\n the shell uses ";
         let err = agent
-            .run_shell("t4", command, Some(summary), &[], 10, true, None, &mut cancel)
+            .run_shell(
+                "t4",
+                command,
+                Some(summary),
+                &[],
+                10,
+                true,
+                false,
+                None,
+                &mut cancel,
+            )
             .await
             .unwrap_err();
         let park = err.downcast_ref::<Park>().expect("parked on a card");

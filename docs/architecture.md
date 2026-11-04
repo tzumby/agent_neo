@@ -570,7 +570,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 |---|---|---|
 | `events` | `seq` (autoincrement), `ts`, `kind`, `data` (JSON) | The append-only event log the apps stream and replay (§6.5) |
 | `history` | `id`, `ts`, `role`, `content`, `agent` | What the model sees as the conversation: user messages and final answers only. The last 20 entries go into each new task |
-| `settings` | `key`, `value` | `model`, `allow_actions`, `tab_target`, `user_timezone`, `user_utc_offset` |
+| `settings` | `key`, `value` | `model`, `allow_actions`, `approvals`, `tab_target`, `user_timezone`, `user_utc_offset` |
 | `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before) | One row per task. `status` is `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `max_steps`, `stuck` or `interrupted` |
 | `pending` | `id`, `kind` (`approval` or `action`), `run`, `card` (JSON), `checkpoint` (the task's serialized `RunState`), `created` (unix seconds); v2: `policy_version` | What the user is being asked: parked approvals and Action needed cards |
 | `memory` | `id`, `agent`, `text`, `trusted`, `created`; v2: `kind` (rule, preference, fact, work_log), `status` (active, superseded, expired, deleted; `pending` only before 0.15.2), `trust` (user_stated, agent_inferred, imported), `importance`, `source_run`, `source_seq`, `source_schedule`, `valid_until`, `superseded_by`, `pending_reason`, `version`, `updated`, `last_recalled`, `recall_count` | Long-term memory (§6.13). `trusted` is kept in step with `trust` and `status` by triggers, for 0.14.0 and the v1 path |
@@ -602,7 +602,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | POST | `/api/v1/stop` | Stops the running task, or gives up on a parked one |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
 | GET | `/api/v1/screenshot` | A live screenshot of the current tab (JPEG). Exists, but the app doesn't use it |
-| GET, PUT | `/api/v1/settings` | `{model, allow_actions, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}` |
+| GET, PUT | `/api/v1/settings` | `{model, allow_actions, approvals, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}`. `approvals` is `root` or `risky` (§6.11); anything else is a 400 |
 | POST | `/api/v1/devices` | `{token, name, environment?}`: registers a device's APNs token with the push relay (503 if push isn't configured). `environment` is `sandbox` (Xcode installs) or `production` (TestFlight, the notarized Mac app); anything else is 400, none means the relay's default |
 | GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active ones by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older apps still read it |
 | GET | `/api/v1/memory/search?q=&kinds=&limit=` | Memory v2: active memories ranked as the agent's notes are, each with its score (what `search_memory` sees) |
@@ -674,7 +674,7 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 | `secret.saved` / `secret.deleted` | `name`, `label`, `by` | Key changes (never values) |
 | `destination.saved` / `destination.deleted` | `name`, `kind`, `channel`, `by` | Where updates go changed (never the token or URL) |
 | `update.posted` / `update.failed` | `task`, `destination`, `id`, `title`, `thread` / `error` | post_update went out, or why it didn't (§6.20). Not in the chat |
-| `settings` | `{model, allow_actions}` | Settings changed |
+| `settings` | `{model, allow_actions, approvals, …}` | Settings changed |
 
 ### 6.6 Task lifecycle
 
@@ -870,7 +870,19 @@ The hardening follows moltis' container settings (MIT).
 
 ### 6.11 Approvals and policy
 
-**Command approvals** (`policy.rs`). A command asks if:
+**The Approvals setting** (`approvals`, in the web app's Settings) says what asks first:
+- **`root`, the default: only commands that run as root.** Every other command, browser change (typing, Send, Delete) and schedule runs without a card. Since 0.15.7 (2026-11-04), after scheduled checks kept stopping for approvals. The walls that never asked stay:
+  - the shell user can't reach the browser, the screen, agentd's state or socket, or the metadata service (§6.10);
+  - its commands reach only the egress allowlist (§5.6), with no DNS of their own (§5.5);
+  - the outright refusals (§6.10): the egress controls, Slack's and Teams' APIs, piped install scripts, shell scheduling;
+  - read-only mode (Browser actions off) still refuses browser changes;
+  - root commands still ask, since a root command could undo every wall above.
+  What this gives up: an instruction injected into a page, an email or a log could get a command to send data to an allowed host (with an account of the attacker's), or the browser to act in the user's logged-in accounts, without anyone seeing a card. The labels (§6.12) and the model's judgment are what's left against that.
+- **`risky`: also the actions below** (the only behaviour before 0.15.7): the policy's rules, commands that could send data after outside content, browser changes and schedules asked for after outside content.
+
+`Agent::asks_only_for_root` reads it at each gate, so a change applies at once, to running tasks too, and to the system prompt's wording (`tools::system_prompt`'s `ask_only_root`). It isn't part of the policy version: changing it doesn't mark every schedule "set up under other rules".
+
+**Command approvals** (`policy.rs`). With `approvals: risky`, a command asks if:
 1. it starts with `sudo` ("runs as root"); or
 2. it matches a dangerous pattern. The defaults, overridable through `policy.toml` from the Ansible variable `agentd_dangerous`, are:
    - `su`, `doas`;
@@ -910,7 +922,7 @@ The hardening follows moltis' container settings (MIT).
 
 These patterns are a speed bump against mistakes and injected instructions, not a security boundary. The boundaries are the privilege split, the guard firewall and the egress allowlist.
 
-**Browser gates.** Clicks, typing and keys are gated as in §6.8. With **Browser actions** off (read-only mode), they're refused rather than asked.
+**Browser gates.** Clicks, typing and keys are gated as in §6.8, with `approvals: risky`; with `root` the ones that would ask go ahead. With **Browser actions** off (read-only mode), they're refused either way.
 
 **Cards.** The card kinds and what they show:
 
@@ -922,6 +934,8 @@ These patterns are a speed bump against mistakes and injected instructions, not 
 | `secret` | Label, why, how (Markdown), link and its host, replace, tainted | "GitHub token needed"; opens the app (no buttons: a value is needed) |
 
 Each answer records who gave it (`by`, from `X-Tailscale-User`).
+
+**Never in a scheduled run.** Nobody is watching, so `approve()` returns `Decision::Unattended` instead of parking the task, whatever the card: the action isn't done and the model is told to say so in its report ("not run: it runs as root, and a scheduled run can't wait for the user's OK…"; a key request gets "not asked: a scheduled run can't ask for keys…"). The run's framing says so up front (`UNATTENDED_RULE`).
 
 **Policy version.** `Policy::version` is the first 16 hex characters of a SHA-256 over:
 - the approval patterns, sorted;
@@ -946,12 +960,12 @@ If today's rules would still only ask, the approval stands.
 Web pages, emails and command output can carry injected instructions. The defences, in layers:
 
 1. **Labels:** tool results with outside content are wrapped in `<untrusted>` tags, and the system prompt says never to follow instructions inside them.
-2. **Taint:**
+2. **Taint** (with `approvals: risky`, §6.11):
    - after outside content, data-out commands need approval;
    - schedules need approval;
    - memories are saved as unverified;
    - key requests carry a warning.
-3. **Approvals** for anything that sends, writes, deletes or runs as root, showing the exact action.
+3. **Approvals** for anything that runs as root, and with `approvals: risky` for anything that sends, writes or deletes, showing the exact action.
 4. **Privilege split:**
    - the shell user can't reach the browser, agentd's state, the socket, the metadata service or other tailnet devices;
    - the browser can't open internal addresses.
@@ -1071,6 +1085,7 @@ Both are read in the user's time zone, which the app sends with every message, a
 - Its prompt is framed as "(agentd) This is the scheduled task "…". They aren't watching…".
 - It doesn't abandon parked tasks.
 - It can't create schedules.
+- It never waits on a card: what would ask is refused, and its report says so (§6.11).
 - Its push title is the schedule's name.
 
 **Shell scheduling** (`crontab`, `at`, timers) is refused, so every scheduled action goes through the model, approvals and notifications.

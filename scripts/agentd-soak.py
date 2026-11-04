@@ -36,20 +36,27 @@ status = subprocess.run(
 out["status"] = json.loads(status or "null")
 db = sqlite3.connect("file:/var/lib/agentd/agentd.db?mode=ro", uri=True)
 q = lambda sql, *a: db.execute(sql, a).fetchall()
+# The soak starts at the later of the day given and the database's first
+# event: a wipe (make agentd-reset) starts it again, and the journal from
+# before it would count against the new database.
+first = (q("SELECT MIN(ts) FROM events")[0][0] or "")[:19]
+start = max(since + "T00:00:00", first)
+out["start"] = start
+out["wiped_after_since"] = first > since + "T00:00:00"
 out["days"] = q(
     "SELECT date(started), kind, COUNT(*), SUM(schedule IS NOT NULL), COALESCE(SUM(cost), 0),"
-    " SUM(status = 'failed') FROM runs WHERE date(started) >= ? GROUP BY 1, 2 ORDER BY 1",
-    since,
+    " SUM(status = 'failed') FROM runs WHERE started >= ? GROUP BY 1, 2 ORDER BY 1",
+    start,
 )
 out["consolidations"] = q(
-    "SELECT status, COUNT(*) FROM runs WHERE kind = 'consolidation' AND date(started) >= ? GROUP BY 1", since
+    "SELECT status, COUNT(*) FROM runs WHERE kind = 'consolidation' AND started >= ? GROUP BY 1", start
 )
 out["memory"] = q("SELECT status, kind, COUNT(*) FROM memory GROUP BY 1, 2")
 out["pending"] = q("SELECT pending_reason, COUNT(*) FROM memory WHERE status = 'pending' GROUP BY 1")
 out["effects"] = q("SELECT kind, attempts, last_error IS NOT NULL FROM effects WHERE attempts > 0")
 out["settings"] = dict(q("SELECT key, value FROM settings WHERE key LIKE 'memory_%'"))
 journal = subprocess.run(
-    ["journalctl", "-u", "agentd", "--since", since, "-o", "cat", "--no-pager"],
+    ["journalctl", "-u", "agentd", "--since", start.replace("T", " ") + " UTC", "-o", "cat", "--no-pager"],
     capture_output=True, text=True,
 ).stdout.splitlines()
 count = lambda text: sum(text in line for line in journal)
@@ -100,6 +107,8 @@ def mark(ok: bool | None) -> str:
 def report(instance: str, since: str, data: dict, soak_start: bool):
     status = data["status"] or {}
     settings = data["settings"]
+    start = datetime.datetime.fromisoformat(data["start"]).replace(tzinfo=datetime.timezone.utc)
+    start_text = start.strftime("%Y-%m-%d %H:%M UTC")
     cap = float(settings.get("memory_consolidation_daily_cap_usd", 0.5))
     journal = data["journal"]
     days: dict[str, dict] = {}
@@ -118,9 +127,14 @@ def report(instance: str, since: str, data: dict, soak_start: bool):
     failing_now = status.get("effects", {}).get("failing", [])
 
     print(f"Soak report: {instance}, agentd {status.get('version', '?')}, memory v2 "
-          f"{'on' if status.get('memory_v2') else 'OFF'}, since {since}")
-    print(f"Tidying up: {settings.get('memory_consolidation', 'observe')}, "
-          f"{settings.get('memory_consolidation_model', 'default model')}, cap ${cap:.2f}/day\n")
+          f"{'on' if status.get('memory_v2') else 'OFF'}, since {start_text}")
+    if data["wiped_after_since"]:
+        print(f"  (the database starts {start_text}: it was wiped after {since}, so the soak counts from there)")
+    # agentd's own view of the settings (its defaults included).
+    live = status.get("settings") or {}
+    print(f"Tidying up: {live.get('memory_consolidation') or settings.get('memory_consolidation', '?')}, "
+          f"{live.get('memory_consolidation_model') or settings.get('memory_consolidation_model', 'default model')}, "
+          f"cap ${cap:.2f}/day\n")
 
     print("Exit criteria (memory-v2.md §18, phase 6)")
     effects_ok = journal["effect_retries"] == 0 and journal["effect_gave_up"] == 0 and not failing_now
@@ -133,8 +147,11 @@ def report(instance: str, since: str, data: dict, soak_start: bool):
     print(f"  {mark(tidy_failed == 0)} Tidy-ups that didn't finish: {tidy_failed}")
     print(f"  {mark(None)} Evals at or above v1: `make agentd-evals` (not measured here)")
     if soak_start:
-        elapsed = (datetime.date.today() - datetime.date.fromisoformat(since)).days
-        print(f"  {mark(elapsed >= 7)} A week of soak: {elapsed} day(s) since {since}\n")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        elapsed = (now - start).total_seconds() / 86400
+        ends = (start + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M UTC")
+        print(f"  {mark(elapsed >= 7)} A week of soak: {elapsed:.1f} day(s) since {start_text}"
+              + ("" if elapsed >= 7 else f"; it ends {ends} if nothing restarts it") + "\n")
     else:
         print(f"  {mark(None)} A week of soak: give --since the day it started\n")
 

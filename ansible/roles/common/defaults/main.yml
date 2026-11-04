@@ -3,6 +3,7 @@ common_packages:
   - ca-certificates
   - curl
   - gnupg
+  - needrestart
   - unattended-upgrades
   - zram-tools
 
@@ -12,3 +13,75 @@ common_removed_packages:
 
 common_zram_size_mb: 2048
 common_zram_algo: zstd
+
+# The maintenance window (tasks/maintenance.yml): reboots into installed
+# updates at these local hours, in the time zone the user's app sent agentd
+# (this one until it has), only while the agent is idle and nobody's viewing.
+common_maintenance: true
+common_maintenance_hours: [4, 5]
+common_maintenance_timezone: UTC
+
+# The journal's limits (tasks/logs.yml).
+common_journal_max_use: 1G
+common_journal_max_retention: 1month
+
+# Hardening (tasks/hardening.yml), from DevSec's os_hardening defaults.
+common_sysctl:
+  fs.protected_hardlinks: 1
+  fs.protected_symlinks: 1
+  fs.protected_fifos: 1
+  fs.protected_regular: 2
+  fs.suid_dumpable: 0
+  kernel.core_uses_pid: 1
+  kernel.kptr_restrict: 2
+  kernel.kexec_load_disabled: 1
+  kernel.sysrq: 0
+  kernel.randomize_va_space: 2
+  kernel.yama.ptrace_scope: 2
+  kernel.dmesg_restrict: 1
+  net.core.bpf_jit_harden: 2
+  net.ipv4.ip_forward: 0
+  net.ipv6.conf.all.forwarding: 0
+  net.ipv4.conf.all.rp_filter: 1
+  net.ipv4.conf.default.rp_filter: 1
+  net.ipv4.icmp_echo_ignore_broadcasts: 1
+  net.ipv4.icmp_ignore_bogus_error_responses: 1
+  net.ipv4.tcp_syncookies: 1
+  net.ipv4.tcp_rfc1337: 1
+  net.ipv4.conf.all.accept_source_route: 0
+  net.ipv4.conf.default.accept_source_route: 0
+  net.ipv6.conf.all.accept_source_route: 0
+  net.ipv6.conf.default.accept_source_route: 0
+  net.ipv4.conf.all.send_redirects: 0
+  net.ipv4.conf.default.send_redirects: 0
+  net.ipv4.conf.all.accept_redirects: 0
+  net.ipv4.conf.default.accept_redirects: 0
+  net.ipv4.conf.all.secure_redirects: 0
+  net.ipv4.conf.default.secure_redirects: 0
+  net.ipv6.conf.all.accept_redirects: 0
+  net.ipv6.conf.default.accept_redirects: 0
+  net.ipv4.conf.all.log_martians: 1
+  net.ipv4.conf.default.log_martians: 1
+  vm.mmap_min_addr: 65536
+common_disabled_modules: [cramfs, freevxfs, jffs2, hfs, hfsplus, udf, dccp, rds, sctp, tipc]
+common_suid_removed:
+  - /usr/bin/chfn
+  - /usr/bin/chsh
+  - /usr/bin/newgrp
+  - /usr/bin/gpasswd
+  - /usr/bin/mount
+  - /usr/bin/umount
+  - /usr/bin/su
+  - /usr/lib/cargo/bin/su
+  - /usr/bin/ntfs-3g
+  - /usr/bin/fusermount3
+  - /usr/lib/openssh/ssh-keysign
+common_nologin_users: [nova]
+common_auditd_settings:
+  max_log_file: 6
+  num_logs: 5
+  max_log_file_action: ROTATE
+  space_left_action: SYSLOG
+  admin_space_left_action: SUSPEND
+  disk_full_action: SUSPEND
+  disk_error_action: SUSPEND

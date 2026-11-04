@@ -1,0 +1,43 @@
+# Automatic updates, ours rather than the image's defaults, so every desktop
+# has them: Ubuntu's security updates daily (and Chrome from Google's repo:
+# the desktop role adds its origin). Old packages and unused kernels go, so
+# the disk doesn't fill. Updates that need a restart or a reboot to take
+# effect get one when the agent is idle (maintenance.yml).
+
+- name: Check updates daily and install them
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      // Managed by Ansible (common role: tasks/updates.yml).
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      // Old downloaded packages, weekly.
+      APT::Periodic::AutocleanInterval "7";
+    mode: "0644"
+
+- name: Install security updates, and clean up after them
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/52cloud-desktops-upgrades
+    content: |
+      // Managed by Ansible (common role: tasks/updates.yml).
+      // Ubuntu's security pockets (also listed by the package's own
+      // 50unattended-upgrades, which this adds to).
+      Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-security";
+        "${distro_id}ESMApps:${distro_codename}-apps-security";
+        "${distro_id}ESM:${distro_codename}-infra-security";
+      };
+      Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+      Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+      // Reboots are the maintenance window's (maintenance.yml): only when
+      // the agent is idle.
+      Unattended-Upgrade::Automatic-Reboot "false";
+    mode: "0644"
+
+- name: Run the daily update timers
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop: [apt-daily.timer, apt-daily-upgrade.timer]

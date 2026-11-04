@@ -42,11 +42,27 @@
     force: false
   register: desktop_chrome_repo
 
+# Latest on every run, and daily in between (below).
 - name: Install Google Chrome stable
   ansible.builtin.apt:
     name: google-chrome-stable
-    state: present
-    update_cache: "{{ desktop_chrome_repo is changed }}"
+    state: latest
+    update_cache: true
+    cache_valid_time: 3600
+
+# Chrome reads the pages the agent opens, attackers' included, so its fixes
+# matter most. Unattended upgrades install them daily with Ubuntu's security
+# updates; the maintenance window (common role) restarts into them.
+- name: Update Chrome automatically
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/52cloud-desktops-chrome
+    content: |
+      // Managed by Ansible (desktop role). Google's repo: Origin "Google LLC",
+      // Label "Google", suite and codename "stable".
+      Unattended-Upgrade::Origins-Pattern {
+        "origin=Google LLC,label=Google,codename=stable";
+      };
+    mode: "0644"
 
 - name: Check that Chrome runs
   ansible.builtin.command: google-chrome --version

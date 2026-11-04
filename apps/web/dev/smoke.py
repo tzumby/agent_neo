@@ -139,12 +139,16 @@ async def main(out):
                 p.check(await p.until(f"{open_step} === 3"), "no Datadog: skipped, on to the checks")
                 buttons = await p.js(f"[...{g}.querySelectorAll('.setup-examples .list-row')].map(r => r.querySelector('.strong').textContent + ':' + r.querySelector('button').disabled)")
                 p.check("Attack spike watch:false" in buttons and "Error spike watch:true" in buttons, "checks that need Datadog wait for it")
-                await p.js(f"[...{g}.querySelectorAll('.setup-examples .list-row')].find(r => r.textContent.includes('Attack spike watch')).querySelector('button').click()")
+                attack = f"[...{g}.querySelectorAll('.setup-examples .list-row')].find(r => r.textContent.includes('Attack spike watch'))"
+                p.check(await p.js(f"{attack}.querySelector('.auto-approve').checked") is False, "Run without asking is off unless ticked")
+                await p.js(f"{attack}.querySelector('button').click()")
                 p.check(await p.until(f"{g}.textContent.includes('All set') && !!{g}.querySelector('.setup-summary')"), "the guide ends on All set")
                 setup = await p.js("fetch('/api/v1/setup').then(r => r.json())")
                 p.check(sorted(setup["skipped"]) == ["datadog", "updates"], "the skipped steps are kept on the desktop")
                 schedules = await p.js("fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules.map(s => s.name))")
                 p.check("Attack spike watch" in schedules, "the check is a schedule on the desktop")
+                auto = await p.js("fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules.find(s => s.name === 'Attack spike watch').auto_approve)")
+                p.check(auto is False, "…that asks (it wasn't ticked)")
                 await p.js(f"[...{g}.querySelectorAll('button')].find(b => b.textContent === 'Start using your agent').click()")
                 p.check(await p.until("document.querySelector('.empty-setup').hidden && !document.querySelector('.empty-suggest').hidden"), "Start using your agent: the chat")
                 # A skipped step, set up after all, from the Setup page.
@@ -226,6 +230,14 @@ async def main(out):
                 p.check(await p.until(f"document.querySelectorAll('.card-needs').length === {cards - 1}"), "an answered card leaves the chat")
                 p.check(await p.until("!document.querySelector('#toast').hidden"), "with a notice when the desktop no longer knows it")
 
+            await p.js("location.hash = '#/schedules'")
+            if await p.until("!!document.querySelector('#view-schedules .auto-approve')", 5):
+                first = "fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules[0].auto_approve)"
+                await p.js("document.querySelector('#view-schedules .auto-approve').click()")
+                p.check(await p.until(f"{first}.then(a => a === true)"), "a schedule can be set to run without asking")
+                p.check(await p.until("[...document.querySelectorAll('#view-schedules .tag')].some(t => t.textContent === 'Runs without asking')"), "…and says so")
+                await p.js("document.querySelector('#view-schedules .auto-approve').click()")
+                p.check(await p.until(f"{first}.then(a => a === false)"), "…and back")
             for page in ["schedules", "settings", "desktop"]:
                 await p.js(f"location.hash = '#/{page}'")
                 p.check(await p.until(f"!document.querySelector('#view-{page}').hidden"), f"the {page} page opens")
@@ -243,14 +255,6 @@ async def main(out):
             await p.js(f"({set_theme})('dark')")
             p.check(await p.js("document.documentElement.dataset.theme") == "dark", "Dark can be chosen in Settings")
             await p.js(f"({set_theme})('light')")
-            p.check(await p.js("document.querySelector('input[name=approvals]:checked')?.value") == "root",
-                    "Approvals: only root commands ask by default")
-            await p.js("document.querySelector('input[name=approvals][value=risky]').click()")
-            p.check(await p.until("fetch('/api/v1/status', {credentials: 'same-origin'}).then(r => r.json()).then(s => s.settings.approvals).then(a => a === 'risky')"), "…and risky actions can be chosen")
-            p.check(await p.until("document.querySelector('input[name=approvals]:checked')?.value === 'risky'"),
-                    "…and the page shows it")
-            await p.js("document.querySelector('input[name=approvals][value=root]').click()")
-            p.check(await p.until("fetch('/api/v1/status', {credentials: 'same-origin'}).then(r => r.json()).then(s => s.settings.approvals).then(a => a === 'root')"), "…and back")
             p.check(await p.js("document.querySelector('.settings-group select') === null || true"), "settings render")
             return p.failed
     finally:

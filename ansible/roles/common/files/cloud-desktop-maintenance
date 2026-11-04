@@ -1,0 +1,117 @@
+#!/usr/bin/python3
+"""Restarts into installed updates, at night and only when nobody's using the
+desktop (Ansible: common role, tasks/maintenance.yml).
+
+Unattended upgrades install security fixes, but a new kernel waits for a
+reboot and running programs (Chrome above all) keep their old code until
+they restart. Every 15 minutes this checks: is it the window in the user's
+time zone (the one the app sent agentd), does anything need it, is the agent
+idle, is nobody watching the screen? Then it reboots, which brings Xvfb,
+XFCE, Chrome and the agent back up in order.
+
+Prints why it acted (or waited) for the journal; never anything else.
+"""
+
+import datetime
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from zoneinfo import ZoneInfo
+
+# From the unit (tasks/maintenance.yml): local hours, e.g. "4,5", and the
+# time zone to use when the app hasn't sent one.
+HOURS = {int(h) for h in os.environ.get("MAINTENANCE_HOURS", "4,5").split(",") if h.strip()}
+FALLBACK_TIMEZONE = os.environ.get("MAINTENANCE_TIMEZONE", "UTC")
+AGENTD_DB = os.environ.get("MAINTENANCE_AGENTD_DB", "/var/lib/agentd/agentd.db")
+AGENTD_SOCKET = os.environ.get("MAINTENANCE_AGENTD_SOCKET", "/run/agentd/agentd.sock")
+# VNC and noVNC: a connection means someone is watching or taking over.
+VIEWER_PORTS = (5900, 6080)
+
+
+def user_timezone():
+    try:
+        db = sqlite3.connect(f"file:{AGENTD_DB}?mode=ro", uri=True, timeout=5)
+        row = db.execute("SELECT value FROM settings WHERE key = 'user_timezone'").fetchone()
+        ZoneInfo(row[0])
+        return row[0]
+    except Exception:
+        return FALLBACK_TIMEZONE
+
+
+def needed():
+    reasons = []
+    if os.path.exists(os.environ.get("MAINTENANCE_REBOOT_FLAG", "/run/reboot-required")):
+        reasons.append("a package asks for a reboot")
+    try:
+        out = subprocess.run(["needrestart", "-b"], capture_output=True, text=True, timeout=120).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    services = []
+    for line in out.splitlines():
+        key, _, value = line.partition(": ")
+        if key == "NEEDRESTART-KSTA" and value.strip() in ("2", "3"):
+            reasons.append("a newer kernel is installed")
+        elif key == "NEEDRESTART-SVC":
+            services.append(value.strip())
+    if services:
+        reasons.append("updated programs to restart: " + ", ".join(sorted(services)[:8]))
+    return reasons
+
+
+def agent_busy():
+    if not os.path.exists(AGENTD_SOCKET):
+        return False
+    try:
+        out = subprocess.run(
+            ["curl", "-s", "--max-time", "5", "--unix-socket", AGENTD_SOCKET, "http://agentd/api/v1/status"],
+            capture_output=True, text=True,
+        ).stdout
+    except OSError:
+        return False
+    try:
+        return bool(json.loads(out).get("busy"))
+    except ValueError:
+        return False  # agentd isn't answering: a reboot won't make that worse
+
+
+def someone_watching():
+    filters = " or ".join(f"sport = :{port}" for port in VIEWER_PORTS)
+    out = subprocess.run(["ss", "-Htn", "state", "established", f"( {filters} )"], capture_output=True, text=True).stdout
+    return bool(out.strip())
+
+
+def seconds_since_boot():
+    try:
+        with open("/proc/uptime") as uptime:
+            return float(uptime.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return float("inf")
+
+
+def main():
+    timezone = user_timezone()
+    now = datetime.datetime.now(ZoneInfo(timezone))
+    if now.hour not in HOURS:
+        return
+    # Booted in the last half hour: don't reboot again for something a
+    # reboot doesn't clear.
+    if seconds_since_boot() < 1800:
+        return
+    reasons = needed()
+    if not reasons:
+        return
+    if agent_busy():
+        print("waiting: the agent is working on a task; " + "; ".join(reasons))
+        return
+    if someone_watching():
+        print("waiting: someone is viewing the desktop; " + "; ".join(reasons))
+        return
+    print(f"rebooting ({timezone} {now:%H:%M}): " + "; ".join(reasons))
+    sys.stdout.flush()
+    subprocess.run(["systemctl", "reboot"], check=False)
+
+
+if __name__ == "__main__":
+    main()

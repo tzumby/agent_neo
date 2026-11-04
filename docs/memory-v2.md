@@ -690,7 +690,7 @@ Phase 6 (in progress; started 2026-11-01):
   - New metrics: recall@8 (whether the fact was in the task's notes, read from `recall_count`; rules and preferences always count), the false-memory rate, staleness, the `report_outcome` missing rate and cost per scenario.
   - `--compare OLD NEW` lines two runs up scenario by scenario.
   - New scenarios cover scheduled runs (quiet, a result, blocked at a sign-in, continuing from the last run, following a rule), a request buried in a task, an API key refused, an email kept, a hyphenated word, a year-old fact, a restart, "what do you remember", a fact used unasked, two false-memory traps, three staleness cases, consolidation skipping trivia, and a full batch.
-- **A soak report:** `make agentd-soak SINCE=<date>` (`scripts/agentd-soak.py`).
+- **A soak report:** `make agentd-soak SINCE=<date>` (`scripts/agentd-soak.py`). A wipe (`make agentd-reset`) starts the soak again: the report counts from the later of the date and the database's first event, and says so.
   - It reads the desktop over SSM, read-only, and only counts and costs leave it.
   - It checks the exit criteria it can: effect failures, consolidation under the cap every day, consolidations that didn't finish, and days of soak. Then it gives tasks and costs by day, and counts from the journal.
 - **Found by the first soak report** (the dev desktop, 2026-11-01): every consolidation of the 20 waiting tasks failed with "no JSON object in the reply".

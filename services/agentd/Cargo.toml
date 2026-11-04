@@ -1,6 +1,6 @@
 [package]
 name = "agentd"
-version = "0.15.7"
+version = "0.15.8"
 edition = "2024"
 description = "Agent for a cloud desktop: model loop, browser and shell tools, chat API"
 publish = false
@@ -15,7 +15,11 @@ base64 = "0.22"
 ciborium = "0.2.2"
 croner = { version = "4", default-features = false, features = ["jiff"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 jiff = "0.2"
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
@@ -24,6 +28,7 @@ secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26.6"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = "0.30"
 toml = "0.9"
@@ -38,6 +43,3 @@ lto = true
 codegen-units = 1
 strip = true
 
-[dev-dependencies]
-rcgen = "0.14.10"
-tokio-rustls = "0.26.6"

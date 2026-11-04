@@ -40,3 +40,15 @@
     name: zramswap
     enabled: true
     state: started
+
+- name: Automatic security updates
+  ansible.builtin.import_tasks: updates.yml
+
+- name: Reboots into updates, when the desktop is idle
+  ansible.builtin.import_tasks: maintenance.yml
+
+- name: Logs kept to a size
+  ansible.builtin.import_tasks: logs.yml
+
+- name: OS hardening (adapted from DevSec's os_hardening)
+  ansible.builtin.import_tasks: hardening.yml

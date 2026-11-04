@@ -1,0 +1,52 @@
+# The maintenance window (files/cloud-desktop-maintenance): once installed
+# updates need a reboot or a restart, the desktop reboots between
+# common_maintenance_hours in its user's time zone, while the agent is idle
+# and nobody is viewing the screen. Off with common_maintenance: false.
+
+- name: Install the maintenance script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/cloud-desktop-maintenance
+    src: cloud-desktop-maintenance
+    mode: "0755"
+
+- name: Install the maintenance units
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    content: "{{ item.content }}"
+    mode: "0644"
+  loop:
+    - name: cloud-desktop-maintenance.service
+      content: |
+        # Managed by Ansible (common role: tasks/maintenance.yml).
+        [Unit]
+        Description=Restart into installed updates when the desktop is idle
+        After=network-online.target
+
+        [Service]
+        Type=oneshot
+        Environment=MAINTENANCE_HOURS={{ common_maintenance_hours | join(',') }}
+        Environment=MAINTENANCE_TIMEZONE={{ common_maintenance_timezone }}
+        ExecStart=/usr/local/sbin/cloud-desktop-maintenance
+    - name: cloud-desktop-maintenance.timer
+      content: |
+        # Managed by Ansible (common role: tasks/maintenance.yml).
+        [Unit]
+        Description=Check every 15 minutes whether installed updates need a reboot
+
+        [Timer]
+        OnCalendar=*:0/15
+        RandomizedDelaySec=60
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Run the maintenance timer
+  ansible.builtin.systemd_service:
+    name: cloud-desktop-maintenance.timer
+    enabled: "{{ common_maintenance }}"
+    state: "{{ 'started' if common_maintenance else 'stopped' }}"
+    daemon_reload: true
+  # A dry run hasn't written the unit yet.
+  ignore_errors: "{{ ansible_check_mode }}"

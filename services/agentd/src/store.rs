@@ -81,10 +81,13 @@ pub struct Schedule {
     /// `user` (asked for in a clean task), `agent_clean`, or `agent_tainted`
     /// (approved through a card after outside content).
     pub created_from: String,
+    /// "Run without asking": set by a person in the web app, never the agent.
+    /// Its runs go ahead with what would otherwise ask, except root commands
+    /// and browser changes (agent.rs).
+    pub auto_approve: bool,
 }
 
-const SCHEDULE_COLUMNS: &str =
-    "id, name, prompt, cron, timezone, next_run, last_run, paused, created, policy_version, created_from";
+const SCHEDULE_COLUMNS: &str = "id, name, prompt, cron, timezone, next_run, last_run, paused, created, policy_version, created_from, auto_approve";
 
 /// A saved key, as the apps list it: never its value.
 #[derive(Clone, Debug, Serialize)]
@@ -456,6 +459,15 @@ impl Store {
         Ok(conn.execute(
             "UPDATE schedules SET paused = ?2, next_run = COALESCE(?3, next_run) WHERE id = ?1",
             params![id, paused, next_run],
+        )? > 0)
+    }
+
+    /// "Run without asking" on or off; false if there's no such schedule.
+    pub fn set_schedule_auto_approve(&self, id: i64, on: bool) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE schedules SET auto_approve = ?2 WHERE id = ?1",
+            params![id, on],
         )? > 0)
     }
 
@@ -964,6 +976,7 @@ fn schedule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
         created: row.get(8)?,
         policy_version: row.get(9)?,
         created_from: row.get(10)?,
+        auto_approve: row.get(11)?,
     })
 }
 
@@ -1038,6 +1051,13 @@ fn migrate(conn: &Connection) -> Result<()> {
         // a schedule): only those get a work-log entry. Null for older tasks.
         conn.execute_batch(
             "BEGIN; ALTER TABLE runs ADD COLUMN acted INTEGER; PRAGMA user_version = 3; COMMIT;",
+        )?;
+    }
+    if version < 4 {
+        // "Run without asking", per schedule: off unless a person turns it on.
+        conn.execute_batch(
+            "BEGIN; ALTER TABLE schedules ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0; \
+             PRAGMA user_version = 4; COMMIT;",
         )?;
     }
     Ok(())
@@ -1348,7 +1368,13 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(version, 3);
+            assert_eq!(version, 4);
+            // Schedules from before don't run without asking.
+            let auto: Option<bool> = conn
+                .query_row("SELECT auto_approve FROM schedules LIMIT 1", [], |r| r.get(0))
+                .optional()
+                .unwrap();
+            assert_ne!(auto, Some(true));
             // Tasks from before don't say whether they changed anything.
             let acted: Option<i64> = conn
                 .query_row("SELECT acted FROM runs LIMIT 1", [], |r| r.get(0))

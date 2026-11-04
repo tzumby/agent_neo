@@ -18,6 +18,29 @@
     validate: squid -k parse -f %s
   notify: Restart Squid
 
+# The request log: daily, two weeks kept, compressed. Squid's own rotation is
+# off (logfile_rotate 0), so this is the only one.
+- name: Rotate Squid's logs
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/squid
+    content: |
+      # Managed by Ansible (agentd role: tasks/egress.yml).
+      /var/log/squid/*.log {
+          daily
+          rotate {{ agentd_squid_log_days }}
+          maxsize 200M
+          compress
+          delaycompress
+          missingok
+          notifempty
+          nocreate
+          sharedscripts
+          postrotate
+              test ! -e /run/squid.pid || test ! -x /usr/sbin/squid || /usr/sbin/squid -k rotate
+          endscript
+      }
+    mode: "0644"
+
 - name: Run Squid
   ansible.builtin.systemd_service:
     name: squid

@@ -22,4 +22,6 @@ cache deny all
 forwarded_for delete
 via off
 access_log daemon:/var/log/squid/access.log squid
-logfile_rotate 7
+# logrotate rotates the logs (/etc/logrotate.d/squid, egress.yml); Squid
+# only reopens them, so they aren't rotated twice.
+logfile_rotate 0

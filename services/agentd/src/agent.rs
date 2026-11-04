@@ -18,6 +18,7 @@ use crate::cdp::Cdp;
 use crate::clock::UserClock;
 use crate::config::Config;
 use crate::destinations::{self, Destination, Kind, Poster, Severity, Update};
+use crate::egress::EgressGate;
 use crate::guard;
 use crate::llm::{self, Together, Usage, truncate};
 use crate::memory;
@@ -52,8 +53,12 @@ const REPORT_OUTCOME_RULE: &str = "End with report_outcome. Use outcome=nothing 
      could not finish. The user is not watching; a result they can use is worth a notification, nothing new is not.";
 /// Added to a scheduled run's framing: it never waits on a card.
 const UNATTENDED_RULE: &str = "Nothing in this run can wait for the user's OK: anything that would need it \
-     (a command as root, a key that isn't saved) is refused instead, so skip it and say in your report what you'd \
-     have done.";
+     (a command as root, a risky command, one that could send data after you've read outside content, a browser \
+     change, a key that isn't saved) is refused instead, so skip it and say in your report what you'd have done.";
+/// The same, for a schedule the user set to run without asking.
+const AUTO_APPROVE_RULE: &str = "The user set this schedule to run without asking: your commands go ahead \
+     without their OK, except ones that run as root, which are refused, as are browser changes and requests for \
+     keys. Skip those and say in your report what you'd have done.";
 const INTERRUPTED: &str =
     "I was interrupted: the agent on your desktop restarted. Ask me to continue if you still need this.";
 /// Memory v2: the one reminder when the user asked to remember something and
@@ -75,11 +80,6 @@ static ASKS_TO_REMEMBER: LazyLock<regex::Regex> = LazyLock::new(|| {
 pub struct Settings {
     pub model: String,
     pub allow_actions: bool,
-    /// What asks first (APPROVALS): "root", only commands that run as root
-    /// (the default); "risky", also browser changes, commands that could send
-    /// data after outside content, the policy's risky commands and schedules
-    /// asked for after outside content.
-    pub approvals: String,
     /// Memory v2's consolidation: off, observe or auto (consolidate.rs).
     pub memory_consolidation: String,
     pub memory_consolidation_model: String,
@@ -243,13 +243,70 @@ pub struct Agent {
     poster: Poster,
     /// The event seq of the tool call being run (a memory's source).
     step_seq: AtomicI64,
+    /// The egress gate (egress.rs), set once it's listening (main.rs).
+    pub gate: std::sync::OnceLock<Arc<EgressGate>>,
+    /// The shell user's uid, for the guard firewall's `squid_locked` set.
+    shell_uid: Option<u32>,
 }
 
 /// The web app's Setup steps (apps/web/public/assets/js/setup.js), in order.
-/// The approvals setting's values (Settings::approvals).
-pub const APPROVALS: &[&str] = &["root", "risky"];
-
 pub const SETUP_STEPS: &[&str] = &["updates", "cloudflare", "datadog", "watching"];
+
+/// Adds the shell user to the guard firewall's `squid_locked` set (or takes it
+/// out): while it's in, it can't reach Squid, only the egress gate.
+fn nft_set(lock: bool, uid: u32) -> Result<()> {
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-n",
+            "nft",
+            if lock { "add" } else { "delete" },
+            "element",
+            "inet",
+            "cloud_desktop_guard",
+            "squid_locked",
+            &format!("{{ {uid} }}"),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("running nft")?;
+    anyhow::ensure!(status.success(), "nft exited with {status}");
+    Ok(())
+}
+
+/// A user's uid (`id -u`); None for none or an unknown user.
+fn uid_of(user: &str) -> Option<u32> {
+    if user.is_empty() {
+        return None;
+    }
+    let out = std::process::Command::new("id")
+        .args(["-u", user])
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+/// The CA bundle gated commands trust (the system's and the egress gate's),
+/// in the state directory.
+pub const EGRESS_BUNDLE: &str = "egress-ca-bundle.pem";
+
+/// A scheduled command's way out, held while it runs (Agent::lock_egress).
+struct EgressLock {
+    gate: Arc<EgressGate>,
+    uid: Option<u32>,
+}
+
+impl Drop for EgressLock {
+    fn drop(&mut self) {
+        self.gate.set_pinning(false);
+        if let Some(uid) = self.uid
+            && let Err(err) = nft_set(false, uid)
+        {
+            tracing::error!(err = %format!("{err:#}"), "couldn't reopen Squid to the shell user");
+        }
+    }
+}
 
 fn short_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
@@ -313,6 +370,12 @@ impl Agent {
                 tasks_max: cfg.shell_tasks_max.clone(),
                 cpu_quota: cfg.shell_cpu_quota.clone(),
                 proxy: cfg.shell_proxy.clone(),
+                gate_proxy: if cfg.egress_gate_listen.is_empty() {
+                    String::new()
+                } else {
+                    format!("http://{}", cfg.egress_gate_listen)
+                },
+                gate_bundle: cfg.state_dir.join(EGRESS_BUNDLE),
             },
             policy,
             skills: Skills::load(&cfg.skills_dir),
@@ -323,6 +386,8 @@ impl Agent {
             schedules_changed: Notify::new(),
             effects_changed: Notify::new(),
             step_seq: AtomicI64::new(0),
+            gate: std::sync::OnceLock::new(),
+            shell_uid: uid_of(&cfg.run_as),
             cfg,
         };
         agent.recover();
@@ -400,37 +465,19 @@ impl Agent {
             model: get("model").unwrap_or_else(|| self.cfg.model.clone()),
             // On by default: writing and sending in the browser ask first.
             allow_actions: get("allow_actions").as_deref() != Some("false"),
-            approvals: match get("approvals").as_deref() {
-                Some("risky") => "risky".into(),
-                _ => "root".into(),
-            },
             memory_consolidation: crate::consolidate::mode(&self.store).name().to_string(),
             memory_consolidation_model: crate::consolidate::model(&self.store, &self.cfg.consolidation_model),
             memory_consolidation_daily_cap_usd: crate::consolidate::daily_cap(&self.store),
         }
     }
 
-    /// The approvals setting is "root": nothing but root commands asks.
-    fn asks_only_for_root(&self) -> bool {
-        self.store.setting("approvals").ok().flatten().as_deref() != Some("risky")
-    }
-
-    pub fn update_settings(
-        &self,
-        model: Option<&str>,
-        allow_actions: Option<bool>,
-        approvals: Option<&str>,
-    ) -> Result<Settings> {
+    pub fn update_settings(&self, model: Option<&str>, allow_actions: Option<bool>) -> Result<Settings> {
         if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
             self.store.set_setting("model", model)?;
         }
         if let Some(allow) = allow_actions {
             self.store
                 .set_setting("allow_actions", if allow { "true" } else { "false" })?;
-        }
-        if let Some(approvals) = approvals.filter(|a| APPROVALS.contains(a)) {
-            self.store.set_setting("approvals", approvals)?;
-            tracing::info!(approvals, "approvals setting changed");
         }
         let settings = self.settings();
         self.emit("settings", json!(settings));
@@ -759,14 +806,18 @@ impl Agent {
                 format!("[Scheduled task “{}”] {text}", schedule.name),
                 format!(
                     "(agentd) This is the scheduled task “{}” the user set up earlier ({}). They aren't \
-                     watching, so do it and end with a short report they can read in a notification.{} {UNATTENDED_RULE}\
-                     \n\n{text}",
+                     watching, so do it and end with a short report they can read in a notification.{} {}\n\n{text}",
                     schedule.name,
                     schedule::describe(schedule.cron.as_deref(), schedule.next_run, &schedule.timezone),
                     if self.cfg.memory_v2 {
                         format!(" {REPORT_OUTCOME_RULE}")
                     } else {
                         String::new()
+                    },
+                    if schedule.auto_approve {
+                        AUTO_APPROVE_RULE
+                    } else {
+                        UNATTENDED_RULE
                     },
                 ),
             ),
@@ -972,7 +1023,6 @@ impl Agent {
             &self.skills.listing(),
             &self.keys_prompt(),
             self.cfg.memory_v2,
-            self.asks_only_for_root(),
         );
         if !destinations.is_empty() {
             let listing: String = destinations
@@ -1532,6 +1582,11 @@ impl Agent {
                 };
                 // Any command: whether it changed something can't be told.
                 self.acted(task_id);
+                // "Run without asking", read now: turning it off applies at once.
+                let auto_approve = schedule
+                    .filter(|id| *id > 0)
+                    .and_then(|id| self.store.schedule(id).ok().flatten())
+                    .is_some_and(|s| s.auto_approve);
                 self.run_shell(
                     task_id,
                     required("command")?,
@@ -1540,6 +1595,7 @@ impl Agent {
                     timeout,
                     tainted,
                     schedule.is_some(),
+                    auto_approve,
                     resumed,
                     cancel,
                 )
@@ -1780,7 +1836,7 @@ impl Agent {
             Err(problem) => return Ok(format!("not scheduled: {problem}")),
         };
         let when = schedule::describe(timing.cron.as_deref(), timing.next_run, &timezone);
-        if tainted && !self.asks_only_for_root() {
+        if tainted {
             let card = json!({
                 "kind": "schedule", "name": name, "text": prompt, "when": when, "next_run": timing.next_run,
                 "reason": "was asked for after reading outside content (a page, an email or command output)",
@@ -1851,6 +1907,24 @@ impl Agent {
     /// A repeating schedule a person sets up in the web app (Setup's
     /// examples): the same limits as schedule_task, no card (they chose it).
     /// The app sends its time zone, remembered as a message's is.
+    /// "Run without asking" for a schedule, set by a person in the web app (the
+    /// agent has no way to): its runs then go ahead with what would ask,
+    /// except root commands and browser changes. None: no such schedule.
+    pub fn set_schedule_auto_approve(&self, id: i64, on: bool, by: Option<String>) -> Result<Option<Value>> {
+        if !self.store.set_schedule_auto_approve(id, on)? {
+            return Ok(None);
+        }
+        tracing::info!(schedule = id, on, "run without asking changed");
+        let mut event = self
+            .store
+            .schedule(id)?
+            .as_ref()
+            .map_or_else(|| json!({"id": id}), schedule::json);
+        event["by"] = json!(by);
+        self.emit("schedule.updated", event.clone());
+        Ok(Some(event))
+    }
+
     pub fn add_user_schedule(
         &self,
         name: &str,
@@ -1858,6 +1932,7 @@ impl Agent {
         cron: &str,
         clock: Option<&UserClock>,
         by: Option<String>,
+        auto_approve: bool,
     ) -> Result<Value, String> {
         let (name, prompt) = (name.trim(), prompt.trim());
         if name.is_empty() || prompt.is_empty() || cron.trim().is_empty() {
@@ -1887,6 +1962,12 @@ impl Agent {
         self.store
             .set_schedule_origin(saved.id, &self.policy_version(), "user")
             .map_err(|e| e.to_string())?;
+        if auto_approve {
+            self.store
+                .set_schedule_auto_approve(saved.id, true)
+                .map_err(|e| e.to_string())?;
+            tracing::info!(schedule = saved.id, "set up to run without asking");
+        }
         let saved = self
             .store
             .schedule(saved.id)
@@ -1978,6 +2059,48 @@ impl Agent {
         })
     }
 
+    /// For a scheduled run's command: Squid closed to the shell user (the
+    /// guard firewall's `squid_locked` set), so its only way out is the egress
+    /// gate, which pins keys meanwhile. Undone when the lock is dropped. None
+    /// without a gate (local development without one, or tests).
+    fn lock_egress(&self) -> Result<Option<EgressLock>> {
+        let Some(gate) = self.gate.get() else {
+            return Ok(None);
+        };
+        let uid = if self.cfg.run_as.is_empty() {
+            None // local development: no firewall
+        } else {
+            let uid = self.shell_uid.context("the shell user's uid is unknown")?;
+            nft_set(true, uid)?;
+            Some(uid)
+        };
+        gate.set_pinning(true);
+        Ok(Some(EgressLock {
+            gate: gate.clone(),
+            uid,
+        }))
+    }
+
+    /// At startup: a lock left by an agentd that stopped mid-command is undone.
+    pub fn clear_egress_locks(&self) {
+        if !self.cfg.run_as.is_empty() {
+            let _ = std::process::Command::new("sudo")
+                .args([
+                    "-n",
+                    "nft",
+                    "flush",
+                    "set",
+                    "inet",
+                    "cloud_desktop_guard",
+                    "squid_locked",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run_shell(
         &self,
@@ -1987,8 +2110,10 @@ impl Agent {
         asked: &[String],
         timeout: u64,
         tainted: bool,
-        // A scheduled run: what would ask is refused instead.
+        // A scheduled run: what would ask is refused instead, or with "Run
+        // without asking" (`auto_approve`) goes ahead, except root.
         unattended: bool,
+        auto_approve: bool,
         resumed: Option<Answer>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<String> {
@@ -2006,13 +2131,8 @@ impl Agent {
             ));
         }
         let (as_root, inner) = split_sudo(command);
-        let reason = if as_root {
+        let mut reason = if as_root {
             Some("runs as root")
-        } else if self.asks_only_for_root() {
-            // The approvals setting: the shell user's commands run. The walls
-            // stay: its own user, the egress allowlist, no DNS, no desktop
-            // controls, and the refusals above (guard.rs).
-            None
         } else if let Some(reason) = self.policy.danger(inner) {
             Some(reason)
         } else if tainted && self.policy.sends_data(inner) && !monitoring::is_monitoring_read(inner, &keys) {
@@ -2028,12 +2148,17 @@ impl Agent {
         } else {
             None
         };
-        if let (Some(reason), true, None) = (reason, unattended, &resumed) {
-            tracing::info!(task = %task_id, "not run: a scheduled run's command that would ask");
-            return Ok(format!(
-                "not run: it {reason}, and a scheduled run can't wait for the user's OK. Skip it, or say in your \
-                 report what you'd run."
-            ));
+        if let (Some(why), true, None) = (reason, unattended, &resumed) {
+            if as_root || !auto_approve {
+                tracing::info!(task = %task_id, "not run: a scheduled run's command that would ask");
+                return Ok(format!(
+                    "not run: it {why}, and a scheduled run can't wait for the user's OK. Skip it, or say in your \
+                     report what you'd run."
+                ));
+            }
+            // The user set this schedule to run without asking.
+            tracing::info!(task = %task_id, "run without asking: the schedule allows it");
+            reason = None;
         }
         // The user decides on the model's plain words, so a card isn't shown
         // without them: the model is asked again (nothing is logged or shown).
@@ -2074,7 +2199,27 @@ impl Agent {
                 path: self.secrets.path(name),
             })
             .collect();
-        let mut output = self.shell.run(inner, as_root, timeout, &files, cancel).await?;
+        // A scheduled run's commands go out only through the egress gate,
+        // which pins Cloudflare's and Datadog's keys (egress.rs).
+        let _egress = if unattended {
+            match self.lock_egress() {
+                Ok(lock) => lock,
+                Err(err) => {
+                    tracing::error!(err = %format!("{err:#}"), "couldn't lock the egress for a scheduled command");
+                    return Ok(
+                        "not run: agentd couldn't route a scheduled run's command through its egress gate. Say so \
+                         in your report."
+                            .into(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let mut output = self
+            .shell
+            .run(inner, as_root, timeout, &files, unattended, cancel)
+            .await?;
         if !keys.is_empty() {
             let _ = self.store.secrets_used(&keys);
         }
@@ -2106,8 +2251,6 @@ impl Agent {
         match gate {
             Gate::Allow => Ok(Ok(false)),
             Gate::Block(refusal) => Ok(Err(refusal)),
-            // The approvals setting: only root commands ask.
-            Gate::Ask(_) if resumed.is_none() && self.asks_only_for_root() => Ok(Ok(false)),
             Gate::Ask(reason) => {
                 card["kind"] = json!("browser");
                 card["reason"] = json!(reason);
@@ -2654,6 +2797,9 @@ pub(crate) fn test_agent_with(slack_api: &str) -> (Arc<Agent>, std::path::PathBu
         shell_tasks_max: "64".into(),
         shell_cpu_quota: "100%".into(),
         shell_proxy: String::new(),
+        egress_gate_listen: String::new(),
+        egress_gate_squid: String::new(),
+        egress_gate_upstream: None,
         policy_path: dir.join("no-policy.toml"),
         skills_dir: dir.join("no-skills"),
         max_steps: 5,
@@ -2707,7 +2853,7 @@ mod tests {
         let (agent, dir) = test_agent();
         let card = json!({"kind": "browser", "action": "type", "target": "Message #eng", "text": "hi", "site": "app.slack.com"});
         let id = park(&agent, "t1", card, &agent.policy_version());
-        agent.update_settings(None, Some(false), None).unwrap();
+        agent.update_settings(None, Some(false)).unwrap();
         assert!(matches!(
             agent.answer_approval(&id, true, Some("me".into())),
             Err(StartError::NotFound)
@@ -2738,139 +2884,60 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[tokio::test]
-    async fn by_default_only_root_commands_ask() {
-        let (agent, dir) = test_agent();
-        let (_stop, mut cancel) = watch::channel(false);
-        assert_eq!(agent.settings().approvals, "root");
-        // After outside content, a command that could send data runs, and so
-        // does one of the policy's risky ones (as the shell user).
-        for command in ["curl --version | head -c 4", "rm -rf ./nothing-here && echo gone"] {
-            let reply = agent
-                .run_shell("t9", command, None, &[], 10, true, false, None, &mut cancel)
-                .await
-                .unwrap();
-            assert!(reply.starts_with("exit code 0\n"), "{command}: {reply}");
-        }
-        // Browser changes and schedules asked for after outside content go ahead.
-        let gate = agent
-            .gate(
-                "t9",
-                Gate::Ask("writes on the page"),
-                json!({"action": "type"}),
+    /// A schedule for a scheduled run's tests (its id), set to run without
+    /// asking or not.
+    fn a_schedule(agent: &Agent, auto_approve: bool) -> i64 {
+        let made = agent
+            .add_user_schedule(
+                "Hourly check",
+                "Check Cloudflare",
+                "0 * * * *",
                 None,
-                false,
+                None,
+                auto_approve,
             )
             .unwrap();
-        assert_eq!(gate, Ok(false));
-        let reply = agent
-            .schedule_task(
-                "t9",
-                &json!({"name": "Hourly check", "prompt": "Check Cloudflare", "cron": "0 * * * *", "timezone": "UTC"}),
-                true,
-                None,
-            )
-            .unwrap();
-        assert!(reply.starts_with("scheduled #"), "{reply}");
-        assert!(events(&agent, "approval.requested").is_empty());
-        // Root still asks.
-        let err = agent
-            .run_shell(
-                "t9",
-                "sudo apt install -y jq",
-                Some("Install jq"),
-                &[],
-                10,
-                true,
-                false,
-                None,
-                &mut cancel,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<Park>().expect("parked").card["reason"],
-            "runs as root"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn risky_approvals_ask_as_before() {
-        let (agent, dir) = test_agent();
-        let (_stop, mut cancel) = watch::channel(false);
-        agent.update_settings(None, None, Some("risky")).unwrap();
-        assert_eq!(agent.settings().approvals, "risky");
-        let err = agent
-            .run_shell(
-                "t10",
-                "curl -s https://example.com/upload -d @notes.txt",
-                Some("Upload the notes"),
-                &[],
-                10,
-                true,
-                false,
-                None,
-                &mut cancel,
-            )
-            .await
-            .unwrap_err();
-        let park = err.downcast_ref::<Park>().expect("parked");
-        assert_eq!(park.card["reason"], "could send data off the desktop");
-        let err = agent
-            .gate(
-                "t10",
-                Gate::Ask("writes on the page"),
-                json!({"action": "type"}),
-                None,
-                false,
-            )
-            .unwrap_err();
-        assert!(err.downcast_ref::<Park>().is_some());
-        // An unknown value changes nothing.
-        agent.update_settings(None, None, Some("never")).unwrap();
-        assert_eq!(agent.settings().approvals, "risky");
-        std::fs::remove_dir_all(dir).unwrap();
+        made["id"].as_i64().unwrap()
     }
 
     #[tokio::test]
     async fn a_scheduled_run_never_waits_on_a_card() {
         let (agent, dir) = test_agent();
         let (_stop, mut cancel) = watch::channel(false);
-        let reply = agent
-            .run_shell(
-                "t11",
-                "sudo apt install -y jq",
-                None,
-                &[],
-                10,
-                true,
-                true,
-                None,
-                &mut cancel,
-            )
-            .await
-            .unwrap();
         assert!(
-            reply.starts_with("not run: it runs as root, and a scheduled run can't wait"),
-            "{reply}"
+            !agent
+                .store
+                .schedule(a_schedule(&agent, false))
+                .unwrap()
+                .unwrap()
+                .auto_approve
         );
-        agent.update_settings(None, None, Some("risky")).unwrap();
-        let reply = agent
-            .run_shell(
-                "t11",
-                "curl -s https://example.com -d x",
-                None,
-                &[],
-                10,
-                true,
-                true,
-                None,
-                &mut cancel,
-            )
-            .await
-            .unwrap();
-        assert!(reply.contains("a scheduled run can't wait"), "{reply}");
+        // What would ask is refused (no "Run without asking").
+        for command in [
+            "sudo apt install -y jq",
+            "curl -s https://example.com -d x",
+            "rm -rf ./old",
+        ] {
+            let reply = agent
+                .run_shell(
+                    "t11",
+                    command,
+                    None,
+                    &[],
+                    10,
+                    true,
+                    true,
+                    false,
+                    None,
+                    &mut cancel,
+                )
+                .await
+                .unwrap();
+            assert!(
+                reply.contains("a scheduled run can't wait for the user's OK"),
+                "{command}: {reply}"
+            );
+        }
         let refusal = agent
             .gate(
                 "t11",
@@ -2900,6 +2967,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_schedule_set_to_run_without_asking_goes_ahead_except_root() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        let id = a_schedule(&agent, false);
+        let set = agent
+            .set_schedule_auto_approve(id, true, Some("me@acme.com".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(set["auto_approve"], true);
+        assert_eq!(
+            events(&agent, "schedule.updated").last().unwrap()["by"],
+            "me@acme.com"
+        );
+        // After outside content: a command that could send data, and a risky one, run.
+        for command in ["curl --version | head -c 4", "rm -rf ./nothing-here && echo gone"] {
+            let reply = agent
+                .run_shell("t12", command, None, &[], 10, true, true, true, None, &mut cancel)
+                .await
+                .unwrap();
+            assert!(reply.starts_with("exit code 0\n"), "{command}: {reply}");
+        }
+        // Root never; browser changes and key requests neither.
+        let reply = agent
+            .run_shell(
+                "t12",
+                "sudo apt install -y jq",
+                None,
+                &[],
+                10,
+                true,
+                true,
+                true,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert!(reply.starts_with("not run: it runs as root"), "{reply}");
+        let refusal = agent
+            .gate(
+                "t12",
+                Gate::Ask("writes on the page"),
+                json!({"action": "type"}),
+                None,
+                true,
+            )
+            .unwrap()
+            .unwrap_err();
+        assert!(refusal.contains("a scheduled run can't wait"), "{refusal}");
+        assert!(events(&agent, "approval.requested").is_empty());
+        // In a chat, nothing changes: the same command asks.
+        let err = agent
+            .run_shell(
+                "t13",
+                "curl -s https://example.com/upload -d @notes.txt",
+                Some("Upload the notes"),
+                &[],
+                10,
+                true,
+                false,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<Park>().expect("parked").card["reason"],
+            "could send data off the desktop"
+        );
+        assert!(
+            agent
+                .set_schedule_auto_approve(9999, true, None)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_command_without_plain_words_is_sent_back_not_shown() {
         let (agent, dir) = test_agent();
         let (_stop, mut cancel) = watch::channel(false);
@@ -2911,6 +3058,7 @@ mod tests {
                     summary,
                     &[],
                     10,
+                    false,
                     false,
                     false,
                     None,
@@ -2942,6 +3090,7 @@ mod tests {
                 &[],
                 10,
                 true,
+                false,
                 false,
                 None,
                 &mut cancel,
@@ -3473,9 +3622,11 @@ mod setup_schedule_tests {
                 "0 8 * * 1-5",
                 Some(&clock),
                 Some("me@acme.com".into()),
+                true,
             )
             .unwrap();
         assert_eq!(made["name"], "Morning security report");
+        assert_eq!(made["auto_approve"], true);
         assert_eq!(made["timezone"], "America/Toronto");
         assert_eq!(
             agent.user_clock().timezone,
@@ -3483,21 +3634,25 @@ mod setup_schedule_tests {
             "remembered, as a message's is"
         );
         let too_often = agent
-            .add_user_schedule("Every minute", "x", "* * * * *", None, None)
+            .add_user_schedule("Every minute", "x", "* * * * *", None, None, false)
             .unwrap_err();
         assert!(too_often.contains("15 minutes"), "{too_often}");
         assert!(
             agent
-                .add_user_schedule("Morning security report", "y", "0 9 * * *", None, None)
+                .add_user_schedule("Morning security report", "y", "0 9 * * *", None, None, false)
                 .unwrap_err()
                 .contains("already")
         );
         assert!(
             agent
-                .add_user_schedule("Bad", "y", "not a cron", None, None)
+                .add_user_schedule("Bad", "y", "not a cron", None, None, false)
                 .is_err()
         );
-        assert!(agent.add_user_schedule("", "y", "0 9 * * *", None, None).is_err());
+        assert!(
+            agent
+                .add_user_schedule("", "y", "0 9 * * *", None, None, false)
+                .is_err()
+        );
         assert_eq!(agent.store.schedules().unwrap().len(), 1);
         let created = agent.store.events_after(0, 100).unwrap();
         assert!(

@@ -1,0 +1,36 @@
+## {{ ansible_managed }}
+## What changed on this desktop, and when root commands ran: not what the
+## commands were. Their arguments can hold the user's data (the agent's
+## commands), so the records holding them aren't kept.
+
+-D
+-b 8192
+-f 1
+--backlog_wait_time 60000
+## A path missing on this host (sudo's differ by release) skips its rule only.
+-i
+
+## No argument lists: EXECVE and PROCTITLE records carry them.
+-a always,exclude -F msgtype=EXECVE
+-a always,exclude -F msgtype=PROCTITLE
+
+## Accounts and who may become root
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+
+## The agent's settings, its rules and its way out
+-w /etc/agentd/ -p wa -k agentd-config
+-w /etc/cloud-desktops/ -p wa -k egress-policy
+-w /etc/squid/ -p wa -k egress-policy
+-w /etc/systemd/system/ -p wa -k systemd-units
+
+## Root commands (the program and who ran it), and kernel modules
+-w /usr/bin/sudo -p x -k root-command
+-w /usr/bin/sudo.ws -p x -k root-command
+-w /usr/lib/cargo/bin/sudo -p x -k root-command
+-w /usr/bin/systemd-run -p x -k root-command
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k modules

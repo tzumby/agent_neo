@@ -70,6 +70,52 @@
     group: "{{ agentd_shell_user }}"
     mode: "0644"
 
+# Old generations of what the agent installed, weekly: the store would
+# otherwise only grow. What's installed now stays.
+- name: Install the Nix clean-up units
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    content: "{{ item.content }}"
+    mode: "0644"
+  loop:
+    - name: agentd-nix-gc.service
+      content: |
+        # Managed by Ansible (agentd role: tasks/nix.yml).
+        [Unit]
+        Description=Remove old Nix generations and unused store paths of the shell user
+
+        [Service]
+        Type=oneshot
+        User={{ agentd_shell_user }}
+        Environment=HOME={{ agentd_shell_home }}
+        ExecStart={{ agentd_shell_home }}/.nix-profile/bin/nix-collect-garbage --delete-older-than 30d
+        Nice=19
+        IOSchedulingClass=idle
+    - name: agentd-nix-gc.timer
+      content: |
+        # Managed by Ansible (agentd role: tasks/nix.yml).
+        [Unit]
+        Description=Clean up the shell user's Nix store weekly
+
+        [Timer]
+        OnCalendar=weekly
+        RandomizedDelaySec=1h
+        Persistent=true
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Run the Nix clean-up weekly
+  ansible.builtin.systemd_service:
+    name: agentd-nix-gc.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+  # A dry run hasn't written the unit yet.
+  ignore_errors: "{{ ansible_check_mode }}"
+
 - name: Keep npm's global packages in the shell user's home
   ansible.builtin.copy:
     dest: "{{ agentd_shell_home }}/.npmrc"

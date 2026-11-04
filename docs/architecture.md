@@ -302,9 +302,20 @@ For a fresh desktop, run them in this order: desktops, agentd, tailnet-proxy.
 
 ### 5.2 Role `common`
 
-- **Packages:** `acl`, `ca-certificates`, `curl`, `gnupg`, `unattended-upgrades` (Ubuntu's default configuration), `zram-tools`.
+- **Packages:** `acl`, `ca-certificates`, `curl`, `gnupg`, `needrestart`, `unattended-upgrades`, `zram-tools`.
 - **Removed:** `openssh-server`, `ec2-instance-connect`.
+- **Automatic updates** (`tasks/updates.yml`), set by the role rather than left to the image: the package lists and unattended upgrades daily (`apt-daily.timer`, `apt-daily-upgrade.timer`), from Ubuntu's security pockets (`-security`, and ESM's when there), plus Chrome from Google's repo (the desktop role's `52cloud-desktops-chrome`: origin `Google LLC`, label `Google`, codename `stable`). Unused kernels and dependencies are removed, and the package cache is cleaned weekly (`AutocleanInterval`). `Automatic-Reboot` is off: reboots are the maintenance window's.
 - **needrestart** is set to list only (`$nrconf{restart} = 'l'`), so unattended upgrades don't restart Xvfb, XFCE or Chrome in the middle of a task.
+- **The maintenance window** (`tasks/maintenance.yml`, `/usr/local/sbin/cloud-desktop-maintenance`, a timer every 15 minutes). Between 04:00 and 06:00 in the user's time zone (agentd's `user_timezone` setting, which the app sends; `common_maintenance_timezone`, UTC, until then), if `/run/reboot-required` exists, needrestart sees a newer kernel, or it lists services running old code (Chrome after an update above all), the desktop reboots, which brings Xvfb, XFCE, Chrome and agentd back in order. Not while agentd is busy, not while a VNC or noVNC connection is open (someone viewing), and not within 30 minutes of a boot. It logs why it rebooted or waited, nothing else. `common_maintenance: false` turns it off.
+- **Logs kept to a size** (`tasks/logs.yml`): the journal at most 1 GB (`SystemMaxUse`), 2 GB always left free, files of 64 MB, one month (`MaxRetentionSec`). logrotate's own rules cover `/var/log`'s files; Squid's are the agentd role's (§5.6).
+- **Hardening** (`tasks/hardening.yml`), adapted from DevSec's `os_hardening` role ([dev-sec.io](https://dev-sec.io), Apache-2.0) rather than applied as is:
+  - kernel and network settings (`/etc/sysctl.d/90-cloud-desktops-hardening.conf`): ptrace only for root (`kernel.yama.ptrace_scope = 2`), no kexec, no SysRq, no core dumps of setuid programs, protected hard links, symlinks, FIFOs and regular files, kernel pointers hidden, BPF JIT hardened, no IP forwarding, strict reverse-path filtering, no source routing or redirects (in or out), martians logged, SYN cookies. Not DevSec's IPv6 router-advertisement settings: AWS networking uses them;
+  - unused filesystem and protocol modules can't load (`cramfs`, `freevxfs`, `jffs2`, `hfs`, `hfsplus`, `udf`, `dccp`, `rds`, `sctp`, `tipc`). Not `squashfs` (the SSM agent is a snap: blocking it would cut off access) or `vfat` (the EFI boot partition), which DevSec's list has;
+  - SUID taken off programs nobody here needs (`chfn`, `chsh`, `newgrp`, `gpasswd`, `mount`, `umount`, both `su`s, `ntfs-3g`, `fusermount3`, `ssh-keysign`), recorded with `dpkg-statoverride` so package updates don't put it back. `sudo` (agentd's), Chrome's sandbox helper (its fallback when user namespaces aren't allowed) and D-Bus's launch helper keep it;
+  - no core dumps (`* hard core 0`), apport off (crash reports hold whatever the program had in memory), `/dev/shm` mounted `nosuid,nodev,noexec`;
+  - no login shell for `nova` (an account novnc's package makes);
+  - **auditd**, rotating (5 files of 6 MB; DevSec's `keep_logs` never deletes). Rules (`/etc/audit/rules.d/cloud-desktops.rules`): changes to accounts and sudoers, to agentd's configuration, the egress policy (`/etc/cloud-desktops`, `/etc/squid`) and systemd units, kernel modules loaded or removed, and each run of `sudo` and `systemd-run`: who ran which program, and when. Never the arguments: `EXECVE` and `PROCTITLE` records are excluded, since the agent's commands can hold the user's data;
+  - not DevSec's password ageing, PAM, `login.defs` or `securetty` rules: every account's password is locked, and there's no SSH.
 - **zram swap:** 2 GB, zstd, priority 100.
 - **cloud-init:** waits for it to finish first (exit code 0 or 2 accepted).
 
@@ -317,7 +328,7 @@ For a fresh desktop, run them in this order: desktops, agentd, tailnet-proxy.
   - Other: python3-venv and tzdata.
   - Removed: `light-locker`, `xfce4-screensaver` and `xfce4-power-manager`, so the screen never blanks or locks.
 - **Chrome:**
-  - Google Chrome stable for the host's architecture, from Google's signed apt repository (deb822 source with `Signed-By`). Ansible writes the source once; after that the Chrome package owns it.
+  - Google Chrome stable for the host's architecture, from Google's signed apt repository (deb822 source with `Signed-By`). Ansible writes the source once; after that the Chrome package owns it. Each run installs the latest, and unattended upgrades keep it current in between (§5.2); the maintenance window restarts into it. (Ubuntu has no Chromium package of its own: `chromium-browser` installs Canonical's snap, which was a release behind Google's on 2026-11-04 and would move the profile, policies and debugging port into snap confinement.)
   - Managed policy `/etc/opt/chrome/policies/managed/cloud-desktops.json` (`desktop_chrome_policy`; Chrome reloads it without a restart; `make desktop TAGS=chrome_policy` updates only it):
     - `PasswordManagerEnabled: false`, so the browser never stores the user's passwords (PLAN.MD ground rule 4).
     - `URLBlocklist` of desktop-app link schemes (`slack:*`, Zoom's, Teams', `discord:*`, `figma:*`, `notion:*`, `vscode:*` and others, 28 in all). Web apps try to open their desktop apps, as Slack's web client does with `slack://`. Chrome then asks "Open xdg-open?" in its own UI, which the agent can't see or answer over DevTools, so tasks hung there (2026-11-02). Blocked, the launch fails quietly and the web app stays in the browser.
@@ -358,12 +369,12 @@ For a fresh desktop, run them in this order: desktops, agentd, tailnet-proxy.
 |---|---|---|
 | `/usr/local/bin/agentd` | root 0755 | The binary |
 | `/etc/agentd/` | root:agentd 0750 | Configuration directory |
-| `/etc/agentd/agentd.env` | root:agentd 0640 | `LISTEN`, `MODEL`, `CDP_URL`, `STATE_DIR`, `WORKDIR`, `RUN_AS=worker`, shell limits, `POLICY`, `MAX_STEPS`, `SHELL_TOOL`, `DESKTOP_NAME`, `SHELL_PROXY=http://127.0.0.1:3128`, `PUSH_RELAY_URL`; with a gateway, also `GATEWAY_URL`, `GATEWAY_MEASUREMENTS`, `GATEWAY_AUDIENCE`, `AWS_REGION` (from SSM `<prefix>/gateway/*` and `<prefix>/push/relay_url`) |
+| `/etc/agentd/agentd.env` | root:agentd 0640 | `LISTEN`, `MODEL`, `CDP_URL`, `STATE_DIR`, `WORKDIR`, `RUN_AS=worker`, shell limits, `POLICY`, `MAX_STEPS`, `SHELL_TOOL`, `DESKTOP_NAME`, `SHELL_PROXY=http://127.0.0.1:3128`, `EGRESS_GATE_LISTEN=127.0.0.1:3129`, `EGRESS_GATE_SQUID=127.0.0.1:3128`, `PUSH_RELAY_URL`; with a gateway, also `GATEWAY_URL`, `GATEWAY_MEASUREMENTS`, `GATEWAY_AUDIENCE`, `AWS_REGION` (from SSM `<prefix>/gateway/*` and `<prefix>/push/relay_url`) |
 | `/etc/agentd/secrets.env` | root:agentd 0640 | Only for bootstrapping without a gateway (`TOGETHER_API_KEY`). Deleted once a gateway exists: desktops hold no provider key |
 | `/etc/agentd/policy.toml` | root:agentd 0640 | Only when `agentd_dangerous` overrides the built-in approval rules |
 | `/etc/agentd/skills/*.md` | root:agentd 0640 | Skills |
 | `/etc/sudoers.d/agentd` | root 0440 (validated by `visudo`) | `agentd ALL=(root) NOPASSWD: ALL`. agentd uses it only for `systemd-run` and `systemctl stop`, and enforces approvals for root commands itself |
-| `/var/lib/agentd/` | agentd 0700 | SQLite, images, saved keys (§6.3) |
+| `/var/lib/agentd/` | agentd 0700 | SQLite, images, saved keys (§6.3), and `egress-ca-bundle.pem` (the system's CAs and the egress gate's, made at each start, §6.21) |
 | `/run/agentd/agentd.sock` | agentd:agentd 0660 in a 0750 directory | The API. Reachable by agentd and tailnet-proxy only |
 | `/etc/cloud-desktops/guard.nft` | root 0644 | Firewall rules (§5.5) |
 
@@ -381,8 +392,10 @@ A single nftables table, `inet cloud_desktop_guard`, with one `output` chain (po
 1. **Instance metadata** (`169.254.169.254` and `fd00:ec2::254`): rejected for every uid except root (the SSM agent) and `agentd` (identity proofs and push relay signing). Chrome, the shell user, tailnet-proxy, websockify and Squid can't get the instance role's credentials.
 2. **The desktop's controls:** `worker` → `127.0.0.1`/`::1` ports 9222 (DevTools), 5900 (VNC) and 6080 (noVNC) are rejected. The shell can't drive the logged-in browser around the approvals.
 3. **DNS:** `worker` → any port 53 (TCP or UDP) is rejected, including the local stub resolver. No data goes out through lookups.
-4. **Loopback:** other `worker` traffic to `lo` is accepted (Squid, dev servers).
-5. **Everything else** from `worker` is rejected: it reaches the internet only through Squid.
+4. **Squid locked:** while `worker` is in the set `squid_locked` (agentd adds it for the length of a scheduled run's command, §6.21), its connections to Squid's port are rejected: its way out is the egress gate.
+5. **Loopback:** other `worker` traffic to `lo` is accepted (Squid, the egress gate, dev servers).
+6. **Everything else** from `worker` is rejected: it reaches the internet only through Squid.
+7. **The egress gate's port** (`lo`, 3129) is rejected for every uid but root, agentd and `worker`.
 
 Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a network port; it's protected by file permissions.
 
@@ -405,7 +418,7 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
   - `api.together.ai`, `api.together.xyz`;
   - `.nixos.org`.
 - **No cache, no `X-Forwarded-For`, no `Via`.**
-- **Every request** is logged in `/var/log/squid/access.log`, rotated 7 times.
+- **Every request** is logged in `/var/log/squid/access.log`, rotated by logrotate only (`/etc/logrotate.d/squid`: daily, `agentd_squid_log_days` = 14 kept, compressed, also at 200 MB). Squid's own rotation is off (`logfile_rotate 0`), so it's not rotated twice.
 - **Known gap:** there's no `Safe_ports` rule, so plain-HTTP requests to listed hosts aren't limited by port.
 
 ### 5.7 Nix for the shell user
@@ -419,6 +432,7 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
   - packages from `nixpkgs` (unstable) through the flake registry.
 - **Profile:** `~/.profile` sources Nix and adds `~/.npm-global/bin` (npm's global prefix). Commands run in `bash -lc`, so they get both.
 - **Preinstalled once:** `uv`, `nodejs`, `gh`, `jq`, `ripgrep`.
+- **Cleaned weekly:** `agentd-nix-gc.timer` runs `nix-collect-garbage --delete-older-than 30d` as `worker`, at the lowest priority: old generations go, what's installed now stays.
 
 ### 5.8 Role `tailnet_proxy`
 
@@ -455,7 +469,8 @@ A second Tailscale account of the operator's (`tzumby.github`), kept for testers
 | Chrome DevTools 9222 | 127.0.0.1 | agentd. Not `worker` (guard). The operator through `make cdp` (SSM) |
 | VNC 5900 | 127.0.0.1 | tailnet-proxy (tailnet :5900), SSM forwarding. Not `worker` |
 | noVNC 6080 | 127.0.0.1 | tailnet-proxy (tailnet :443, at `/viewer/`), `make viewer`. Not `worker` |
-| Squid 3128 | 127.0.0.1 | `worker` (its only way out) |
+| Squid 3128 | 127.0.0.1 | `worker` (its only way out), except during a scheduled run's command; agentd (the egress gate's way on) |
+| Egress gate 3129 | 127.0.0.1 (agentd) | `worker` (§6.21). Nobody else (guard) |
 | `/run/agentd/agentd.sock` | Unix socket | agentd, tailnet-proxy |
 | tailnet :443 (web app, API, viewer), :5900 | Tailscale (tsnet, userspace) | Allowed Tailscale logins only (§9) |
 | Inbound from the VPC or internet | none | Nothing: the security group has no inbound rules |
@@ -514,6 +529,8 @@ A customer deployment ([customer-cloud.md](customer-cloud.md)) runs `terraform/s
 | `RUN_AS` | `worker` | The shell user (empty: run commands as agentd itself, local development) |
 | `SHELL_MEMORY_MAX` / `SHELL_TASKS_MAX` / `SHELL_CPU_QUOTA` | `2G` / `512` / `200%` | Limits on each command's systemd unit |
 | `SHELL_PROXY` | (empty) | The shell user's egress proxy, `http://127.0.0.1:3128` on desktops |
+| `EGRESS_GATE_LISTEN` / `EGRESS_GATE_SQUID` | (empty) / `127.0.0.1:3128` | The egress gate (§6.21) and where it passes traffic on. Empty: no gate, and scheduled commands go out like any other |
+| `EGRESS_GATE_UPSTREAM` | (empty) | Tests and local development only: pinned requests go to `<this>/<host><path>` instead of the real hosts |
 | `POLICY` | `/etc/agentd/policy.toml` | Overrides the built-in approval patterns |
 | `SKILLS_DIR` | `/etc/agentd/skills` | Markdown how-tos |
 | `MAX_STEPS` | `40` | Model turns per task |
@@ -529,8 +546,9 @@ A customer deployment ([customer-cloud.md](customer-cloud.md)) runs `terraform/s
   4. Load the policy, the skills and the saved keys (`STATE_DIR/secrets`, created with mode 0700).
   5. Recover tasks a restart cut off (§6.6).
   6. Bind the socket, refusing if another agentd already answers on it, and set it to mode 0660.
-  7. Only then start the scheduler and the effects runner (§6.19), so two agentd processes never both run them.
-  8. On SIGTERM, give open requests 3 seconds. The apps' event streams never end on their own, and without that limit systemd would wait 90 s.
+  7. Undo a `squid_locked` entry left by an agentd that stopped mid-command, then start the egress gate (§6.21): a new CA, the bundle written, then listen. If that fails it's logged, and scheduled commands reach nothing.
+  8. Only then start the scheduler and the effects runner (§6.19), so two agentd processes never both run them.
+  9. On SIGTERM, give open requests 3 seconds. The apps' event streams never end on their own, and without that limit systemd would wait 90 s.
 - **Other entry points:** `agentd --version`, and `agentd --check-gateway`, which checks the gateway the way a model call would but without sending a prompt.
 
 ### 6.2 Modules
@@ -547,6 +565,8 @@ A customer deployment ([customer-cloud.md](customer-cloud.md)) runs `terraform/s
 | `browser.rs`, `cdp.rs` | Browser tools over the Chrome DevTools Protocol (§6.9) |
 | `shell.rs` | Running commands in hardened transient systemd units (§6.10) |
 | `policy.rs` | Approval rules for commands, clicks, typing and keys (§6.11) |
+| `monitoring.rs` | Which commands are monitoring reads that don't ask (§6.11) |
+| `egress.rs` | The egress gate: scheduled runs' way out, pinning Cloudflare's and Datadog's keys (§6.21) |
 | `guard.rs` | Untrusted-content labels, the context budget, loop detection, refusals (sleep, `curl \| sh`, shell scheduling, `date`), URL checks |
 | `store.rs` | SQLite: events, history, runs, pending approvals, memory, schedules, key metadata, settings (§6.3) |
 | `schedule.rs` | Cron and one-time planning, the scheduler loop (§6.14) |
@@ -570,14 +590,14 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 |---|---|---|
 | `events` | `seq` (autoincrement), `ts`, `kind`, `data` (JSON) | The append-only event log the apps stream and replay (§6.5) |
 | `history` | `id`, `ts`, `role`, `content`, `agent` | What the model sees as the conversation: user messages and final answers only. The last 20 entries go into each new task |
-| `settings` | `key`, `value` | `model`, `allow_actions`, `approvals`, `tab_target`, `user_timezone`, `user_utc_offset` |
+| `settings` | `key`, `value` | `model`, `allow_actions`, `tab_target`, `user_timezone`, `user_utc_offset` |
 | `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before) | One row per task. `status` is `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `max_steps`, `stuck` or `interrupted` |
 | `pending` | `id`, `kind` (`approval` or `action`), `run`, `card` (JSON), `checkpoint` (the task's serialized `RunState`), `created` (unix seconds); v2: `policy_version` | What the user is being asked: parked approvals and Action needed cards |
 | `memory` | `id`, `agent`, `text`, `trusted`, `created`; v2: `kind` (rule, preference, fact, work_log), `status` (active, superseded, expired, deleted; `pending` only before 0.15.2), `trust` (user_stated, agent_inferred, imported), `importance`, `source_run`, `source_seq`, `source_schedule`, `valid_until`, `superseded_by`, `pending_reason`, `version`, `updated`, `last_recalled`, `recall_count` | Long-term memory (§6.13). `trusted` is kept in step with `trust` and `status` by triggers, for 0.14.0 and the v1 path |
 | `memory_fts` | FTS5 (`id`, `text`; porter stemming) | Full-text index over `memory`, kept in step by triggers |
 | `memory_events` | `seq`, `memory_id`, `actor`, `action`, `by_user`, `run`, `before`, `after`, `created` | History of every memory change; `before` and `after` are cleared when a memory is purged |
 | `effects` | `kind`, `key` (primary key together), `payload`, `due`, `attempts`, `last_error`, `created` | Side effects waiting to be done (§6.19) |
-| `schedules` | `id`, `agent`, `name`, `prompt`, `cron`, `timezone`, `next_run`, `last_run`, `paused`, `created`; v2: `policy_version`, `created_from` | Scheduled tasks (§6.14) |
+| `schedules` | `id`, `agent`, `name`, `prompt`, `cron`, `timezone`, `next_run`, `last_run`, `paused`, `created`; v2: `policy_version`, `created_from`; v4: `auto_approve` (0 unless a person turns on "Run without asking", §6.21) | Scheduled tasks (§6.14) |
 | `secrets` | `name`, `agent`, `label`, `created`, `updated`, `last_used` | Saved keys' names and labels, never their values (§6.15) |
 
 - **`images/<32 hex>.jpg`**: screenshots shown in the chat (`show_screenshot`, Action needed cards), served at `/api/v1/images/{id}`.
@@ -602,7 +622,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | POST | `/api/v1/stop` | Stops the running task, or gives up on a parked one |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
 | GET | `/api/v1/screenshot` | A live screenshot of the current tab (JPEG). Exists, but the app doesn't use it |
-| GET, PUT | `/api/v1/settings` | `{model, allow_actions, approvals, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}`. `approvals` is `root` or `risky` (§6.11); anything else is a 400 |
+| GET, PUT | `/api/v1/settings` | `{model, allow_actions, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}` |
 | POST | `/api/v1/devices` | `{token, name, environment?}`: registers a device's APNs token with the push relay (503 if push isn't configured). `environment` is `sandbox` (Xcode installs) or `production` (TestFlight, the notarized Mac app); anything else is 400, none means the relay's default |
 | GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active ones by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older apps still read it |
 | GET | `/api/v1/memory/search?q=&kinds=&limit=` | Memory v2: active memories ranked as the agent's notes are, each with its score (what `search_memory` sees) |
@@ -617,9 +637,10 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | PATCH | `/api/v1/memory/{id}` | Memory v2: `{text?, kind?, valid_until?, importance?, expected_version}`. 409 with the current memory if it changed meanwhile. The text goes through the secret filter, and the memory becomes user-stated |
 | GET | `/api/v1/memory/{id}/history` | Memory v2: its `memory_events`, newest first |
 | GET | `/api/v1/schedules` | Schedules, each with its plain-language description |
-| POST | `/api/v1/schedules` | `{name, prompt, cron, timezone?, utc_offset?}`: a repeating schedule set up in the web app (Setup's suggested checks). The same limits as `schedule_task` (25 at most, every 15 minutes at most), no card, origin `user`; a name already used is refused; the time zone is remembered as a message's is |
+| POST | `/api/v1/schedules` | `{name, prompt, cron, timezone?, utc_offset?, auto_approve?}` (`auto_approve` false unless the person ticked it): a repeating schedule set up in the web app (Setup's suggested checks). The same limits as `schedule_task` (25 at most, every 15 minutes at most), no card, origin `user`; a name already used is refused; the time zone is remembered as a message's is |
 | GET, PUT | `/api/v1/setup` | `{steps, skipped}`: the web app's Setup steps (`updates`, `cloudflare`, `datadog`, `watching`) and those someone skipped (setting `setup_skipped`), for every browser of the desktop. PUT `{skipped}` replaces the list; an unknown step is 400 |
 | DELETE | `/api/v1/schedules/{id}` | Cancel |
+| PUT | `/api/v1/schedules/{id}` | `{auto_approve}`: "Run without asking" on or off (§6.21); `schedule.updated` with `by`. The agent has no tool for it: only a person, through the web app |
 | POST | `/api/v1/schedules/{id}/pause`, `/resume` | A resumed schedule picks up from now. A one-time schedule whose time has passed: 409 |
 | GET | `/api/v1/secrets` | Saved keys: name, label, created, updated, last used. **Never values** |
 | PUT | `/api/v1/secrets/{name}` | `{value, label?, approval?}`. Saves or replaces a key. With `approval`, resumes the task whose request card asked for exactly this key. Returns `{secret, resumed, busy}`. The body is never logged |
@@ -674,7 +695,7 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 | `secret.saved` / `secret.deleted` | `name`, `label`, `by` | Key changes (never values) |
 | `destination.saved` / `destination.deleted` | `name`, `kind`, `channel`, `by` | Where updates go changed (never the token or URL) |
 | `update.posted` / `update.failed` | `task`, `destination`, `id`, `title`, `thread` / `error` | post_update went out, or why it didn't (§6.20). Not in the chat |
-| `settings` | `{model, allow_actions, approvals, …}` | Settings changed |
+| `settings` | `{model, allow_actions}` | Settings changed |
 
 ### 6.6 Task lifecycle
 
@@ -870,19 +891,7 @@ The hardening follows moltis' container settings (MIT).
 
 ### 6.11 Approvals and policy
 
-**The Approvals setting** (`approvals`, in the web app's Settings) says what asks first:
-- **`root`, the default: only commands that run as root.** Every other command, browser change (typing, Send, Delete) and schedule runs without a card. Since 0.15.7 (2026-11-04), after scheduled checks kept stopping for approvals. The walls that never asked stay:
-  - the shell user can't reach the browser, the screen, agentd's state or socket, or the metadata service (§6.10);
-  - its commands reach only the egress allowlist (§5.6), with no DNS of their own (§5.5);
-  - the outright refusals (§6.10): the egress controls, Slack's and Teams' APIs, piped install scripts, shell scheduling;
-  - read-only mode (Browser actions off) still refuses browser changes;
-  - root commands still ask, since a root command could undo every wall above.
-  What this gives up: an instruction injected into a page, an email or a log could get a command to send data to an allowed host (with an account of the attacker's), or the browser to act in the user's logged-in accounts, without anyone seeing a card. The labels (§6.12) and the model's judgment are what's left against that.
-- **`risky`: also the actions below** (the only behaviour before 0.15.7): the policy's rules, commands that could send data after outside content, browser changes and schedules asked for after outside content.
-
-`Agent::asks_only_for_root` reads it at each gate, so a change applies at once, to running tasks too, and to the system prompt's wording (`tools::system_prompt`'s `ask_only_root`). It isn't part of the policy version: changing it doesn't mark every schedule "set up under other rules".
-
-**Command approvals** (`policy.rs`). With `approvals: risky`, a command asks if:
+**Command approvals** (`policy.rs`). A command asks if:
 1. it starts with `sudo` ("runs as root"); or
 2. it matches a dangerous pattern. The defaults, overridable through `policy.toml` from the Ansible variable `agentd_dangerous`, are:
    - `su`, `doas`;
@@ -922,7 +931,7 @@ The hardening follows moltis' container settings (MIT).
 
 These patterns are a speed bump against mistakes and injected instructions, not a security boundary. The boundaries are the privilege split, the guard firewall and the egress allowlist.
 
-**Browser gates.** Clicks, typing and keys are gated as in §6.8, with `approvals: risky`; with `root` the ones that would ask go ahead. With **Browser actions** off (read-only mode), they're refused either way.
+**Browser gates.** Clicks, typing and keys are gated as in §6.8. With **Browser actions** off (read-only mode), they're refused rather than asked.
 
 **Cards.** The card kinds and what they show:
 
@@ -935,7 +944,7 @@ These patterns are a speed bump against mistakes and injected instructions, not 
 
 Each answer records who gave it (`by`, from `X-Tailscale-User`).
 
-**Never in a scheduled run.** Nobody is watching, so `approve()` returns `Decision::Unattended` instead of parking the task, whatever the card: the action isn't done and the model is told to say so in its report ("not run: it runs as root, and a scheduled run can't wait for the user's OK…"; a key request gets "not asked: a scheduled run can't ask for keys…"). The run's framing says so up front (`UNATTENDED_RULE`).
+**Never in a scheduled run.** Nobody is watching, so `approve()` returns `Decision::Unattended` instead of parking the task, whatever the card: the action isn't done and the model is told to say so in its report ("not run: it runs as root, and a scheduled run can't wait for the user's OK…"; a key request gets "not asked: a scheduled run can't ask for keys…"). A schedule a person set to **run without asking** lets its commands go ahead instead, except root ones (§6.21). The run's framing says which (`UNATTENDED_RULE`, `AUTO_APPROVE_RULE`).
 
 **Policy version.** `Policy::version` is the first 16 hex characters of a SHA-256 over:
 - the approval patterns, sorted;
@@ -960,12 +969,12 @@ If today's rules would still only ask, the approval stands.
 Web pages, emails and command output can carry injected instructions. The defences, in layers:
 
 1. **Labels:** tool results with outside content are wrapped in `<untrusted>` tags, and the system prompt says never to follow instructions inside them.
-2. **Taint** (with `approvals: risky`, §6.11):
+2. **Taint:**
    - after outside content, data-out commands need approval;
    - schedules need approval;
    - memories are saved as unverified;
    - key requests carry a warning.
-3. **Approvals** for anything that runs as root, and with `approvals: risky` for anything that sends, writes or deletes, showing the exact action.
+3. **Approvals** for anything that sends, writes, deletes or runs as root, showing the exact action (in a scheduled run: refused, or with "Run without asking" done, except root and the browser; §6.21).
 4. **Privilege split:**
    - the shell user can't reach the browser, agentd's state, the socket, the metadata service or other tailnet devices;
    - the browser can't open internal addresses.
@@ -1085,7 +1094,8 @@ Both are read in the user's time zone, which the app sends with every message, a
 - Its prompt is framed as "(agentd) This is the scheduled task "…". They aren't watching…".
 - It doesn't abandon parked tasks.
 - It can't create schedules.
-- It never waits on a card: what would ask is refused, and its report says so (§6.11).
+- It never waits on a card: what would ask is refused, and its report says so (§6.11), unless the schedule runs without asking (§6.21).
+- Its commands go out through the egress gate, which pins Cloudflare's and Datadog's keys (§6.21).
 - Its push title is the schedule's name.
 
 **Shell scheduling** (`crontab`, `at`, timers) is refused, so every scheduled action goes through the model, approvals and notifications.
@@ -1203,6 +1213,20 @@ The agent posts updates (what it found, what it did) to channels a person set up
 - **Sending:** `Poster`, a reqwest client with a 15 s timeout, no redirects, and https only (plain http only when `SLACK_API_URL` points at localhost, for `make web-dev` and the tests). Failures are said plainly (the app isn't in the channel, the token was revoked, the workflow was deleted), kept as the destination's last error, and logged as `update.failed`.
 - **Setting up is the user's:** with no destination, the prompt says so and sends the user to Updates. The shell can't reach Slack (Squid), and agentd refuses, even with approval, any command that calls Slack's or Teams' APIs (`guard::calls_messaging_api`) or touches the egress proxy or the guard firewall (`guard::touches_egress_policy`, §6.10).
 - **Approvals stay in the web app:** there are no buttons in Slack or Teams, which would need an inbound endpoint and would go around the planned passkey approvals.
+
+### 6.21 Scheduled runs: "Run without asking" and the egress gate (`egress.rs`)
+
+Scheduled checks are what a monitoring agent is for, and nobody watches them. They read logs on their first call, and attackers write logs, so in a chat each command after that which could send data would ask. A scheduled run never waits on a card (§6.11); instead:
+
+- **"Run without asking"**, per schedule (`schedules.auto_approve`), off unless a person turns it on: on the Schedules page, or ticked on one of Setup's example checks before adding it. The agent has no tool to set it, and `schedule_task` never does. With it on, a run's commands go ahead with what would otherwise ask (the policy's rules, data-out after outside content), **except commands as root**, which are refused. Browser changes and key requests are refused either way. Turning it off applies to the next command (it's read at each one). This replaced 0.15.7's desktop-wide "only root commands ask", which the user rejected the same day as too broad: the choice is per schedule, and never the default.
+- **The egress gate**, for every scheduled run's commands, with or without the switch:
+  - before each command, agentd puts the shell user into the guard firewall's `squid_locked` set (`sudo nft add element inet cloud_desktop_guard squid_locked { <uid> }`), and takes it out afterwards (`EgressLock`'s drop; a leftover is flushed at startup). Meanwhile its only way out is the gate on `EGRESS_GATE_LISTEN`. If the lock can't be taken, the command isn't run;
+  - the command gets `HTTPS_PROXY` (and the others) set to the gate, and trusts `egress-ca-bundle.pem` (the system's CAs and the gate's: `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, through `LoadCredential`);
+  - the gate passes everything on to Squid as it came (the allowlist and the log still apply), except `CONNECT`s to **Cloudflare's API and Datadog's hosts** (`api.cloudflare.com`; anything under `datadoghq.com`, `datadoghq.eu`, `ddog-gov.com`, intake hosts included), which it opens: a certificate from a CA made at each start (rcgen; the private key stays in memory), ALPN http/1.1, hyper;
+  - on those, **the user's own saved keys only**: every way to authenticate the command sent is removed (`Authorization`, `Cookie`, `X-Auth-*`, any Datadog key header, `api_key`/`application_key`/`dd-api-key` in the query, the key in `/v1/input/<key>`), and `Authorization: Bearer <CLOUDFLARE_API_TOKEN>` or `DD-API-KEY`/`DD-APPLICATION-KEY` added. The request then goes on through Squid. Data can only end up in the customer's own accounts; without a saved key, a 403 says which is missing. Plain http to those hosts is refused;
+  - the journal gets the host, method and status of each pinned request, never paths, queries or bodies.
+
+What a schedule that runs without asking still allows: data to the other hosts on the allowlist (with an account of whoever's), since only Cloudflare's and Datadog's keys are pinned. In a chat nothing changes: commands go to Squid directly and ask as in §6.11.
 
 ## 7. The attested model gateway
 
@@ -1756,7 +1780,7 @@ The same screens as the iPhone's, in Mac form:
 | `agentd-test`, `agentd-build`, `agentd-deploy`, `agentd-logs` | agentd: fmt/clippy/tests; static build for `DESKTOP_ARCH`; deploy (copies the database first when the version changes); `journalctl -u agentd` over SSM |
 | `agentd-evals` | Memory evals on the Mac: a local agentd against Together, headless Chrome, shell tool off, 41 scripted conversations with assertions (scheduled runs, restarts, real consolidations) (`services/agentd/evals`; results in [memory-v2.md](memory-v2.md) §19). Reports recall@8, the false-memory rate, staleness, the `report_outcome` missing rate and cost per scenario; `--compare OLD NEW` lines two result files up. About $0.30 a run; `MEMORY_V2=on\|off`, `SCENARIO=a,b`, `MODEL=id`; `PROVIDER=bedrock [BEDROCK_REGION=us-east-1]` runs against Bedrock's OpenAI-compatible endpoint with a short-term Bedrock key from your AWS credentials, tidy-up on the same model (for comparing models only: desktops call Together through the gateway) |
 | `agentd-reset` | A clean slate for testing (`scripts/agentd-reset.py`, over SSM). Stops agentd and Chrome, then deletes `/var/lib/agentd`'s database (chat, tasks, memories, schedules, settings), its upgrade copies, screenshots and saved keys, and Chrome's whole profile (cookies and every sign-in, local storage, IndexedDB, history, tabs, cache), its cache and config folders and the Downloads folder's contents; Chrome's user and profile come from `chrome.service`. Starts Chrome, then agentd, empty. Keeps Chrome's policy, push (registered at the relay) and the config. Shows counts first, asks for the desktop's name, refuses while a task runs. `FILES=1` also empties `/home/worker/work`; `KEEP_COPY=1` moves it all to `/var/lib/agentd-reset/<time>` (root only, with a manifest of paths and owners) instead, and `RESTORE=1` puts the newest copy back; `DRY_RUN=1` only shows the counts |
-| `agentd-soak` | Memory v2 soak report for the desktop, read-only over SSM (`scripts/agentd-soak.py`): phase 6's exit criteria (effect failures, consolidation under the daily cap, consolidations that didn't finish, days of soak), then tasks, scheduled runs and costs by day, and counts from the journal. Only counts and costs leave the desktop. `SINCE=YYYY-MM-DD`, the day the soak started |
+| `agentd-soak` | Memory v2 soak report for the desktop, read-only over SSM (`scripts/agentd-soak.py`): phase 6's exit criteria (effect failures, consolidation under the daily cap, consolidations that didn't finish, days of soak), then tasks, scheduled runs and costs by day, and counts from the journal. Only counts and costs leave the desktop. `SINCE=YYYY-MM-DD`, the day the soak started; it counts from the database's first event instead when that's later (a wipe with `agentd-reset` starts the soak again), journal included, and reads the tidy-up settings from agentd's `/status` |
 | `gatewayd-test`, `gatewayd-build`, `gateway-image` | gatewayd tests; static arm64 build; build an attestable AMI and publish its measurements |
 | `tailnet-build`, `tailnet-deploy` | tailnet-proxy |
 | `front-door-test`, `front-door-build`, `front-door-deploy` | front-door (§5.11): vet and tests; static linux build for `DESKTOP_ARCH`; the `front_door` role on a customer deployment's desktops (with the web app, copied to `/usr/local/share/front-door/web`) |

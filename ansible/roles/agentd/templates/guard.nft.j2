@@ -6,6 +6,12 @@ table inet cloud_desktop_guard
 delete table inet cloud_desktop_guard
 
 table inet cloud_desktop_guard {
+  # The shell user while a scheduled run's command runs (agentd adds and
+  # removes it; services/agentd/src/agent.rs, lock_egress).
+  set squid_locked {
+    typeof meta skuid
+  }
+
   chain output {
     type filter hook output priority filter; policy accept;
 
@@ -24,9 +30,17 @@ table inet cloud_desktop_guard {
     # DNS lookups.
     meta skuid {{ agentd_shell_uid }} meta l4proto { tcp, udp } th dport 53 counter reject
 
+    # During a scheduled run's command, Squid is closed to it: its way out
+    # is agentd's egress gate, which passes on to Squid and puts the user's own
+    # keys on Cloudflare's and Datadog's APIs.
+    meta skuid @squid_locked tcp dport {{ agentd_egress_proxy_port }} counter reject
+
     # Local services (a dev server it started, the egress proxy) are fine;
     # everything else goes through the proxy.
     meta skuid {{ agentd_shell_uid }} oifname "lo" accept
     meta skuid {{ agentd_shell_uid }} counter reject
+
+    # The egress gate is the shell user's alone (root and agentd aside).
+    oifname "lo" tcp dport {{ agentd_egress_gate_port }} meta skuid != { 0, {{ agentd_uid }}, {{ agentd_shell_uid }} } counter reject
   }
 }

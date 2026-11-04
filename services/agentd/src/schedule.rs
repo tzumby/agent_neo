@@ -241,6 +241,7 @@ pub fn json(schedule: &Schedule) -> serde_json::Value {
         "created": schedule.created,
         "policy_version": schedule.policy_version,
         "created_from": schedule.created_from,
+        "auto_approve": schedule.auto_approve,
     })
 }
 

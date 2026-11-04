@@ -54,7 +54,10 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/memory/{id}/history", get(memory_history))
         .route("/api/v1/schedules", get(schedules).post(add_schedule))
         .route("/api/v1/setup", get(get_setup).put(put_setup))
-        .route("/api/v1/schedules/{id}", delete(delete_schedule))
+        .route(
+            "/api/v1/schedules/{id}",
+            delete(delete_schedule).put(update_schedule),
+        )
         .route("/api/v1/schedules/{id}/pause", post(pause_schedule))
         .route("/api/v1/schedules/{id}/resume", post(resume_schedule))
         .route("/api/v1/secrets", get(list_secrets))
@@ -723,6 +726,31 @@ struct NewSchedule {
     timezone: Option<String>,
     #[serde(default)]
     utc_offset: Option<i64>,
+    /// "Run without asking" (off unless the person ticks it).
+    #[serde(default)]
+    auto_approve: bool,
+}
+
+#[derive(Deserialize)]
+struct ScheduleChange {
+    auto_approve: Option<bool>,
+}
+
+/// A person changes a schedule in the web app: "Run without asking".
+async fn update_schedule(
+    State(agent): App,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(body): Json<ScheduleChange>,
+) -> Response {
+    let Some(on) = body.auto_approve else {
+        return error(StatusCode::BAD_REQUEST, "nothing to change (auto_approve)");
+    };
+    match agent.set_schedule_auto_approve(id, on, caller(&headers)) {
+        Ok(Some(schedule)) => Json(schedule).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "no such schedule"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
 }
 
 /// A repeating schedule set up in the web app (Setup's examples).
@@ -737,6 +765,7 @@ async fn add_schedule(State(agent): App, headers: HeaderMap, Json(body): Json<Ne
         &body.cron,
         clock.as_ref(),
         caller(&headers),
+        body.auto_approve,
     ) {
         Ok(schedule) => Json(json!({"schedule": schedule})).into_response(),
         Err(problem) => error(StatusCode::BAD_REQUEST, &problem),
@@ -934,19 +963,12 @@ async fn settings(State(agent): App) -> Json<Value> {
 struct SettingsUpdate {
     model: Option<String>,
     allow_actions: Option<bool>,
-    /// "root" or "risky" (agent::APPROVALS).
-    approvals: Option<String>,
     memory_consolidation: Option<String>,
     memory_consolidation_model: Option<String>,
     memory_consolidation_daily_cap_usd: Option<f64>,
 }
 
 async fn put_settings(State(agent): App, Json(body): Json<SettingsUpdate>) -> Response {
-    if let Some(approvals) = body.approvals.as_deref()
-        && !crate::agent::APPROVALS.contains(&approvals)
-    {
-        return error(StatusCode::BAD_REQUEST, "approvals must be root or risky");
-    }
     let memory = agent.update_memory_settings(
         body.memory_consolidation.as_deref(),
         body.memory_consolidation_model.as_deref(),
@@ -957,11 +979,7 @@ async fn put_settings(State(agent): App, Json(body): Json<SettingsUpdate>) -> Re
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         Ok(Ok(_)) => {}
     }
-    match agent.update_settings(
-        body.model.as_deref(),
-        body.allow_actions,
-        body.approvals.as_deref(),
-    ) {
+    match agent.update_settings(body.model.as_deref(), body.allow_actions) {
         Ok(settings) => Json(json!(settings)).into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }

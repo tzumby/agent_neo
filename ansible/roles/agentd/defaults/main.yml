@@ -19,6 +19,12 @@ agentd_guarded_ports: [9222, 5900, 6080]
 # localhost): listed hosts, never internal addresses, every request logged.
 # A leading dot also allows subdomains.
 agentd_egress_proxy_port: 3128
+# Days of Squid's request log kept (rotated daily, compressed).
+agentd_squid_log_days: 14
+# agentd's egress gate (services/agentd/src/egress.rs): while a scheduled
+# run's command runs, the shell user reaches Squid only through it, and it
+# swaps in the saved keys on Cloudflare's and Datadog's APIs.
+agentd_egress_gate_port: 3129
 agentd_shell_allowed_domains:
   - .github.com
   - .githubusercontent.com

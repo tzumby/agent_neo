@@ -1,0 +1,139 @@
+# OS hardening, adapted from DevSec's os_hardening role (devsec.hardening,
+# Apache-2.0; https://dev-sec.io) for this desktop rather than applied as is:
+# - its kernel and network settings, except IPv6 router advertisements (AWS
+#   networking uses them);
+# - its unused-filesystem modules, except squashfs (the SSM agent is a snap)
+#   and vfat (the EFI boot partition);
+# - SUID bits off programs nobody here needs, recorded with dpkg-statoverride
+#   so package updates don't put them back; sudo (agentd), Chrome's sandbox
+#   helper and D-Bus's keep theirs;
+# - no core dumps, /dev/shm without exec, auditd with rotation;
+# - not its password, PAM, login.defs or securetty rules: every account's
+#   password is locked and there's no SSH (SSM only).
+
+- name: Kernel and network settings
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-cloud-desktops-hardening.conf
+    content: |
+      # Managed by Ansible (common role: tasks/hardening.yml), from DevSec's
+      # os_hardening defaults.
+      {% for key, value in common_sysctl | dictsort %}
+      {{ key }} = {{ value }}
+      {% endfor %}
+    mode: "0644"
+  notify: Apply sysctl settings
+
+- name: Keep unused filesystem and protocol modules from loading
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/cloud-desktops-hardening.conf
+    content: |
+      # Managed by Ansible (common role: tasks/hardening.yml).
+      {% for module in common_disabled_modules %}
+      install {{ module }} /bin/false
+      blacklist {{ module }}
+      {% endfor %}
+    mode: "0644"
+
+- name: Take SUID off programs nobody here needs (kept across package updates)
+  ansible.builtin.shell: |
+    set -eu
+    changed=0
+    for path in {{ common_suid_removed | join(' ') }}; do
+      [ -f "$path" ] || continue
+      dpkg-statoverride --list "$path" >/dev/null 2>&1 && continue
+      mode=$(stat -c '%a' "$path")
+      [ "$((0$mode & 06000))" -ne 0 ] || continue
+      owner=$(stat -c '%U' "$path"); group=$(stat -c '%G' "$path")
+      dpkg-statoverride --update --add "$owner" "$group" "$(printf '%o' $((0$mode & 0777)))" "$path"
+      changed=1
+    done
+    echo "changed=$changed"
+  args:
+    executable: /bin/bash
+  register: common_suid
+  changed_when: "'changed=1' in common_suid.stdout"
+
+- name: No core dumps
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/90-cloud-desktops.conf
+    content: |
+      # Managed by Ansible (common role: tasks/hardening.yml).
+      * hard core 0
+    mode: "0644"
+
+# Crash reports can hold whatever the crashed program had in memory: a page,
+# a chat.
+- name: Turn off apport
+  ansible.builtin.systemd_service:
+    name: apport
+    enabled: false
+    state: stopped
+  failed_when: false
+
+- name: Keep apport off
+  ansible.builtin.lineinfile:
+    path: /etc/default/apport
+    regexp: "^enabled="
+    line: "enabled=0"
+    create: false
+  failed_when: false
+
+- name: Mount /dev/shm without exec, SUID or devices
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^\S+\s+/dev/shm\s'
+    line: "tmpfs /dev/shm tmpfs rw,nosuid,nodev,noexec 0 0"
+  register: common_shm
+
+- name: Remount /dev/shm
+  ansible.builtin.command: mount -o remount,rw,nosuid,nodev,noexec /dev/shm
+  when: common_shm is changed
+
+- name: Look up accounts
+  ansible.builtin.getent:
+    database: passwd
+
+# novnc's package makes a "nova" account with a login shell (a leftover from
+# OpenStack); nothing logs in as it.
+- name: No login shell for service accounts
+  ansible.builtin.user:
+    name: "{{ item }}"
+    shell: /usr/sbin/nologin
+  loop: "{{ common_nologin_users | select('in', ansible_facts.getent_passwd) | list }}"
+
+# --- auditd ------------------------------------------------------------------
+
+- name: Install auditd
+  ansible.builtin.apt:
+    name: auditd
+    state: present
+
+# Rotating, unlike DevSec's keep_logs (which never deletes): at most
+# common_auditd_num_logs files of common_auditd_max_log_file MB. Only these
+# keys, in the package's own file.
+- name: Keep auditd's log to a size
+  ansible.builtin.lineinfile:
+    path: /etc/audit/auditd.conf
+    regexp: "^{{ item.key }}\\s*="
+    line: "{{ item.key }} = {{ item.value }}"
+  loop: "{{ common_auditd_settings | dict2items }}"
+  notify: Restart auditd
+  # A dry run hasn't installed auditd.
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Audit rules
+  ansible.builtin.template:
+    src: audit.rules.j2
+    dest: /etc/audit/rules.d/cloud-desktops.rules
+    mode: "0640"
+  notify: Load audit rules
+  # A dry run hasn't installed auditd.
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Run auditd
+  ansible.builtin.systemd_service:
+    name: auditd
+    enabled: true
+    state: started
+  # A dry run hasn't installed auditd.
+  ignore_errors: "{{ ansible_check_mode }}"

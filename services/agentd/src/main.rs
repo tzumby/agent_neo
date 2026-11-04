@@ -12,6 +12,7 @@ mod config;
 mod consolidate;
 mod destinations;
 mod effects;
+mod egress;
 mod gateway;
 mod guard;
 mod llm;
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(cfg.state_dir.join("images")).context("creating the state directory")?;
     let agent = Arc::new(agent::Agent::new(cfg.clone())?);
     let app = api::router(agent.clone());
+    start_egress_gate(&cfg, &agent).await;
 
     if let Some(path) = cfg.listen.strip_prefix("unix:") {
         // Only agentd and tailnet-proxy (via the socket's group) can connect;
@@ -124,5 +126,38 @@ async fn shutdown() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
+    }
+}
+
+/// The egress gate, scheduled runs' way out (egress.rs). If it can't start,
+/// scheduled commands reach nothing (Squid is closed to them while they run)
+/// and their reports say so.
+async fn start_egress_gate(cfg: &config::Config, agent: &Arc<agent::Agent>) {
+    // A lock left by an agentd that stopped mid-command.
+    agent.clear_egress_locks();
+    if cfg.egress_gate_listen.is_empty() {
+        return;
+    }
+    let weak = Arc::downgrade(agent);
+    let keys: egress::Keys = Box::new(move |name| weak.upgrade()?.secrets.get(name));
+    let started = async {
+        let gate = Arc::new(egress::EgressGate::new(
+            keys,
+            &cfg.egress_gate_squid,
+            cfg.egress_gate_upstream.clone(),
+        )?);
+        gate.write_bundle(&cfg.state_dir.join(agent::EGRESS_BUNDLE))?;
+        let listener = tokio::net::TcpListener::bind(&cfg.egress_gate_listen)
+            .await
+            .with_context(|| format!("binding {}", cfg.egress_gate_listen))?;
+        tokio::spawn(gate.clone().serve(listener));
+        anyhow::Ok(gate)
+    };
+    match started.await {
+        Ok(gate) => {
+            let _ = agent.gate.set(gate);
+            tracing::info!(listen = %cfg.egress_gate_listen, "egress gate for scheduled runs");
+        }
+        Err(err) => tracing::error!(err = %format!("{err:#}"), "the egress gate didn't start"),
     }
 }

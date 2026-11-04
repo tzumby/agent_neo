@@ -43,6 +43,14 @@ pub struct Config {
     pub shell_cpu_quota: String,
     /// The shell user's egress proxy, e.g. http://127.0.0.1:3128 (empty: none).
     pub shell_proxy: String,
+    /// The egress gate (egress.rs), scheduled runs' way out: where it listens
+    /// (host:port on localhost; empty: not started, and scheduled commands go
+    /// out like any other) and where it sends traffic on (Squid, host:port).
+    pub egress_gate_listen: String,
+    pub egress_gate_squid: String,
+    /// Local development and tests only: the gate sends opened-up requests
+    /// to `{this}/{host}{path}` instead of the real hosts.
+    pub egress_gate_upstream: Option<String>,
     pub policy_path: PathBuf,
     /// Skills: Markdown how-tos the agent reads on demand (skills.rs).
     pub skills_dir: PathBuf,
@@ -125,6 +133,9 @@ impl Config {
             shell_tasks_max: get("SHELL_TASKS_MAX", "512"),
             shell_cpu_quota: get("SHELL_CPU_QUOTA", "200%"),
             shell_proxy: get("SHELL_PROXY", ""),
+            egress_gate_listen: get("EGRESS_GATE_LISTEN", ""),
+            egress_gate_squid: get("EGRESS_GATE_SQUID", "127.0.0.1:3128"),
+            egress_gate_upstream: Some(get("EGRESS_GATE_UPSTREAM", "")).filter(|u| !u.is_empty()),
             policy_path: get("POLICY", "/etc/agentd/policy.toml").into(),
             skills_dir: get("SKILLS_DIR", "/etc/agentd/skills").into(),
             max_steps: get("MAX_STEPS", "40").parse().context("MAX_STEPS")?,

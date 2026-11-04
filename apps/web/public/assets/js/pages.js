@@ -3,7 +3,7 @@
 
 import { busyButton, fill, h, icon, when } from "./dom.js";
 import { isValidName, normalizedName } from "./keys.js";
-import { copyList } from "./setup.js";
+import { autoApprove, copyList } from "./setup.js";
 
 // --- Desktop ---------------------------------------------------------------------
 
@@ -77,12 +77,17 @@ export function mountSchedules(store, view) {
     cancel.addEventListener("click", () => busyButton(cancel, async () => {
       if (confirm(`Cancel “${s.name}”? It won't run again.`)) await act(() => store.api.deleteSchedule(s.id));
     }));
+    const auto = autoApprove(s.auto_approve === true, async (on) => {
+      await act(() => store.api.setScheduleAutoApprove(s.id, on));
+    });
     return h("li", { class: "list-row" },
       h("div", { class: "list-main" },
-        h("p", { class: "strong" }, s.name, s.paused ? h("span", { class: "tag" }, "Paused") : null),
+        h("p", { class: "strong" }, s.name, s.paused ? h("span", { class: "tag" }, "Paused") : null,
+          s.auto_approve ? h("span", { class: "tag" }, "Runs without asking") : null),
         h("p", null, s.description),
         h("p", { class: "muted" }, s.paused ? "Paused" : `Next run ${when(s.next_run * 1000)}`,
           s.last_run ? `. Last ran ${when(s.last_run * 1000)}` : ""),
+        auto,
         h("details", { class: "instructions" }, h("summary", null, "Instructions"), h("p", { class: "pre" }, s.prompt))),
       h("div", { class: "list-actions" }, pause, cancel));
   }
@@ -241,22 +246,6 @@ export function mountSettings(store, view, session) {
     };
     model.addEventListener("change", save);
     actions.addEventListener("change", save);
-    // What asks first: only root commands (the default), or anything risky.
-    const approvals = settings.approvals === "risky" ? "risky" : "root";
-    const choice = (value, title, text) => {
-      const input = h("input", { type: "radio", name: "approvals", value, checked: approvals === value });
-      input.addEventListener("change", async () => {
-        try {
-          await store.api.updateSettings({ approvals: value });
-          store.refreshStatus();
-          store.notice("Settings saved.");
-        } catch (error) {
-          store.notice(error.message);
-        }
-      });
-      return h("label", { class: "toggle" }, input,
-        h("span", null, h("span", { class: "strong" }, title), h("span", { class: "muted block" }, text)));
-    };
     let current = "light";
     try {
       current = localStorage.getItem("theme") || "light";
@@ -276,15 +265,7 @@ export function mountSettings(store, view, session) {
         h("label", { class: "label" }, "Model", model),
         h("label", { class: "toggle" }, actions,
           h("span", null, h("span", { class: "strong" }, "Browser actions"),
-            h("span", { class: "muted block" }, "Lets the agent click, type and press keys in your desktop's browser. Off, it only reads pages.")))),
-      h("section", { class: "settings-group" },
-        h("h2", { class: "page-h2" }, "Approvals"),
-        h("p", { class: "muted" }, "When the agent stops to ask you first. Scheduled tasks never wait: what would need your OK is skipped, and the report says so."),
-        h("div", { class: "choices", role: "radiogroup", "aria-label": "Approvals" },
-          choice("root", "Only commands that run as root",
-            "Everything else runs without asking, including sending in the browser. Commands still reach only the sites this desktop allows, and can't change its firewall or post to Slack or Teams except through Updates."),
-          choice("risky", "Anything that could send or change something",
-            "Also asks before browser changes (sending, deleting), before commands that could send data once the agent has read a page, email or log, and before risky commands such as deletes."))),
+            h("span", { class: "muted block" }, "Lets the agent click, type and press keys in your desktop's browser. It still asks you before anything that sends or changes things. Off, it only reads pages.")))),
       h("section", { class: "settings-group" },
         h("h2", { class: "page-h2" }, "Appearance"),
         h("label", { class: "label" }, "Theme", theme),

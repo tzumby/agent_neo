@@ -92,7 +92,7 @@ From PLAN.MD's ground rules, the user's instructions and the design docs:
 6. **Operator-blind is the goal** (`operator-isolation.md`): users' prompts and data should be unreadable to us.
    - **Built:** the model gateway. Prompts leave the desktop only to an image nobody can log into. agentd can also verify which image by attestation (`gateway_attested`, §7), but that's off: we have root on our own desktops anyway, and in a customer's account it would only keep out the customer's own admins.
    - **Not built:** an attested desktop. Today the operator has root on desktops through SSM.
-7. **The agent acts only with the user's approval for anything consequential.**
+7. **The agent acts only with the user's approval for anything consequential**, unless the user turns on Auto approve (§6.11).
    - Sending, writing, deleting, buying, running as root, sending data out after reading outside content, scheduling after outside content.
    - The user sees the exact action (the text to be typed, the command) before approving.
 8. **Untrusted content is data, not instructions.** It's labelled, it taints the task, and the privilege split limits what an injected instruction could do (§6.12).
@@ -596,7 +596,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 |---|---|---|
 | `events` | `seq` (autoincrement), `ts`, `kind`, `data` (JSON) | The append-only event log the apps stream and replay (§6.5) |
 | `history` | `id`, `ts`, `role`, `content`, `agent` | What the model sees as the conversation: user messages and final answers only. The last 20 entries go into each new task |
-| `settings` | `key`, `value` | `model`, `allow_actions`, `tab_target`, `user_timezone`, `user_utc_offset` |
+| `settings` | `key`, `value` | `model`, `allow_actions`, `auto_approve`, `tab_target`, `user_timezone`, `user_utc_offset` |
 | `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before); 0.15.10: `due` (unix seconds: a queued run isn't taken before then) and `attempt` (0, or 1 for the retry) | One row per task. `status` is `queued` (a scheduled run waiting for the background worker), `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `max_steps`, `stuck`, `interrupted` or `skipped` (a queued run that waited over an hour) |
 | `pending` | `id`, `kind` (`approval` or `action`), `run`, `card` (JSON), `checkpoint` (the task's serialized `RunState`), `created` (unix seconds); v2: `policy_version` | What the user is being asked: parked approvals and Action needed cards |
 | `memory` | `id`, `agent`, `text`, `trusted`, `created`; v2: `kind` (rule, preference, fact, work_log), `status` (active, superseded, expired, deleted; `pending` only before 0.15.2), `trust` (user_stated, agent_inferred, imported), `importance`, `source_run`, `source_seq`, `source_schedule`, `valid_until`, `superseded_by`, `pending_reason`, `version`, `updated`, `last_recalled`, `recall_count` | Long-term memory (§6.13). `trusted` is kept in step with `trust` and `status` by triggers, for 0.14.0 and the v1 path |
@@ -629,7 +629,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | POST | `/api/v1/stop` | Stops the running task, or gives up on a parked one |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
 | GET | `/api/v1/screenshot` | A live screenshot of the current tab (JPEG). Exists, but the app doesn't use it |
-| GET, PUT | `/api/v1/settings` | `{model, allow_actions, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}` |
+| GET, PUT | `/api/v1/settings` | `{model, allow_actions, auto_approve, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}` |
 | POST | `/api/v1/devices` | `{token, name, environment?}`: registers a device's APNs token with the push relay (503 if push isn't configured). `environment` is `sandbox` (Xcode installs) or `production` (TestFlight, the notarized Mac app); anything else is 400, none means the relay's default |
 | GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active ones by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older apps still read it |
 | GET | `/api/v1/memory/search?q=&kinds=&limit=` | Memory v2: active memories ranked as the agent's notes are, each with its score (what `search_memory` sees) |
@@ -708,7 +708,9 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 | `secret.saved` / `secret.deleted` | `name`, `label`, `by` | Key changes (never values) |
 | `destination.saved` / `destination.deleted` | `name`, `kind`, `channel`, `by` | Where updates go changed (never the token or URL) |
 | `update.posted` / `update.failed` | `task`, `destination`, `id`, `title`, `thread` / `error` | post_update went out, or why it didn't (§6.20). Not in the chat |
-| `settings` | `{model, allow_actions}` | Settings changed |
+| `settings` | `{model, allow_actions, auto_approve}` | Settings changed |
+| `auto_approve.changed` | `{on, by}` | A person turned Auto approve on or off (§6.11) |
+| `approval.auto` | `{task, card}` | Auto approve let an action through with no card: what the card would have shown (§6.11) |
 
 ### 6.6 Task lifecycle
 
@@ -969,9 +971,16 @@ Each answer records who gave it (`by`, from `X-Tailscale-User`).
 
 **Never in a scheduled run.** Nobody is watching, so `approve()` returns `Decision::Unattended` instead of parking the task, whatever the card: the action isn't done and the model is told to say so in its report ("not run: it runs as root, and a scheduled run can't wait for the user's OK…"; a key request gets "not asked: a scheduled run can't ask for keys…"). A schedule a person set to **run without asking** lets its commands go ahead instead, except root and direct ones (§6.21, §6.23). The run's framing says which (`UNATTENDED_RULE`, `AUTO_APPROVE_RULE`).
 
+**Auto approve** (0.15.12; the setting `auto_approve`, off by default). One switch for the whole desktop, in Settings in the web app and the iPhone and Mac apps, which ask for confirmation before turning it on. It's set only through `PUT /api/v1/settings`: the model has no tool for it, and the shell can't reach the API socket or the database. While it's on, nothing waits for anyone's OK, in a chat or a scheduled run, whatever a schedule's own "Run without asking" says (§6.21). Commands as root, direct connections (§6.23), dangerous patterns, data-out after outside content, browser changes, new sites (§6.22, recorded as allowed by "Auto approve") and schedules after outside content all go ahead, with no plain summary needed. Scheduled runs are told so in their framing (`AUTO_APPROVE_ALL_RULE`).
+- **What stays:** a key request still needs a person, who has the value (a chat shows the card, a scheduled run reports it missing). So do Action needed cards. Browser actions off still refuses browser changes, since that's a refusal, not a question. The outright refusals in `guard.rs` (§6.10) stay, and a scheduled run still can't set up schedules.
+- **When it applies:** it's read at each action, so turning it off applies to the next one. A card already waiting when it's turned on stays until someone answers it.
+- **What's recorded:** `auto_approve.changed` says who turned it on or off. Each action it lets through gets an `approval.auto` event holding what the card would have shown, redacted like every event, and a journal line with only the kind. The policy version differs while it's on, so runs under it can be told apart.
+- **What it gives up:** every approval. Text that fools the model can run commands as root, which reach everything on the desktop (saved keys, the Chrome profile, the firewall and proxy settings, this setting), and act in the user's logged-in browser, with no card. It's for desktops holding nothing the user would mind losing.
+
 **Policy version.** `Policy::version` is the first 16 hex characters of a SHA-256 over:
 - the approval patterns, sorted;
 - Browser actions on or off;
+- Auto approve, only when it's on (so a desktop that never uses it keeps its version);
 - `SHELL_TOOL`;
 - `RUN_AS`;
 - the allowed models, sorted.
@@ -997,7 +1006,7 @@ Web pages, emails and command output can carry injected instructions. The defenc
    - schedules need approval;
    - memories are saved as unverified;
    - key requests carry a warning.
-3. **Approvals** for anything that sends, writes, deletes or runs as root, showing the exact action (in a scheduled run: refused, or with "Run without asking" done, except root, direct connections and the browser; §6.21, §6.23).
+3. **Approvals** for anything that sends, writes, deletes or runs as root, showing the exact action (in a scheduled run: refused, or with "Run without asking" done, except root, direct connections and the browser; §6.21, §6.23). With Auto approve on, nothing asks (§6.11).
 4. **Privilege split:**
    - the shell user can't reach the browser, agentd's state, the socket, the metadata service or other tailnet devices;
    - the browser can't open internal addresses.
@@ -1257,7 +1266,7 @@ Scheduled checks are what a monitoring agent is for, and nobody watches them. Th
   - on those, **the user's own saved keys only**: every way to authenticate the command sent is removed (`Authorization`, `Cookie`, `X-Auth-*`, any Datadog key header, `api_key`/`application_key`/`dd-api-key` in the query, the key in `/v1/input/<key>`), and `Authorization: Bearer <CLOUDFLARE_API_TOKEN>` or `DD-API-KEY`/`DD-APPLICATION-KEY` added. The request then goes on through Squid. Data can only end up in the customer's own accounts; without a saved key, a 403 says which is missing. Plain http to those hosts is refused;
   - the journal gets the host, method and status of each pinned request, never paths, queries or bodies.
 
-What a schedule that runs without asking still allows: data to the other hosts on the allowlist (with an account of whoever's), since only Cloudflare's and Datadog's keys are pinned. In a chat nothing changes: commands go to Squid directly and ask as in §6.11.
+What a schedule that runs without asking still allows: data to the other hosts on the allowlist (with an account of whoever's), since only Cloudflare's and Datadog's keys are pinned. In a chat nothing changes: commands go to Squid directly and ask as in §6.11. Auto approve (§6.11) goes further than this switch, for every schedule: root, direct connections and browser changes go ahead too. Commands still leave through the gate, except root and direct ones, which never did.
 
 ### 6.22 Sites the agent can reach (`access.rs`)
 
@@ -1288,7 +1297,7 @@ Some tools ignore `HTTPS_PROXY` and connect on their own, often to an address no
    - **The command** runs as `worker` in its usual hardened unit, without the proxy's variables (`Route::Direct`).
    - With `sudo`, it's an ordinary root card: root isn't firewalled.
 
-**What stays closed:** internal addresses, the instance metadata service and the desktop's controls (§5.5). A scheduled run never gets it, even with "Run without asking": nobody is there to decide. The agent's commands can't add to the set themselves (`guard::touches_egress_policy`, even with approval).
+**What stays closed:** internal addresses, the instance metadata service and the desktop's controls (§5.5). A scheduled run never gets it, even with "Run without asking": nobody is there to decide (only Auto approve, §6.11, lets one). The agent's commands can't add to the set themselves (`guard::touches_egress_policy`, even with approval).
 
 **What it gives up:** while the command runs it can send data to any public address, with any saved keys it was given, and Squid doesn't log it. The kernel log has each connection's destination and port (`journalctl -k | grep agentd-direct`), not what was sent. After outside content the card warns that the request may be steered (`tainted`). An approved `sudo` command has unfiltered internet anyway, so this is the same decision by the user with less privilege.
 
@@ -1629,7 +1638,7 @@ None of them imports UIKit; the app targets hold everything platform-specific ex
     - **Action needed**, with a screenshot, Skip / I'm done / Take over;
   - screenshots the agent shows (`show_screenshot`).
 - **Settings:**
-  - model, Browser actions, agentd version;
+  - model, Browser actions, Auto approve, agentd version;
   - **Memory** (memory v2; the plan's §14):
     - Nothing waits for approval here (since 0.15.2): you come only to fix or forget something.
     - The memories by kind (Rules, Preferences, Facts, Work log), searchable (full text), with expired and replaced ones shown on request and restorable. A hint (saved after outside content) can be confirmed.
@@ -1842,6 +1851,7 @@ The same screens as the iPhone's, in Mac form:
 | A web page or email injects instructions | `<untrusted>` labels; taint makes data-out, schedules and key requests ask, and makes memories unverified. The user approves anything consequential and sees exact text and commands. The shell is boxed in (no browser, no secrets, allowlist). `open_url` refuses internal targets |
 | The agent sends data to an attacker | Data-out commands ask after outside content; browser sends ask; Squid only reaches listed hosts; `worker` has no DNS. A key given to a command could still be misused against an allowed host (e.g. a GitHub token creating a gist), which is why `gh` writes ask after outside content too |
 | The agent approves its own actions | The API is on a socket the shell user can't open. Approvals come only from the app, through tailnet-proxy |
+| The user turned on Auto approve | No answer while it's on: a fooled model can act as root and in the logged-in browser with no card (§6.11). It's off by default, the apps confirm before turning it on, and the model can't set it (though an auto-approved root command could). `approval.auto` events record what went ahead |
 | The agent drives the logged-in browser from the shell | The guard firewall blocks `worker` from 9222, 5900 and 6080; the X cookie and profile are private |
 | The agent steals AWS credentials | The guard firewall blocks the metadata service for everyone but root and agentd. The desktop's role can't read our SSM parameters anyway |
 | The model sees or leaks a user's key | Keys are never in the model's context: they're injected per command through systemd credentials, and every result, event, history entry and notification is redacted |

@@ -8,6 +8,7 @@ struct SettingsView: View {
     let client: AgentClient
     @Environment(TailnetService.self) private var tailnet
     @Environment(\.dismiss) private var dismiss
+    @State private var confirmingAutoApprove = false
 
     var body: some View {
         GroupedList {
@@ -35,11 +36,31 @@ struct SettingsView: View {
                                 Task { await store.update(settings: settings, client: client) }
                             })
                     )
+                    Toggle(
+                        "Auto approve",
+                        isOn: Binding(
+                            get: { status.settings.autoApprove },
+                            set: { on in
+                                if on {
+                                    confirmingAutoApprove = true
+                                } else {
+                                    setAutoApprove(false, status)
+                                }
+                            })
+                    )
+                    .confirmationDialog(
+                        "Turn on Auto approve?", isPresented: $confirmingAutoApprove, titleVisibility: .visible
+                    ) {
+                        Button("Turn on", role: .destructive) { setAutoApprove(true, status) }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("Nothing will wait for your OK, including commands as root and changes in your logged-in browser, even if a page or log has fooled the agent.")
+                    }
                     LabeledContent("agentd", value: status.version)
                 } header: {
                     Text("Agent")
                 } footer: {
-                    Text("On: the agent can type, click and send in the browser, and asks you before each change. Off: it can only read and navigate.")
+                    Text("Browser actions on: the agent can type, click and send in the browser, and asks you before each change. Off: it can only read and navigate.\n\nAuto approve on: nothing waits for your OK, in chats or scheduled runs. Keys still come from you, and what the agent is never allowed to do stays refused.")
                 }
             }
             Section {
@@ -65,6 +86,12 @@ struct SettingsView: View {
         .navigationTitle("Settings")
         .inlineTitle()
         .toolbar { Button("Done") { dismiss() } }
+    }
+
+    private func setAutoApprove(_ on: Bool, _ status: AgentStatus) {
+        var settings = status.settings
+        settings.autoApprove = on
+        Task { await store.update(settings: settings, client: client) }
     }
 
     private func shortName(_ model: String) -> String {

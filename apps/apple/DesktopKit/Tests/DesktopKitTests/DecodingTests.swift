@@ -43,6 +43,16 @@ import Testing
     #expect(status.desktop == "cloud-desktop-dev")
     #expect(status.settings.model == "zai-org/GLM-5.3")
     #expect(status.lastSeq == 10)
+    #expect(status.settings.autoApprove == false)
+}
+
+@Test func autoApproveRoundTrips() throws {
+    let json = #"{"model":"m","allow_actions":true,"auto_approve":true}"#
+    var settings = try JSONDecoder().decode(AgentSettings.self, from: Data(json.utf8))
+    #expect(settings.autoApprove)
+    settings.autoApprove = false
+    let sent = try JSONDecoder().decode(AgentSettings.self, from: JSONEncoder().encode(settings))
+    #expect(sent.autoApprove == false)
 }
 
 @Test func decodesAPageOfEvents() throws {

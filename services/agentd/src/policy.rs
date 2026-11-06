@@ -173,11 +173,19 @@ impl Policy {
     }
 
     /// The rules in force, as 16 hex characters: SHA-256 over the approval
-    /// patterns (sorted), Browser actions, the shell tool, the shell user and
-    /// the allowed models (sorted). Parked cards and schedules record it, and
-    /// work made under other rules is checked again before it goes ahead
-    /// (docs/memory-v2.md §10). Memory never takes part: it can't grant anything.
-    pub fn version(&self, allow_actions: bool, shell_tool: bool, run_as: &str, models: &[&str]) -> String {
+    /// patterns (sorted), Browser actions, Auto approve when it's on, the shell
+    /// tool, the shell user and the allowed models (sorted). Parked cards and
+    /// schedules record it, and work made under other rules is checked again
+    /// before it goes ahead (docs/memory-v2.md §10). Memory never takes part: it
+    /// can't grant anything.
+    pub fn version(
+        &self,
+        allow_actions: bool,
+        auto_approve: bool,
+        shell_tool: bool,
+        run_as: &str,
+        models: &[&str],
+    ) -> String {
         let mut rules: Vec<String> = self
             .dangerous
             .iter()
@@ -186,11 +194,15 @@ impl Policy {
         rules.sort();
         let mut models: Vec<&str> = models.to_vec();
         models.sort_unstable();
-        let canonical = format!(
+        let mut canonical = format!(
             "dangerous:\n{}\nallow_actions:{allow_actions}\nshell_tool:{shell_tool}\nrun_as:{run_as}\nmodels:{}\n",
             rules.join("\n"),
             models.join(","),
         );
+        // Only when on, so a desktop that never uses it keeps its version.
+        if auto_approve {
+            canonical.push_str("auto_approve:true\n");
+        }
         let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, canonical.as_bytes());
         hash.as_ref()[..8].iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -315,19 +327,20 @@ mod tests {
     fn the_policy_version_is_stable_and_follows_every_input() {
         let policy = Policy::defaults();
         let models = ["zai-org/GLM-5.3", "moonshotai/Kimi-K3"];
-        let base = policy.version(true, true, "worker", &models);
+        let base = policy.version(true, false, true, "worker", &models);
         assert_eq!(base.len(), 16);
         assert!(base.chars().all(|c| c.is_ascii_hexdigit()));
         // Same inputs, same version (the order of the models doesn't matter).
         assert_eq!(
             base,
-            Policy::defaults().version(true, true, "worker", &[models[1], models[0]])
+            Policy::defaults().version(true, false, true, "worker", &[models[1], models[0]])
         );
         let changed = [
-            policy.version(false, true, "worker", &models),
-            policy.version(true, false, "worker", &models),
-            policy.version(true, true, "", &models),
-            policy.version(true, true, "worker", &models[..1]),
+            policy.version(false, false, true, "worker", &models),
+            policy.version(true, true, true, "worker", &models),
+            policy.version(true, false, false, "worker", &models),
+            policy.version(true, false, true, "", &models),
+            policy.version(true, false, true, "worker", &models[..1]),
         ];
         for version in &changed {
             assert_ne!(*version, base);
@@ -342,7 +355,7 @@ mod tests {
         )
         .unwrap();
         let custom = Policy::load(&path).unwrap();
-        assert_ne!(custom.version(true, true, "worker", &models), base);
+        assert_ne!(custom.version(true, false, true, "worker", &models), base);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

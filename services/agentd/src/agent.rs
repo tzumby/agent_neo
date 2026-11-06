@@ -65,6 +65,12 @@ const UNATTENDED_RULE: &str = "Nothing in this run can wait for the user's OK: a
 const AUTO_APPROVE_RULE: &str = "The user set this schedule to run without asking: your commands go ahead \
      without their OK, except ones that run as root, which are refused, as are browser changes and requests for \
      keys. Skip those and say in your report what you'd have done.";
+/// The same, with Auto approve on (a person's setting, for the whole desktop).
+const AUTO_APPROVE_ALL_RULE: &str = "Auto approve is on: nothing in this run waits for the user's OK, and what \
+     would need it goes ahead, commands as root and browser changes included. A key that isn't saved still has to \
+     come from the user, so say in your report that it's missing.";
+/// Who allowed a site, when no person answered a card.
+const AUTO_APPROVE_BY: &str = "Auto approve";
 const INTERRUPTED: &str =
     "I was interrupted: the agent on your desktop restarted. Ask me to continue if you still need this.";
 /// Memory v2: the one reminder when the user asked to remember something and
@@ -86,6 +92,9 @@ static ASKS_TO_REMEMBER: LazyLock<regex::Regex> = LazyLock::new(|| {
 pub struct Settings {
     pub model: String,
     pub allow_actions: bool,
+    /// Nothing waits for the user's OK, in a chat or a scheduled run. Only a
+    /// person can set it, through the API; the model has no way to.
+    pub auto_approve: bool,
     /// Memory v2's consolidation: off, observe or auto (consolidate.rs).
     pub memory_consolidation: String,
     pub memory_consolidation_model: String,
@@ -583,19 +592,33 @@ impl Agent {
             model: get("model").unwrap_or_else(|| self.cfg.model.clone()),
             // On by default: writing and sending in the browser ask first.
             allow_actions: get("allow_actions").as_deref() != Some("false"),
+            // Off by default.
+            auto_approve: get("auto_approve").as_deref() == Some("true"),
             memory_consolidation: crate::consolidate::mode(&self.store).name().to_string(),
             memory_consolidation_model: crate::consolidate::model(&self.store, &self.cfg.consolidation_model),
             memory_consolidation_daily_cap_usd: crate::consolidate::daily_cap(&self.store),
         }
     }
 
-    pub fn update_settings(&self, model: Option<&str>, allow_actions: Option<bool>) -> Result<Settings> {
+    pub fn update_settings(
+        &self,
+        model: Option<&str>,
+        allow_actions: Option<bool>,
+        auto_approve: Option<bool>,
+        by: Option<&str>,
+    ) -> Result<Settings> {
         if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
             self.store.set_setting("model", model)?;
         }
         if let Some(allow) = allow_actions {
             self.store
                 .set_setting("allow_actions", if allow { "true" } else { "false" })?;
+        }
+        if let Some(on) = auto_approve.filter(|on| *on != self.settings().auto_approve) {
+            self.store
+                .set_setting("auto_approve", if on { "true" } else { "false" })?;
+            tracing::warn!(on, "auto approve changed");
+            self.emit("auto_approve.changed", json!({"on": on, "by": by}));
         }
         let settings = self.settings();
         self.emit("settings", json!(settings));
@@ -665,10 +688,12 @@ impl Agent {
     }
 
     /// The rules in force (policy.rs): recorded on runs and parked cards, and
-    /// shown in `/status`. Follows the Browser actions setting.
+    /// shown in `/status`. Follows the Browser actions and Auto approve settings.
     pub fn policy_version(&self) -> String {
+        let settings = self.settings();
         self.policy.version(
-            self.settings().allow_actions,
+            settings.allow_actions,
+            settings.auto_approve,
             self.cfg.shell_tool,
             &self.cfg.run_as,
             &llm::KNOWN_MODELS,
@@ -1000,7 +1025,9 @@ impl Agent {
                     } else {
                         String::new()
                     },
-                    if schedule.auto_approve {
+                    if self.settings().auto_approve {
+                        AUTO_APPROVE_ALL_RULE
+                    } else if schedule.auto_approve {
                         AUTO_APPROVE_RULE
                     } else {
                         UNATTENDED_RULE
@@ -2481,7 +2508,10 @@ impl Agent {
             "summary": format!("Let your agent reach {list}"),
             "reason": "lets its commands reach a site the desktop's proxy refuses", "command": list,
         });
-        let by = resumed.as_ref().and_then(|a| a.by.clone());
+        let by = resumed
+            .as_ref()
+            .and_then(|a| a.by.clone())
+            .or_else(|| self.settings().auto_approve.then(|| AUTO_APPROVE_BY.to_string()));
         Ok(match self.approve(task_id, card, resumed, unattended)? {
             Decision::Unattended => format!(
                 "not asked: a scheduled run can't ask to reach new sites. Say in your report that it needs {list}; \
@@ -2692,6 +2722,21 @@ impl Agent {
         } else {
             None
         };
+        // Auto approve goes ahead with all of it, root and direct connections
+        // included, in a chat or a scheduled run. Read at each command, so
+        // turning it off applies to the next one.
+        if resumed.is_none()
+            && self.settings().auto_approve
+            && let Some(why) = reason.take()
+        {
+            self.auto_approved(
+                task_id,
+                json!({
+                    "kind": "shell", "command": command, "reason": why, "secrets": keys,
+                    "as_root": as_root, "direct": direct, "tainted": tainted,
+                }),
+            );
+        }
         if let (Some(why), true, None) = (reason.as_deref(), unattended, &resumed) {
             // "Run without asking" never covers root or a direct connection.
             if as_root || direct || !auto_approve {
@@ -2852,6 +2897,13 @@ impl Agent {
         }
     }
 
+    /// What Auto approve let through, for the event log: no card shows it, so
+    /// this is the record of what went ahead without anyone seeing it first.
+    fn auto_approved(&self, task_id: &str, card: Value) {
+        tracing::info!(task = %task_id, kind = card["kind"].as_str().unwrap_or(""), "auto approved");
+        self.emit("approval.auto", json!({"task": task_id, "card": card}));
+    }
+
     /// Asks the user about an action. A resumed task brings the answer to the
     /// card it parked on; otherwise this returns a Park error: the task parks
     /// and the card goes to the apps.
@@ -2863,6 +2915,11 @@ impl Agent {
         unattended: bool,
     ) -> Result<Decision> {
         card["task"] = json!(task_id);
+        // Auto approve answers every card but a key's: only a person has the value.
+        if resumed.is_none() && card["kind"] != "secret" && self.settings().auto_approve {
+            self.auto_approved(task_id, card);
+            return Ok(Decision::Approved);
+        }
         // A scheduled run never waits on a card: nobody is watching.
         if unattended && resumed.is_none() {
             tracing::info!(task = %task_id, kind = card["kind"].as_str().unwrap_or(""), "not asked: a scheduled run");
@@ -3437,7 +3494,7 @@ mod tests {
         let (agent, dir) = test_agent();
         let card = json!({"kind": "browser", "action": "type", "target": "Message #eng", "text": "hi", "site": "app.slack.com"});
         let id = park(&agent, "t1", card, &agent.policy_version());
-        agent.update_settings(None, Some(false)).unwrap();
+        agent.update_settings(None, Some(false), None, None).unwrap();
         assert!(matches!(
             agent.answer_approval(&id, true, Some("me".into())),
             Err(StartError::NotFound)
@@ -3759,6 +3816,177 @@ mod tests {
             reply.starts_with("not run: this command needs the user's OK"),
             "{reply}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_approve_lets_everything_through_until_it_is_turned_off() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        let policy_off = agent.policy_version();
+        // Off by default: a risky command asks.
+        assert!(!agent.settings().auto_approve);
+        let asked = agent
+            .run_shell(
+                "t1",
+                "rm -rf ./old",
+                Some("Clear the old build"),
+                &[],
+                10,
+                false,
+                false,
+                false,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(asked.downcast::<Park>().is_ok());
+
+        agent
+            .update_settings(None, None, Some(true), Some("me@acme.com"))
+            .unwrap();
+        assert!(agent.settings().auto_approve);
+        assert_ne!(agent.policy_version(), policy_off);
+        let changed = events(&agent, "auto_approve.changed");
+        assert_eq!(changed[0]["on"], true);
+        assert_eq!(changed[0]["by"], "me@acme.com");
+
+        // A chat and a scheduled run, whose own "Run without asking" is off:
+        // risky, data-out after outside content, direct, and no summary needed.
+        for (scheduled, task) in [(false, "t2"), (true, "t3")] {
+            for (command, direct, tainted) in [
+                ("rm -rf ./old", false, false),
+                ("curl --version", false, true),
+                ("echo direct", true, false),
+            ] {
+                let reply = agent
+                    .run_shell(
+                        task,
+                        command,
+                        None,
+                        &[],
+                        10,
+                        direct,
+                        tainted,
+                        scheduled,
+                        false,
+                        None,
+                        &mut cancel,
+                    )
+                    .await
+                    .unwrap();
+                assert!(reply.starts_with("exit code 0"), "{command}: {reply}");
+            }
+            // Root too. It may fail here (no systemd-run), but it isn't asked or refused.
+            let root = agent
+                .run_shell(
+                    task,
+                    "sudo true",
+                    None,
+                    &[],
+                    10,
+                    false,
+                    false,
+                    scheduled,
+                    false,
+                    None,
+                    &mut cancel,
+                )
+                .await;
+            match root {
+                Ok(reply) => assert!(!reply.starts_with("not run"), "{reply}"),
+                Err(err) => assert!(err.downcast::<Park>().is_err(), "it asked"),
+            }
+            // Browser changes, and a new schedule after outside content.
+            assert_eq!(
+                agent
+                    .gate(
+                        task,
+                        Gate::Ask("writes on the page"),
+                        json!({"action": "type"}),
+                        None,
+                        scheduled,
+                    )
+                    .unwrap(),
+                Ok(true)
+            );
+        }
+        let reply = agent
+            .schedule_task(
+                "t4",
+                &json!({"name": "Daily", "prompt": "Check", "cron": "0 8 * * *"}),
+                true,
+                None,
+            )
+            .unwrap();
+        assert!(reply.starts_with("scheduled #"), "{reply}");
+        // Everything that went ahead is on record, with what it was.
+        let done = events(&agent, "approval.auto");
+        assert!(
+            done.iter()
+                .any(|e| e["card"]["command"] == "sudo true" && e["card"]["as_root"] == true)
+        );
+        assert!(done.iter().any(|e| e["card"]["kind"] == "browser"));
+        assert!(done.iter().any(|e| e["card"]["kind"] == "schedule"));
+        assert!(events(&agent, "approval.requested").is_empty());
+
+        // Browser actions off is still read-only: that's a refusal, not a question.
+        assert!(
+            agent
+                .gate(
+                    "t5",
+                    Gate::Block("blocked: read-only".into()),
+                    json!({"action": "type"}),
+                    None,
+                    false,
+                )
+                .unwrap()
+                .is_err()
+        );
+
+        // Off again: the next command asks, and the rules are what they were.
+        agent
+            .update_settings(None, None, Some(false), Some("me@acme.com"))
+            .unwrap();
+        assert_eq!(agent.policy_version(), policy_off);
+        assert_eq!(events(&agent, "auto_approve.changed").len(), 2);
+        let asked = agent
+            .run_shell(
+                "t6",
+                "rm -rf ./old",
+                Some("Clear the old build"),
+                &[],
+                10,
+                false,
+                false,
+                false,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(asked.downcast::<Park>().is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn auto_approve_can_not_make_up_a_key() {
+        let (agent, dir) = test_agent();
+        agent.update_settings(None, None, Some(true), None).unwrap();
+        let args = json!({"name": "GITHUB_TOKEN", "why": "to clone the repo"});
+        // A chat still asks the user for it, and a scheduled run says it's missing.
+        let park = agent
+            .request_secret("t1", &args, false, None, false)
+            .unwrap_err()
+            .downcast::<Park>()
+            .expect("a key has to come from a person");
+        assert_eq!(park.card["kind"], "secret");
+        let reply = agent.request_secret("t2", &args, false, None, true).unwrap();
+        assert!(reply.starts_with("not asked: a scheduled run"), "{reply}");
+        assert!(events(&agent, "approval.auto").is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4909,6 +5137,22 @@ mod access_tests {
         // Removed in Settings: gone from Squid's file too.
         assert!(agent.remove_host("api.example.com", Some("me@acme.com")).unwrap());
         assert!(!file(&agent).contains("api.example.com"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn auto_approve_opens_a_site_and_says_who_allowed_it() {
+        let (agent, dir) = agent_with_sites();
+        agent.update_settings(None, None, Some(true), None).unwrap();
+        // In a scheduled run too, which otherwise can't ask.
+        let reply = agent
+            .request_access("t1", &json!({"hosts": ["api.example.com"]}), true, None, true)
+            .unwrap();
+        assert!(reply.starts_with("allowed:"), "{reply}");
+        assert_eq!(
+            agent.store.egress_hosts().unwrap()[0].by.as_deref(),
+            Some(AUTO_APPROVE_BY)
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

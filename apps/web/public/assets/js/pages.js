@@ -230,9 +230,10 @@ export function mountSettings(store, view, session) {
     const models = [...new Set([settings.model, ...(status.known_models || [])])].filter(Boolean);
     const model = h("select", { class: "field" }, models.map((m) => h("option", { value: m, selected: m === settings.model }, m)));
     const actions = h("input", { type: "checkbox", checked: settings.allow_actions === true });
+    const autoApprove = h("input", { type: "checkbox", checked: settings.auto_approve === true });
     const save = async () => {
       try {
-        await store.api.updateSettings({ model: model.value, allow_actions: actions.checked });
+        await store.api.updateSettings({ model: model.value, allow_actions: actions.checked, auto_approve: autoApprove.checked });
         store.refreshStatus();
         store.notice("Settings saved.");
       } catch (error) {
@@ -241,6 +242,13 @@ export function mountSettings(store, view, session) {
     };
     model.addEventListener("change", save);
     actions.addEventListener("change", save);
+    autoApprove.addEventListener("change", () => {
+      if (autoApprove.checked && !confirm("Turn on Auto approve? Nothing will wait for your OK, including commands as root and changes in your logged-in browser, even if a page or log has fooled the agent.")) {
+        autoApprove.checked = false;
+        return;
+      }
+      save();
+    });
     let current = "light";
     try {
       current = localStorage.getItem("theme") || "light";
@@ -260,7 +268,10 @@ export function mountSettings(store, view, session) {
         h("label", { class: "label" }, "Model", model),
         h("label", { class: "toggle" }, actions,
           h("span", null, h("span", { class: "strong" }, "Browser actions"),
-            h("span", { class: "muted block" }, "Lets the agent click, type and press keys in your desktop's browser. It still asks you before anything that sends or changes things. Off, it only reads pages.")))),
+            h("span", { class: "muted block" }, "Lets the agent click, type and press keys in your desktop's browser. It still asks you before anything that sends or changes things. Off, it only reads pages."))),
+        h("label", { class: "toggle" }, autoApprove,
+          h("span", null, h("span", { class: "strong" }, "Auto approve"),
+            h("span", { class: "muted block" }, "Nothing waits for your OK, in chats or scheduled runs. Commands as root, direct connections, browser changes, new sites and schedules all go ahead, even if a page or log has fooled the agent. Keys still come from you, and what the agent is never allowed to do stays refused.")))),
       sitesSection(store),
       h("section", { class: "settings-group" },
         h("h2", { class: "page-h2" }, "Appearance"),

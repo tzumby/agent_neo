@@ -1041,12 +1041,13 @@ async fn settings(State(agent): App) -> Json<Value> {
 struct SettingsUpdate {
     model: Option<String>,
     allow_actions: Option<bool>,
+    auto_approve: Option<bool>,
     memory_consolidation: Option<String>,
     memory_consolidation_model: Option<String>,
     memory_consolidation_daily_cap_usd: Option<f64>,
 }
 
-async fn put_settings(State(agent): App, Json(body): Json<SettingsUpdate>) -> Response {
+async fn put_settings(State(agent): App, headers: HeaderMap, Json(body): Json<SettingsUpdate>) -> Response {
     let memory = agent.update_memory_settings(
         body.memory_consolidation.as_deref(),
         body.memory_consolidation_model.as_deref(),
@@ -1057,7 +1058,12 @@ async fn put_settings(State(agent): App, Json(body): Json<SettingsUpdate>) -> Re
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         Ok(Ok(_)) => {}
     }
-    match agent.update_settings(body.model.as_deref(), body.allow_actions) {
+    match agent.update_settings(
+        body.model.as_deref(),
+        body.allow_actions,
+        body.auto_approve,
+        caller(&headers).as_deref(),
+    ) {
         Ok(settings) => Json(json!(settings)).into_response(),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }

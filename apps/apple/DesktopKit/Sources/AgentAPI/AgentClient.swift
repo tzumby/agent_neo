@@ -219,10 +219,20 @@ public struct EventPage: Decodable, Sendable, Equatable {
 public struct AgentSettings: Codable, Sendable, Equatable {
     public var model: String
     public var allowActions: Bool
+    /// Nothing waits for the user's OK. An agentd from before 0.15.12 doesn't send it.
+    public var autoApprove: Bool
 
     enum CodingKeys: String, CodingKey {
         case model
         case allowActions = "allow_actions"
+        case autoApprove = "auto_approve"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        model = try container.decode(String.self, forKey: .model)
+        allowActions = try container.decode(Bool.self, forKey: .allowActions)
+        autoApprove = try container.decodeIfPresent(Bool.self, forKey: .autoApprove) ?? false
     }
 }
 

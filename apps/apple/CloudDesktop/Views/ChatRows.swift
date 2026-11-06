@@ -19,6 +19,8 @@ struct ChatRow: View, Equatable {
                 SecretRequestCard(approval: approval, request: request)
             } else if let proposal = approval.schedule {
                 ScheduleApprovalCard(approval: approval, proposal: proposal)
+            } else if let request = approval.access {
+                AccessApprovalCard(approval: approval, request: request)
             } else if let action = approval.browser {
                 BrowserApprovalCard(approval: approval, action: action)
             } else {
@@ -460,6 +462,64 @@ private struct ScheduleApprovalCard: View {
                     .glassButton()
                 Button { answer(true) } label: {
                     Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
+                }
+                .primaryGlass()
+            }
+            .controlSize(.large)
+        }
+        .card()
+    }
+
+    private func answer(_ approved: Bool) {
+        guard let store, let client else { return }
+        Task { await store.answer(approval, approved: approved, client: client) }
+    }
+}
+
+/// The agent asks to reach sites the desktop's proxy refuses.
+private struct AccessApprovalCard: View {
+    let approval: Approval
+    let request: AccessRequest
+    @Environment(\.chatStore) private var store
+    @Environment(\.agentClient) private var client
+
+    private var one: Bool { request.hosts.count == 1 }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label {
+                Text(one ? "Let your agent reach this site?" : "Let your agent reach these sites?")
+                    .font(.app(.headline))
+            } icon: {
+                Image(systemName: "globe").foregroundStyle(.orange)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(request.hosts, id: \.self) { host in
+                    Text(host).font(.app(.subheadline).monospaced()).textSelection(.enabled)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.inset, in: .rect(cornerRadius: 14))
+            if !request.why.isEmpty {
+                Text(request.why).font(.app(.subheadline))
+            }
+            Text("Its commands can reach \(one ? "it" : "them") from now on, scheduled checks included. You can remove sites in the web app's Settings.")
+                .font(.app(.footnote))
+                .foregroundStyle(.secondary)
+            if approval.tainted {
+                Label(
+                    "Asked for after the agent read a page or command output. Allow only if you asked for something that needs \(one ? "this site" : "these sites").",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.app(.footnote))
+                .foregroundStyle(.orange)
+            }
+            HStack(spacing: 10) {
+                Button { answer(false) } label: { Text("Don't allow").frame(maxWidth: .infinity) }
+                    .glassButton()
+                Button { answer(true) } label: {
+                    Text("Allow").foregroundStyle(.black).frame(maxWidth: .infinity)
                 }
                 .primaryGlass()
             }

@@ -55,8 +55,6 @@ export const api = {
   setup: () => request("GET", "/api/v1/setup"),
   saveSetup: (skipped) => request("PUT", "/api/v1/setup", { skipped }),
   deleteSchedule: (id) => request("DELETE", `/api/v1/schedules/${enc(id)}`, {}),
-  // "Run without asking" (only a person sets it: the agent has no way to).
-  setScheduleAutoApprove: (id, on) => request("PUT", `/api/v1/schedules/${enc(id)}`, { auto_approve: on }),
   pauseSchedule: (id, paused) => request("POST", `/api/v1/schedules/${enc(id)}/${paused ? "pause" : "resume"}`, {}),
   secrets: async () => (await request("GET", "/api/v1/secrets")).secrets,
   saveSecret: (name, value, label, approval) =>
@@ -66,6 +64,9 @@ export const api = {
   saveDestination: (name, body) => request("PUT", `/api/v1/destinations/${enc(name)}`, body),
   deleteDestination: (name) => request("DELETE", `/api/v1/destinations/${enc(name)}`, {}),
   testDestination: (name) => request("POST", `/api/v1/destinations/${enc(name)}/test`, {}),
+  access: () => request("GET", "/api/v1/access"),
+  allowSite: (host) => request("POST", "/api/v1/access", { host }),
+  removeSite: (host) => request("DELETE", `/api/v1/access/${enc(host)}`, {}),
 };
 
 /**

@@ -193,9 +193,13 @@ def wait_until_up():
         time.sleep(1)
     return None
 
+def working(st):
+    # The chat's task, or a scheduled run beside it (agentd 0.15.10).
+    return bool(st and (st.get("busy") or (st.get("background") or {}).get("running")))
+
 out = {"before": counts(), "status": status()}
 if action != "survey":
-    if out["status"] and out["status"].get("busy"):
+    if working(out["status"]):
         out["refused"] = "a task is running"
     elif action == "restore" and not out["before"]["copies"]:
         out["refused"] = "there is no copy to restore"
@@ -331,7 +335,8 @@ def main():
     name = desktop_name(args.instance)
     survey = run_remote(args.instance, "survey", False)
     status, before = survey["status"] or {}, survey["before"]
-    state = "busy: a task is running" if status.get("busy") else "idle" if status else "agentd isn't answering"
+    running = status.get("busy") or (status.get("background") or {}).get("running")
+    state = "busy: a task is running" if running else "idle" if status else "agentd isn't answering"
     chrome = f", Chrome as {before['chrome_user']}" if before["chrome"] else ", no Chrome service"
     print(f"Desktop {name} ({args.instance}), agentd {status.get('version', '?')}, {state}{chrome}.")
     if before["copies"]:
@@ -355,7 +360,7 @@ def main():
             print("This can't be undone (--keep-copy moves it aside instead).")
     if args.dry_run:
         return
-    if status.get("busy"):
+    if running:
         sys.exit("\nA task is running: wait for it, or stop it in the app, then run this again.")
     if input(f"\nType the desktop's name ({name}) to go ahead: ").strip() != name:
         sys.exit("Nothing changed.")

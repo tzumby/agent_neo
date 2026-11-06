@@ -1,11 +1,16 @@
-//! The agent: runs one task at a time (there is one browser), emits events for
-//! the apps, and asks the user for approvals and "action needed".
+//! The agent: runs the chat's tasks one at a time, emits events for the apps,
+//! and asks the user for approvals and "action needed". Scheduled runs go
+//! beside the chat, one at a time, from a queue (schedule.rs), so the chat is
+//! never kept waiting for one: they work in a browser window of their own, and
+//! their report reaches the chat when they end.
 //!
 //! A task that needs an approval parks: its state is saved, the desktop is free
 //! again, and the user's answer resumes it from there (after a restart too).
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -13,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast, watch};
 
+use crate::access;
 use crate::browser::Browser;
 use crate::cdp::Cdp;
 use crate::clock::UserClock;
@@ -30,7 +36,7 @@ use crate::schedule;
 use crate::secrets::{self, Secrets};
 use crate::shell::{KeyFile, Shell, split_sudo};
 use crate::skills::Skills;
-use crate::store::{Event, Pending, Post, Schedule, SecretInfo, Store};
+use crate::store::{Event, Pending, Post, QueuedRun, Schedule, SecretInfo, Store};
 use crate::tools;
 
 const HISTORY_LIMIT: i64 = 20;
@@ -148,7 +154,37 @@ struct RunState {
     /// Asked once for the answer after an empty reply.
     #[serde(default)]
     asked_again: bool,
+    /// What the user asked, or the schedule's prompt: a scheduled run's
+    /// report shows it as its instructions.
+    #[serde(default)]
+    request: String,
 }
+
+/// The scheduled run the background worker is on.
+struct Background {
+    task: String,
+    schedule: i64,
+    /// 0, or 1 for the retry.
+    attempt: i64,
+}
+
+/// The chat's history while a chat task is between its question and its
+/// answer: scheduled runs' reports that end meanwhile wait, so the question
+/// and its answer stay together for the model.
+#[derive(Default)]
+struct Thread {
+    open: bool,
+    held: Vec<(&'static str, String)>,
+}
+
+/// Added to a command's output when the proxy refused a host.
+const ACCESS_HINT: &str = "\n\n(agentd: the desktop's proxy refused a site that isn't on its list. If the task \
+     needs it, call request_access with that exact host and why; don't try to get around the proxy.)";
+const ACCESS_HINT_SCHEDULED: &str = "\n\n(agentd: the desktop's proxy refused a site that isn't on its list. A \
+     scheduled run can't ask for it: say in your report which host it needs.)";
+
+/// A scheduled run that failed is tried once more after this long.
+const RETRY_AFTER_SECS: i64 = 120;
 
 /// The last second of a local date (`YYYY-MM-DD`) in `timezone` (UTC if
 /// unknown), as a unix time. Touches no store, so it's safe anywhere.
@@ -183,6 +219,8 @@ struct Answer {
     approved: bool,
     /// The card they answered, to check the action is still the same one.
     card: Value,
+    /// Who answered (the app's signed-in person), when known.
+    by: Option<String>,
 }
 
 /// What an approval decided.
@@ -225,9 +263,21 @@ pub struct Agent {
     policy: Arc<Policy>,
     shell: Shell,
     skills: Skills,
-    /// A task is running (not counting one parked on an approval).
+    /// The chat's task is running (not counting one parked on an approval).
     busy: AtomicBool,
+    /// Stops the chat's task.
     cancel: watch::Sender<bool>,
+    /// The scheduled run in progress, beside the chat (schedule.rs).
+    background: Mutex<Option<Background>>,
+    /// Stops the scheduled run in progress.
+    background_cancel: watch::Sender<bool>,
+    /// Wakes the background worker when a run is queued.
+    pub runs_queued: Notify,
+    /// One shell command at a time, the chat's or a scheduled run's: a
+    /// scheduled run's command closes Squid to the shell user (lock_egress),
+    /// which would cut off a chat command running beside it.
+    shell_turn: tokio::sync::Mutex<()>,
+    thread: Mutex<Thread>,
     /// Push notifications through the relay; None when it isn't configured.
     pub push: Option<Arc<Relay>>,
     /// Wakes the scheduler when schedules are added or resumed.
@@ -241,8 +291,8 @@ pub struct Agent {
     /// of their own, given to no command, redacted like the keys.
     pub destination_credentials: Secrets,
     poster: Poster,
-    /// The event seq of the tool call being run (a memory's source).
-    step_seq: AtomicI64,
+    /// The event seq of the tool call each task is running (a memory's source).
+    step_seqs: Mutex<HashMap<String, i64>>,
     /// The egress gate (egress.rs), set once it's listening (main.rs).
     pub gate: std::sync::OnceLock<Arc<EgressGate>>,
     /// The shell user's uid, for the guard firewall's `squid_locked` set.
@@ -334,7 +384,7 @@ fn clip_summary(summary: &str) -> Option<String> {
 fn same_request(approved: &Value, now: &Value) -> bool {
     [
         "kind", "action", "role", "target", "text", "key", "submit", "site", "command", "when", "name",
-        "secrets",
+        "secrets", "hosts",
     ]
     .iter()
     .all(|key| approved[key] == now[key])
@@ -383,20 +433,37 @@ impl Agent {
             bus,
             busy: AtomicBool::new(false),
             cancel: watch::channel(false).0,
+            background: Mutex::new(None),
+            background_cancel: watch::channel(false).0,
+            runs_queued: Notify::new(),
+            shell_turn: tokio::sync::Mutex::new(()),
+            thread: Mutex::default(),
             schedules_changed: Notify::new(),
             effects_changed: Notify::new(),
-            step_seq: AtomicI64::new(0),
+            step_seqs: Mutex::default(),
             gate: std::sync::OnceLock::new(),
             shell_uid: uid_of(&cfg.run_as),
             cfg,
         };
         agent.recover();
+        // Squid's list of the sites the user allowed, as the database has it.
+        if let Err(err) = agent.sync_access() {
+            tracing::error!(err = %format!("{err:#}"), "couldn't write the sites the user allowed for Squid");
+        }
         Ok(agent)
     }
 
     /// After a restart: tasks that were running were cut off, so say so. Parked
     /// ones keep waiting for their approval.
     fn recover(&self) {
+        // Scheduled runs cut off: tried once more, quietly, unless it's late.
+        let now = unix_now();
+        for run in self.store.running_scheduled_runs().unwrap_or_default() {
+            let _ = self.store.set_run_status(&run.id, "interrupted");
+            let retried =
+                run.attempt == 0 && now - run.due <= schedule::MAX_LATE_SECS && self.retry(run.schedule, now);
+            tracing::warn!(task = %run.id, schedule = run.schedule, retried, "scheduled run interrupted by a restart");
+        }
         for task in self.store.runs_with_status("running").unwrap_or_default() {
             tracing::warn!(task = %task, "task interrupted by a restart");
             let _ = self.store.add_history("assistant", INTERRUPTED);
@@ -527,8 +594,23 @@ impl Agent {
         self.llm.chat(request).await
     }
 
+    /// The chat's task is running: what the apps show as working.
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// The scheduled run in progress beside the chat: (task, schedule).
+    pub fn background_run(&self) -> Option<(String, i64)> {
+        self.background
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|b| (b.task.clone(), b.schedule))
+    }
+
+    /// Anything is running: the chat's task or a scheduled run.
+    pub fn is_working(&self) -> bool {
+        self.is_busy() || self.background.lock().unwrap().is_some()
     }
 
     /// The rules in force (policy.rs): recorded on runs and parked cards, and
@@ -568,22 +650,73 @@ impl Agent {
         Ok(task_id)
     }
 
-    /// Starts a schedule's run. Unlike a message from the user, it leaves a task
-    /// that's waiting for an approval alone: the user may still answer it.
-    pub fn start_scheduled(self: &Arc<Self>, schedule: &Schedule) -> Result<String, StartError> {
-        if self.busy.swap(true, Ordering::SeqCst) {
-            return Err(StartError::Busy);
-        }
-        self.cancel.send_replace(false);
-        let task_id = short_id();
-        let agent = self.clone();
-        let id = task_id.clone();
-        let schedule = schedule.clone();
-        tokio::spawn(async move {
-            let prompt = schedule.prompt.clone();
-            agent.run(id, prompt, None, Some(schedule)).await
+    /// Runs a queued scheduled run to its end, beside the chat (the background
+    /// worker's, schedule.rs). It leaves the chat's task, and the cards waiting
+    /// there, alone.
+    pub async fn run_queued(self: Arc<Self>, queued: QueuedRun, schedule: Schedule) {
+        *self.background.lock().unwrap() = Some(Background {
+            task: queued.id.clone(),
+            schedule: schedule.id,
+            attempt: queued.attempt,
         });
-        Ok(task_id)
+        self.background_cancel.send_replace(false);
+        let prompt = schedule.prompt.clone();
+        self.clone().run(queued.id, prompt, None, Some(schedule)).await;
+        *self.background.lock().unwrap() = None;
+    }
+
+    /// Whether `task` is the scheduled run in progress, on its first try.
+    fn first_try(&self, task: &str) -> bool {
+        self.background
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|b| b.task == task && b.attempt == 0)
+    }
+
+    /// A schedule was paused or cancelled: its queued runs are dropped and the
+    /// one in progress is stopped. True if one was.
+    pub fn stop_schedule_runs(&self, schedule: i64) -> bool {
+        if let Err(err) = self.store.cancel_queued_runs(schedule) {
+            tracing::error!(%err, schedule, "couldn't cancel the schedule's queued runs");
+        }
+        let running = self
+            .background
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|b| b.schedule == schedule);
+        if running {
+            self.background_cancel.send_replace(true);
+        }
+        running
+    }
+
+    /// Queues a schedule's retry, due at `due`. False if the schedule is gone
+    /// or paused, or already has a run queued or running.
+    fn retry(&self, schedule: i64, due: i64) -> bool {
+        let Ok(Some(schedule)) = self.store.schedule(schedule) else {
+            return false;
+        };
+        if schedule.paused {
+            return false;
+        }
+        let queued = self
+            .store
+            .enqueue_run(
+                &short_id(),
+                schedule.id,
+                &schedule.prompt,
+                &self.settings().model,
+                &self.policy_version(),
+                due,
+                1,
+            )
+            .unwrap_or(false);
+        if queued {
+            self.runs_queued.notify_one();
+        }
+        queued
     }
 
     /// A note from the agent in the chat, outside any task.
@@ -694,10 +827,12 @@ impl Agent {
         self.cancel.send_replace(false);
         self.emit("task.resumed", json!({"task": state.task}));
         tracing::info!(task = %state.task, approved, by = ?by, "task resumed");
+        self.thread.lock().unwrap().open = true;
         let agent = self.clone();
         let answer = Answer {
             approved,
             card: parked.card,
+            by: by.clone(),
         };
         tokio::spawn(async move { agent.drive(state, Some(answer)).await });
         Ok(())
@@ -823,28 +958,50 @@ impl Agent {
             ),
             None => (text.clone(), text.clone()),
         };
-        if let Err(err) = self.store.add_history("user", &for_history) {
-            tracing::error!(%err, "couldn't store the message");
+        // A scheduled run's instructions reach the chat and the history with its
+        // report, when it ends (finish): never in the middle of the user's
+        // conversation.
+        if scheduled.is_none() {
+            self.open_thread(&for_history);
         }
         let by_label = by
             .clone()
             .or_else(|| scheduled.as_ref().map(|_| "schedule".to_string()));
-        if let Err(err) = self.store.start_run(
-            &task_id,
-            &text,
-            by_label.as_deref(),
-            &settings.model,
-            &self.policy_version(),
-            scheduled.as_ref().map(|s| s.id),
-        ) {
+        // A queued run has its row already.
+        let queued = scheduled.is_some()
+            && self
+                .store
+                .begin_queued_run(&task_id, &settings.model, &self.policy_version())
+                .unwrap_or(false);
+        if !queued
+            && let Err(err) = self.store.start_run(
+                &task_id,
+                &text,
+                by_label.as_deref(),
+                &settings.model,
+                &self.policy_version(),
+                scheduled.as_ref().map(|s| s.id),
+            )
+        {
             tracing::error!(%err, "couldn't store the run");
         }
-        let schedule_info = scheduled.as_ref().map(|s| json!({"id": s.id, "name": s.name}));
-        self.emit(
-            "message",
-            json!({"role": "user", "text": text, "task": task_id, "by": by, "schedule": schedule_info}),
-        );
-        self.emit("task.started", json!({"task": task_id, "model": settings.model}));
+        match &scheduled {
+            None => {
+                self.emit(
+                    "message",
+                    json!({"role": "user", "text": text, "task": task_id, "by": by}),
+                );
+                self.emit("task.started", json!({"task": task_id, "model": settings.model}));
+            }
+            // Not task.started: the apps show that as the chat working.
+            Some(schedule) => {
+                self.emit(
+                    "run.started",
+                    json!({"task": task_id, "model": settings.model,
+                           "schedule": {"id": schedule.id, "name": schedule.name}}),
+                );
+            }
+        }
         tracing::info!(task = %task_id, model = %settings.model, by = ?by_label, "task started");
 
         // The system prompt is written at each (re)start of the loop.
@@ -896,30 +1053,85 @@ impl Agent {
             asked_again: false,
             schedule_id: scheduled.as_ref().map(|s| s.id),
             scheduled: scheduled.map(|s| s.name),
+            request: text,
         };
         self.drive(state, None).await;
     }
 
     /// Runs a task until it finishes or parks on an approval, then frees the
-    /// desktop for the next request.
+    /// chat for the next request (a scheduled run frees the background worker
+    /// by returning).
     async fn drive(&self, mut state: RunState, answer: Option<Answer>) {
         let started = Instant::now();
         let result = self.run_loop(&mut state, answer).await;
         state.seconds += started.elapsed().as_secs_f64();
+        let chat = state.scheduled.is_none();
         match result {
-            Ok(Outcome::Parked(park)) => match self.save_parked(&state, &park) {
+            Ok(Outcome::Parked(park)) if chat => match self.save_parked(&state, &park) {
                 Ok(()) => {
-                    // Free the desktop before asking, so an answer can resume it at once.
+                    // Free the chat before asking, so an answer can resume it at once.
+                    self.close_thread(None);
                     self.busy.store(false, Ordering::SeqCst);
                     self.ask(&state.task, park);
                     return;
                 }
                 Err(err) => self.finish(&state, &format!("Something went wrong: {err:#}"), "error"),
             },
+            // A scheduled run never parks (approve); if one did, it ends here.
+            Ok(Outcome::Parked(_)) => self.finish(
+                &state,
+                "Something went wrong: a scheduled run asked for an approval.",
+                "error",
+            ),
             Ok(Outcome::Finished(answer, status)) => self.finish(&state, &answer, status),
             Err(err) => self.finish(&state, &format!("Something went wrong: {err:#}"), "error"),
         }
-        self.busy.store(false, Ordering::SeqCst);
+        if chat {
+            self.busy.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// A chat task starts: its question goes into the history, and the reports
+    /// of scheduled runs that end meanwhile wait for its answer.
+    fn open_thread(&self, question: &str) {
+        let mut thread = self.thread.lock().unwrap();
+        if let Err(err) = self.store.add_history("user", question) {
+            tracing::error!(%err, "couldn't store the message");
+        }
+        thread.open = true;
+    }
+
+    /// The chat task's answer (none when it parks), then the reports that
+    /// came in meanwhile.
+    fn close_thread(&self, answer: Option<&str>) {
+        let mut thread = self.thread.lock().unwrap();
+        if let Some(answer) = answer
+            && let Err(err) = self.store.add_history("assistant", answer)
+        {
+            tracing::error!(%err, "couldn't store the answer");
+        }
+        thread.open = false;
+        for (role, text) in std::mem::take(&mut thread.held) {
+            if let Err(err) = self.store.add_history(role, &text) {
+                tracing::error!(%err, "couldn't store a scheduled run's report");
+            }
+        }
+    }
+
+    /// A scheduled run's report, for the model's later turns: now, or after
+    /// the chat task's answer if one is in progress.
+    fn add_report_history(&self, instructions: String, report: &str) {
+        let mut thread = self.thread.lock().unwrap();
+        if thread.open {
+            thread.held.push(("user", instructions));
+            thread.held.push(("assistant", report.to_string()));
+            return;
+        }
+        for (role, text) in [("user", instructions.as_str()), ("assistant", report)] {
+            if let Err(err) = self.store.add_history(role, text) {
+                tracing::error!(%err, "couldn't store a scheduled run's report");
+            }
+        }
     }
 
     fn save_parked(&self, state: &RunState, park: &Park) -> Result<()> {
@@ -944,19 +1156,54 @@ impl Agent {
     /// The answer, to the chat and the history, and the task's end.
     fn finish(&self, state: &RunState, answer: &str, status: &str) {
         let task_id = &state.task;
-        if let Err(err) = self.store.add_history("assistant", answer) {
-            tracing::error!(%err, "couldn't store the answer");
+        self.step_seqs.lock().unwrap().remove(task_id);
+        let cost = state.usage.cost(&state.model);
+        let seconds = state.seconds.round();
+        // A scheduled run that failed (the model or the network, most likely)
+        // is tried once more, a little later, and only the retry's report is
+        // shown.
+        if let (Some(schedule), "error") = (state.schedule_id, status)
+            && self.first_try(task_id)
+        {
+            if let Err(err) = self.store.finish_run(task_id, status, state.step, cost, answer) {
+                tracing::error!(%err, "couldn't store the run's end");
+            }
+            if self.retry(schedule, unix_now() + RETRY_AFTER_SECS) {
+                tracing::warn!(task = %task_id, schedule, "scheduled run failed: trying again");
+                self.emit(
+                    "run.finished",
+                    json!({"task": task_id, "status": status, "steps": state.step, "seconds": seconds,
+                           "model": state.model, "cost": cost, "retry": true}),
+                );
+                return;
+            }
         }
-        // A scheduled run that found nothing: a quiet row in the chat.
-        let quiet = state.reported.as_ref().is_some_and(|r| r.outcome == "nothing");
+        match &state.scheduled {
+            None => self.close_thread(Some(answer)),
+            Some(name) => {
+                self.add_report_history(format!("[Scheduled task “{name}”] {}", state.request), answer);
+                // The report, whole: its instructions, then its answer below.
+                self.emit(
+                    "message",
+                    json!({"role": "user", "text": state.request, "task": task_id, "by": null,
+                           "schedule": {"id": state.schedule_id, "name": name}}),
+                );
+            }
+        }
+        // A scheduled run that found nothing, or that was stopped because its
+        // schedule was paused or cancelled: a quiet row in the chat.
+        let quiet = state.reported.as_ref().is_some_and(|r| r.outcome == "nothing")
+            || (state.scheduled.is_some() && status == "cancelled");
         self.emit(
             "message",
             json!({"role": "assistant", "text": answer, "task": task_id, "quiet": quiet.then_some(true)}),
         );
-        let cost = state.usage.cost(&state.model);
-        let seconds = state.seconds.round();
         self.emit(
-            "task.finished",
+            if state.scheduled.is_some() {
+                "run.finished"
+            } else {
+                "task.finished"
+            },
             json!({
                 "task": task_id, "status": status, "steps": state.step, "seconds": seconds,
                 "model": state.model, "usage": state.usage, "cost": cost,
@@ -1034,10 +1281,17 @@ impl Agent {
             prompt.push_str(tools::NO_UPDATES_RULE);
         }
         state.messages[0] = json!({"role": "system", "content": prompt});
+        let background = state.scheduled.is_some();
         let mut browser = Browser::new(self.cdp.clone(), state.allow_actions, self.policy.clone());
-        browser
-            .attach(self.store.setting("tab_target")?.as_deref())
-            .await?;
+        if background {
+            // A window of its own, opened when it first needs the browser:
+            // never the tab the chat works in.
+            browser.use_own_window();
+        } else {
+            browser
+                .attach(self.store.setting("tab_target")?.as_deref())
+                .await?;
+        }
         let mut schemas = tools::schemas(
             self.cfg.shell_tool,
             !self.skills.is_empty(),
@@ -1050,9 +1304,14 @@ impl Agent {
             let names: Vec<String> = destinations.iter().map(|d| d.name.clone()).collect();
             list.push(tools::post_update_tool(&names));
         }
-        let mut cancel = self.cancel.subscribe();
+        let lane = if background {
+            &self.background_cancel
+        } else {
+            &self.cancel
+        };
+        let mut cancel = lane.subscribe();
         // A second receiver, to interrupt model calls and browser actions.
-        let mut stop = self.cancel.subscribe();
+        let mut stop = lane.subscribe();
         let task_id = state.task.clone();
 
         let outcome = 'task: loop {
@@ -1117,7 +1376,10 @@ impl Agent {
                         "step",
                         json!({"task": task_id, "step": step, "tool": name, "args": truncate(&raw, 300)}),
                     );
-                    self.step_seq.store(seq.unwrap_or(0), Ordering::SeqCst);
+                    self.step_seqs
+                        .lock()
+                        .unwrap()
+                        .insert(task_id.clone(), seq.unwrap_or(0));
                 }
                 if name == "remember" {
                     state.remembered = true;
@@ -1306,7 +1568,16 @@ impl Agent {
             }
             state.queue = calls;
         };
-        if let Some(target) = browser.current_target() {
+        if background {
+            // Its window stays open for the user only when it needs them
+            // (needs_user), and "I'm done" carries on there; otherwise it's
+            // closed when the browser is dropped.
+            if matches!(outcome, Outcome::Finished(_, "needs_user"))
+                && let Some(target) = browser.keep_own_window()
+            {
+                let _ = self.store.set_setting("tab_target", &target);
+            }
+        } else if let Some(target) = browser.current_target() {
             let _ = self.store.set_setting("tab_target", &target);
         }
         Ok(outcome)
@@ -1366,6 +1637,21 @@ impl Agent {
                 .or_else(|| args[key].as_str()?.trim().parse().ok())
         };
         let max_chars = number("max_chars").map_or(12_000, |n| n.clamp(500, 100_000) as usize);
+        // A scheduled run's browser: its own window, opened on first use.
+        if browser.own_window_only() {
+            match name {
+                "list_tabs" | "switch_tab" => {
+                    return Ok(
+                        "not done: a scheduled run works in a browser window of its own, not the \
+                               user's tabs; use open_url there"
+                            .into(),
+                    );
+                }
+                "open_url" | "read_text" | "snapshot" | "click" | "type_text" | "press_key" | "wait_for"
+                | "show_screenshot" => browser.open_own_window().await?,
+                _ => {}
+            }
+        }
         match name {
             "list_tabs" => browser.list_tabs().await,
             "switch_tab" => {
@@ -1549,6 +1835,7 @@ impl Agent {
                 let id = number("id").ok_or_else(|| anyhow!("id is required"))?;
                 if self.store.delete_schedule(id)? {
                     self.acted(task_id);
+                    self.stop_schedule_runs(id);
                     self.emit("schedule.deleted", json!({"task": task_id, "id": id}));
                     Ok(format!("cancelled schedule #{id}"))
                 } else {
@@ -1604,6 +1891,9 @@ impl Agent {
             "request_secret" if self.cfg.shell_tool => {
                 self.request_secret(task_id, args, tainted, resumed, schedule.is_some())
             }
+            "request_access" if self.cfg.shell_tool => {
+                self.request_access(task_id, args, tainted, resumed, schedule.is_some())
+            }
             "post_update" => {
                 self.acted(task_id);
                 Ok(self.post_update(Some(task_id), args).await)
@@ -1630,7 +1920,13 @@ impl Agent {
         };
         let actor = memory::Actor::Agent {
             run: task_id,
-            seq: Some(self.step_seq.load(Ordering::SeqCst)).filter(|s| *s > 0),
+            seq: self
+                .step_seqs
+                .lock()
+                .unwrap()
+                .get(task_id)
+                .copied()
+                .filter(|s| *s > 0),
             tainted,
             schedule: schedule.filter(|s| *s > 0),
         };
@@ -1853,6 +2149,12 @@ impl Agent {
         let origin = if tainted { "agent_tainted" } else { "user" };
         self.store
             .set_schedule_origin(saved.id, &self.policy_version(), origin)?;
+        // Runs without asking, as every schedule a person sets up does (§6.21),
+        // unless outside content may have asked for it: then its runs skip
+        // whatever would ask.
+        if !tainted {
+            self.store.set_schedule_auto_approve(saved.id, true)?;
+        }
         let saved = self.store.schedule(saved.id)?.unwrap_or(saved);
         self.schedules_changed.notify_one();
         let mut event = schedule::json(&saved);
@@ -2059,6 +2361,176 @@ impl Agent {
         })
     }
 
+    /// `request_access`: a card asking the user to let the shell reach sites
+    /// the proxy refuses (access.rs). Approved, they're open at once.
+    fn request_access(
+        &self,
+        task_id: &str,
+        args: &Value,
+        tainted: bool,
+        resumed: Option<Answer>,
+        unattended: bool,
+    ) -> Result<String> {
+        if self.cfg.egress_user_hosts.is_empty() {
+            return Ok(
+                "not asked: on this desktop, the sites the shell can reach are set by whoever deploys \
+                       it. Tell the user which host you need."
+                    .into(),
+            );
+        }
+        let given: Vec<String> = match &args["hosts"] {
+            Value::Array(list) => list.iter().filter_map(Value::as_str).map(String::from).collect(),
+            Value::String(one) => vec![one.clone()],
+            _ => Vec::new(),
+        };
+        if given.is_empty() {
+            return Ok("not asked: give the hosts, e.g. [\"api.example.com\"]".into());
+        }
+        if given.len() > access::MAX_PER_REQUEST {
+            return Ok(format!(
+                "not asked: at most {} hosts at a time; ask only for what this task needs",
+                access::MAX_PER_REQUEST
+            ));
+        }
+        let mut hosts: Vec<String> = Vec::new();
+        for raw in &given {
+            match access::check_host(raw) {
+                Ok(host) if !hosts.contains(&host) => hosts.push(host),
+                Ok(_) => {}
+                Err(problem) => return Ok(format!("not asked: {problem}")),
+            }
+        }
+        let open = self.reachable_hosts();
+        let (already, hosts): (Vec<String>, Vec<String>) =
+            hosts.into_iter().partition(|h| access::covered(h, &open));
+        if hosts.is_empty() {
+            return Ok(format!(
+                "already allowed: {}. If a command still fails, the proxy isn't what stops it.",
+                already.join(", ")
+            ));
+        }
+        if self.store.egress_hosts()?.len() + hosts.len() > access::MAX_HOSTS {
+            return Ok(
+                "not asked: the user has allowed too many sites; ask them to remove some in Settings".into(),
+            );
+        }
+        let why: String = args["why"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(300)
+            .collect();
+        let list = hosts.join(", ");
+        // `summary`, `reason` and `command`: what an app from before 0.15.10
+        // shows on a card it doesn't know.
+        let card = json!({
+            "kind": "access", "hosts": hosts, "why": why, "tainted": tainted,
+            "summary": format!("Let your agent reach {list}"),
+            "reason": "lets its commands reach a site the desktop's proxy refuses", "command": list,
+        });
+        let by = resumed.as_ref().and_then(|a| a.by.clone());
+        Ok(match self.approve(task_id, card, resumed, unattended)? {
+            Decision::Unattended => format!(
+                "not asked: a scheduled run can't ask to reach new sites. Say in your report that it needs {list}; \
+                 the user can allow it in the web app's Settings."
+            ),
+            Decision::Approved => match self.allow_hosts(&hosts, by.as_deref(), Some(task_id), Some(&why)) {
+                Ok(_) => {
+                    self.acted(task_id);
+                    format!("allowed: the shell can reach {list} now. Try again.")
+                }
+                Err(err) => {
+                    tracing::error!(err = %format!("{err:#}"), "couldn't open sites the user allowed");
+                    format!(
+                        "the user allowed {list}, but agentd couldn't open them ({err:#}). Tell the user."
+                    )
+                }
+            },
+            Decision::Changed | Decision::Denied => format!(
+                "the user didn't allow {list}. Don't try another way to reach them; tell the user what you \
+                 couldn't do without them."
+            ),
+        })
+    }
+
+    /// Everything Squid lets the shell reach: the deployment's list and the
+    /// user's.
+    fn reachable_hosts(&self) -> Vec<String> {
+        let mut hosts = self.cfg.egress_base_hosts.clone();
+        hosts.extend(
+            self.store
+                .egress_hosts()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|h| h.host),
+        );
+        hosts
+    }
+
+    /// The sites for the app: whether the user can add any here, the
+    /// deployment's list, and theirs.
+    pub fn access_list(&self) -> Value {
+        json!({
+            "enabled": !self.cfg.egress_user_hosts.is_empty(),
+            "base": self.cfg.egress_base_hosts,
+            "allowed": self.store.egress_hosts().unwrap_or_default(),
+        })
+    }
+
+    /// Lets the shell reach `hosts` (checked already): saved, written for
+    /// Squid and reloaded. Undone if Squid can't be told. How many were new.
+    pub fn allow_hosts(
+        &self,
+        hosts: &[String],
+        by: Option<&str>,
+        task: Option<&str>,
+        why: Option<&str>,
+    ) -> Result<usize> {
+        anyhow::ensure!(
+            !self.cfg.egress_user_hosts.is_empty(),
+            "this desktop's sites are set by its deployment"
+        );
+        let before: Vec<String> = self.store.egress_hosts()?.into_iter().map(|h| h.host).collect();
+        let added = self.store.allow_hosts(hosts, by, task, why)?;
+        if let Err(err) = self.sync_access() {
+            for host in hosts.iter().filter(|h| !before.contains(h)) {
+                let _ = self.store.remove_host(host);
+            }
+            let _ = self.sync_access();
+            return Err(err);
+        }
+        tracing::info!(hosts = hosts.len(), added, "sites allowed");
+        self.emit("access.allowed", json!({"hosts": hosts, "by": by, "task": task}));
+        Ok(added)
+    }
+
+    /// The shell can no longer reach `host`. False if it wasn't allowed.
+    pub fn remove_host(&self, host: &str, by: Option<&str>) -> Result<bool> {
+        if !self.store.remove_host(host)? {
+            return Ok(false);
+        }
+        self.sync_access()?;
+        self.emit("access.removed", json!({"host": host, "by": by}));
+        Ok(true)
+    }
+
+    /// Writes the user's sites for Squid and reloads it if they changed.
+    fn sync_access(&self) -> Result<()> {
+        if self.cfg.egress_user_hosts.is_empty() {
+            return Ok(());
+        }
+        let hosts: Vec<String> = self.store.egress_hosts()?.into_iter().map(|h| h.host).collect();
+        // Squid is told only where the shell goes through it (not in local
+        // development or tests).
+        if access::write_list(Path::new(&self.cfg.egress_user_hosts), &hosts)?
+            && !self.cfg.shell_proxy.is_empty()
+        {
+            access::reload_squid()?;
+        }
+        Ok(())
+    }
+
     /// For a scheduled run's command: Squid closed to the shell user (the
     /// guard firewall's `squid_locked` set), so its only way out is the egress
     /// gate, which pins keys meanwhile. Undone when the lock is dropped. None
@@ -2199,6 +2671,12 @@ impl Agent {
                 path: self.secrets.path(name),
             })
             .collect();
+        // One command at a time across the chat and the scheduled runs
+        // (shell_turn); waiting for it can be stopped.
+        let _turn = tokio::select! {
+            turn = self.shell_turn.lock() => turn,
+            _ = cancel.wait_for(|stopped| *stopped) => return Ok("not run: stopped".into()),
+        };
         // A scheduled run's commands go out only through the egress gate,
         // which pins Cloudflare's and Datadog's keys (egress.rs).
         let _egress = if unattended {
@@ -2225,6 +2703,7 @@ impl Agent {
         }
         // Before it's cut to size, so no part of a value is left at the cut.
         output.text = self.secrets.redact(&output.text).into_owned();
+        let refused = access::refused_by_proxy(&output.text);
         // For the log: the app's chat shows only messages and the cards waiting for the user.
         self.emit(
             "shell.output",
@@ -2234,7 +2713,16 @@ impl Agent {
                 "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
             }),
         );
-        Ok(output.for_model())
+        let mut result = output.for_model();
+        // The proxy refused a host: how to ask for it (access.rs).
+        if refused {
+            result.push_str(if unattended {
+                ACCESS_HINT_SCHEDULED
+            } else {
+                ACCESS_HINT
+            });
+        }
+        Ok(result)
     }
 
     /// Runs a browser action's gate: `Ok(Ok(asked))` to go ahead (`asked`: the
@@ -2800,6 +3288,8 @@ pub(crate) fn test_agent_with(slack_api: &str) -> (Arc<Agent>, std::path::PathBu
         egress_gate_listen: String::new(),
         egress_gate_squid: String::new(),
         egress_gate_upstream: None,
+        egress_user_hosts: String::new(),
+        egress_base_hosts: vec![".github.com".into(), "pypi.org".into()],
         policy_path: dir.join("no-policy.toml"),
         skills_dir: dir.join("no-skills"),
         max_steps: 5,
@@ -3142,7 +3632,9 @@ mod tests {
             (message["text"].as_str(), message["quiet"].as_bool()),
             (Some("Nothing new."), Some(true))
         );
-        assert_eq!(events(&agent, "task.finished")[0]["outcome"], "nothing");
+        // A scheduled run's end isn't task.finished: the apps show that as the chat.
+        assert!(events(&agent, "task.finished").is_empty());
+        assert_eq!(events(&agent, "run.finished")[0]["outcome"], "nothing");
         // And the attention rules keep the phone quiet for it (push.rs).
         assert_eq!(
             push::on_finish(
@@ -3662,6 +4154,42 @@ mod setup_schedule_tests {
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn schedules_from_the_chat_run_without_asking_unless_outside_content_asked() {
+        let (agent, dir) = test_agent();
+        let asked = json!({"name": "Daily check", "prompt": "Check Cloudflare.", "cron": "0 9 * * *"});
+        let made = agent.schedule_task("t1", &asked, false, None).unwrap();
+        assert!(made.starts_with("scheduled #"), "{made}");
+        let daily = agent.store.schedules().unwrap();
+        assert!(daily[0].auto_approve, "asked for in a clean chat");
+
+        // After a page or an email: a card first, and even once approved its
+        // runs skip whatever would ask.
+        let after = json!({"name": "Hourly sync", "prompt": "Sync it.", "cron": "0 * * * *"});
+        let park = agent
+            .schedule_task("t2", &after, true, None)
+            .unwrap_err()
+            .downcast::<Park>()
+            .expect("asks first");
+        let approved = Answer {
+            approved: true,
+            card: park.card,
+            by: None,
+        };
+        let made = agent.schedule_task("t2", &after, true, Some(approved)).unwrap();
+        assert!(made.starts_with("scheduled #"), "{made}");
+        let hourly = agent
+            .store
+            .schedules()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "Hourly sync")
+            .unwrap();
+        assert!(!hourly.auto_approve);
+        assert_eq!(hourly.created_from, "agent_tainted");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -3695,5 +4223,437 @@ mod setup_skip_tests {
         );
         assert!(agent.set_setup_skipped(&[], None).unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::routing::post;
+
+    use super::*;
+    use crate::store::QueuedRun;
+
+    /// What the stand-in model does with a scheduled run's request.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Scheduled {
+        /// Answers once released (`Notify`).
+        Hold,
+        /// Answers with a 400, which isn't retried.
+        Fail,
+    }
+
+    /// A stand-in for the model on localhost: a scheduled run's request as
+    /// `scheduled` says, anything else answered at once.
+    async fn stand_in_model(scheduled: Scheduled) -> (String, Arc<Notify>) {
+        let release = Arc::new(Notify::new());
+        let held = release.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let held = held.clone();
+                async move {
+                    let is_scheduled = body["messages"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|m| m["content"].as_str().is_some_and(|c| c.contains("This is the scheduled task")));
+                    let answer = |text: &str| {
+                        axum::Json(json!({
+                            "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                        }))
+                        .into_response()
+                    };
+                    match (is_scheduled, scheduled) {
+                        (false, _) => answer("Hi there."),
+                        (true, Scheduled::Hold) => {
+                            held.notified().await;
+                            answer("All quiet.")
+                        }
+                        (true, Scheduled::Fail) => {
+                            (axum::http::StatusCode::BAD_REQUEST, "no").into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, release)
+    }
+
+    use axum::response::IntoResponse;
+
+    fn agent_on(model: &str) -> (Arc<Agent>, std::path::PathBuf) {
+        let (agent, dir) = test_agent();
+        let mut cfg = agent.cfg.clone();
+        cfg.llm_url = model.to_string();
+        drop(agent);
+        (Arc::new(Agent::new(cfg).unwrap()), dir)
+    }
+
+    fn a_schedule(agent: &Agent) -> Schedule {
+        let made = agent
+            .add_user_schedule("Hourly check", "Check Cloudflare", "0 * * * *", None, None, true)
+            .unwrap();
+        agent
+            .store
+            .schedule(made["id"].as_i64().unwrap())
+            .unwrap()
+            .unwrap()
+    }
+
+    fn queue(agent: &Agent, schedule: &Schedule, task: &str) -> QueuedRun {
+        let now = unix_now();
+        assert!(
+            agent
+                .store
+                .enqueue_run(
+                    task,
+                    schedule.id,
+                    &schedule.prompt,
+                    "zai-org/GLM-5.3",
+                    "v",
+                    now - 1,
+                    0
+                )
+                .unwrap()
+        );
+        agent.store.claim_run(now).unwrap().unwrap()
+    }
+
+    fn events(agent: &Agent, kind: &str) -> Vec<Value> {
+        agent
+            .store
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.data)
+            .collect()
+    }
+
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting until {what}");
+    }
+
+    #[tokio::test]
+    async fn the_chat_stays_free_while_a_scheduled_run_works() {
+        let (model, release) = stand_in_model(Scheduled::Hold).await;
+        let (agent, dir) = agent_on(&model);
+        let schedule = a_schedule(&agent);
+        let queued = queue(&agent, &schedule, "sched1");
+        let background = tokio::spawn(agent.clone().run_queued(queued, schedule));
+        until("the run is in progress", || agent.background_run().is_some()).await;
+
+        // The chat isn't busy, and a message starts a task at once. (It
+        // fails without Chrome here; what matters is that it ran.)
+        assert!(!agent.is_busy());
+        let Ok(chat) = agent.start("Hi".into(), None) else {
+            panic!("the chat is busy")
+        };
+        until("the chat's task ends", || !agent.is_busy()).await;
+        let started: Vec<Value> = events(&agent, "task.started");
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["task"], chat);
+        assert_eq!(events(&agent, "run.started")[0]["task"], "sched1");
+        // Nothing of the run's in the chat yet.
+        assert!(events(&agent, "message").iter().all(|m| m["task"] != "sched1"));
+
+        release.notify_one();
+        background.await.unwrap();
+        // Its report, whole, after the chat: instructions, then the answer.
+        let messages = events(&agent, "message");
+        let n = messages.len();
+        assert_eq!(messages[n - 2]["schedule"]["name"], "Hourly check");
+        assert_eq!(messages[n - 2]["text"], "Check Cloudflare");
+        assert_eq!(messages[n - 1]["text"], "All quiet.");
+        assert_eq!(events(&agent, "run.finished")[0]["status"], "done");
+        assert_eq!(events(&agent, "task.finished").len(), 1); // the chat's only
+        let history = agent.store.history(10).unwrap();
+        let roles: Vec<&str> = history.iter().map(|h| h.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+        assert_eq!(history[0].text, "Hi");
+        assert!(history[2].text.starts_with("[Scheduled task “Hourly check”]"));
+        assert!(agent.background_run().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_report_that_ends_mid_question_waits_for_the_answer() {
+        let (agent, dir) = test_agent();
+        agent.open_thread("What's in my inbox?");
+        agent.add_report_history(
+            "[Scheduled task “Hourly check”] Check Cloudflare".into(),
+            "All quiet.",
+        );
+        assert_eq!(agent.store.history(10).unwrap().len(), 1);
+        agent.close_thread(Some("Two new emails."));
+        let texts: Vec<String> = agent
+            .store
+            .history(10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.text)
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "What's in my inbox?",
+                "Two new emails.",
+                "[Scheduled task “Hourly check”] Check Cloudflare",
+                "All quiet."
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_scheduled_run_is_tried_once_more_quietly() {
+        let (model, _release) = stand_in_model(Scheduled::Fail).await;
+        let (agent, dir) = agent_on(&model);
+        let schedule = a_schedule(&agent);
+        let first = queue(&agent, &schedule, "try1");
+        agent.clone().run_queued(first, schedule.clone()).await;
+        // Nothing in the chat; a retry queued for a little later.
+        assert!(events(&agent, "message").is_empty());
+        assert_eq!(events(&agent, "run.finished")[0]["retry"], true);
+        assert!(agent.store.claim_run(unix_now()).unwrap().is_none());
+        let retry = agent
+            .store
+            .claim_run(unix_now() + RETRY_AFTER_SECS + 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.attempt, 1);
+        // The retry fails too: that one is reported.
+        agent.clone().run_queued(retry, schedule).await;
+        let messages = events(&agent, "message");
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages[1]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Something went wrong")
+        );
+        assert_eq!(agent.store.queued_count().unwrap(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pausing_a_schedule_stops_its_run_and_drops_what_is_queued() {
+        let (model, _release) = stand_in_model(Scheduled::Hold).await;
+        let (agent, dir) = agent_on(&model);
+        let schedule = a_schedule(&agent);
+        let queued = queue(&agent, &schedule, "sched2");
+        let background = tokio::spawn(agent.clone().run_queued(queued, schedule.clone()));
+        until("the run is in progress", || agent.background_run().is_some()).await;
+        assert!(agent.stop_schedule_runs(schedule.id));
+        background.await.unwrap();
+        let messages = events(&agent, "message");
+        assert_eq!(messages.last().unwrap()["quiet"], true);
+        assert_eq!(events(&agent, "run.finished")[0]["status"], "cancelled");
+        // A run queued for it later is dropped too.
+        let now = unix_now();
+        assert!(
+            agent
+                .store
+                .enqueue_run("sched3", schedule.id, "x", "m", "v", now, 0)
+                .unwrap()
+        );
+        assert!(!agent.stop_schedule_runs(schedule.id));
+        assert_eq!(agent.store.queued_count().unwrap(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_run_cut_off_by_a_restart_is_queued_again_once() {
+        let (agent, dir) = test_agent();
+        let schedule = a_schedule(&agent);
+        let now = unix_now();
+        agent
+            .store
+            .enqueue_run("cut1", schedule.id, "x", "m", "v", now - 5, 0)
+            .unwrap();
+        agent.store.claim_run(now).unwrap().unwrap(); // running when agentd stopped
+        let restarted = Agent::new(agent.cfg.clone()).unwrap();
+        let retry = restarted.store.claim_run(now).unwrap().expect("queued again");
+        assert_eq!(retry.attempt, 1);
+        assert_eq!(retry.schedule, schedule.id);
+        // Cut off again: not a third time.
+        let again = Agent::new(agent.cfg.clone()).unwrap();
+        assert!(again.store.claim_run(now).unwrap().is_none());
+        assert!(events(&again, "message").is_empty()); // quietly
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+
+    /// An agent whose user-allowed sites go to a file in its state directory
+    /// (no Squid to reload here: local development).
+    fn agent_with_sites() -> (Arc<Agent>, std::path::PathBuf) {
+        let (agent, dir) = test_agent();
+        let mut cfg = agent.cfg.clone();
+        cfg.egress_user_hosts = dir.join("allowed-hosts.txt").to_string_lossy().into_owned();
+        drop(agent);
+        (Arc::new(Agent::new(cfg).unwrap()), dir)
+    }
+
+    fn file(agent: &Agent) -> String {
+        std::fs::read_to_string(&agent.cfg.egress_user_hosts).unwrap()
+    }
+
+    #[test]
+    fn asking_for_a_site_shows_a_card_and_approving_opens_it() {
+        let (agent, dir) = agent_with_sites();
+        // Squid's file exists from the start, empty but for its note.
+        assert!(file(&agent).starts_with('#'));
+        let args = json!({"hosts": ["api.example.com", "https://api.github.com/repos"], "why": "to read the status API"});
+        let park = agent
+            .request_access("t1", &args, true, None, false)
+            .unwrap_err()
+            .downcast::<Park>()
+            .expect("asks first");
+        // .github.com is the deployment's already: only the new one is asked.
+        assert_eq!(park.card["kind"], "access");
+        assert_eq!(park.card["hosts"], json!(["api.example.com"]));
+        assert_eq!(park.card["tainted"], true);
+        let answer = Answer {
+            approved: true,
+            card: park.card,
+            by: Some("me@acme.com".into()),
+        };
+        let reply = agent
+            .request_access("t1", &args, true, Some(answer), false)
+            .unwrap();
+        assert!(reply.starts_with("allowed:"), "{reply}");
+        assert!(file(&agent).ends_with("api.example.com\n"));
+        let saved = agent.store.egress_hosts().unwrap();
+        assert_eq!(saved[0].by.as_deref(), Some("me@acme.com"));
+        assert_eq!(saved[0].task.as_deref(), Some("t1"));
+        assert_eq!(agent.access_list()["allowed"][0]["host"], "api.example.com");
+        // Asked again: nothing to ask.
+        let again = agent.request_access("t2", &args, false, None, false).unwrap();
+        assert!(again.starts_with("already allowed"), "{again}");
+        // Removed in Settings: gone from Squid's file too.
+        assert!(agent.remove_host("api.example.com", Some("me@acme.com")).unwrap());
+        assert!(!file(&agent).contains("api.example.com"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn what_can_never_be_asked_for() {
+        let (agent, dir) = agent_with_sites();
+        let ask = |hosts: Value| {
+            agent
+                .request_access("t3", &json!({"hosts": hosts, "why": "x"}), false, None, false)
+                .unwrap()
+        };
+        for hosts in [
+            json!(["10.0.0.5"]),
+            json!(["*.example.com"]),
+            json!(["db.internal"]),
+            json!([]),
+            json!([
+                "a.example.com",
+                "b.example.com",
+                "c.example.com",
+                "d.example.com",
+                "e.example.com",
+                "f.example.com"
+            ]),
+        ] {
+            assert!(ask(hosts.clone()).starts_with("not asked"), "{hosts}");
+        }
+        // A scheduled run can't ask, and a denied card opens nothing.
+        let reply = agent
+            .request_access("t4", &json!({"hosts": ["api.example.com"]}), false, None, true)
+            .unwrap();
+        assert!(
+            reply.starts_with("not asked: a scheduled run can't ask"),
+            "{reply}"
+        );
+        let card = json!({"kind": "access", "hosts": ["api.example.com"], "why": "", "tainted": false});
+        let denied = Answer {
+            approved: false,
+            card,
+            by: None,
+        };
+        let reply = agent
+            .request_access(
+                "t5",
+                &json!({"hosts": ["api.example.com"]}),
+                false,
+                Some(denied),
+                false,
+            )
+            .unwrap();
+        assert!(reply.starts_with("the user didn't allow"), "{reply}");
+        assert!(agent.store.egress_hosts().unwrap().is_empty());
+        assert!(events_of(&agent, "approval.requested").is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn without_a_hosts_file_the_deployment_decides() {
+        let (agent, dir) = test_agent();
+        let reply = agent
+            .request_access("t6", &json!({"hosts": ["api.example.com"]}), false, None, false)
+            .unwrap();
+        assert!(reply.contains("set by whoever deploys it"), "{reply}");
+        assert_eq!(agent.access_list()["enabled"], false);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_site_in_a_commands_output_says_how_to_ask() {
+        let (agent, dir) = agent_with_sites();
+        let (_stop, mut cancel) = watch::channel(false);
+        let command = "echo 'curl: (56) CONNECT tunnel failed, response 403'";
+        let chat = agent
+            .run_shell(
+                "t7",
+                command,
+                None,
+                &[],
+                10,
+                false,
+                false,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert!(chat.contains("call request_access"), "{chat}");
+        let scheduled = agent
+            .run_shell("t8", command, None, &[], 10, false, true, true, None, &mut cancel)
+            .await
+            .unwrap();
+        assert!(scheduled.contains("A scheduled run can't ask"), "{scheduled}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn events_of(agent: &Agent, kind: &str) -> Vec<Value> {
+        agent
+            .store
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.data)
+            .collect()
     }
 }

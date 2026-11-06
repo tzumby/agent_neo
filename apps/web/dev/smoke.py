@@ -140,7 +140,7 @@ async def main(out):
                 buttons = await p.js(f"[...{g}.querySelectorAll('.setup-examples .list-row')].map(r => r.querySelector('.strong').textContent + ':' + r.querySelector('button').disabled)")
                 p.check("Attack spike watch:false" in buttons and "Error spike watch:true" in buttons, "checks that need Datadog wait for it")
                 attack = f"[...{g}.querySelectorAll('.setup-examples .list-row')].find(r => r.textContent.includes('Attack spike watch'))"
-                p.check(await p.js(f"{attack}.querySelector('.auto-approve').checked") is False, "Run without asking is off unless ticked")
+                p.check(await p.js(f"!{attack}.querySelector('input[type=checkbox]')"), "no Run without asking box: it's the default")
                 await p.js(f"{attack}.querySelector('button').click()")
                 p.check(await p.until(f"{g}.textContent.includes('All set') && !!{g}.querySelector('.setup-summary')"), "the guide ends on All set")
                 setup = await p.js("fetch('/api/v1/setup').then(r => r.json())")
@@ -148,7 +148,7 @@ async def main(out):
                 schedules = await p.js("fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules.map(s => s.name))")
                 p.check("Attack spike watch" in schedules, "the check is a schedule on the desktop")
                 auto = await p.js("fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules.find(s => s.name === 'Attack spike watch').auto_approve)")
-                p.check(auto is False, "…that asks (it wasn't ticked)")
+                p.check(auto is True, "…that runs without asking")
                 await p.js(f"[...{g}.querySelectorAll('button')].find(b => b.textContent === 'Start using your agent').click()")
                 p.check(await p.until("document.querySelector('.empty-setup').hidden && !document.querySelector('.empty-suggest').hidden"), "Start using your agent: the chat")
                 # A skipped step, set up after all, from the Setup page.
@@ -221,6 +221,30 @@ async def main(out):
             p.check(len(slack_posts()) == before + 2 and posted["channel"] == "#security", "…to #security")
             p.check("hxxps://bad[.]example[.]net" in text and "https://bad" not in text and posted["unfurl_links"] is False, "…with its links defanged")
 
+            # A site the proxy refuses: the agent asks with a card; Allow opens it, Settings lists it.
+            await p.js("location.hash = '#/chat'")
+            await p.until("!document.querySelector('#view-chat').hidden")
+            await p.js("""(() => { const t = document.querySelector('.composer textarea');
+                t.value = 'Read the status site for the incident'; t.dispatchEvent(new Event('input')); })()""")
+            await p.js("document.querySelector('.composer .send').click()")
+            card = "[...document.querySelectorAll('.card-needs')].find(c => c.textContent.includes('reach this site'))"
+            p.check(await p.until(f"!!{card}", 15), "a site the proxy refuses: the agent asks with a card")
+            p.check(await p.js(f"{card}.querySelector('.card-hosts').textContent") == "status.example.com", "…naming the exact host")
+            await p.shot(f"{out}/smoke-access.png")
+            opened = "[...document.querySelectorAll('.row-agent')].filter(r => r.textContent.includes('can reach status.example.com')).length"
+            before = await p.js(opened)
+            await p.js(f"[...{card}.querySelectorAll('button')].find(b => b.textContent === 'Allow').click()")
+            p.check(await p.until(f"{opened} > {before}", 15), "Allow opens it, and the task carries on")
+            access = await p.js("fetch('/api/v1/access').then(r => r.json())")
+            p.check([s["host"] for s in access["allowed"]] == ["status.example.com"], "…and it's on the desktop's list")
+            await p.js("location.hash = '#/settings'")
+            sites = "[...document.querySelectorAll('#view-settings .list-row')]"
+            p.check(await p.until(f"{sites}.some(r => r.textContent.includes('status.example.com'))"), "Settings lists it")
+            await p.shot(f"{out}/smoke-sites.png")
+            await p.js("window.confirm = () => true")
+            await p.js(f"{sites}.find(r => r.textContent.includes('status.example.com')).querySelector('button').click()")
+            p.check(await p.until(f"!{sites}.some(r => r.textContent.includes('status.example.com'))"), "…and Remove takes it off")
+
             # A card the desktop doesn't know (a sample one): it expires.
             await p.js("location.hash = '#/chat'")
             await p.until("!document.querySelector('#view-chat').hidden")
@@ -231,13 +255,8 @@ async def main(out):
                 p.check(await p.until("!document.querySelector('#toast').hidden"), "with a notice when the desktop no longer knows it")
 
             await p.js("location.hash = '#/schedules'")
-            if await p.until("!!document.querySelector('#view-schedules .auto-approve')", 5):
-                first = "fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules[0].auto_approve)"
-                await p.js("document.querySelector('#view-schedules .auto-approve').click()")
-                p.check(await p.until(f"{first}.then(a => a === true)"), "a schedule can be set to run without asking")
-                p.check(await p.until("[...document.querySelectorAll('#view-schedules .tag')].some(t => t.textContent === 'Runs without asking')"), "…and says so")
-                await p.js("document.querySelector('#view-schedules .auto-approve').click()")
-                p.check(await p.until(f"{first}.then(a => a === false)"), "…and back")
+            if await p.until("!!document.querySelector('#view-schedules .list-row')", 5):
+                p.check(await p.js("!document.querySelector('#view-schedules input[type=checkbox]') && ![...document.querySelectorAll('#view-schedules .tag')].some(t => t.textContent === 'Runs without asking')"), "Schedules shows no Run without asking switch or tag")
             for page in ["schedules", "settings", "desktop"]:
                 await p.js(f"location.hash = '#/{page}'")
                 p.check(await p.until(f"!document.querySelector('#view-{page}').hidden"), f"the {page} page opens")

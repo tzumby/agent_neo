@@ -232,6 +232,9 @@ h4.md-h, h5.md-h, h6.md-h { font-size: 1rem; font-weight: 650; }
 .card-warning { margin: 0; display: flex; gap: 0.45rem; color: var(--signal-text); font-size: 0.88rem; }
 .card-warning .icon { margin-top: 0.15em; }
 .card-note { margin: 0; display: flex; gap: 0.45rem; align-items: center; color: var(--slate); font-size: 0.84rem; }
+.card-hosts { list-style: none; margin: 0; padding-left: 0; display: flex; flex-direction: column; gap: 0.2rem; }
+ul.card-inset.card-hosts { padding: 0.7rem 0.85rem; }
+.card-hosts code { font-family: var(--mono); font-size: 0.9rem; overflow-wrap: anywhere; }
 .card-ok { margin: 0; display: flex; gap: 0.4rem; align-items: center; color: var(--ok); font-weight: 600; }
 .card-how { font-size: 0.93rem; }
 .card-link { display: inline-flex; align-items: center; gap: 0.3rem; width: fit-content; font-weight: 600; }

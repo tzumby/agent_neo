@@ -1,6 +1,7 @@
 //! agentd: the agent on a cloud desktop. Runs the model loop with browser and
 //! shell tools, keeps the chat history, and serves the chat API to the apps.
 
+mod access;
 mod agent;
 mod api;
 mod attest;
@@ -75,6 +76,7 @@ async fn main() -> Result<()> {
         // Only once this agentd owns the socket: never two schedulers or
         // effect runners.
         tokio::spawn(schedule::run(agent.clone()));
+        tokio::spawn(schedule::work(agent.clone()));
         tokio::spawn(effects::run(agent));
         serve_until_stopped(axum::serve(listener, app).with_graceful_shutdown(shutdown())).await?;
     } else {
@@ -83,6 +85,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("binding {}", cfg.listen))?;
         tracing::info!(address = %cfg.listen, model = %cfg.model, "listening");
         tokio::spawn(schedule::run(agent.clone()));
+        tokio::spawn(schedule::work(agent.clone()));
         tokio::spawn(effects::run(agent));
         serve_until_stopped(axum::serve(listener, app).with_graceful_shutdown(shutdown())).await?;
     }

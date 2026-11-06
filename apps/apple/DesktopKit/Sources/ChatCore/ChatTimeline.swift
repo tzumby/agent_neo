@@ -134,6 +134,9 @@ public struct ChatTimeline: Sendable, Equatable {
                 approval.schedule = ScheduleProposal(
                     name: data["name"]?.string ?? "", prompt: data["text"]?.string ?? "",
                     when: data["when"]?.string ?? "")
+            } else if data["kind"]?.string == "access" {
+                approval.access = AccessRequest(
+                    hosts: data["hosts"]?.array?.compactMap(\.string) ?? [], why: data["why"]?.string ?? "")
             } else if data["kind"]?.string == "browser" {
                 approval.browser = BrowserAction(
                     action: data["action"]?.string ?? "", target: data["target"]?.string ?? "",
@@ -305,6 +308,23 @@ public struct Approval: Sendable, Equatable {
     public var schedule: ScheduleProposal?
     /// Set when the agent asks for a key or token.
     public var secret: SecretRequest?
+    /// Set when the agent asks to reach sites the desktop's proxy refuses.
+    public var access: AccessRequest?
+}
+
+/// The agent's commands hit sites the desktop's proxy doesn't let through:
+/// allowed, they're open from then on (scheduled checks too), until removed
+/// in the web app's Settings.
+public struct AccessRequest: Sendable, Equatable {
+    /// Exact host names, e.g. status.example.com.
+    public let hosts: [String]
+    /// What the agent needs them for.
+    public let why: String
+
+    public init(hosts: [String], why: String) {
+        self.hosts = hosts
+        self.why = why
+    }
 }
 
 /// The agent asks for a key or token (a GitHub token, an API key): the user

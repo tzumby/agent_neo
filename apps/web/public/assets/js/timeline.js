@@ -86,7 +86,7 @@ export class Timeline {
         const id = str(d.id);
         const card = {
           type: "approval", id, seq: event.seq, state: "pending",
-          kind: d.kind === "secret" || d.kind === "schedule" || d.kind === "browser" ? d.kind : "shell",
+          kind: ["secret", "schedule", "browser", "access"].includes(d.kind) ? d.kind : "shell",
           command: str(d.command), reason: str(d.reason), summary: d.summary || null, tainted: d.tainted === true,
         };
         if (card.kind === "secret") {
@@ -96,6 +96,8 @@ export class Timeline {
           };
         } else if (card.kind === "schedule") {
           card.schedule = { name: str(d.name), prompt: str(d.text), when: str(d.when) };
+        } else if (card.kind === "access") {
+          card.access = { hosts: Array.isArray(d.hosts) ? d.hosts.map(str) : [], why: str(d.why) };
         } else if (card.kind === "browser") {
           card.browser = {
             action: str(d.action), target: str(d.target), text: d.text ?? null, key: d.key ?? null,

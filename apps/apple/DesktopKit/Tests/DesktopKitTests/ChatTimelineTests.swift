@@ -267,3 +267,31 @@ private func run(_ seq: Int, _ task: String, _ schedule: String, _ answer: Strin
     #expect(worded.command.hasPrefix("env | grep"))
     #expect(bare.summary == nil && !bare.tainted)
 }
+
+@Test func aSiteToAllowIsACardWithItsHosts() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(
+        try event(
+            1, "approval.requested",
+            #"{"kind":"access","id":"w1","task":"t1","hosts":["status.example.com"],"why":"To read the incident timeline","tainted":true}"#
+        ))
+    guard case .approval(let approval) = timeline.visibleItems.last, let request = approval.access else {
+        Issue.record("no access card")
+        return
+    }
+    #expect(request == AccessRequest(hosts: ["status.example.com"], why: "To read the incident timeline"))
+    #expect(approval.tainted && approval.secret == nil && approval.browser == nil)
+    timeline.apply(try event(2, "approval.resolved", #"{"task":"t1","id":"w1","approved":true}"#))
+    #expect(timeline.visibleItems.isEmpty)
+}
+
+@Test func aScheduledRunBesideTheChatDoesNotMakeItBusy() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(try event(1, "run.started", #"{"task":"r1","model":"m","schedule":{"id":1,"name":"Spike watch"}}"#))
+    #expect(!timeline.busy)
+    timeline.apply(try event(2, "message", #"{"role":"user","text":"Hi","task":"t1"}"#))
+    timeline.apply(try event(3, "task.started", #"{"task":"t1","model":"m"}"#))
+    #expect(timeline.busy)
+    timeline.apply(try event(4, "run.finished", #"{"task":"r1","status":"done"}"#))
+    #expect(timeline.busy, "the chat's own task is still working")
+}

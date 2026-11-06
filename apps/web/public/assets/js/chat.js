@@ -211,6 +211,7 @@ function approvalCard(card, ctx) {
   if (card.kind === "browser") return browserCard(card, ctx);
   if (card.kind === "schedule") return scheduleCard(card, ctx);
   if (card.kind === "secret") return secretCard(card, ctx);
+  if (card.kind === "access") return accessCard(card, ctx);
   return h("section", { class: "card card-needs", "aria-label": "Needs your OK" },
     h("p", { class: "card-kicker" }, icon("shield"), "Needs your OK"),
     h("h3", { class: "card-title" }, card.summary || "Run a command on your desktop"),
@@ -252,6 +253,24 @@ function scheduleCard(card, ctx) {
       h("p", { class: "muted pre" }, s.prompt)),
     h("p", { class: "card-text muted" }, "The agent asked for this after reading outside content. Approve only if you asked for it."),
     answerButtons(card, ctx));
+}
+
+// The agent's commands hit a site the desktop's proxy doesn't let through.
+function accessCard(card, ctx) {
+  const { hosts, why } = card.access;
+  const one = hosts.length === 1;
+  const deny = h("button", { class: "button", type: "button" }, "Don't allow");
+  const allow = h("button", { class: "button button-primary", type: "button" }, "Allow");
+  deny.addEventListener("click", () => busyButton(deny, () => ctx.store.answer(card, false)));
+  allow.addEventListener("click", () => busyButton(allow, () => ctx.store.answer(card, true)));
+  const title = one ? "Let your agent reach this site?" : "Let your agent reach these sites?";
+  return h("section", { class: "card card-needs", "aria-label": title },
+    h("h3", { class: "card-title" }, icon("globe"), title),
+    h("ul", { class: "card-inset card-hosts" }, hosts.map((host) => h("li", null, h("code", null, host)))),
+    why ? h("p", { class: "card-text" }, why) : null,
+    h("p", { class: "card-note" }, `Its commands can reach ${one ? "it" : "them"} from now on, scheduled checks included. You can remove sites in Settings.`),
+    card.tainted ? warning(`Asked for after the agent read a page or command output. Allow only if you asked for something that needs ${one ? "this site" : "these sites"}.`) : null,
+    buttons(deny, allow));
 }
 
 function secretCard(card, ctx) {

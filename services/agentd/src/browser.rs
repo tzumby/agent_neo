@@ -37,6 +37,23 @@ pub struct Browser {
     watch: Mutex<Option<PageWatch>>,
     allow_actions: bool,
     policy: Arc<Policy>,
+    /// A scheduled run's: it works only in a window it opens itself.
+    own_window: bool,
+    /// The window it opened, closed when the browser is dropped unless kept.
+    opened: Option<String>,
+}
+
+impl Drop for Browser {
+    fn drop(&mut self) {
+        if let Some(id) = self.opened.take() {
+            let cdp = self.cdp.clone();
+            tokio::spawn(async move {
+                if let Err(err) = cdp.close(&id).await {
+                    tracing::warn!(%err, "couldn't close a scheduled run's window");
+                }
+            });
+        }
+    }
 }
 
 impl Browser {
@@ -47,7 +64,34 @@ impl Browser {
             watch: Mutex::new(None),
             allow_actions,
             policy,
+            own_window: false,
+            opened: None,
         }
+    }
+
+    /// From now on it works only in a window of its own (a scheduled run's),
+    /// opened by `open_own_window`; the user's tabs are left alone.
+    pub fn use_own_window(&mut self) {
+        self.own_window = true;
+    }
+
+    pub fn own_window_only(&self) -> bool {
+        self.own_window
+    }
+
+    /// Opens its own window, the first time.
+    pub async fn open_own_window(&mut self) -> Result<()> {
+        if self.page.is_some() {
+            return Ok(());
+        }
+        let target = self.cdp.new_window().await?;
+        self.opened = Some(target.id.clone());
+        self.connect(&target).await
+    }
+
+    /// Leaves its window open after all (for the user to take over); its id.
+    pub fn keep_own_window(&mut self) -> Option<String> {
+        self.opened.take()
     }
 
     /// The current tab: the one remembered from earlier, else the first tab.
@@ -244,7 +288,8 @@ impl Browser {
     }
 
     pub async fn open_url(&mut self, url: &str, new_tab: bool) -> Result<String> {
-        if new_tab {
+        // In its own window, a scheduled run loads everything in its one tab.
+        if new_tab && !self.own_window {
             let target = self.cdp.new_page().await?;
             self.switch_to(&target).await?;
         }

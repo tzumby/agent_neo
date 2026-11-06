@@ -358,9 +358,8 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
       const added = names.has(example.name);
       const missing = example.needs.filter((source) => !sources[source]);
       const add = h("button", { class: "button", type: "button", disabled: added || missing.length > 0 }, added ? "Added" : "Add");
-      // Off unless the person ticks it; changeable later under Schedules.
-      let runWithoutAsking = false;
-      const auto = added ? null : autoApprove(false, (on) => { runWithoutAsking = on; });
+      // Its runs don't ask: agentd sets every schedule a person adds to run
+      // without asking (still never as root or in the browser).
       add.addEventListener("click", () => busyButton(add, async () => {
         try {
           await store.api.addSchedule({
@@ -369,7 +368,6 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
             cron: example.cron,
             timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
             utc_offset: -new Date().getTimezoneOffset() * 60,
-            auto_approve: runWithoutAsking,
           });
           open = STEPS.findIndex((t) => t.id === "watching");
           await load();
@@ -385,7 +383,6 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
           h("p", { class: "strong" }, example.name),
           h("p", { class: "muted" }, example.when),
           note,
-          missing.length ? null : auto,
           h("details", { class: "instructions" }, h("summary", null, "What it does"), h("p", null, example.prompt))),
         h("div", { class: "list-actions" }, add));
     });
@@ -423,16 +420,6 @@ export function mountSetup(store, el, { openUpdates, openChat, intro = false, on
 
 /** Names to type or search for somewhere else (scopes, permissions): one per
  * row, each with Copy, and Copy all. */
-/** "Run without asking" for a schedule: what it allows, said plainly. */
-export function autoApprove(checked, onChange) {
-  const input = h("input", { type: "checkbox", checked, class: "auto-approve" });
-  input.addEventListener("change", () => onChange(input.checked));
-  return h("label", { class: "toggle" }, input,
-    h("span", null, h("span", { class: "strong" }, "Run without asking"),
-      h("span", { class: "muted block" },
-        "Its runs go ahead with commands that would otherwise wait for your OK, including ones that could send data after reading logs or pages. Commands as root and changes in the browser are still skipped. Calls to Cloudflare and Datadog always use your own saved keys.")));
-}
-
 export function copyList(items) {
   const copied = (button, label) => (ok) => {
     button.textContent = ok ? "Copied" : "Select and copy it";

@@ -5,6 +5,9 @@
 http_port 127.0.0.1:{{ agentd_egress_proxy_port }}
 
 acl allowed dstdomain {{ (agentd_shell_allowed_domains + agentd_shell_extra_domains) | join(' ') }}
+# And the sites the user allowed in the app: exact hosts, written by agentd
+# (services/agentd/src/access.rs), which reloads Squid after each change.
+acl user_allowed dstdomain "{{ agentd_egress_user_hosts }}"
 # Internal: this machine, the VPC, link-local (the metadata service), CGNAT
 # (Tailscale), private ranges. Checked on the resolved address, so a listed
 # name that resolves inside is refused too.
@@ -15,6 +18,7 @@ acl CONNECT method CONNECT
 http_access deny internal
 http_access deny CONNECT !https
 http_access allow allowed
+http_access allow user_allowed
 http_access deny all
 
 # A pass-through, not a cache; don't tell sites about the desktop.

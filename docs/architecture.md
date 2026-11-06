@@ -406,7 +406,8 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
   1. Deny internal destinations, checked on the **resolved** address: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` (Tailscale), `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, `::1`, `fc00::/7`, `fe80::/10`. A listed name that resolves to an internal address is refused too.
   2. Deny `CONNECT` to ports other than 443.
   3. Allow `dstdomain` in `agentd_shell_allowed_domains` (a leading dot allows subdomains).
-  4. Deny everything else.
+  4. Allow `dstdomain` from `/etc/squid/agentd/allowed-hosts.txt`: the sites the user allowed in the app (§6.22). Exact hosts, one per line, written by agentd. The directory is `agentd:proxy` 2750 and the file 0640, so Squid reads it and `worker` can't.
+  5. Deny everything else.
 - **The allowlist:**
   - `.github.com`, `.githubusercontent.com`;
   - `.npmjs.org`, `.yarnpkg.com`, `nodejs.org`;
@@ -583,7 +584,10 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 
 - **`agentd.db`** (SQLite, WAL mode). Migrations use `PRAGMA user_version`:
   - version 1 added `history.agent`;
-  - version 2 (0.15.0, one transaction) added memory v2's columns and tables, the effects queue, and policy versions (below).
+  - version 2 (0.15.0, one transaction) added memory v2's columns and tables, the effects queue, and policy versions (below);
+  - version 3 (0.15.2) added `runs.acted`, version 4 (0.15.8) `schedules.auto_approve`;
+  - version 5 (0.15.10) added `runs.due` and `runs.attempt`, and an index on `runs.status`: the scheduled runs' queue (§6.14);
+  - version 6 (0.15.10) added `egress_hosts`, the sites the user allowed (§6.22).
 
   Every change is additive, so an older agentd still reads and writes a newer database. 0.14.0 was tested on a v2 database.
 
@@ -592,13 +596,14 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | `events` | `seq` (autoincrement), `ts`, `kind`, `data` (JSON) | The append-only event log the apps stream and replay (§6.5) |
 | `history` | `id`, `ts`, `role`, `content`, `agent` | What the model sees as the conversation: user messages and final answers only. The last 20 entries go into each new task |
 | `settings` | `key`, `value` | `model`, `allow_actions`, `tab_target`, `user_timezone`, `user_utc_offset` |
-| `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before) | One row per task. `status` is `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `max_steps`, `stuck` or `interrupted` |
+| `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before); 0.15.10: `due` (unix seconds: a queued run isn't taken before then) and `attempt` (0, or 1 for the retry) | One row per task. `status` is `queued` (a scheduled run waiting for the background worker), `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `max_steps`, `stuck`, `interrupted` or `skipped` (a queued run that waited over an hour) |
 | `pending` | `id`, `kind` (`approval` or `action`), `run`, `card` (JSON), `checkpoint` (the task's serialized `RunState`), `created` (unix seconds); v2: `policy_version` | What the user is being asked: parked approvals and Action needed cards |
 | `memory` | `id`, `agent`, `text`, `trusted`, `created`; v2: `kind` (rule, preference, fact, work_log), `status` (active, superseded, expired, deleted; `pending` only before 0.15.2), `trust` (user_stated, agent_inferred, imported), `importance`, `source_run`, `source_seq`, `source_schedule`, `valid_until`, `superseded_by`, `pending_reason`, `version`, `updated`, `last_recalled`, `recall_count` | Long-term memory (§6.13). `trusted` is kept in step with `trust` and `status` by triggers, for 0.14.0 and the v1 path |
 | `memory_fts` | FTS5 (`id`, `text`; porter stemming) | Full-text index over `memory`, kept in step by triggers |
 | `memory_events` | `seq`, `memory_id`, `actor`, `action`, `by_user`, `run`, `before`, `after`, `created` | History of every memory change; `before` and `after` are cleared when a memory is purged |
 | `effects` | `kind`, `key` (primary key together), `payload`, `due`, `attempts`, `last_error`, `created` | Side effects waiting to be done (§6.19) |
-| `schedules` | `id`, `agent`, `name`, `prompt`, `cron`, `timezone`, `next_run`, `last_run`, `paused`, `created`; v2: `policy_version`, `created_from`; v4: `auto_approve` (0 unless a person turns on "Run without asking", §6.21) | Scheduled tasks (§6.14) |
+| `egress_hosts` | `host` (primary key), `added` (unix seconds), `by_user`, `task` (the run whose card asked; null from Settings), `why` | The sites the user allowed the shell to reach (§6.22); written to Squid's file at every change and at startup |
+| `schedules` | `id`, `agent`, `name`, `prompt`, `cron`, `timezone`, `next_run`, `last_run`, `paused`, `created`; v2: `policy_version`, `created_from`; v4: `auto_approve` (1 for every schedule a person sets up, 0 for one asked for after outside content; the column's default stays 0, §6.21) | Scheduled tasks (§6.14) |
 | `secrets` | `name`, `agent`, `label`, `created`, `updated`, `last_used` | Saved keys' names and labels, never their values (§6.15) |
 
 - **`images/<32 hex>.jpg`**: screenshots shown in the chat (`show_screenshot`, Action needed cards), served at `/api/v1/images/{id}`.
@@ -613,7 +618,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 
 | Method | Path | What it does |
 |---|---|---|
-| GET | `/api/v1/status` | Desktop name, `busy`, `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2`, `memory {active, pending}`, `stage` and `stage_detail` (below the table) |
+| GET | `/api/v1/status` | Desktop name, `busy` (the chat's task), `background {running: {task, schedule} or null, queued}` (scheduled runs, 0.15.10), `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2`, `memory {active, pending}`, `stage` and `stage_detail` (below the table) |
 | GET | `/api/v1/messages?limit=` | The chat history (default 50, at most 500), with saved keys redacted |
 | POST | `/api/v1/messages` | `{text, timezone, utc_offset}` starts a task. 202 `{task}`, or 409 while one runs. The time zone is remembered for later tasks and schedules |
 | GET | `/api/v1/events?after=&kinds=` | Server-Sent Events: up to 5,000 logged events after `after`, then live ones; `kinds` (comma-separated) keeps only those. Each SSE message has `id: seq`, `event: kind` and the JSON event. Keep-alive comments every 15 s. Subscribes to the live bus before reading the backlog, so nothing falls between them |
@@ -638,10 +643,10 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | PATCH | `/api/v1/memory/{id}` | Memory v2: `{text?, kind?, valid_until?, importance?, expected_version}`. 409 with the current memory if it changed meanwhile. The text goes through the secret filter, and the memory becomes user-stated |
 | GET | `/api/v1/memory/{id}/history` | Memory v2: its `memory_events`, newest first |
 | GET | `/api/v1/schedules` | Schedules, each with its plain-language description |
-| POST | `/api/v1/schedules` | `{name, prompt, cron, timezone?, utc_offset?, auto_approve?}` (`auto_approve` false unless the person ticked it): a repeating schedule set up in the web app (Setup's suggested checks). The same limits as `schedule_task` (25 at most, every 15 minutes at most), no card, origin `user`; a name already used is refused; the time zone is remembered as a message's is |
+| POST | `/api/v1/schedules` | `{name, prompt, cron, timezone?, utc_offset?, auto_approve?}` (`auto_approve` true unless the request says false; the web app doesn't send it): a repeating schedule set up in the web app (Setup's suggested checks). The same limits as `schedule_task` (25 at most, every 15 minutes at most), no card, origin `user`; a name already used is refused; the time zone is remembered as a message's is |
 | GET, PUT | `/api/v1/setup` | `{steps, skipped}`: the web app's Setup steps (`updates`, `cloudflare`, `datadog`, `watching`) and those someone skipped (setting `setup_skipped`), for every browser of the desktop. PUT `{skipped}` replaces the list; an unknown step is 400 |
 | DELETE | `/api/v1/schedules/{id}` | Cancel |
-| PUT | `/api/v1/schedules/{id}` | `{auto_approve}`: "Run without asking" on or off (§6.21); `schedule.updated` with `by`. The agent has no tool for it: only a person, through the web app |
+| PUT | `/api/v1/schedules/{id}` | `{auto_approve}`: "Run without asking" on or off (§6.21); `schedule.updated` with `by`. The agent has no tool for it, and since 2026-11-05 the web app doesn't show it either: only a person, through the API |
 | POST | `/api/v1/schedules/{id}/pause`, `/resume` | A resumed schedule picks up from now. A one-time schedule whose time has passed: 409 |
 | GET | `/api/v1/secrets` | Saved keys: name, label, created, updated, last used. **Never values** |
 | PUT | `/api/v1/secrets/{name}` | `{value, label?, approval?}`. Saves or replaces a key. With `approval`, resumes the task whose request card asked for exactly this key. Returns `{secret, resumed, busy}`. The body is never logged |
@@ -650,6 +655,9 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | PUT | `/api/v1/destinations/{name}` | `{kind: slack\|teams, channel, credential?, link}`. Adds or changes one; without `credential` the saved one stays. 400 with the reason in plain words. The body is never logged |
 | DELETE | `/api/v1/destinations/{name}` | Removes it and its credential |
 | POST | `/api/v1/destinations/{name}/test` | Posts a fixed test message (outside the rate limit); 502 with Slack's or Teams' reason in plain words |
+| GET | `/api/v1/access` | `{enabled, base, allowed: [{host, added, by, task, why}]}`: whether the user can add sites on this desktop (`EGRESS_USER_HOSTS` set), the deployment's list as Squid has it, and the user's (§6.22) |
+| POST | `/api/v1/access` | `{host}`: a person allows a site from Settings. 400 for a host that isn't an exact public name; 409 if it's allowed already, if there are 100, or if the deployment sets the list |
+| DELETE | `/api/v1/access/{host}` | The shell can no longer reach it; 404 if it wasn't on the list |
 
 **`stage`** is one word for what the desktop needs, from the first matching row:
 
@@ -675,8 +683,9 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 
 | Kind | Data | Emitted when |
 |---|---|---|
-| `message` | `role` (user or assistant), `text`, `task`, `by`, `schedule` ({id, name} for a scheduled run), `quiet` (a scheduled run that found nothing: the apps show it as one grey line when it's one short line, folded with the schedule's other such runs, and show a longer report in full) | A request starts; an answer is final; agentd says something outside a task (e.g. a skipped schedule, or that a schedule's rules changed) |
-| `task.started` | `task`, `model` | A task starts |
+| `message` | `role` (user or assistant), `text`, `task`, `by`, `schedule` ({id, name} for a scheduled run), `quiet` (a scheduled run that found nothing, or was stopped because its schedule was paused or cancelled: the apps show it as one grey line when it's one short line, folded with the schedule's other such runs, and show a longer report in full) | A request starts; an answer is final; a scheduled run ends (its instructions, with `schedule`, then its answer, one after the other: since 0.15.10 nothing of a scheduled run reaches the chat before it ends); agentd says something outside a task (e.g. a skipped schedule, or that a schedule's rules changed) |
+| `task.started` | `task`, `model` | A chat task starts (the apps show the chat as working until `task.finished` or `task.paused`) |
+| `run.started` | `task`, `model`, `schedule` ({id, name}) | A scheduled run starts, beside the chat (0.15.10). Not `task.started`, so the apps don't show the chat as working |
 | `step` | `task`, `step`, `tool`, `args` (first 300 characters) | Each tool call, except a resumed one |
 | `shell` | `task`, `command`, `as_root`, `needs_approval`, `secrets` (key names) | A command is about to run or ask |
 | `shell.output` | `task`, `command`, `exit_code`, `timed_out`, `stopped`, `output` (last 4,000 characters), `seconds` | A command ended |
@@ -685,8 +694,10 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 | `approval.resolved` | `task`, `id`, `approved`, `by`, `expired`, `reason` (`policy_changed`) | Answered, or given up on |
 | `task.resumed` | `task` | A parked task carries on |
 | `task.stopping` | (nothing) | Stop was pressed while a task ran |
-| `task.finished` | `task`, `status`, `steps`, `seconds`, `model`, `usage` ({input, output, cached}), `cost` (USD), `outcome` (a scheduled run's `report_outcome`) | A task ends |
+| `task.finished` | `task`, `status`, `steps`, `seconds`, `model`, `usage` ({input, output, cached}), `cost` (USD) | A chat task ends |
+| `run.finished` | The same as `task.finished`, plus `outcome` (`report_outcome`) and `retry: true` when it failed and a second try is queued (its error isn't shown) | A scheduled run ends (0.15.10; before, `task.finished`) |
 | `action_needed` | `task`, `id`, `reason`, `page` ("title \| url"), `image` | The agent called `needs_user` |
+| `access.allowed` / `access.removed` | `hosts` (or `host`), `by`, `task` | A site was allowed (from a card or Settings) or removed (§6.22) |
 | `action.resolved` | `id`, `choice`, `by` | "I'm done" or "Skip" |
 | `image` | `task`, `id`, `url`, `caption` | `show_screenshot` |
 | `memory.saved` / `memory.forgotten` / `memory.confirmed` | `id`, `text`, `trusted`, `by`; v2 adds `kind`, `trust`, `status` | Memory changes |
@@ -701,7 +712,7 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 ### 6.6 Task lifecycle
 
 ```
-POST /messages ──► start(): busy=true; give up on any parked task; spawn run()
+POST /messages ──► start(): busy=true (the chat's); give up on any parked task; spawn run()
                    │
 run(): store the user message in history (and the event log), start a runs row,
        build messages = [system prompt, last 20 history entries, the request]
@@ -716,7 +727,14 @@ POST /approvals/{id} ──► answer_approval(): load the checkpoint, remove th
                          emit approval.resolved + task.resumed, drive(state, answer)
 ```
 
-- **One task at a time.** There's one browser, so `busy` is an `AtomicBool`. A second message gets 409 ("busy with another request; stop it first").
+- **Two lanes (0.15.10).** The chat runs one task at a time: `busy` is an `AtomicBool`, and a second message gets 409 ("busy with another request; stop it first"). Scheduled runs go beside it, one at a time, from a queue (§6.14), so a check never keeps the user waiting. What they share is kept apart:
+  - **the browser:** a scheduled run opens a window of its own (`Target.createTarget` with `newWindow`, on the browser's DevTools session), only when it first needs the browser, and closes it at the end; `list_tabs` and `switch_tab` are refused there, and it never touches `tab_target`. If it ends needing the user (`needs_user`), its window stays open and becomes `tab_target`, so "I'm done" carries on there;
+  - **Stop:** each lane has its own `watch` channel. Stop in the app stops the chat's task; pausing or deleting a schedule stops its run in progress (`stop_schedule_runs`) and drops its queued ones;
+  - **shell commands:** one at a time across both lanes (`shell_turn`, a `tokio::sync::Mutex` held for the command; waiting for it can be stopped). A scheduled run's command closes Squid to the shell user (§6.21), which would cut off a chat command running beside it;
+  - **the history:** a scheduled run's instructions and report go into `history` when it ends. If a chat task is between its question and its answer then, they wait for the answer (`Thread`), so the model sees each question next to its answer;
+  - **memory sources:** the event seq of each task's current tool call is kept per task (`step_seqs`);
+  - **consolidation** waits while either lane is working (`is_working`), and doesn't let a scheduled run in progress hold back the chat's tasks;
+  - **`/api/v1/status`:** `busy` is the chat's; `background` says which run is in progress and how many are queued. The maintenance reboot (§5) and `agentd-reset` wait for either.
 - **Parking.** A task that needs an answer saves its whole `RunState` and frees the desktop:
   - `RunState` holds the messages, the queue of tool calls not yet run, the step count, `tainted`, the loop detector, usage, time worked, an armed send and the schedule name.
   - The answer resumes it, after an agentd restart too.
@@ -726,7 +744,7 @@ POST /approvals/{id} ──► answer_approval(): load the checkpoint, remove th
   - model calls and browser actions are dropped at once (`tokio::select!`);
   - a shell command's systemd unit is stopped, which kills everything it started;
   - the app gets `task.stopping` immediately.
-- **Restart recovery.** Tasks still marked `running` when agentd starts were cut off: each gets an "I was interrupted…" answer and the status `interrupted`. Parked tasks keep waiting.
+- **Restart recovery.** Chat tasks still marked `running` when agentd starts were cut off: each gets an "I was interrupted…" answer and the status `interrupted`. Scheduled runs are queued again once, quietly (§6.14). Parked tasks keep waiting.
 - **Step limit.** After `MAX_STEPS` (40) model turns, a wrap-up turn runs with no tools (`tool_choice: none`, 2,048 tokens). The model reports what it did, what's left and why. Status `max_steps`.
 - **End-of-task notification.** Every finished task pushes a notification (title: the desktop's name, or "Your desktop hit a problem"; body: the start of the answer), except `needs_user`, which already pushed its own, and `cancelled`.
 
@@ -786,10 +804,11 @@ For each tool call:
 | `read_skill` | `name` | Returns a skill's Markdown (§6.16) | No |
 | `run_shell` | `command`, `summary` (what it does in plain words, for the approval card), `timeout` (120 s; 1–900), `secrets` | Runs bash as `worker` (§6.10) | `sudo …`, dangerous patterns, and data-out after outside content |
 | `request_secret` | `name`, `label`, `why`, `how`, `url`, `replace` | Asks the user for an API key or token (§6.15) | Always: it's a card with a secure field |
+| `request_access` | `hosts` (at most 5), `why` | Asks the user to let the shell reach sites the proxy refuses (§6.22) | Always: it's an `access` card |
 | `post_update` | `destination` (one of those set up), `title`, `body` (Markdown), `severity` (`info`, `warning`, `critical`), `thread` | Posts to a Slack or Teams channel the user set up (§6.20). Offered only when there's at least one | No: only to destinations a person added, through agentd's content checks and rate limit |
 | `report_outcome` (memory v2, scheduled runs only) | `outcome` (result, nothing, blocked), `summary` (≤ 180 characters) | Ends a scheduled run. `result` pushes the summary, `blocked` pushes "<name>: needs you", `nothing` pushes nothing and leaves a quiet row in the chat (§6.17) | No |
 
-The shell tools (`run_shell`, `request_secret`) exist only when `SHELL_TOOL=on`; `read_skill` only when there are skills.
+The shell tools (`run_shell`, `request_secret`, `request_access`) exist only when `SHELL_TOOL=on`; `read_skill` only when there are skills.
 
 ### 6.9 Browser control (Chrome DevTools Protocol)
 
@@ -864,7 +883,7 @@ The hardening follows moltis' container settings (MIT).
 
 **Refused outright, not even asked** (`guard.rs`; the model is told why, and nothing is shown):
 - a bare `sleep` or `date`, a piped install script, scheduling through the shell;
-- anything touching the egress controls: Squid (`/etc/squid`, `squid -k`, the service) or the guard firewall (`cloud-desktop-guard`, `guard.nft`, `/etc/cloud-desktops`). These stop injected instructions from sending data anywhere, so they're the deployment's (Ansible's `agentd_shell_allowed_domains`/`agentd_shell_extra_domains`), never the chat's;
+- anything touching the egress controls: Squid (`/etc/squid`, `squid -k`, the service; the user's list in `/etc/squid/agentd` too) or the guard firewall (`cloud-desktop-guard`, `guard.nft`, `/etc/cloud-desktops`). These stop injected instructions from sending data anywhere, so they're the deployment's (Ansible's `agentd_shell_allowed_domains`/`agentd_shell_extra_domains`) and the user's (§6.22: a card the agent can only ask for, or Settings), never the agent's commands';
 - Slack's or Teams' APIs and webhooks (updates go through `post_update`, §6.20).
 
 **A command that needs approval must come with a plain summary** (`guard::is_plain_summary`): present, not the command itself, no shell symbols or flags, and not starting with a program's name. Otherwise it isn't shown or logged, and the model is asked to call again with one (`SUMMARY_REFUSAL`). The card and its notification lead with it; the command is a tap away.
@@ -1086,11 +1105,17 @@ Both are read in the user's time zone, which the app sends with every message, a
 
 **The scheduler** (`schedule::run`, started once the socket is bound):
 1. Sleeps until the next due run, at most 60 s. A new schedule or a resume wakes it at once.
-2. Starts due runs. If the desktop is busy, it retries every 5 s.
-3. Skips a run more than 1 hour late, with a note in the chat.
+2. Queues due runs: a `runs` row with status `queued`, its `due` time and the schedule (`enqueue_run`). A schedule whose last run is still queued or running gets no second one.
+3. Skips a run more than 1 hour late (agentd was down), with a note in the chat.
 4. Moves a recurring schedule to its next run, and deletes a one-time schedule once it has run.
 
+**The background worker** (`schedule::work`, also started once the socket is bound) takes the queued run due first (`claim_run`), one at a time, beside the chat. It drops a run whose schedule was paused or deleted meanwhile (`cancelled`), and skips one that waited over an hour (`skipped`, with a note). The queue is in the database, so it outlives restarts:
+- **cut off by a restart:** a scheduled run still `running` when agentd starts becomes `interrupted` and is queued again once (`attempt` 1), quietly, unless it's over an hour late;
+- **failed** (`error`: the model or the network, most likely): queued again once, 2 minutes later. Only the retry's report reaches the chat and the phone;
+- the retry's failure is reported like any other.
+
 **A scheduled run.**
+- It runs beside the chat (above, and §6.6): the user can keep talking to the agent meanwhile. Nothing of it reaches the chat until it ends; then its report appears whole, at the bottom.
 - It starts without the chat history.
 - Its prompt is framed as "(agentd) This is the scheduled task "…". They aren't watching…".
 - It doesn't abandon parked tasks.
@@ -1219,15 +1244,34 @@ The agent posts updates (what it found, what it did) to channels a person set up
 
 Scheduled checks are what a monitoring agent is for, and nobody watches them. They read logs on their first call, and attackers write logs, so in a chat each command after that which could send data would ask. A scheduled run never waits on a card (§6.11); instead:
 
-- **"Run without asking"**, per schedule (`schedules.auto_approve`), off unless a person turns it on: on the Schedules page, or ticked on one of Setup's example checks before adding it. The agent has no tool to set it, and `schedule_task` never does. With it on, a run's commands go ahead with what would otherwise ask (the policy's rules, data-out after outside content), **except commands as root**, which are refused. Browser changes and key requests are refused either way. Turning it off applies to the next command (it's read at each one). This replaced 0.15.7's desktop-wide "only root commands ask", which the user rejected the same day as too broad: the choice is per schedule, and never the default.
+- **"Run without asking"**, per schedule (`schedules.auto_approve`), **on for every schedule a person sets up**: one of Setup's example checks (`POST /api/v1/schedules`), or one asked for in a clean chat (`schedule_task`). The web app doesn't show the switch anywhere. The one exception: a schedule asked for after outside content (a page, an email or command output) needs a card first, and even once approved it stays off (`created_from = agent_tainted`), so its runs skip whatever would ask. With it on, a run's commands go ahead with what would otherwise ask (the policy's rules, data-out after outside content), **except commands as root**, which are refused. Browser changes and key requests are refused either way. Only a person can turn it off, through `PUT /api/v1/schedules/{id}`; it applies to the next command (it's read at each one).
+- **How it got here:** 0.15.7's desktop-wide "only root commands ask" was rejected the same day as too broad. 0.15.8 made it per schedule and off by default, with a box on Setup's checks and the Schedules page. On 2026-11-05 the user asked for it to be the default and not shown: scheduled runs only, never chats (0.15.9).
 - **The egress gate**, for every scheduled run's commands, with or without the switch:
-  - before each command, agentd puts the shell user into the guard firewall's `squid_locked` set (`sudo nft add element inet cloud_desktop_guard squid_locked { <uid> }`), and takes it out afterwards (`EgressLock`'s drop; a leftover is flushed at startup). Meanwhile its only way out is the gate on `EGRESS_GATE_LISTEN`. If the lock can't be taken, the command isn't run;
+  - before each command, agentd puts the shell user into the guard firewall's `squid_locked` set (`sudo nft add element inet cloud_desktop_guard squid_locked { <uid> }`), and takes it out afterwards (`EgressLock`'s drop; a leftover is flushed at startup). Meanwhile its only way out is the gate on `EGRESS_GATE_LISTEN`. If the lock can't be taken, the command isn't run. The lock is per uid, so the chat's commands wait while it's held (`shell_turn`, §6.6);
   - the command gets `HTTPS_PROXY` (and the others) set to the gate, and trusts `egress-ca-bundle.pem` (the system's CAs and the gate's: `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, through `LoadCredential`);
   - the gate passes everything on to Squid as it came (the allowlist and the log still apply), except `CONNECT`s to **Cloudflare's API and Datadog's hosts** (`api.cloudflare.com`; anything under `datadoghq.com`, `datadoghq.eu`, `ddog-gov.com`, intake hosts included), which it opens: a certificate from a CA made at each start (rcgen; the private key stays in memory), ALPN http/1.1, hyper;
   - on those, **the user's own saved keys only**: every way to authenticate the command sent is removed (`Authorization`, `Cookie`, `X-Auth-*`, any Datadog key header, `api_key`/`application_key`/`dd-api-key` in the query, the key in `/v1/input/<key>`), and `Authorization: Bearer <CLOUDFLARE_API_TOKEN>` or `DD-API-KEY`/`DD-APPLICATION-KEY` added. The request then goes on through Squid. Data can only end up in the customer's own accounts; without a saved key, a 403 says which is missing. Plain http to those hosts is refused;
   - the journal gets the host, method and status of each pinned request, never paths, queries or bodies.
 
 What a schedule that runs without asking still allows: data to the other hosts on the allowlist (with an account of whoever's), since only Cloudflare's and Datadog's keys are pinned. In a chat nothing changes: commands go to Squid directly and ask as in §6.11.
+
+### 6.22 Sites the agent can reach (`access.rs`)
+
+Until 0.15.10 a new site for the shell meant changing Ansible's list and deploying. Now the agent asks, and the user decides in the chat:
+
+1. **A refused site.** Squid answers `403` to a `CONNECT` for a host that isn't listed. When a command's output shows that (curl's `CONNECT tunnel failed, response 403`, git's `HTTP code 403 from proxy`, Python's `Tunnel connection failed: 403`, wget's, Squid's `ERR_ACCESS_DENIED`), agentd adds a note for the model: call `request_access` with that exact host. The prompt says the same, and never to work around the proxy.
+2. **The card.** `request_access {hosts, why}` checks each host (`access::check_host`) and drops those already reachable, the deployment's list included (`.github.com` covers `api.github.com`). Then it parks on an `access` card: the hosts, why, and, after outside content, a warning (`tainted`). For apps from before 0.15.10 the card also carries `summary`, `reason` and `command`, so they show it as "Let your agent reach …" rather than as an empty command.
+3. **Allow.** agentd saves the hosts (`egress_hosts`, with who allowed them, the task and why), writes Squid's file whole (renamed into place), and runs `sudo -n squid -k reconfigure`. If Squid can't be told, the hosts are taken back off and the model hears so. The task resumes and retries. "Don't allow" opens nothing, and the model is told not to try another way.
+4. **Settings → Sites your agent can reach** (web app) lists the user's sites, with who allowed them and why. A person can remove one, or allow one by name (`POST /api/v1/access`). The deployment's list is shown too, read-only.
+
+**What can be asked for:** exact public host names. Not wildcards (`*.example.com`, `.example.com`), IP addresses, single-label names, or internal suffixes (`localhost`, `local`, `internal`, `lan`, `home`, `corp`, `intranet`, `home.arpa`, the reverse-DNS zones, `ts.net`). At most 5 hosts a request, 100 in all. Squid still refuses internal addresses whatever a name resolves to (§5.6, rule 1).
+
+**What it doesn't change:**
+- the agent's commands can't edit the list or reload Squid (`guard::touches_egress_policy`, even with approval);
+- a scheduled run can't ask: it reports the host it needed, and the user allows it in Settings. Once allowed, a host is reachable by scheduled runs too (through the egress gate, which passes it on to Squid), and the card says so;
+- where `EGRESS_USER_HOSTS` isn't set, the deployment decides alone: the tool says so, and Settings shows the list read-only.
+
+**Setup (Ansible, agentd role):** `agentd_egress_user_hosts` (default `/etc/squid/agentd/allowed-hosts.txt`) creates the directory and an empty file before Squid's configuration is validated. agentd gets `EGRESS_USER_HOSTS` and `EGRESS_BASE_HOSTS` (the deployment's list). At startup agentd writes the file from the database and reloads Squid if it changed, so a restored database and Squid agree. Squid is reloaded only where the shell uses it (`SHELL_PROXY` set), not in local development.
 
 ## 7. The model gateway
 
@@ -1724,8 +1768,8 @@ The same screens as the iPhone's, in Mac form:
    - `schedule_task(cron "0 8 * * 1-5")` in the user's zone (America/Toronto);
    - next run computed with DST;
    - `schedule.created` emitted; the answer says so, and Settings → Schedules lists it.
-2. At 08:00 local, the scheduler (woken by its timer) starts a task with the stored prompt, no history and the scheduled framing. The chat shows a report headed "Morning inbox · 8:00 AM".
-3. If a parked task or another task is running, the scheduler retries every 5 s. A run that's an hour late is skipped with a note.
+2. At 08:00 local, the scheduler (woken by its timer) queues a run, and the background worker starts it with the stored prompt, no history and the scheduled framing, beside whatever the chat is doing.
+3. When it ends, the chat shows a report headed "Morning inbox · 8:00 AM". A run that waited an hour behind others is skipped with a note.
 4. The answer is pushed, titled "Morning inbox". The schedule moves to the next weekday.
 
 ### 11.7 Deploying a change to agentd
@@ -1862,10 +1906,10 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform yet.
 
 | Component | Tests |
 |---|---|
-| agentd | 139 unit tests (plus a 5,000-memory speed test run on demand): memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text notification bodies, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the app's filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning (attested and published fingerprints, and which setting wins), SigV4 for SSM reads, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
+| agentd | 155 unit tests (plus a 5,000-memory speed test run on demand): sites the user allows (host checks, a card only for hosts not already reachable, Squid's file, a scheduled run that can't ask, a denied card, the proxy's refusal spotted in output), scheduled runs beside the chat with a stand-in model (the chat free meanwhile, the report whole at the end, its history after the chat's answer, one quiet retry after a failure or a restart, a paused schedule stopping its run), the run queue (one per schedule, due order, cancelling), memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, the attention rules for notifications and push effects, `stage`, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text notification bodies, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the app's filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, attestation verification with a stand-in PKI, gateway pinning (attested and published fingerprints, and which setting wins), SigV4 for SSM reads, guards (sleep, date, piped installs, shell scheduling, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
 | gatewayd | Attestation binding and nonces, the published certificate fingerprint, identity proofs (scope, age, audience), desktop ARN parsing, request limits and the model allowlist, cost with cached input, UTC days |
 | push relay | Caller checks, JWT, payload filtering, token validation, APNs outcomes (`node --test`) |
-| DesktopKit | 32 tests (§10.8): also setup links and setup codes read from pictures |
+| DesktopKit | 35 tests (§10.8): also setup links and setup codes read from pictures, the `access` card, and scheduled runs (`run.*`) not making the chat busy |
 
 ## 14. How this differs from PLAN.MD
 
@@ -1890,6 +1934,9 @@ Found while writing this document. None of them is a known exploit; most are dri
 **Security and robustness.**
 - The operator has root on desktops (SSM), and the user KMS keys use default policies. Attested desktops are planned.
 - Squid has no `Safe_ports` rule, so plain-HTTP requests to allowed hosts aren't port-limited.
+- A chat command waits while a scheduled run's command runs (`shell_turn`, §6.6), up to that command's timeout (120 s by default; the model may set more). The uid-wide `squid_locked` is the reason; restricting each scheduled command's own unit to the egress gate (systemd's `IPAddressDeny`/`IPAddressAllow`, with the gate on its own loopback address) would remove the wait.
+- A site the user allows (§6.22) is reachable by scheduled runs that run without asking too, with whatever account a command brings: only Cloudflare's and Datadog's keys are pinned.
+- iPhone and Mac builds from before 0.15.10 show an `access` card as a generic one, from its `summary` and `reason`; the dedicated card needs a new build.
 - The single fck-nat instance serves both AZs: a single point of failure.
 - Desktop egress at the security-group level is open (all protocols); only `worker` is restricted, and that's done on the host.
 - The gateway's budget is a pre-check (concurrent calls can overshoot), and there's no per-minute rate limit.

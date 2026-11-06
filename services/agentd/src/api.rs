@@ -68,6 +68,8 @@ pub fn router(agent: Arc<Agent>) -> Router {
             put(save_destination).delete(delete_destination),
         )
         .route("/api/v1/destinations/{name}/test", post(test_destination))
+        .route("/api/v1/access", get(access_list).post(allow_host))
+        .route("/api/v1/access/{host}", delete(remove_host))
         .with_state(agent)
 }
 
@@ -167,7 +169,12 @@ async fn status(State(agent): App) -> Json<Value> {
         .collect();
     Json(json!({
         "desktop": agent.cfg.desktop_name,
+        // The chat's task is running (scheduled runs go beside it: background).
         "busy": agent.is_busy(),
+        "background": {
+            "running": agent.background_run().map(|(task, schedule)| json!({"task": task, "schedule": schedule})),
+            "queued": agent.store.queued_count().unwrap_or(0),
+        },
         // The approval a parked task waits on.
         "waiting_on": agent.waiting_on(),
         "settings": agent.settings(),
@@ -726,9 +733,14 @@ struct NewSchedule {
     timezone: Option<String>,
     #[serde(default)]
     utc_offset: Option<i64>,
-    /// "Run without asking" (off unless the person ticks it).
-    #[serde(default)]
+    /// "Run without asking": on unless the request turns it off. A person
+    /// set it up, so its runs don't wait for them (§6.21).
+    #[serde(default = "run_without_asking")]
     auto_approve: bool,
+}
+
+fn run_without_asking() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -785,6 +797,7 @@ async fn schedules(State(agent): App) -> Response {
 async fn delete_schedule(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
     match agent.store.delete_schedule(id) {
         Ok(true) => {
+            agent.stop_schedule_runs(id);
             agent.emit("schedule.deleted", json!({"id": id, "by": caller(&headers)}));
             Json(json!({"ok": true})).into_response()
         }
@@ -818,6 +831,9 @@ fn set_paused(agent: &Agent, id: i64, paused: bool, headers: &HeaderMap) -> Resp
     }
     match agent.store.set_schedule_paused(id, paused, next_run) {
         Ok(true) => {
+            if paused {
+                agent.stop_schedule_runs(id);
+            }
             agent.schedules_changed.notify_one();
             let updated = agent.store.schedule(id).ok().flatten();
             let mut event = updated.as_ref().map_or_else(|| json!({"id": id}), schedule::json);
@@ -827,6 +843,68 @@ fn set_paused(agent: &Agent, id: i64, paused: bool, headers: &HeaderMap) -> Resp
         }
         Ok(false) => error(StatusCode::NOT_FOUND, "no such schedule"),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// The sites the shell can reach: the deployment's and the user's (access.rs).
+async fn access_list(State(agent): App) -> Json<Value> {
+    Json(agent.access_list())
+}
+
+#[derive(Deserialize)]
+struct AllowHost {
+    host: String,
+}
+
+/// A person adds a site in Settings.
+async fn allow_host(State(agent): App, headers: HeaderMap, Json(body): Json<AllowHost>) -> Response {
+    if !agent.access_list()["enabled"].as_bool().unwrap_or(false) {
+        return error(
+            StatusCode::CONFLICT,
+            "this desktop's sites are set by its deployment",
+        );
+    }
+    let host = match crate::access::check_host(&body.host) {
+        Ok(host) => host,
+        Err(problem) => return error(StatusCode::BAD_REQUEST, &problem),
+    };
+    let list = agent.access_list();
+    let open: Vec<String> = list["base"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .chain(
+            list["allowed"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|h| h["host"].as_str().map(String::from)),
+        )
+        .collect();
+    if crate::access::covered(&host, &open) {
+        return error(StatusCode::CONFLICT, &format!("{host} is already allowed"));
+    }
+    if list["allowed"].as_array().map_or(0, Vec::len) >= crate::access::MAX_HOSTS {
+        return error(StatusCode::CONFLICT, "too many sites: remove some first");
+    }
+    match agent.allow_hosts(
+        std::slice::from_ref(&host),
+        caller(&headers).as_deref(),
+        None,
+        None,
+    ) {
+        Ok(_) => Json(json!({"host": host})).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
+}
+
+async fn remove_host(State(agent): App, Path(host): Path<String>, headers: HeaderMap) -> Response {
+    match agent.remove_host(&host.to_ascii_lowercase(), caller(&headers).as_deref()) {
+        Ok(true) => Json(json!({"ok": true})).into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "that site isn't on the list"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
     }
 }
 
@@ -988,6 +1066,19 @@ async fn put_settings(State(agent): App, Json(body): Json<SettingsUpdate>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_schedule_from_the_app_runs_without_asking_unless_told_otherwise() {
+        let body = |extra: &str| {
+            serde_json::from_str::<NewSchedule>(&format!(
+                r#"{{"name":"n","prompt":"p","cron":"0 9 * * *"{extra}}}"#
+            ))
+            .unwrap()
+            .auto_approve
+        };
+        assert!(body(""));
+        assert!(!body(r#","auto_approve":false"#));
+    }
 
     #[test]
     fn the_caller_comes_from_either_proxy() {

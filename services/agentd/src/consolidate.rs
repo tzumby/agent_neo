@@ -186,7 +186,10 @@ pub fn batch(store: &Store) -> Result<(Vec<Run>, i64)> {
         let mut runs = Vec::new();
         let mut new_mark = mark;
         for run in rows {
-            if matches!(run.status.as_str(), "running" | "waiting") || runs.len() as i64 >= MAX_BATCH {
+            // A scheduled run in the queue or in progress is passed over
+            // anyway, so it doesn't hold the chat's tasks back.
+            let unfinished = matches!(run.status.as_str(), "running" | "waiting");
+            if (unfinished && run.schedule.is_none()) || runs.len() as i64 >= MAX_BATCH {
                 break;
             }
             new_mark = run.rowid;
@@ -636,8 +639,9 @@ pub async fn run(agent: &Agent) -> Outcome {
     if !agent.cfg.memory_v2 || mode == Mode::Off {
         return Outcome::Done;
     }
-    // Never alongside a task: it would compete for the model and the budget.
-    if agent.is_busy() {
+    // Never alongside a task, the chat's or a scheduled run: it would compete
+    // for the model and the budget.
+    if agent.is_working() {
         return Outcome::Later(Duration::from_secs(60));
     }
     let cap = daily_cap(store);

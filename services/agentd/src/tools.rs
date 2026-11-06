@@ -54,8 +54,9 @@ pub fn system_prompt(
         format!(
             "- Shell: run_shell runs bash as its own user in ~/work. Commands that start with sudo run \
              as root. Those, and other risky commands, wait for the user's approval; if one is denied, don't \
-             look for a workaround. The shell reaches the internet only through a proxy that allows package \
-             registries and code hosts; if a host is blocked, tell the user rather than working around it. \
+             look for a workaround. The shell reaches the internet only through a proxy that allows listed \
+             sites; if it refuses a host the task needs (a 403 from the proxy), call request_access for that \
+             exact host, and never work around the proxy. \
              Install software the way the install-software skill says (Nix first); never pipe a downloaded \
              script into a shell (curl | bash is refused).
 - Keys and tokens: when a job needs an API key or access token (a GitHub token for a private repo, an API \
@@ -394,6 +395,17 @@ pub fn schemas(shell: bool, skills: bool, memory_v2: bool, scheduled: bool) -> V
                 "replace": {"type": "boolean", "description": "ask for a new value for a saved key (it expired or was rejected)"},
             }),
             &["name", "label", "why", "how"],
+        ));
+        tools.push(tool(
+            "request_access",
+            "Ask the user to let the shell reach sites the proxy refuses. They allow or refuse it on a card in \
+             the app, and the task waits until they answer. Exact host names, only what the task needs.",
+            json!({
+                "hosts": {"type": "array", "items": {"type": "string"},
+                          "description": "host names, e.g. [\"api.example.com\"] (at most 5)"},
+                "why": {"type": "string", "description": "one sentence: what you need them for"},
+            }),
+            &["hosts", "why"],
         ));
     }
     Value::Array(tools)

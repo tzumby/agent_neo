@@ -50,6 +50,9 @@ agentd_shell_allowed_domains:
 # More hosts for some desktops (group_vars), e.g. a customer deployment's
 # Cloudflare and Datadog APIs.
 agentd_shell_extra_domains: []
+# The sites the user allows in the app, beyond those (the agent asks with a
+# card, or they add them in Settings): agentd writes this file, Squid reads it.
+agentd_egress_user_hosts: /etc/squid/agentd/allowed-hosts.txt
 # Nix for the shell user (tasks/nix.yml): the release, its published SHA-256
 # per architecture, and the tools installed up front.
 agentd_nix_version: 2.35.4

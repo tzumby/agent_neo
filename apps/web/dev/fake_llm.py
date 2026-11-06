@@ -7,6 +7,7 @@ last user message, with no real model and no key.
 - "schedule" or "report": schedules a one-time run in two minutes (a report)
 - "slow": takes 6 seconds (the working dots)
 - "post": posts an update to the first destination set up (post_update)
+- "status site": asks to reach status.example.com (request_access: a card)
 - anything else: a Markdown answer with a table, a list and code
 
 It also stands in for Slack's chat.postMessage (agentd's SLACK_API_URL), and
@@ -59,6 +60,8 @@ def reply(messages, tools=()):
                                     "title": f"Credential stuffing on /api/login ({time.strftime('%H:%M:%S')})",
                                     "body": "**312** bursts blocked from 41 addresses, mostly one ASN.\n"
                                             "```\nPOST /api/login 429 from https://bad.example.net\n```"})
+    if "status site" in text:
+        return call("request_access", {"hosts": ["status.example.com"], "why": "To read the status page's API for the incident timeline."})
     if "sign in" in text or "action" in text:
         return call("needs_user", {"reason": "Sign in to the Cloudflare dashboard so I can read the firewall events."})
     if "schedule" in text or "report" in text:

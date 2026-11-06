@@ -36,7 +36,8 @@ chrome=${CHROME:-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
   --no-first-run --no-default-browser-check about:blank >/dev/null 2>&1 &
 pids+=($!)
 env -i PATH="$PATH" HOME="$work/home" LISTEN="unix:$sock" STATE_DIR="$work/state" \
-  CDP_URL=http://127.0.0.1:9333 RUN_AS= SHELL_TOOL=off POLICY=/nonexistent SKILLS_DIR=/nonexistent \
+  CDP_URL=http://127.0.0.1:9333 RUN_AS= SHELL_TOOL=on POLICY=/nonexistent SKILLS_DIR=/nonexistent \
+  EGRESS_USER_HOSTS="$work/state/allowed-hosts.txt" EGRESS_BASE_HOSTS=".github.com pypi.org api.cloudflare.com .datadoghq.com" \
   MODEL=zai-org/GLM-5.3 LLM_URL=http://127.0.0.1:8091/v1/chat/completions LLM_API_KEY=dev \
   MEMORY_V2=on DESKTOP_NAME=acme-agent RUST_LOG=agentd=info SLACK_API_URL=http://127.0.0.1:8091/api \
   services/agentd/target/debug/agentd >"$work/agentd.log" 2>&1 &
@@ -52,6 +53,6 @@ done
 pids+=($!)
 
 echo "The web app: http://127.0.0.1:8088/  (logs in $work; Ctrl-C stops it)"
-echo "Try: a question; \"sign in\" (Action needed); \"schedule a report\" (a run in two minutes); \"slow\";"
+echo "Try: a question; \"sign in\" (Action needed); \"schedule a report\" (a run in two minutes); \"slow\"; \"status site\" (a site to allow);"
 echo "     after adding Slack under Updates (any xoxb-… token), \"post an update\". Slack's stand-in: http://127.0.0.1:8091/slack-posts"
 wait

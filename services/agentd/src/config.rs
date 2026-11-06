@@ -50,6 +50,12 @@ pub struct Config {
     /// out like any other) and where it sends traffic on (Squid, host:port).
     pub egress_gate_listen: String,
     pub egress_gate_squid: String,
+    /// The file of sites the user allowed, which Squid reads (access.rs);
+    /// empty: the agent can't ask for new sites on this desktop.
+    pub egress_user_hosts: String,
+    /// The deployment's list (Ansible's), as Squid has it: shown in Settings
+    /// and checked before asking.
+    pub egress_base_hosts: Vec<String>,
     /// Local development and tests only: the gate sends opened-up requests
     /// to `{this}/{host}{path}` instead of the real hosts.
     pub egress_gate_upstream: Option<String>,
@@ -140,6 +146,11 @@ impl Config {
             egress_gate_listen: get("EGRESS_GATE_LISTEN", ""),
             egress_gate_squid: get("EGRESS_GATE_SQUID", "127.0.0.1:3128"),
             egress_gate_upstream: Some(get("EGRESS_GATE_UPSTREAM", "")).filter(|u| !u.is_empty()),
+            egress_user_hosts: get("EGRESS_USER_HOSTS", ""),
+            egress_base_hosts: get("EGRESS_BASE_HOSTS", "")
+                .split_whitespace()
+                .map(str::to_ascii_lowercase)
+                .collect(),
             policy_path: get("POLICY", "/etc/agentd/policy.toml").into(),
             skills_dir: get("SKILLS_DIR", "/etc/agentd/skills").into(),
             max_steps: get("MAX_STEPS", "40").parse().context("MAX_STEPS")?,

@@ -4,6 +4,11 @@
 //! ordinary task (same tools, same approvals) whose answer reaches the app and
 //! the phone. The shell's crontab isn't used: it would run commands with no
 //! approvals, no model and no way to tell the user.
+//!
+//! A due run joins a queue in the database (`runs` rows, `queued`), and a
+//! background worker takes them one at a time, beside the chat: the user can
+//! keep talking to the agent while a check runs. The queue outlives restarts;
+//! a run cut off by one, or that failed, is tried once more (agent.rs).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,20 +19,18 @@ use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned, civil};
 use serde_json::json;
 
-use crate::agent::{Agent, StartError};
+use crate::agent::Agent;
 use crate::store::Schedule;
 
 /// At most this many schedules.
 pub const MAX_SCHEDULES: usize = 25;
 /// Repeating schedules run at most this often: each run costs model calls.
 pub const MIN_INTERVAL_SECS: i64 = 15 * 60;
-/// A run due longer ago than this (agentd was down, or the desktop busy all
-/// along) is skipped rather than run late.
+/// A run due longer ago than this (agentd was down, or the runs before it in
+/// the queue took that long) is skipped rather than run late.
 pub const MAX_LATE_SECS: i64 = 3600;
 /// One-time runs at most this far ahead.
 const MAX_AHEAD_SECS: i64 = 366 * 86_400;
-/// While a run waits for the desktop to be free, look again this often.
-const BUSY_RETRY: Duration = Duration::from_secs(5);
 
 /// When a new schedule runs: checked, with its first run.
 #[derive(Debug, PartialEq)]
@@ -245,25 +248,18 @@ pub fn json(schedule: &Schedule) -> serde_json::Value {
     })
 }
 
-/// Starts schedules' runs when they're due, for as long as agentd runs.
+/// Queues schedules' runs when they're due, for as long as agentd runs.
 pub async fn run(agent: Arc<Agent>) {
     loop {
         let now = Timestamp::now().as_second();
-        let waiting = match agent.store.due_schedules(now) {
-            Ok(due) => start_due(&agent, due, now),
-            Err(err) => {
-                tracing::error!(%err, "couldn't read the schedules");
-                false
-            }
-        };
+        match agent.store.due_schedules(now) {
+            Ok(due) => enqueue_due(&agent, due, now),
+            Err(err) => tracing::error!(%err, "couldn't read the schedules"),
+        }
         // Sleep until the next run is due (at most a minute, in case the clock
         // jumps), or until the schedules change.
-        let wait = if waiting {
-            BUSY_RETRY
-        } else {
-            let next = agent.store.next_due().ok().flatten();
-            Duration::from_secs(next.map_or(60, |at| (at - now).clamp(1, 60)) as u64)
-        };
+        let next = agent.store.next_due().ok().flatten();
+        let wait = Duration::from_secs(next.map_or(60, |at| (at - now).clamp(1, 60)) as u64);
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             _ = agent.schedules_changed.notified() => {}
@@ -271,9 +267,52 @@ pub async fn run(agent: Arc<Agent>) {
     }
 }
 
-/// Starts the runs that are due, oldest first. Returns true if one has to wait
-/// for the desktop to be free.
-fn start_due(agent: &Arc<Agent>, due: Vec<Schedule>, now: i64) -> bool {
+/// The background worker: runs the queued runs, one at a time and oldest
+/// first, beside the chat, for as long as agentd runs.
+pub async fn work(agent: Arc<Agent>) {
+    loop {
+        let now = Timestamp::now().as_second();
+        match agent.store.claim_run(now) {
+            Ok(Some(queued)) => {
+                let schedule = agent.store.schedule(queued.schedule).ok().flatten();
+                match schedule {
+                    // Paused or cancelled since it was queued.
+                    Some(schedule) if schedule.paused => {
+                        let _ = agent.store.set_run_status(&queued.id, "cancelled");
+                    }
+                    None => {
+                        let _ = agent.store.set_run_status(&queued.id, "cancelled");
+                    }
+                    Some(schedule) if now - queued.due > MAX_LATE_SECS => {
+                        tracing::warn!(schedule = schedule.id, task = %queued.id, "skipping a queued run that's too late");
+                        let _ = agent.store.set_run_status(&queued.id, "skipped");
+                        agent.say(&format!(
+                            "I skipped the scheduled task “{}” that was due {}: it waited too long behind others.",
+                            schedule.name,
+                            local(queued.due, &schedule.timezone)
+                        ));
+                    }
+                    Some(schedule) => {
+                        tracing::info!(schedule = schedule.id, task = %queued.id, attempt = queued.attempt, late = now - queued.due, "scheduled run started");
+                        agent.clone().run_queued(queued, schedule).await;
+                    }
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(err) => tracing::error!(%err, "couldn't read the queue"),
+        }
+        let next = agent.store.next_queued().ok().flatten();
+        let wait = Duration::from_secs(next.map_or(60, |at| (at - now).clamp(1, 60)) as u64);
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = agent.runs_queued.notified() => {}
+        }
+    }
+}
+
+/// Queues the runs that are due, oldest first, and moves each schedule on.
+fn enqueue_due(agent: &Arc<Agent>, due: Vec<Schedule>, now: i64) {
     for schedule in due {
         let late = now - schedule.next_run;
         if late > MAX_LATE_SECS {
@@ -302,17 +341,33 @@ fn start_due(agent: &Arc<Agent>, due: Vec<Schedule>, now: i64) -> bool {
                 tracing::error!(%err, schedule = schedule.id, "couldn't record the schedule's rules");
             }
         }
-        match agent.start_scheduled(&schedule) {
-            Ok(task) => {
-                tracing::info!(schedule = schedule.id, %task, late, "scheduled run started");
+        let task = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        let queued = agent.store.enqueue_run(
+            &task,
+            schedule.id,
+            &schedule.prompt,
+            &agent.settings().model,
+            &current,
+            schedule.next_run,
+            0,
+        );
+        match queued {
+            Ok(true) => {
+                tracing::info!(schedule = schedule.id, %task, late, "scheduled run queued");
+                agent.runs_queued.notify_one();
                 advance(agent, &schedule, now, Some(now));
             }
-            // One task at a time: wait for the current one (it may be the user's).
-            Err(StartError::Busy) => return true,
-            Err(StartError::NotFound) => advance(agent, &schedule, now, None),
+            // Its last run is still queued or running: this one is dropped.
+            Ok(false) => {
+                tracing::info!(
+                    schedule = schedule.id,
+                    "a run is still queued or running: not queued again"
+                );
+                advance(agent, &schedule, now, None);
+            }
+            Err(err) => tracing::error!(%err, schedule = schedule.id, "couldn't queue a scheduled run"),
         }
     }
-    false
 }
 
 /// After a run (or a skipped one): a repeating schedule moves on to its next
@@ -358,7 +413,8 @@ mod tests {
             .set_schedule_origin(schedule.id, "0000000000000000", "user")
             .unwrap();
         let due = agent.store.due_schedules(now).unwrap();
-        assert!(!start_due(&agent, due, now)); // it started
+        enqueue_due(&agent, due, now);
+        assert_eq!(agent.store.queued_count().unwrap(), 1); // queued, not started
         let notes: Vec<String> = agent
             .store
             .events_after(0, 100)
@@ -379,14 +435,8 @@ mod tests {
             .store
             .add_schedule("Old", "x", Some("0 9 * * *"), "UTC", now - 5)
             .unwrap();
-        while agent.is_busy() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(!start_due(
-            &agent,
-            vec![agent.store.schedule(old.id).unwrap().unwrap()],
-            now
-        ));
+        enqueue_due(&agent, vec![agent.store.schedule(old.id).unwrap().unwrap()], now);
+        assert_eq!(agent.store.queued_count().unwrap(), 2);
         let notes = agent.store.events_after(0, 200).unwrap().into_iter().filter(|e| {
             e.kind == "message"
                 && e.data["text"]

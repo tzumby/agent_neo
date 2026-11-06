@@ -89,6 +89,39 @@ pub struct Schedule {
 
 const SCHEDULE_COLUMNS: &str = "id, name, prompt, cron, timezone, next_run, last_run, paused, created, policy_version, created_from, auto_approve";
 
+/// A site the user allowed the shell to reach (access.rs).
+#[derive(Clone, Debug, Serialize)]
+pub struct EgressHost {
+    pub host: String,
+    /// Unix seconds.
+    pub added: i64,
+    pub by: Option<String>,
+    /// The task whose card asked; none when added in Settings.
+    pub task: Option<String>,
+    pub why: Option<String>,
+}
+
+/// A scheduled run in the queue (a `runs` row, `queued` until the background
+/// worker takes it; schedule.rs).
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueuedRun {
+    pub id: String,
+    pub schedule: i64,
+    /// Unix seconds: not taken before then; how late it is counts from it.
+    pub due: i64,
+    /// 0 for the first try, 1 for the one retry (after an error or a restart).
+    pub attempt: i64,
+}
+
+fn queued_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedRun> {
+    Ok(QueuedRun {
+        id: row.get(0)?,
+        schedule: row.get(1)?,
+        due: row.get(2)?,
+        attempt: row.get(3)?,
+    })
+}
+
 /// A saved key, as the apps list it: never its value.
 #[derive(Clone, Debug, Serialize)]
 pub struct SecretInfo {
@@ -335,6 +368,143 @@ impl Store {
             params![id, status, steps, cost, answer],
         )?;
         Ok(())
+    }
+
+    /// A schedule's run joins the queue, due at `due`, unless the schedule
+    /// already has one queued or running (then nothing is added: false).
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_run(
+        &self,
+        id: &str,
+        schedule: i64,
+        request: &str,
+        model: &str,
+        policy_version: &str,
+        due: i64,
+        attempt: i64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "INSERT INTO runs (id, status, request, by_user, model, policy_version, schedule, acted, due, attempt)
+             SELECT ?1, 'queued', ?2, 'schedule', ?3, ?4, ?5, 0, ?6, ?7
+             WHERE NOT EXISTS (SELECT 1 FROM runs WHERE schedule = ?5 AND status IN ('queued', 'running'))",
+            params![id, request, model, policy_version, schedule, due, attempt],
+        )? > 0)
+    }
+
+    /// Takes the queued run due first (by `now`): it's `running` from here.
+    pub fn claim_run(&self, now: i64) -> Result<Option<QueuedRun>> {
+        let conn = self.conn.lock().unwrap();
+        let next = conn
+            .query_row(
+                "SELECT id, schedule, due, attempt FROM runs
+                 WHERE status = 'queued' AND due <= ?1 ORDER BY due, rowid LIMIT 1",
+                params![now],
+                queued_row,
+            )
+            .optional()?;
+        if let Some(run) = &next {
+            conn.execute(
+                &format!(
+                    "UPDATE runs SET status = 'running', started = {NOW}, updated = {NOW} WHERE id = ?1"
+                ),
+                params![run.id],
+            )?;
+        }
+        Ok(next)
+    }
+
+    /// When the next queued run is due.
+    pub fn next_queued(&self) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(
+            conn.query_row("SELECT MIN(due) FROM runs WHERE status = 'queued'", [], |row| {
+                row.get(0)
+            })?,
+        )
+    }
+
+    /// How many runs wait in the queue.
+    pub fn queued_count(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(
+            conn.query_row("SELECT COUNT(*) FROM runs WHERE status = 'queued'", [], |row| {
+                row.get(0)
+            })?,
+        )
+    }
+
+    /// A schedule's queued runs are cancelled (it was paused or deleted).
+    pub fn cancel_queued_runs(&self, schedule: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            &format!("UPDATE runs SET status = 'cancelled', updated = {NOW} WHERE status = 'queued' AND schedule = ?1"),
+            params![schedule],
+        )?)
+    }
+
+    /// Scheduled runs left `running` (agentd stopped during them).
+    pub fn running_scheduled_runs(&self) -> Result<Vec<QueuedRun>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, schedule, COALESCE(due, 0), attempt FROM runs
+             WHERE status = 'running' AND schedule IS NOT NULL ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], queued_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A scheduled run that was queued: it starts now, on this model and
+    /// these rules. False if there's no such row (it wasn't queued).
+    pub fn begin_queued_run(&self, id: &str, model: &str, policy_version: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            &format!("UPDATE runs SET model = ?2, policy_version = ?3, updated = {NOW} WHERE id = ?1"),
+            params![id, model, policy_version],
+        )? > 0)
+    }
+
+    // --- Sites the user allowed (access.rs) -----------------------------------------
+
+    /// The hosts, alphabetically.
+    pub fn egress_hosts(&self) -> Result<Vec<EgressHost>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT host, added, by_user, task, why FROM egress_hosts ORDER BY host")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(EgressHost {
+                host: row.get(0)?,
+                added: row.get(1)?,
+                by: row.get(2)?,
+                task: row.get(3)?,
+                why: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Adds hosts (ones already there keep their record). How many were new.
+    pub fn allow_hosts(
+        &self,
+        hosts: &[String],
+        by: Option<&str>,
+        task: Option<&str>,
+        why: Option<&str>,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut added = 0;
+        for host in hosts {
+            added += conn.execute(
+                "INSERT OR IGNORE INTO egress_hosts (host, added, by_user, task, why) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![host, unix_now(), by, task, why],
+            )?;
+        }
+        Ok(added)
+    }
+
+    pub fn remove_host(&self, host: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM egress_hosts WHERE host = ?1", params![host])? > 0)
     }
 
     /// IDs of the runs with this status, oldest first.
@@ -1060,6 +1230,28 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 4; COMMIT;",
         )?;
     }
+    if version < 5 {
+        // The scheduled runs' queue (schedule.rs): when a queued run is due,
+        // and which try it is.
+        conn.execute_batch(
+            "BEGIN; ALTER TABLE runs ADD COLUMN due INTEGER; \
+             ALTER TABLE runs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0; \
+             CREATE INDEX IF NOT EXISTS runs_by_status ON runs (status); \
+             PRAGMA user_version = 5; COMMIT;",
+        )?;
+    }
+    if version < 6 {
+        // Sites the user allowed the shell to reach (access.rs).
+        conn.execute_batch(
+            "BEGIN; CREATE TABLE IF NOT EXISTS egress_hosts (
+                 host TEXT PRIMARY KEY,
+                 added INTEGER NOT NULL,
+                 by_user TEXT,
+                 task TEXT,
+                 why TEXT);
+             PRAGMA user_version = 6; COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1363,12 +1555,43 @@ mod tests {
     }
 
     #[test]
+    fn the_run_queue_keeps_one_per_schedule_in_due_order() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let q = |id: &str, schedule: i64, due: i64| {
+            store.enqueue_run(id, schedule, "p", "m", "v", due, 0).unwrap()
+        };
+        assert!(q("a", 1, 200));
+        assert!(!q("a2", 1, 300)); // schedule 1 has one queued already
+        assert!(q("b", 2, 100));
+        assert_eq!(store.queued_count().unwrap(), 2);
+        assert_eq!(store.next_queued().unwrap(), Some(100));
+        assert!(store.claim_run(50).unwrap().is_none()); // none due yet
+        let first = store.claim_run(1000).unwrap().unwrap();
+        assert_eq!((first.id.as_str(), first.schedule, first.due), ("b", 2, 100));
+        assert!(!q("b2", 2, 400)); // still running
+        assert_eq!(
+            store.running_scheduled_runs().unwrap(),
+            std::slice::from_ref(&first)
+        );
+        assert_eq!(store.cancel_queued_runs(1).unwrap(), 1);
+        assert!(store.claim_run(1000).unwrap().is_none());
+        store.finish_run("b", "done", 2, None, "ok").unwrap();
+        assert!(q("b3", 2, 500)); // free again
+    }
+
+    #[test]
     fn migrates_a_v1_database_to_the_latest() {
         let (store, dir) = migrated_v1();
         {
             let conn = store.conn.lock().unwrap();
             let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(version, 4);
+            assert_eq!(version, 6);
+            // Older runs: no due time, first try.
+            let attempt: Option<i64> = conn
+                .query_row("SELECT attempt FROM runs LIMIT 1", [], |r| r.get(0))
+                .optional()
+                .unwrap();
+            assert!(attempt.is_none_or(|a| a == 0));
             // Schedules from before don't run without asking.
             let auto: Option<bool> = conn
                 .query_row("SELECT auto_approve FROM schedules LIMIT 1", [], |r| r.get(0))

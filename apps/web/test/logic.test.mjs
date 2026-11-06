@@ -69,6 +69,34 @@ test("scheduled runs are reports, and quiet runs of one schedule fold", () => {
   assert.equal(rows[2].answer.quiet, false, "a long answer isn't a quiet line");
 });
 
+test("a scheduled run beside the chat leaves the chat free, and its report lands when it ends", () => {
+  const t = new Timeline([
+    ev("message", { role: "user", text: "What's new?", task: "t1" }),
+    ev("task.started", { task: "t1" }),
+    ev("run.started", { task: "r1", schedule: { id: 1, name: "Spike watch" } }),
+    ev("step", { task: "r1", tool: "run_shell" }),
+  ]);
+  assert.equal(t.busy, true, "the chat's own task");
+  t.apply(ev("message", { role: "assistant", text: "Nothing yet.", task: "t1" }));
+  t.apply(ev("task.finished", { task: "t1", status: "done" }));
+  assert.equal(t.busy, false, "free while the run goes on");
+  t.apply(ev("message", { role: "user", text: "Look for spikes", task: "r1", schedule: { id: 1, name: "Spike watch" } }));
+  t.apply(ev("message", { role: "assistant", text: "A spike at 03:10.", task: "r1" }));
+  t.apply(ev("run.finished", { task: "r1", status: "done" }));
+  assert.deepEqual(t.visible().map((r) => r.type), ["user", "assistant", "report"]);
+  assert.equal(t.busy, false);
+});
+
+test("a site to allow is a card with its hosts", () => {
+  const t = new Timeline([
+    ev("approval.requested", { id: "w", kind: "access", hosts: ["status.example.com"], why: "to read the incident timeline", tainted: true }),
+  ]);
+  const [card] = t.visible();
+  assert.equal(card.kind, "access");
+  assert.deepEqual(card.access, { hosts: ["status.example.com"], why: "to read the incident timeline" });
+  assert.equal(card.tainted, true);
+});
+
 test("an answer whose report is on an older page still shows", () => {
   const t = new Timeline([ev("message", { role: "assistant", text: "Report", task: "r0" })]);
   assert.equal(t.visible()[0].type, "assistant");

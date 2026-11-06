@@ -72,6 +72,71 @@ impl Cdp {
         Ok(target)
     }
 
+    /// A new window with one blank tab, not brought to the front: a scheduled
+    /// run's, so it never takes the tab the chat works in.
+    pub async fn new_window(&self) -> Result<Target> {
+        #[derive(Deserialize)]
+        struct Version {
+            #[serde(rename = "webSocketDebuggerUrl")]
+            ws_url: String,
+        }
+        let version: Version = self
+            .http
+            .get(format!("{}/json/version", self.base))
+            .send()
+            .await
+            .context("Chrome isn't reachable")?
+            .error_for_status()?
+            .json()
+            .await?;
+        // The browser's own session: windows are opened there.
+        let (mut ws, _) = tokio_tungstenite::connect_async(version.ws_url.as_str())
+            .await
+            .context("connecting to Chrome")?;
+        let request = json!({"id": 1, "method": "Target.createTarget",
+                             "params": {"url": "about:blank", "newWindow": true, "background": true}});
+        ws.send(Message::Text(request.to_string().into())).await?;
+        let reply = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(message) = ws.next().await {
+                if let Message::Text(text) = message?
+                    && let Ok(value) = serde_json::from_str::<Value>(text.as_str())
+                    && value["id"] == 1
+                {
+                    return Ok(value);
+                }
+            }
+            bail!("Chrome closed the connection")
+        })
+        .await
+        .map_err(|_| anyhow!("Chrome didn't open a window in time"))??;
+        let _ = ws.close(None).await;
+        if let Some(err) = reply.get("error") {
+            bail!(
+                "Chrome didn't open a window: {}",
+                err["message"].as_str().unwrap_or("error")
+            );
+        }
+        let id = reply["result"]["targetId"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Chrome didn't say which window it opened"))?
+            .to_string();
+        self.pages()
+            .await?
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| anyhow!("Chrome's new window isn't listed"))
+    }
+
+    /// Closes a tab (the last one closes its window).
+    pub async fn close(&self, id: &str) -> Result<()> {
+        self.http
+            .get(format!("{}/json/close/{id}", self.base))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     pub async fn activate(&self, id: &str) -> Result<()> {
         self.http
             .get(format!("{}/json/activate/{id}", self.base))

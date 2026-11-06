@@ -3,7 +3,7 @@
 
 import { busyButton, fill, h, icon, when } from "./dom.js";
 import { isValidName, normalizedName } from "./keys.js";
-import { autoApprove, copyList } from "./setup.js";
+import { copyList } from "./setup.js";
 
 // --- Desktop ---------------------------------------------------------------------
 
@@ -77,17 +77,12 @@ export function mountSchedules(store, view) {
     cancel.addEventListener("click", () => busyButton(cancel, async () => {
       if (confirm(`Cancel “${s.name}”? It won't run again.`)) await act(() => store.api.deleteSchedule(s.id));
     }));
-    const auto = autoApprove(s.auto_approve === true, async (on) => {
-      await act(() => store.api.setScheduleAutoApprove(s.id, on));
-    });
     return h("li", { class: "list-row" },
       h("div", { class: "list-main" },
-        h("p", { class: "strong" }, s.name, s.paused ? h("span", { class: "tag" }, "Paused") : null,
-          s.auto_approve ? h("span", { class: "tag" }, "Runs without asking") : null),
+        h("p", { class: "strong" }, s.name, s.paused ? h("span", { class: "tag" }, "Paused") : null),
         h("p", null, s.description),
         h("p", { class: "muted" }, s.paused ? "Paused" : `Next run ${when(s.next_run * 1000)}`,
           s.last_run ? `. Last ran ${when(s.last_run * 1000)}` : ""),
-        auto,
         h("details", { class: "instructions" }, h("summary", null, "Instructions"), h("p", { class: "pre" }, s.prompt))),
       h("div", { class: "list-actions" }, pause, cancel));
   }
@@ -266,6 +261,7 @@ export function mountSettings(store, view, session) {
         h("label", { class: "toggle" }, actions,
           h("span", null, h("span", { class: "strong" }, "Browser actions"),
             h("span", { class: "muted block" }, "Lets the agent click, type and press keys in your desktop's browser. It still asks you before anything that sends or changes things. Off, it only reads pages.")))),
+      sitesSection(store),
       h("section", { class: "settings-group" },
         h("h2", { class: "page-h2" }, "Appearance"),
         h("label", { class: "label" }, "Theme", theme),
@@ -284,6 +280,92 @@ export function mountSettings(store, view, session) {
   }
 
   return { enter: load };
+}
+
+/** "*.github.com" for the proxy's ".github.com": a domain and everything under it. */
+function siteLabel(entry) {
+  return entry.startsWith(".") ? `*${entry}` : entry;
+}
+
+// The sites the agent's commands can reach: the deployment's, and the ones
+// you allowed (from a card in the chat, or here).
+function sitesSection(store) {
+  const section = h("section", { class: "settings-group" });
+  const heading = () => h("h2", { class: "page-h2" }, "Sites your agent can reach");
+  const intro = h("p", { class: "muted" },
+    "Its commands reach the internet only through your desktop's proxy, which lets these sites through. When it needs another, it asks you in the chat.");
+
+  async function render() {
+    let access;
+    try {
+      access = await store.api.access();
+    } catch (error) {
+      fill(section, heading(), h("p", { class: "error" }, `Couldn't load the sites: ${error.message}`));
+      return;
+    }
+    const base = access.base || [];
+    const always = base.length
+      ? h("details", { class: "instructions" },
+          h("summary", null, `Always allowed by your deployment (${base.length})`),
+          h("ul", { class: "card-hosts" }, base.map((entry) => h("li", null, h("code", null, siteLabel(entry))))))
+      : null;
+    if (!access.enabled) {
+      fill(section, heading(), intro, h("p", { class: "muted" }, "On this desktop, the list is set by whoever deploys it."), always);
+      return;
+    }
+    const allowed = access.allowed || [];
+    const list = allowed.length
+      ? h("ul", { class: "list" }, allowed.map(row))
+      : h("p", { class: "muted" }, "You haven't allowed any others yet.");
+    fill(section, heading(), intro, list, addForm(), always);
+  }
+
+  function row(site) {
+    const remove = h("button", { class: "button button-quiet", type: "button" }, "Remove");
+    remove.addEventListener("click", () => busyButton(remove, async () => {
+      if (!confirm(`Remove ${site.host}? Your agent will have to ask again to reach it.`)) return;
+      try {
+        await store.api.removeSite(site.host);
+        store.notice(`Removed ${site.host}.`);
+      } catch (error) {
+        store.notice(error.message);
+      }
+      await render();
+    }));
+    const added = when(new Date(site.added * 1000));
+    return h("li", { class: "list-row" },
+      h("div", { class: "list-main" },
+        h("p", null, h("code", { class: "md-chip" }, site.host)),
+        site.why ? h("p", null, site.why) : null,
+        h("p", { class: "muted" }, site.by ? `Allowed ${added} by ${site.by}` : `Allowed ${added}`)),
+      h("div", { class: "list-actions" }, remove));
+  }
+
+  function addForm() {
+    const host = h("input", { class: "field mono", placeholder: "api.example.com", spellcheck: "false", autocapitalize: "off", "aria-label": "Site" });
+    const add = h("button", { class: "button", type: "submit" }, "Allow site");
+    const problem = h("p", { class: "error", hidden: true });
+    const form = h("form", { class: "key-form" }, h("label", { class: "label" }, "Allow another site", host), problem, h("div", { class: "card-actions" }, add));
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!host.value.trim()) return host.focus();
+      busyButton(add, async () => {
+        try {
+          const { host: allowed } = await store.api.allowSite(host.value.trim());
+          store.notice(`Allowed ${allowed}.`);
+          await render();
+        } catch (error) {
+          problem.hidden = false;
+          problem.textContent = error.message;
+        }
+      });
+    });
+    return form;
+  }
+
+  fill(section, heading(), h("p", { class: "muted" }, "Loading…"));
+  render();
+  return section;
 }
 
 // --- Updates: where the agent posts to Slack and Teams ----------------------------

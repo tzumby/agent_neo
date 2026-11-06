@@ -71,7 +71,9 @@ def agent_busy():
     except OSError:
         return False
     try:
-        return bool(json.loads(out).get("busy"))
+        status = json.loads(out)
+        # The chat's task, or a scheduled run beside it (agentd 0.15.10).
+        return bool(status.get("busy") or (status.get("background") or {}).get("running"))
     except ValueError:
         return False  # agentd isn't answering: a reboot won't make that worse
 

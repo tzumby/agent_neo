@@ -8,6 +8,26 @@
     name: squid
     state: present
 
+# The sites the user allowed in the app (services/agentd/src/access.rs):
+# agentd writes the file and reloads Squid; Squid reads it through the
+# directory's group. The shell user can't read or change either.
+- name: Create the directory for the sites the user allowed
+  ansible.builtin.file:
+    path: "{{ agentd_egress_user_hosts | dirname }}"
+    state: directory
+    owner: agentd
+    group: proxy
+    mode: "2750"
+
+- name: Start the list of sites the user allowed (agentd keeps it after)
+  ansible.builtin.copy:
+    dest: "{{ agentd_egress_user_hosts }}"
+    content: "# Sites the user allowed in the app. agentd writes this file; don't edit it.\n"
+    owner: agentd
+    group: proxy
+    mode: "0640"
+    force: false
+
 - name: Configure Squid as the shell user's egress proxy
   ansible.builtin.template:
     src: squid.conf.j2

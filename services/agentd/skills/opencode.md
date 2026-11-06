@@ -39,5 +39,5 @@ description: Setting up and running opencode, a coding agent CLI, with a Togethe
 5. A 401 or "invalid API key" means the key is wrong or was revoked: ask
    again with request_secret and `replace` set.
 
-opencode talks to Together AI at api.together.xyz. If the proxy blocks it,
-tell the user the desktop's allowlist needs that host.
+opencode talks to Together AI at api.together.xyz, which the proxy allows.
+If it refuses that host anyway, ask with request_access.

@@ -85,7 +85,9 @@ the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
   gh, jq and ripgrep preinstalled). `curl … | bash` is refused. **Skills**
   (`services/agentd/skills`, deployed to `/etc/agentd/skills`) are how-tos the
   agent reads on demand: installing software, Python with uv, Node, git and
-  GitHub tokens, opencode with Together AI;
+  GitHub tokens, opencode with Together AI, and authorized penetration
+  testing of our own systems (methodology, recon, web/API, code audit,
+  cloud, detection checks);
 - the agent **remembers** facts across conversations (`remember` / `forget`,
   shown in each task's instructions). Facts saved after it read outside content
   stay unverified until confirmed in the app's Settings → Memory;

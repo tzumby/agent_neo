@@ -131,8 +131,10 @@ pub const EGRESS_REFUSAL: &str = "not run: the shell's internet access (the prox
 pub fn touches_egress_policy(command: &str) -> bool {
     use std::sync::LazyLock;
     static EGRESS: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\bsquid\b|/etc/squid|cloud-desktop-guard|guard\.nft|/etc/cloud-desktops\b")
-            .expect("valid regex")
+        regex::Regex::new(
+            r"(?i)\bsquid\b|/etc/squid|cloud[-_]desktop[-_]guard|guard\.nft|/etc/cloud-desktops\b",
+        )
+        .expect("valid regex")
     });
     EGRESS.is_match(command)
 }
@@ -376,6 +378,9 @@ mod tests {
             "sudo systemctl restart squid",
             "sudo nft -f /etc/cloud-desktops/guard.nft",
             "sudo systemctl stop cloud-desktop-guard",
+            // Holding the firewall open past the one command the user approved.
+            "sudo nft add element inet cloud_desktop_guard direct_egress '{ 1002 timeout 1d }'",
+            "sudo nft flush set inet cloud_desktop_guard squid_locked",
         ] {
             assert!(touches_egress_policy(egress), "{egress}");
         }

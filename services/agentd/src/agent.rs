@@ -34,7 +34,7 @@ use crate::policy::Policy;
 use crate::push::{self, Push, Relay};
 use crate::schedule;
 use crate::secrets::{self, Secrets};
-use crate::shell::{KeyFile, Shell, split_sudo};
+use crate::shell::{KeyFile, MAX_COMMAND_SECS, Route, Shell, split_sudo};
 use crate::skills::Skills;
 use crate::store::{Event, Pending, Post, QueuedRun, Schedule, SecretInfo, Store};
 use crate::tools;
@@ -182,6 +182,41 @@ const ACCESS_HINT: &str = "\n\n(agentd: the desktop's proxy refused a site that 
      needs it, call request_access with that exact host and why; don't try to get around the proxy.)";
 const ACCESS_HINT_SCHEDULED: &str = "\n\n(agentd: the desktop's proxy refused a site that isn't on its list. A \
      scheduled run can't ask for it: say in your report which host it needs.)";
+/// Added to a failed command's output when it seems to have connected on its
+/// own, which the guard firewall refuses.
+const DIRECT_HINT: &str = "\n\n(agentd: this command seems to have connected to the internet on its own, not \
+     through the desktop's proxy, and the firewall refuses that; there's no DNS outside the proxy either. \
+     request_access can't help, since it only adds sites to the proxy's list. Look for the tool's proxy setting or \
+     a mode that uses HTTPS_PROXY (a skill may name it). If it has none, run this one command again with \
+     direct_internet true, which the user approves on a card, or tell the user what has to run elsewhere. Don't \
+     try to get around the firewall any other way.)";
+const DIRECT_HINT_SCHEDULED: &str = "\n\n(agentd: this command seems to have connected to the internet on its \
+     own, not through the desktop's proxy, and the firewall refuses that. A scheduled run can't ask for direct \
+     access: say in your report what it needs.)";
+
+/// Why a direct command asks: a shell card's "It …".
+const DIRECT_REASON: &str =
+    "connects directly to the internet and can reach any site, not just the allowed ones";
+
+/// What a command's output says about its way out, for the model (access.rs).
+/// `firewalled`: the guard firewall applied to it.
+fn egress_hint(text: &str, code: Option<i32>, firewalled: bool, unattended: bool) -> Option<&'static str> {
+    if access::refused_by_proxy(text) {
+        Some(if unattended {
+            ACCESS_HINT_SCHEDULED
+        } else {
+            ACCESS_HINT
+        })
+    } else if firewalled && code != Some(0) && access::connected_directly(text) {
+        Some(if unattended {
+            DIRECT_HINT_SCHEDULED
+        } else {
+            DIRECT_HINT
+        })
+    } else {
+        None
+    }
+}
 
 /// A scheduled run that failed is tried once more after this long.
 const RETRY_AFTER_SECS: i64 = 120;
@@ -295,26 +330,27 @@ pub struct Agent {
     step_seqs: Mutex<HashMap<String, i64>>,
     /// The egress gate (egress.rs), set once it's listening (main.rs).
     pub gate: std::sync::OnceLock<Arc<EgressGate>>,
-    /// The shell user's uid, for the guard firewall's `squid_locked` set.
+    /// The shell user's uid, for the guard firewall's sets.
     shell_uid: Option<u32>,
 }
 
 /// The web app's Setup steps (apps/web/public/assets/js/setup.js), in order.
 pub const SETUP_STEPS: &[&str] = &["updates", "cloudflare", "datadog", "watching"];
 
-/// Adds the shell user to the guard firewall's `squid_locked` set (or takes it
-/// out): while it's in, it can't reach Squid, only the egress gate.
-fn nft_set(lock: bool, uid: u32) -> Result<()> {
+/// Adds an entry to one of the guard firewall's sets, or deletes it:
+/// `squid_locked` (the shell user can't reach Squid, only the egress gate) or
+/// `direct_egress` (it may connect on its own).
+fn nft_element(verb: &str, set: &str, element: &str) -> Result<()> {
     let status = std::process::Command::new("sudo")
         .args([
             "-n",
             "nft",
-            if lock { "add" } else { "delete" },
+            verb,
             "element",
             "inet",
             "cloud_desktop_guard",
-            "squid_locked",
-            &format!("{{ {uid} }}"),
+            set,
+            &format!("{{ {element} }}"),
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -351,9 +387,24 @@ impl Drop for EgressLock {
     fn drop(&mut self) {
         self.gate.set_pinning(false);
         if let Some(uid) = self.uid
-            && let Err(err) = nft_set(false, uid)
+            && let Err(err) = nft_element("delete", "squid_locked", &uid.to_string())
         {
             tracing::error!(err = %format!("{err:#}"), "couldn't reopen Squid to the shell user");
+        }
+    }
+}
+
+/// The firewall open for a command the user approved to connect on its own
+/// (Agent::open_direct), held while it runs.
+struct DirectEgress {
+    uid: u32,
+}
+
+impl Drop for DirectEgress {
+    fn drop(&mut self) {
+        // If this fails the entry still expires by itself.
+        if let Err(err) = nft_element("delete", "direct_egress", &self.uid.to_string()) {
+            tracing::error!(err = %format!("{err:#}"), "couldn't close the firewall after a direct command");
         }
     }
 }
@@ -383,8 +434,8 @@ fn clip_summary(summary: &str) -> Option<String> {
 
 fn same_request(approved: &Value, now: &Value) -> bool {
     [
-        "kind", "action", "role", "target", "text", "key", "submit", "site", "command", "when", "name",
-        "secrets", "hosts",
+        "kind", "action", "role", "target", "text", "key", "submit", "site", "command", "direct", "when",
+        "name", "secrets", "hosts",
     ]
     .iter()
     .all(|key| approved[key] == now[key])
@@ -1880,6 +1931,7 @@ impl Agent {
                     text("summary"),
                     &asked,
                     timeout,
+                    args["direct_internet"].as_bool() == Some(true),
                     tainted,
                     schedule.is_some(),
                     auto_approve,
@@ -2543,7 +2595,7 @@ impl Agent {
             None // local development: no firewall
         } else {
             let uid = self.shell_uid.context("the shell user's uid is unknown")?;
-            nft_set(true, uid)?;
+            nft_element("add", "squid_locked", &uid.to_string())?;
             Some(uid)
         };
         gate.set_pinning(true);
@@ -2553,23 +2605,34 @@ impl Agent {
         }))
     }
 
-    /// At startup: a lock left by an agentd that stopped mid-command is undone.
+    /// For a command the user approved to connect on its own: the guard
+    /// firewall lets the shell user out (its `direct_egress` set) until this
+    /// is dropped. Commands run one at a time and each unit's processes end
+    /// with it, so only this command gets through. The entry also expires
+    /// just past the command's limit, in case agentd stops meanwhile. None
+    /// without a firewall (local development).
+    fn open_direct(&self, timeout: u64) -> Result<Option<DirectEgress>> {
+        if self.cfg.run_as.is_empty() {
+            return Ok(None);
+        }
+        let uid = self.shell_uid.context("the shell user's uid is unknown")?;
+        let expires = timeout.clamp(1, MAX_COMMAND_SECS) + 60;
+        nft_element("add", "direct_egress", &format!("{uid} timeout {expires}s"))?;
+        Ok(Some(DirectEgress { uid }))
+    }
+
+    /// At startup: what an agentd that stopped mid-command left in the guard
+    /// firewall's sets is undone.
     pub fn clear_egress_locks(&self) {
         if !self.cfg.run_as.is_empty() {
-            let _ = std::process::Command::new("sudo")
-                .args([
-                    "-n",
-                    "nft",
-                    "flush",
-                    "set",
-                    "inet",
-                    "cloud_desktop_guard",
-                    "squid_locked",
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            for set in ["squid_locked", "direct_egress"] {
+                let _ = std::process::Command::new("sudo")
+                    .args(["-n", "nft", "flush", "set", "inet", "cloud_desktop_guard", set])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
     }
 
@@ -2581,6 +2644,9 @@ impl Agent {
         summary: Option<&str>,
         asked: &[String],
         timeout: u64,
+        // Outside the proxy, for this command only: the user always decides.
+        // Root isn't firewalled, so a sudo command needs no such thing.
+        direct_internet: bool,
         tainted: bool,
         // A scheduled run: what would ask is refused instead, or with "Run
         // without asking" (`auto_approve`) goes ahead, except root.
@@ -2603,25 +2669,32 @@ impl Agent {
             ));
         }
         let (as_root, inner) = split_sudo(command);
-        let mut reason = if as_root {
-            Some("runs as root")
-        } else if let Some(reason) = self.policy.danger(inner) {
-            Some(reason)
+        let direct = direct_internet && !as_root;
+        let danger = self.policy.danger(inner);
+        let mut reason: Option<String> = if as_root {
+            Some("runs as root".into())
+        } else if direct {
+            Some(danger.map_or(DIRECT_REASON.into(), |danger| {
+                format!("{DIRECT_REASON}, and {danger}")
+            }))
+        } else if let Some(danger) = danger {
+            Some(danger.into())
         } else if tainted && self.policy.sends_data(inner) && !monitoring::is_monitoring_read(inner, &keys) {
             // Injected instructions in a page could try to send data out (the
             // card says it came after outside content: `tainted`). Reading the
             // customer's own Cloudflare or Datadog, as monitoring does after
             // reading their logs, doesn't ask (monitoring.rs).
             Some(if keys.is_empty() {
-                "could send data off the desktop"
+                "could send data off the desktop".into()
             } else {
-                "could send data off the desktop with your saved key"
+                "could send data off the desktop with your saved key".into()
             })
         } else {
             None
         };
-        if let (Some(why), true, None) = (reason, unattended, &resumed) {
-            if as_root || !auto_approve {
+        if let (Some(why), true, None) = (reason.as_deref(), unattended, &resumed) {
+            // "Run without asking" never covers root or a direct connection.
+            if as_root || direct || !auto_approve {
                 tracing::info!(task = %task_id, "not run: a scheduled run's command that would ask");
                 return Ok(format!(
                     "not run: it {why}, and a scheduled run can't wait for the user's OK. Skip it, or say in your \
@@ -2642,18 +2715,22 @@ impl Agent {
             self.emit(
                 "shell",
                 json!({
-                    "task": task_id, "command": command, "as_root": as_root, "needs_approval": reason.is_some(),
-                    "secrets": keys,
+                    "task": task_id, "command": command, "as_root": as_root, "direct": direct,
+                    "needs_approval": reason.is_some(), "secrets": keys,
                 }),
             );
         }
         if let Some(reason) = reason {
             // The model's plain words lead the card; the command is a tap away. After
             // outside content they may be steered, so the card says so (`tainted`).
-            let card = json!({
+            let mut card = json!({
                 "kind": "shell", "command": command, "reason": reason, "secrets": keys,
                 "summary": summary.and_then(clip_summary), "tainted": tainted,
             });
+            // Only when set, so cards parked before this was added still match.
+            if direct {
+                card["direct"] = json!(true);
+            }
             if !matches!(
                 self.approve(task_id, card, resumed, unattended)?,
                 Decision::Approved
@@ -2694,16 +2771,38 @@ impl Agent {
         } else {
             None
         };
+        // Only now, holding shell_turn, so no other command shares the opening.
+        let _direct = if direct {
+            match self.open_direct(timeout) {
+                Ok(open) => open,
+                Err(err) => {
+                    tracing::error!(err = %format!("{err:#}"), "couldn't open the firewall for a direct command");
+                    return Ok(
+                        "not run: agentd couldn't open the firewall for this command. Tell the user.".into(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let route = if direct {
+            Route::Direct
+        } else if unattended {
+            Route::Gate
+        } else {
+            Route::Proxy
+        };
         let mut output = self
             .shell
-            .run(inner, as_root, timeout, &files, unattended, cancel)
+            .run(inner, as_root, timeout, &files, route, cancel)
             .await?;
         if !keys.is_empty() {
             let _ = self.store.secrets_used(&keys);
         }
         // Before it's cut to size, so no part of a value is left at the cut.
         output.text = self.secrets.redact(&output.text).into_owned();
-        let refused = access::refused_by_proxy(&output.text);
+        let firewalled = !as_root && !direct && !self.cfg.run_as.is_empty();
+        let hint = egress_hint(&output.text, output.code, firewalled, unattended);
         // For the log: the app's chat shows only messages and the cards waiting for the user.
         self.emit(
             "shell.output",
@@ -2714,13 +2813,8 @@ impl Agent {
             }),
         );
         let mut result = output.for_model();
-        // The proxy refused a host: how to ask for it (access.rs).
-        if refused {
-            result.push_str(if unattended {
-                ACCESS_HINT_SCHEDULED
-            } else {
-                ACCESS_HINT
-            });
+        if let Some(hint) = hint {
+            result.push_str(hint);
         }
         Ok(result)
     }
@@ -3415,6 +3509,7 @@ mod tests {
                     None,
                     &[],
                     10,
+                    false,
                     true,
                     true,
                     false,
@@ -3473,7 +3568,19 @@ mod tests {
         // After outside content: a command that could send data, and a risky one, run.
         for command in ["curl --version | head -c 4", "rm -rf ./nothing-here && echo gone"] {
             let reply = agent
-                .run_shell("t12", command, None, &[], 10, true, true, true, None, &mut cancel)
+                .run_shell(
+                    "t12",
+                    command,
+                    None,
+                    &[],
+                    10,
+                    false,
+                    true,
+                    true,
+                    true,
+                    None,
+                    &mut cancel,
+                )
                 .await
                 .unwrap();
             assert!(reply.starts_with("exit code 0\n"), "{command}: {reply}");
@@ -3486,6 +3593,7 @@ mod tests {
                 None,
                 &[],
                 10,
+                false,
                 true,
                 true,
                 true,
@@ -3515,6 +3623,7 @@ mod tests {
                 Some("Upload the notes"),
                 &[],
                 10,
+                false,
                 true,
                 false,
                 false,
@@ -3537,6 +3646,254 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_direct_command_always_asks_and_runs_once_approved() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        // Harmless, so it wouldn't ask if it went through the proxy.
+        let command = "echo direct";
+        let summary = Some("Say hello");
+        let err = agent
+            .run_shell(
+                "t20",
+                command,
+                summary,
+                &[],
+                10,
+                true,
+                false,
+                false,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap_err();
+        let park = err.downcast::<Park>().expect("asks first");
+        assert_eq!(park.card["direct"], true);
+        assert_eq!(park.card["reason"], DIRECT_REASON);
+        assert_eq!(events(&agent, "shell")[0]["direct"], true);
+        let answered = |approved: bool, card: &Value| {
+            Some(Answer {
+                approved,
+                card: card.clone(),
+                by: None,
+            })
+        };
+
+        let reply = agent
+            .run_shell(
+                "t20",
+                command,
+                summary,
+                &[],
+                10,
+                true,
+                false,
+                false,
+                false,
+                answered(true, &park.card),
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert!(reply.starts_with("exit code 0\ndirect"), "{reply}");
+
+        let reply = agent
+            .run_shell(
+                "t20",
+                command,
+                summary,
+                &[],
+                10,
+                true,
+                false,
+                false,
+                false,
+                answered(false, &park.card),
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert!(reply.starts_with("denied:"), "{reply}");
+
+        // A yes to the same command without direct internet is no yes to it.
+        let mut proxied = park.card.clone();
+        proxied.as_object_mut().unwrap().remove("direct");
+        assert!(!same_request(&proxied, &park.card));
+        let reply = agent
+            .run_shell(
+                "t20",
+                command,
+                summary,
+                &[],
+                10,
+                true,
+                false,
+                false,
+                false,
+                answered(true, &proxied),
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert!(reply.starts_with("denied:"), "{reply}");
+
+        // No plain words for the card: asked again, like any command that asks.
+        let reply = agent
+            .run_shell(
+                "t20",
+                command,
+                None,
+                &[],
+                10,
+                true,
+                false,
+                false,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert!(
+            reply.starts_with("not run: this command needs the user's OK"),
+            "{reply}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_never_connects_directly() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        // Not with "Run without asking" either.
+        for auto_approve in [false, true] {
+            let reply = agent
+                .run_shell(
+                    "t21",
+                    "echo direct",
+                    None,
+                    &[],
+                    10,
+                    true,
+                    false,
+                    true,
+                    auto_approve,
+                    None,
+                    &mut cancel,
+                )
+                .await
+                .unwrap();
+            assert!(reply.starts_with("not run: it connects directly"), "{reply}");
+        }
+        assert!(events(&agent, "approval.requested").is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_direct_card_keeps_what_else_it_asks_about() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        let park = |err: anyhow::Error| err.downcast::<Park>().expect("asks");
+        // A dangerous command still says so.
+        let card = park(
+            agent
+                .run_shell(
+                    "t22",
+                    "rm -rf ./old",
+                    Some("Clear the old build"),
+                    &[],
+                    10,
+                    true,
+                    false,
+                    false,
+                    false,
+                    None,
+                    &mut cancel,
+                )
+                .await
+                .unwrap_err(),
+        )
+        .card;
+        let reason = card["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with(DIRECT_REASON) && reason.contains(", and "),
+            "{reason}"
+        );
+        // Root isn't firewalled: it's a root card, not a direct one.
+        let card = park(
+            agent
+                .run_shell(
+                    "t23",
+                    "sudo apt install -y jq",
+                    Some("Install jq"),
+                    &[],
+                    10,
+                    true,
+                    false,
+                    false,
+                    false,
+                    None,
+                    &mut cancel,
+                )
+                .await
+                .unwrap_err(),
+        )
+        .card;
+        assert_eq!(card["reason"], "runs as root");
+        assert!(card.get("direct").is_none());
+        // Through the proxy, the card is as it always was: one parked before
+        // direct_internet existed still matches when it's answered.
+        let card = park(
+            agent
+                .run_shell(
+                    "t24",
+                    "rm -rf ./old",
+                    Some("Clear the old build"),
+                    &[],
+                    10,
+                    false,
+                    false,
+                    false,
+                    false,
+                    None,
+                    &mut cancel,
+                )
+                .await
+                .unwrap_err(),
+        )
+        .card;
+        assert!(card.get("direct").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_commands_output_says_which_way_out_to_try() {
+        let direct =
+            "transport: Error while dialing: dial tcp 149.248.212.172:443: connect: connection refused";
+        assert_eq!(egress_hint(direct, Some(1), true, false), Some(DIRECT_HINT));
+        assert_eq!(
+            egress_hint(direct, Some(1), true, true),
+            Some(DIRECT_HINT_SCHEDULED)
+        );
+        // Timed out while it kept retrying: it failed too.
+        assert_eq!(egress_hint(direct, None, true, false), Some(DIRECT_HINT));
+        // It worked and merely printed that (a log it read).
+        assert_eq!(egress_hint(direct, Some(0), true, false), None);
+        // Outside the firewall (root, a direct command, local development)
+        // the firewall isn't why it failed.
+        assert_eq!(egress_hint(direct, Some(1), false, false), None);
+
+        let refused = "curl: (56) CONNECT tunnel failed, response 403";
+        assert_eq!(egress_hint(refused, Some(56), true, false), Some(ACCESS_HINT));
+        assert_eq!(
+            egress_hint(refused, Some(56), true, true),
+            Some(ACCESS_HINT_SCHEDULED)
+        );
+        assert_eq!(egress_hint("all good", Some(0), true, false), None);
+    }
+
+    #[tokio::test]
     async fn a_command_without_plain_words_is_sent_back_not_shown() {
         let (agent, dir) = test_agent();
         let (_stop, mut cancel) = watch::channel(false);
@@ -3548,6 +3905,7 @@ mod tests {
                     summary,
                     &[],
                     10,
+                    false,
                     false,
                     false,
                     false,
@@ -3579,6 +3937,7 @@ mod tests {
                 Some(summary),
                 &[],
                 10,
+                false,
                 true,
                 false,
                 false,
@@ -4632,6 +4991,7 @@ mod access_tests {
                 false,
                 false,
                 false,
+                false,
                 None,
                 &mut cancel,
             )
@@ -4639,7 +4999,19 @@ mod access_tests {
             .unwrap();
         assert!(chat.contains("call request_access"), "{chat}");
         let scheduled = agent
-            .run_shell("t8", command, None, &[], 10, false, true, true, None, &mut cancel)
+            .run_shell(
+                "t8",
+                command,
+                None,
+                &[],
+                10,
+                false,
+                false,
+                true,
+                true,
+                None,
+                &mut cancel,
+            )
             .await
             .unwrap();
         assert!(scheduled.contains("A scheduled run can't ask"), "{scheduled}");

@@ -128,7 +128,8 @@ the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
   internet only through a local Squid proxy: listed hosts
   (`agentd_shell_allowed_domains`: code hosts and package registries), never
   internal addresses, every request in `/var/log/squid/access.log`, and no DNS
-  of its own;
+  of its own. The one exception is a single command the user approves on a card
+  to connect directly (public addresses only, logged, never in a scheduled run);
 - `open_url` only opens http(s) sites, never `file://`, localhost or internal
   addresses (the logged-in Chrome would hand over its profile or DevTools);
 - commands starting with `sudo`, risky ones, and (after the agent has read a web

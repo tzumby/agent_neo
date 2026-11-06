@@ -6,8 +6,8 @@
 //! cookie keep them out). Commands starting with `sudo` run as root, only
 //! after the user approved them.
 //!
-//! A scheduled run's commands are `gated`: they go out through the egress
-//! gate (egress.rs) and trust its CA next to the system's.
+//! Each command has a `Route` to the internet. A scheduled run's go out
+//! through the egress gate (egress.rs) and trust its CA next to the system's.
 //!
 //! The unit's hardening follows moltis' container settings (MIT License,
 //! Copyright (c) the moltis contributors; crates/tools/src/sandbox/docker.rs):
@@ -39,6 +39,21 @@ pub struct Shell {
     /// bundle gated commands trust (the system's CAs and the gate's).
     pub gate_proxy: String,
     pub gate_bundle: PathBuf,
+}
+
+/// The longest a command may run.
+pub const MAX_COMMAND_SECS: u64 = 900;
+
+/// How a shell user's command reaches the internet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Route {
+    /// Through Squid, the usual way.
+    Proxy,
+    /// A scheduled run's: through the egress gate.
+    Gate,
+    /// One the user approved to connect on its own: no proxy settings. The
+    /// guard firewall is opened for it (Agent::open_direct).
+    Direct,
 }
 
 /// What a command printed (stdout, then stderr) and how it ended.
@@ -147,8 +162,8 @@ impl Shell {
     /// The command line: a transient unit through `sudo systemd-run`, or a
     /// plain `bash` in local development.
     /// Whether a gated command goes through the gate (it's configured).
-    fn gated(&self, gated: bool, as_root: bool) -> bool {
-        gated && !as_root && !self.gate_proxy.is_empty()
+    fn gated(&self, route: Route, as_root: bool) -> bool {
+        route == Route::Gate && !as_root && !self.gate_proxy.is_empty()
     }
 
     fn argv(
@@ -158,9 +173,9 @@ impl Shell {
         as_root: bool,
         timeout_secs: u64,
         keys: &[KeyFile],
-        gated: bool,
+        route: Route,
     ) -> Vec<String> {
-        let gated = self.gated(gated, as_root);
+        let gated = self.gated(route, as_root);
         let workdir = self.workdir.to_string_lossy();
         if self.local(as_root) {
             // Keys come through the environment here (run()).
@@ -190,7 +205,11 @@ impl Shell {
             for property in HARDENING {
                 argv.push(format!("--property={property}"));
             }
-            let proxy = if gated { &self.gate_proxy } else { &self.proxy };
+            let proxy: &str = match route {
+                Route::Direct => "",
+                _ if gated => &self.gate_proxy,
+                _ => &self.proxy,
+            };
             if !proxy.is_empty() {
                 for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
                     argv.push(format!("--setenv={name}={proxy}"));
@@ -226,20 +245,19 @@ impl Shell {
         argv
     }
 
-    /// `gated`: a scheduled run's command, out through the egress gate.
     pub async fn run(
         &self,
         command: &str,
         as_root: bool,
         timeout_secs: u64,
         keys: &[KeyFile],
-        gated: bool,
+        route: Route,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<ShellOutput> {
-        let timeout_secs = timeout_secs.clamp(1, 900);
+        let timeout_secs = timeout_secs.clamp(1, MAX_COMMAND_SECS);
         let unit = format!("agentd-cmd-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
-        let argv = self.argv(&unit, command, as_root, timeout_secs, keys, gated);
-        let gated = self.gated(gated, as_root);
+        let argv = self.argv(&unit, command, as_root, timeout_secs, keys, route);
+        let gated = self.gated(route, as_root);
         let local = self.local(as_root);
 
         let mut process = tokio::process::Command::new(&argv[0]);
@@ -336,7 +354,7 @@ mod tests {
 
     #[test]
     fn worker_commands_run_in_a_hardened_unit() {
-        let argv = shell("worker").argv("agentd-cmd-x", "ls -la", false, 60, &[], false);
+        let argv = shell("worker").argv("agentd-cmd-x", "ls -la", false, 60, &[], Route::Proxy);
         let has = |s: &str| argv.iter().any(|a| a == s);
         assert_eq!(&argv[..4], ["sudo", "-n", "--", "systemd-run"]);
         assert!(has("--uid=worker") && has("--unit=agentd-cmd-x"));
@@ -352,7 +370,7 @@ mod tests {
 
     #[test]
     fn approved_root_commands_run_as_root_without_the_shell_limits() {
-        let argv = shell("worker").argv("agentd-cmd-y", "apt install -y jq", true, 300, &[], true);
+        let argv = shell("worker").argv("agentd-cmd-y", "apt install -y jq", true, 300, &[], Route::Gate);
         assert!(
             !argv
                 .iter()
@@ -363,12 +381,29 @@ mod tests {
     }
 
     #[test]
+    fn direct_commands_keep_the_limits_but_have_no_proxy_settings() {
+        let argv = shell("worker").argv("agentd-cmd-d", "fly deploy", false, 60, &[], Route::Direct);
+        let has = |s: &str| argv.iter().any(|a| a == s);
+        assert!(has("--uid=worker") && has("--property=NoNewPrivileges=yes"));
+        assert!(has("--property=MemoryMax=2G") && has("--property=RuntimeMaxSec=60"));
+        assert!(!argv.iter().any(|a| a.to_ascii_lowercase().contains("proxy")));
+        assert_eq!(argv.last().unwrap(), "fly deploy");
+    }
+
+    #[test]
     fn keys_come_as_credentials_never_on_the_command_line() {
         let keys = [KeyFile {
             name: "GITHUB_TOKEN".into(),
             path: "/var/lib/agentd/secrets/GITHUB_TOKEN".into(),
         }];
-        let argv = shell("worker").argv("agentd-cmd-z", "gh repo clone acme/api", false, 60, &keys, false);
+        let argv = shell("worker").argv(
+            "agentd-cmd-z",
+            "gh repo clone acme/api",
+            false,
+            60,
+            &keys,
+            Route::Proxy,
+        );
         assert!(
             argv.iter()
                 .any(|a| a == "--property=LoadCredential=GITHUB_TOKEN:/var/lib/agentd/secrets/GITHUB_TOKEN")
@@ -391,7 +426,7 @@ mod tests {
             false,
             60,
             &keys,
-            true,
+            Route::Gate,
         );
         let has = |s: &str| argv.iter().any(|a| a == s);
         assert!(has("--uid=worker") && has("--setenv=HTTPS_PROXY=http://127.0.0.1:3129"));
@@ -411,7 +446,7 @@ mod tests {
             gate_proxy: String::new(),
             ..shell("worker")
         };
-        let argv = unconfigured.argv("agentd-cmd-h", "ls", false, 60, &[], true);
+        let argv = unconfigured.argv("agentd-cmd-h", "ls", false, 60, &[], Route::Gate);
         assert!(
             argv.iter()
                 .any(|a| a == "--setenv=HTTPS_PROXY=http://127.0.0.1:3128")
@@ -434,7 +469,7 @@ mod tests {
         }];
         let (_stop, mut cancel) = watch::channel(false);
         let out = shell
-            .run("echo \"[$API_KEY]\"", false, 10, &keys, false, &mut cancel)
+            .run("echo \"[$API_KEY]\"", false, 10, &keys, Route::Proxy, &mut cancel)
             .await
             .unwrap();
         assert_eq!(out.text, "[abc123456789]");
@@ -449,7 +484,7 @@ mod tests {
         };
         let (_stop, mut cancel) = watch::channel(false);
         let out = shell
-            .run("echo hi && pwd", false, 10, &[], false, &mut cancel)
+            .run("echo hi && pwd", false, 10, &[], Route::Proxy, &mut cancel)
             .await
             .unwrap();
         assert!(
@@ -458,7 +493,7 @@ mod tests {
             out.for_model()
         );
         let out = shell
-            .run("exit 3", false, 10, &[], false, &mut cancel)
+            .run("exit 3", false, 10, &[], Route::Proxy, &mut cancel)
             .await
             .unwrap();
         assert_eq!(out.code, Some(3));
@@ -477,7 +512,7 @@ mod tests {
         });
         let started = Instant::now();
         let out = shell
-            .run("sleep 30", false, 60, &[], false, &mut cancel)
+            .run("sleep 30", false, 60, &[], Route::Proxy, &mut cancel)
             .await
             .unwrap();
         assert!(out.stopped && started.elapsed() < Duration::from_secs(5));

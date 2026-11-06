@@ -148,6 +148,41 @@ pub fn refused_by_proxy(output: &str) -> bool {
     REFUSED.is_match(output)
 }
 
+/// What a command's output says when it tried to connect on its own, not
+/// through the proxy, and the guard firewall stopped it: no DNS, or a refused
+/// connection to somewhere other than this machine (a local server being down
+/// is something else). Adding a host to the proxy's list can't help these.
+pub fn connected_directly(output: &str) -> bool {
+    static NO_DNS: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)Could not resolve host|Temporary failure in name resolution|Name or service not known|no such host|getaddrinfo (EAI_AGAIN|ENOTFOUND)|unable to resolve host|failed to lookup address|UnknownHostException|\blookup \S+ on \S+:53\b",
+        )
+        .expect("valid regex")
+    });
+    // Go, curl, Node, ssh, Python: each names where it tried to connect.
+    static REFUSED: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)dial tcp (\S+): connect: connection refused|Failed to connect to (\S+) port \d+|connect ECONNREFUSED (\S+)|connect to host (\S+) port \d+: Connection refused|Pool\(host='([^']+)'.*Connection refused",
+        )
+        .expect("valid regex")
+    });
+    let this_machine = |address: &str| {
+        let host = address.trim_start_matches('[');
+        ["localhost", "127.", "::1", "0.0.0.0"]
+            .iter()
+            .any(|start| host.starts_with(start))
+    };
+    NO_DNS.is_match(output)
+        || REFUSED.captures_iter(output).any(|found| {
+            found
+                .iter()
+                .skip(1)
+                .flatten()
+                .next()
+                .is_some_and(|address| !this_machine(address.as_str()))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +258,44 @@ mod tests {
             "HTTP/1.1 403 Forbidden\n{\"error\":\"bad token\"}"
         ));
         assert!(!refused_by_proxy("all good"));
+    }
+
+    #[test]
+    fn recognises_a_tool_connecting_on_its_own() {
+        for output in [
+            // flyctl's Depot builder, dialling a build machine by address.
+            "rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing: \
+             dial tcp 149.248.212.172:443: connect: connection refused\"",
+            "Get \"https://api.fly.io/\": dial tcp: lookup api.fly.io on 127.0.0.53:53: read udp \
+             127.0.0.1:40000->127.0.0.53:53: read: connection refused",
+            "dial tcp: lookup api.fly.io: no such host",
+            "curl: (6) Could not resolve host: example.com",
+            "curl: (7) Failed to connect to 1.2.3.4 port 443 after 0 ms: Couldn't connect to server",
+            "ssh: Could not resolve hostname github.com: Temporary failure in name resolution",
+            "ssh: connect to host github.com port 22: Connection refused",
+            "wget: unable to resolve host address 'example.com'",
+            "Error: getaddrinfo EAI_AGAIN registry.example.com",
+            "Error: connect ECONNREFUSED 1.2.3.4:443",
+            "socket.gaierror: [Errno -2] Name or service not known",
+            "HTTPSConnectionPool(host='api.example.com', port=443): Max retries exceeded with url: / (Caused by \
+             NewConnectionError('Failed to establish a new connection: [Errno 111] Connection refused'))",
+        ] {
+            assert!(connected_directly(output), "{output}");
+        }
+        for output in [
+            // This machine: a local server that isn't up, or the proxy itself.
+            "curl: (7) Failed to connect to localhost port 3000 after 0 ms: Couldn't connect to server",
+            "fatal: unable to access 'https://github.com/': Failed to connect to 127.0.0.1 port 3128",
+            "dial tcp 127.0.0.1:5432: connect: connection refused",
+            "dial tcp [::1]:8080: connect: connection refused",
+            "Error: connect ECONNREFUSED 127.0.0.1:3000",
+            "HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded (Caused by \
+             NewConnectionError('[Errno 111] Connection refused'))",
+            // The proxy's own refusal is request_access's.
+            "curl: (56) CONNECT tunnel failed, response 403",
+            "all good",
+        ] {
+            assert!(!connected_directly(output), "{output}");
+        }
     }
 }

@@ -56,7 +56,9 @@ pub fn system_prompt(
              as root. Those, and other risky commands, wait for the user's approval; if one is denied, don't \
              look for a workaround. The shell reaches the internet only through a proxy that allows listed \
              sites; if it refuses a host the task needs (a 403 from the proxy), call request_access for that \
-             exact host, and never work around the proxy. \
+             exact host, and never work around the proxy. Only if a tool can't use a proxy at all (it connects \
+             to addresses on its own and has no proxy setting), run that one command with direct_internet: the \
+             user decides on a card. \
              Install software the way the install-software skill says (Nix first); never pipe a downloaded \
              script into a shell (curl | bash is refused).
 - Keys and tokens: when a job needs an API key or access token (a GitHub token for a private repo, an API \
@@ -377,6 +379,12 @@ pub fn schemas(shell: bool, skills: bool, memory_v2: bool, scheduled: bool) -> V
                     "type": "array", "items": {"type": "string"},
                     "description": "saved keys the command needs as environment variables, e.g. [\"GITHUB_TOKEN\"] \
                         (keys named as $NAME in the command are given anyway)",
+                },
+                "direct_internet": {
+                    "type": "boolean",
+                    "description": "run this one command outside the proxy, able to reach any public address. The \
+                        user always decides on a card; scheduled runs can't. Only for a tool that can't use a proxy; \
+                        for a host the proxy refused, use request_access",
                 },
             }),
             &["command", "summary"],

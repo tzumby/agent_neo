@@ -40,6 +40,8 @@ test("card kinds keep their fields", () => {
   ]);
   const [browser, schedule, secret, action] = t.visible();
   assert.equal(browser.browser.sends, true);
+  assert.equal(browser.editable, false, "only a card that says it takes an edit offers one");
+  assert.equal(new Timeline([ev("approval.requested", { id: "e", kind: "browser", action: "type", text: "hi", editable: true })]).visible()[0].editable, true);
   assert.equal(schedule.schedule.when, "Weekdays at 08:00");
   assert.equal(secret.secret.host, "dash.cloudflare.com");
   assert.equal(action.type, "action");

@@ -137,7 +137,9 @@ the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
 - commands starting with `sudo`, risky ones, and (after the agent has read a web
   page or command output) ones that can send data out (`curl`, `scp`, `git push`,
   `gh` commands that write such as `gh gist create` or `gh api`, `npm publish`,
-  ...) wait for approval in the app; approvals record who answered;
+  ...) wait for approval in the app; approvals record who answered. On a card
+  about text (a command, a message to write, a schedule's instructions) you can
+  edit it first, and your version is what runs, through the same checks;
 - **Auto approve** (Settings, off by default) stops all of that asking, in chats and
   scheduled runs: root commands, direct connections, browser changes, new sites and
   schedules go ahead, with each one recorded in the event log. Keys still come from

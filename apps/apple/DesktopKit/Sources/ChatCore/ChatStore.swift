@@ -139,12 +139,12 @@ public final class ChatStore {
         await attempt { try await client.stop() }
     }
 
-    public func answer(_ approval: Approval, approved: Bool, client: AgentClient) async {
+    public func answer(_ approval: Approval, approved: Bool, text: String? = nil, client: AgentClient) async {
         await attempt(onGone: {
             $0.expiredApprovals.insert(approval.id)
             $0.timeline.expire(approval: approval.id)
         }) {
-            try await client.answer(approval: approval.id, approved: approved)
+            try await client.answer(approval: approval.id, approved: approved, text: text)
         }
     }
 

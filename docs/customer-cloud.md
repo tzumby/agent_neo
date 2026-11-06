@@ -111,6 +111,7 @@ Every apply and playbook run below needs the user's explicit OK on the plan firs
 - **Cards:**
   - Needs your OK (summary, reason, outside-content warning, the command on request);
   - Write this? / Write and send this? / Press …? / Click this?;
+  - Edit, on any card about text: a command, what to write, a schedule's instructions. What you approve is your version (architecture.md §6.11);
   - Schedule this?;
   - key requests (saved straight to the desktop, Continue when it was busy);
   - Action needed (Skip, I'm done, Take over).

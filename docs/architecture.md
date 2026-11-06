@@ -624,7 +624,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | POST | `/api/v1/messages` | `{text, timezone, utc_offset}` starts a task. 202 `{task}`, or 409 while one runs. The time zone is remembered for later tasks and schedules |
 | GET | `/api/v1/events?after=&kinds=` | Server-Sent Events: up to 5,000 logged events after `after`, then live ones; `kinds` (comma-separated) keeps only those. Each SSE message has `id: seq`, `event: kind` and the JSON event. Keep-alive comments every 15 s. Subscribes to the live bus before reading the backlog, so nothing falls between them |
 | GET | `/api/v1/events/page?before=&limit=&kinds=` | A page of the log, oldest first: up to `limit` (default 100, at most 500) events of `kinds` before `before` (from the newest when absent). `{events, more, last_seq}`: `more` says older ones remain, and `last_seq` is the log's newest seq, read under the same lock, for the stream to go on from. Keys redacted as in the stream (0.15.1) |
-| POST | `/api/v1/approvals/{id}` | `{approved}`. Resumes the parked task. 404 if unknown or expired, 409 if another task is running |
+| POST | `/api/v1/approvals/{id}` | `{approved, text?}`. Resumes the parked task; `text` replaces the card's text (§6.11). 400 if it can't, 404 if unknown or expired, 409 if another task is running |
 | POST | `/api/v1/actions/{id}` | `{choice: done or skip}` on an Action needed card. Starts a new task with "I've done what you asked… continue" or "I'm skipping that step…" |
 | POST | `/api/v1/stop` | Stops the running task, or gives up on a parked one |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
@@ -692,7 +692,7 @@ Every change the apps show is an event: appended to `events` and broadcast on an
 | `shell.output` | `task`, `command`, `exit_code`, `timed_out`, `stopped`, `output` (last 4,000 characters), `seconds` | A command ended |
 | `approval.requested` | The card: `id`, `task`, `kind` (`shell`, `browser`, `schedule` or `secret`) and its fields. A `shell` card has `command`, `reason`, `secrets`, `summary` (the model's plain words, one line, at most 120 characters), `tainted` (asked after outside content) and, only for a direct command, `direct: true` (§6.23) | A task parks |
 | `task.paused` | `task`, `approval` | Right after the card |
-| `approval.resolved` | `task`, `id`, `approved`, `by`, `expired`, `reason` (`policy_changed`) | Answered, or given up on |
+| `approval.resolved` | `task`, `id`, `approved`, `by`, `edited`, `text`, `expired`, `reason` (`policy_changed`) | Answered (`text`: what the person changed it to), or given up on |
 | `task.resumed` | `task` | A parked task carries on |
 | `task.stopping` | (nothing) | Stop was pressed while a task ran |
 | `task.finished` | `task`, `status`, `steps`, `seconds`, `model`, `usage` ({input, output, cached}), `cost` (USD) | A chat task ends |
@@ -968,6 +968,11 @@ These patterns are a speed bump against mistakes and injected instructions, not 
 | `secret` | Label, why, how (Markdown), link and its host, replace, tainted | "GitHub token needed"; opens the app (no buttons: a value is needed) |
 
 Each answer records who gave it (`by`, from `X-Tailscale-User`).
+
+**Editing a card** (0.15.13). On a card about text the agent wrote, the person can change it before approving: a command, what to type in the browser, or a schedule's instructions (not its name or time). The apps offer Edit only on a card with `editable: true`, because an older agentd would ignore the edit and run the agent's words. `POST /api/v1/approvals/{id}` takes `text` alongside `approved`; blank text or a card that can't be edited gets a 400, and nothing runs.
+- **It goes through the same checks:** the task resumes by running its parked call again, so the edit is written into that call (`apply_edit`), not just the card. A command the person edits to something refused outright (§6.10) stays refused, and one that now needs no approval simply runs. The card is rebuilt to match, including which saved keys the command names, so the action still counts as the one approved. A schedule keeps its name.
+- **Who knows:** the model's own call still shows its words, so its result ends with a note saying what the person approved, redacted like any result and outside the `<untrusted>` label. `approval.resolved` carries `edited: true` and the text.
+- **Not from a notification:** Approve on a notification approves the text it showed. Editing means opening the card.
 
 **Never in a scheduled run.** Nobody is watching, so `approve()` returns `Decision::Unattended` instead of parking the task, whatever the card: the action isn't done and the model is told to say so in its report ("not run: it runs as root, and a scheduled run can't wait for the user's OK…"; a key request gets "not asked: a scheduled run can't ask for keys…"). A schedule a person set to **run without asking** lets its commands go ahead instead, except root and direct ones (§6.21, §6.23). The run's framing says which (`UNATTENDED_RULE`, `AUTO_APPROVE_RULE`).
 

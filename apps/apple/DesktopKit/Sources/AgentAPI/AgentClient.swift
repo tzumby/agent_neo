@@ -216,6 +216,11 @@ public struct EventPage: Decodable, Sendable, Equatable {
     }
 }
 
+struct ApprovalAnswer: Encodable, Equatable {
+    let approved: Bool
+    let text: String?
+}
+
 public struct AgentSettings: Codable, Sendable, Equatable {
     public var model: String
     public var allowActions: Bool
@@ -346,8 +351,10 @@ public struct AgentClient: Sendable {
         }
     }
 
-    public func answer(approval id: String, approved: Bool) async throws {
-        let _: [String: Bool] = try await post("/api/v1/approvals/\(id)", body: ["approved": approved])
+    /// `text`: what the user changed the card's text to, on a card that takes an edit.
+    public func answer(approval id: String, approved: Bool, text: String? = nil) async throws {
+        let _: [String: Bool] = try await post(
+            "/api/v1/approvals/\(id)", body: ApprovalAnswer(approved: approved, text: text))
     }
 
     /// "I'm done" (true) or "Skip" (false) on an action-needed card; starts a new task.

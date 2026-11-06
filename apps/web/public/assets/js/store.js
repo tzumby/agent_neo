@@ -159,8 +159,8 @@ export class Store {
     return this.attempt(() => this.api.stop());
   }
 
-  async answer(card, approved) {
-    return this.attempt(() => this.api.answer(card.id, approved), () => {
+  async answer(card, approved, text) {
+    return this.attempt(() => this.api.answer(card.id, approved, text), () => {
       this.expiredApprovals.add(card.id);
       this.timeline.expireApproval(card.id);
     });

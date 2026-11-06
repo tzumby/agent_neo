@@ -46,6 +46,14 @@ import Testing
     #expect(status.settings.autoApprove == false)
 }
 
+@Test func anAnswerSendsTextOnlyWhenEdited() throws {
+    let plain = try JSONEncoder().encode(ApprovalAnswer(approved: true, text: nil))
+    #expect(String(decoding: plain, as: UTF8.self) == #"{"approved":true}"#)
+    let edited = try JSONSerialization.jsonObject(
+        with: JSONEncoder().encode(ApprovalAnswer(approved: true, text: "Hi Lawrence"))) as? [String: Any]
+    #expect(edited?["text"] as? String == "Hi Lawrence")
+}
+
 @Test func autoApproveRoundTrips() throws {
     let json = #"{"model":"m","allow_actions":true,"auto_approve":true}"#
     var settings = try JSONDecoder().decode(AgentSettings.self, from: Data(json.utf8))

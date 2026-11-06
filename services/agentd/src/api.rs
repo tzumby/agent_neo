@@ -357,6 +357,9 @@ async fn events_page(State(agent): App, Query(query): Query<PageQuery>) -> Respo
 #[derive(Deserialize)]
 struct Approval {
     approved: bool,
+    /// What the user changed the card's text to (a command, a message, a
+    /// schedule's instructions): it replaces the agent's.
+    text: Option<String>,
 }
 
 async fn answer_approval(
@@ -365,8 +368,12 @@ async fn answer_approval(
     headers: HeaderMap,
     Json(body): Json<Approval>,
 ) -> Response {
-    tracing::info!(id, approved = body.approved, by = ?caller(&headers), "approval answered");
-    match agent.answer_approval(&id, body.approved, caller(&headers)) {
+    let edited = body.text.as_deref().filter(|_| body.approved);
+    tracing::info!(id, approved = body.approved, edited = edited.is_some(), by = ?caller(&headers), "approval answered");
+    if let Some(problem) = edited.and_then(|text| agent.edit_problem(&id, text)) {
+        return error(StatusCode::BAD_REQUEST, problem);
+    }
+    match agent.answer_approval(&id, body.approved, edited, caller(&headers)) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(StartError::NotFound) => error(
             StatusCode::NOT_FOUND,

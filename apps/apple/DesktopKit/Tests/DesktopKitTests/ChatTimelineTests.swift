@@ -114,6 +114,19 @@ private func aTask() throws -> [AgentEvent] {
     #expect(timeline.visibleItems == [.assistant(Message(id: 5, text: "Stopped.", task: "t1"))])
 }
 
+@Test func aCardSaysWhetherItTakesAnEdit() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(
+        try event(
+            1, "approval.requested",
+            #"{"task":"t1","id":"c1","kind":"shell","command":"ls","reason":"x","editable":true}"#))
+    guard case .approval(let card) = timeline.visibleItems.last else {
+        Issue.record("no card")
+        return
+    }
+    #expect(card.editable)
+}
+
 @Test func browserAndScheduleCardsShowWhileTheyWait() throws {
     var timeline = ChatTimeline()
     timeline.apply(try event(1, "task.started", #"{"task":"t1","model":"m"}"#))
@@ -127,6 +140,7 @@ private func aTask() throws -> [AgentEvent] {
         return
     }
     #expect(browser.browser?.target == "Message to Alice" && browser.browser?.sends == true)
+    #expect(browser.editable == false)
     timeline.apply(try event(3, "approval.resolved", #"{"task":"t1","id":"b1","approved":true}"#))
     #expect(timeline.visibleItems.isEmpty)
 

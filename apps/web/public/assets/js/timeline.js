@@ -88,6 +88,7 @@ export class Timeline {
           type: "approval", id, seq: event.seq, state: "pending",
           kind: ["secret", "schedule", "browser", "access"].includes(d.kind) ? d.kind : "shell",
           command: str(d.command), reason: str(d.reason), summary: d.summary || null, tainted: d.tainted === true,
+          editable: d.editable === true,
         };
         if (card.kind === "secret") {
           card.secret = {

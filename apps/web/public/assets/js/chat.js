@@ -195,12 +195,47 @@ function buttons(...list) {
   return h("div", { class: "card-actions" }, ...list);
 }
 
-function answerButtons(card, ctx) {
+function answerButtons(card, ctx, edit) {
   const deny = h("button", { class: "button", type: "button" }, "Deny");
   const approve = h("button", { class: "button button-primary", type: "button" }, "Approve");
   deny.addEventListener("click", () => busyButton(deny, () => ctx.store.answer(card, false)));
-  approve.addEventListener("click", () => busyButton(approve, () => ctx.store.answer(card, true)));
-  return buttons(deny, approve);
+  approve.addEventListener("click", () => busyButton(approve, () => ctx.store.answer(card, true, edit?.changed())));
+  if (!edit?.button) return buttons(deny, approve);
+  edit.onChange = () => (approve.disabled = edit.blank());
+  return buttons(edit.button, deny, approve);
+}
+
+// The text a card asks about, with Edit: what gets approved can be the person's
+// own version. `shown` is how the card shows it until then. Only on a card that
+// says it takes an edit: an older agent would ignore it and run its own words.
+function textEdit(card, original, label, shown, { code = false } = {}) {
+  if (!card.editable) return { button: null, input: null, changed: () => undefined };
+  const input = h("textarea", {
+    class: `field card-edit${code ? " card-edit-code" : ""}`, "aria-label": label, hidden: true,
+    rows: Math.min(14, Math.max(3, original.split("\n").length + 1)), spellcheck: code ? "false" : "true",
+  });
+  const button = h("button", { class: "button", type: "button" }, "Edit");
+  const edit = {
+    button, input, onChange: () => {},
+    blank: () => !input.hidden && !input.value.trim(),
+    changed: () => (!input.hidden && input.value !== original ? input.value : undefined),
+  };
+  input.addEventListener("input", () => edit.onChange());
+  button.addEventListener("click", () => {
+    const opening = input.hidden;
+    input.value = original;
+    input.hidden = !opening;
+    shown.hidden = opening;
+    button.textContent = opening ? "Undo changes" : "Edit";
+    if (opening) {
+      // A command starts folded away.
+      const details = input.closest("details");
+      if (details) details.open = true;
+      input.focus();
+    }
+    edit.onChange();
+  });
+  return edit;
 }
 
 function warning(text) {
@@ -212,13 +247,15 @@ function approvalCard(card, ctx) {
   if (card.kind === "schedule") return scheduleCard(card, ctx);
   if (card.kind === "secret") return secretCard(card, ctx);
   if (card.kind === "access") return accessCard(card, ctx);
+  const command = h("pre", null, h("code", null, card.command));
+  const edit = textEdit(card, card.command, "The command", command, { code: true });
   return h("section", { class: "card card-needs", "aria-label": "Needs your OK" },
     h("p", { class: "card-kicker" }, icon("shield"), "Needs your OK"),
     h("h3", { class: "card-title" }, card.summary || "Run a command on your desktop"),
     card.reason ? h("p", { class: "card-text" }, `It ${card.reason}.`) : null,
     card.tainted ? warning("The agent read web pages or other outside content before asking. Check the command if this isn't what you asked for.") : null,
-    h("details", { class: "command" }, h("summary", null, "Show the command"), h("pre", null, h("code", null, card.command))),
-    answerButtons(card, ctx));
+    h("details", { class: "command" }, h("summary", null, "Show the command"), command, edit.input),
+    answerButtons(card, ctx, edit));
 }
 
 function browserCard(card, ctx) {
@@ -226,8 +263,11 @@ function browserCard(card, ctx) {
   const title = b.action === "type" ? (b.submit || b.sends ? "Write and send this?" : "Write this?")
     : b.action === "key" ? `Press ${b.key || "a key"}?` : "Click this?";
   let what;
+  let edit;
   if (b.action === "type") {
-    what = [b.target ? h("p", { class: "card-text muted" }, `In “${b.target}”`) : null, h("blockquote", { class: "card-quote" }, b.text || "")];
+    const quote = h("blockquote", { class: "card-quote" }, b.text || "");
+    edit = textEdit(card, b.text || "", "What to write", quote);
+    what = [b.target ? h("p", { class: "card-text muted" }, `In “${b.target}”`) : null, quote, edit.input];
   } else if (b.action === "key") {
     what = h("p", { class: "card-text" }, h("kbd", null, b.key || "?"), b.target ? ` in “${b.target}”` : "");
   } else {
@@ -240,19 +280,21 @@ function browserCard(card, ctx) {
     h("div", { class: "card-head" },
       h("h3", { class: "card-title" }, icon(b.action === "click" ? "click" : "keyboard"), title),
       b.site ? h("span", { class: "card-site" }, icon("globe"), site(b.site)) : null),
-    what, note, answerButtons(card, ctx));
+    what, note, answerButtons(card, ctx, edit));
 }
 
 function scheduleCard(card, ctx) {
   const s = card.schedule;
+  const prompt = h("p", { class: "muted pre" }, s.prompt);
+  const edit = textEdit(card, s.prompt, "What to do each time", prompt);
   return h("section", { class: "card card-needs", "aria-label": "Schedule this?" },
     h("h3", { class: "card-title" }, icon("calendar"), "Schedule this?"),
     h("div", { class: "card-inset" },
       h("p", { class: "strong" }, s.name),
       h("p", null, s.when),
-      h("p", { class: "muted pre" }, s.prompt)),
+      prompt, edit.input),
     h("p", { class: "card-text muted" }, "The agent asked for this after reading outside content. Approve only if you asked for it."),
-    answerButtons(card, ctx));
+    answerButtons(card, ctx, edit));
 }
 
 // The agent's commands hit a site the desktop's proxy doesn't let through.

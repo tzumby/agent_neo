@@ -42,11 +42,39 @@ I'd tighten the login rate limit to 5 per minute. Want me to draft the rule?"""
 SLACK_POSTS = []
 
 
+# Each ends in a card that asks about text, to try editing it.
+SCRIPTS = {
+    "write a message": [
+        ("open_url", {"url": "http://form.test/form"}),
+        ("type_text", {"role": "textbox", "name": "Message Lawrence", "text": "Hello from the agent"}),
+        ("read_text", {}),
+    ],
+    "risky command": [("run_shell", {"command": "rm -rf ./old-build", "summary": "Clear the old build"})],
+    "schedule after reading": [
+        ("run_shell", {"command": "echo some outside content"}),
+        ("schedule_task", {"name": "Morning check", "prompt": "Check everything", "cron": "0 8 * * *"}),
+    ],
+}
+
+# A page with a message field, which run.sh's Chrome reaches as http://form.test/form.
+FORM = b"""<!doctype html><title>Message Lawrence</title><p id="echo">Nothing written yet.</p>
+<textarea aria-label="Message Lawrence" oninput="document.getElementById('echo').textContent = 'On the page: ' + this.value"></textarea>"""
+
+
 def reply(messages, tools=()):
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
     text = last_user.get("content") if isinstance(last_user.get("content"), str) else json.dumps(last_user.get("content"))
     text = (text or "").lower()
     after_tool = messages and messages[-1].get("role") == "tool"
+    # Calls one after another, each once the last one has answered.
+    done = 0
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            break
+        done += message.get("role") == "tool"
+    for trigger, steps in SCRIPTS.items():
+        if trigger in text and done < len(steps):
+            return call(*steps[done])
     if after_tool:
         result = str(messages[-1].get("content", ""))[:300]
         return {"role": "assistant", "content": f"Done. The tool said: {result}"}
@@ -90,6 +118,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/slack-posts":
             self.send_json(SLACK_POSTS)
+        elif self.path == "/form":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(FORM)))
+            self.end_headers()
+            self.wfile.write(FORM)
         else:
             self.send_error(404)
 

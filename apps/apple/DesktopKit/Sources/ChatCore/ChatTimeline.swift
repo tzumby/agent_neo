@@ -124,6 +124,7 @@ public struct ChatTimeline: Sendable, Equatable {
                 id: id, seq: event.seq, command: data["command"]?.string ?? "", reason: data["reason"]?.string ?? "")
             approval.summary = data["summary"]?.string.flatMap { $0.isEmpty ? nil : $0 }
             approval.tainted = data["tainted"]?.bool ?? false
+            approval.editable = data["editable"]?.bool ?? false
             if data["kind"]?.string == "secret" {
                 approval.secret = SecretRequest(
                     name: data["name"]?.string ?? "", label: data["label"]?.string ?? "",
@@ -302,6 +303,10 @@ public struct Approval: Sendable, Equatable {
     /// Asked for after the agent read outside content (a page, an email,
     /// command output), so its words may have been steered by that content.
     public var tainted = false
+    /// The user can change its text before approving: a command, what to type,
+    /// a schedule's instructions. Only a card that says so: an older agentd
+    /// would ignore the edit and run the agent's words.
+    public var editable = false
     /// Set when it's a browser action (typing, a key, a click) rather than a command.
     public var browser: BrowserAction?
     /// Set when it's a schedule the agent wants to set up.

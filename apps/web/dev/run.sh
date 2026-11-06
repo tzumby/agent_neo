@@ -33,7 +33,8 @@ pids+=($!)
 # agentd drives a browser: a headless Chrome of its own, as its evals do.
 chrome=${CHROME:-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
 "$chrome" --headless=new --remote-debugging-port=9333 --user-data-dir="$work/chrome" \
-  --no-first-run --no-default-browser-check about:blank >/dev/null 2>&1 &
+  --no-first-run --no-default-browser-check --host-resolver-rules="MAP form.test 127.0.0.1:8091" \
+  about:blank >/dev/null 2>&1 &
 pids+=($!)
 env -i PATH="$PATH" HOME="$work/home" LISTEN="unix:$sock" STATE_DIR="$work/state" \
   CDP_URL=http://127.0.0.1:9333 RUN_AS= SHELL_TOOL=on POLICY=/nonexistent SKILLS_DIR=/nonexistent \
@@ -53,6 +54,6 @@ done
 pids+=($!)
 
 echo "The web app: http://127.0.0.1:8088/  (logs in $work; Ctrl-C stops it)"
-echo "Try: a question; \"sign in\" (Action needed); \"schedule a report\" (a run in two minutes); \"slow\"; \"status site\" (a site to allow);"
+echo "Try: a question; \"sign in\" (Action needed); \"schedule a report\" (a run in two minutes); \"slow\"; \"status site\" (a site to allow); \"write a message\", \"risky command\", \"schedule after reading\" (cards to edit);"
 echo "     after adding Slack under Updates (any xoxb-… token), \"post an update\". Slack's stand-in: http://127.0.0.1:8091/slack-posts"
 wait

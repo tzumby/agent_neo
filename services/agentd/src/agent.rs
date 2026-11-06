@@ -71,6 +71,8 @@ const AUTO_APPROVE_ALL_RULE: &str = "Auto approve is on: nothing in this run wai
      come from the user, so say in your report that it's missing.";
 /// Who allowed a site, when no person answered a card.
 const AUTO_APPROVE_BY: &str = "Auto approve";
+/// How much of what the agent wants to type a card shows.
+const CARD_TEXT_MAX_CHARS: usize = 4000;
 const INTERRUPTED: &str =
     "I was interrupted: the agent on your desktop restarted. Ask me to continue if you still need this.";
 /// Memory v2: the one reminder when the user asked to remember something and
@@ -265,6 +267,8 @@ struct Answer {
     card: Value,
     /// Who answered (the app's signed-in person), when known.
     by: Option<String>,
+    /// What they changed the card's text to, if they did.
+    edited: Option<String>,
 }
 
 /// What an approval decided.
@@ -438,6 +442,31 @@ fn clip_summary(summary: &str) -> Option<String> {
         _ if line.is_empty() => None,
         Some((cut, _)) => Some(format!("{}…", line[..cut].trim_end())),
         None => Some(line),
+    }
+}
+
+/// Which tool argument and which card field hold the text of a card the user
+/// can edit: a command, what to type, or a schedule's instructions. A card says
+/// it's editable, so an app never offers an edit to an agentd that would ignore
+/// it and run the agent's words instead.
+fn editable_text(card: &Value) -> Option<(&'static str, &'static str)> {
+    if card["editable"] != true {
+        return None;
+    }
+    match card["kind"].as_str()? {
+        "shell" => Some(("command", "command")),
+        "browser" if card["action"] == "type" => Some(("text", "text")),
+        "schedule" => Some(("prompt", "text")),
+        _ => None,
+    }
+}
+
+/// The saved keys a call to run_shell asks for by name.
+fn asked_secrets(args: &Value) -> Vec<String> {
+    match &args["secrets"] {
+        Value::Array(names) => names.iter().filter_map(Value::as_str).map(String::from).collect(),
+        Value::String(name) => vec![name.clone()],
+        _ => Vec::new(),
     }
 }
 
@@ -854,6 +883,7 @@ impl Agent {
         self: &Arc<Self>,
         id: &str,
         approved: bool,
+        edited: Option<&str>,
         by: Option<String>,
     ) -> Result<(), StartError> {
         let Ok(Some(parked)) = self.store.parked(id) else {
@@ -883,22 +913,39 @@ impl Agent {
                 return Err(StartError::NotFound);
             }
         }
-        if self.busy.swap(true, Ordering::SeqCst) {
-            return Err(StartError::Busy);
-        }
-        let state = parked
+        let mut state = parked
             .checkpoint
             .as_deref()
             .and_then(|c| serde_json::from_str::<RunState>(c).ok());
+        let mut card = parked.card.clone();
+        // An edit that can't be used stops here: going ahead would run the
+        // agent's words when the user approved their own.
+        let edited = match edited.filter(|_| approved) {
+            Some(text) => {
+                let applied = state
+                    .as_mut()
+                    .and_then(|state| self.apply_edit(state, &mut card, text));
+                if applied.is_none() {
+                    return Err(StartError::NotFound);
+                }
+                applied
+            }
+            None => None,
+        };
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return Err(StartError::Busy);
+        }
         let (Some(state), Ok(true)) = (state, self.store.remove_pending(id)) else {
             self.busy.store(false, Ordering::SeqCst);
             return Err(StartError::NotFound);
         };
         // The event log records who decided (an audit trail).
-        self.emit(
-            "approval.resolved",
-            json!({"task": parked.run, "id": id, "approved": approved, "by": by}),
-        );
+        let mut resolved = json!({"task": parked.run, "id": id, "approved": approved, "by": by});
+        if let Some(text) = &edited {
+            resolved["edited"] = json!(true);
+            resolved["text"] = json!(text);
+        }
+        self.emit("approval.resolved", resolved);
         let _ = self.store.set_run_status(&state.task, "running");
         self.cancel.send_replace(false);
         self.emit("task.resumed", json!({"task": state.task}));
@@ -907,11 +954,66 @@ impl Agent {
         let agent = self.clone();
         let answer = Answer {
             approved,
-            card: parked.card,
+            card,
             by: by.clone(),
+            edited,
         };
         tokio::spawn(async move { agent.drive(state, Some(answer)).await });
         Ok(())
+    }
+
+    /// Why this card's text can't be changed to `text`, if it can't. A card
+    /// that's gone isn't a problem here: answering it says so.
+    pub fn edit_problem(&self, id: &str, text: &str) -> Option<&'static str> {
+        let parked = self.store.parked(id).ok().flatten()?;
+        if editable_text(&parked.card).is_none() {
+            return Some("this card has no text to edit");
+        }
+        text.trim()
+            .is_empty()
+            .then_some("the text is empty: deny the card instead")
+    }
+
+    /// Puts what the user wrote into the tool call the task parked on, and into
+    /// the card, as the call would make it, so the action still counts as the one
+    /// they approved. The call then runs again from the top: a command that's
+    /// refused outright stays refused, and one that now runs as root does.
+    /// Returns the text, or None if this card can't take an edit.
+    fn apply_edit(&self, state: &mut RunState, card: &mut Value, text: &str) -> Option<String> {
+        let (argument, field) = editable_text(card)?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        let call = state.queue.first_mut()?;
+        let mut args: Value = serde_json::from_str(call["function"]["arguments"].as_str()?).ok()?;
+        args.as_object()?;
+        let kind = card["kind"].as_str()?.to_string();
+        // A schedule's instructions are trimmed when it's made.
+        let text = if kind == "schedule" { text.trim() } else { text };
+        args[argument] = json!(text);
+        card[field] = match kind.as_str() {
+            "browser" => json!(truncate(text, CARD_TEXT_MAX_CHARS)),
+            "schedule" => {
+                // Without a name it would take one from the new instructions.
+                args["name"] = card["name"].clone();
+                json!(text.chars().take(SCHEDULE_PROMPT_MAX_CHARS).collect::<String>())
+            }
+            _ => {
+                // A command gets the keys it names, so the edit can change them.
+                card["secrets"] = json!(self.secrets.used_by(text, &asked_secrets(&args)).0);
+                json!(text)
+            }
+        };
+        call["function"]["arguments"] = json!(args.to_string());
+        Some(text.to_string())
+    }
+
+    /// For the model: its own call still shows what it wrote.
+    fn edited_note(&self, text: &str) -> String {
+        format!(
+            "\n\n(agentd: the user changed this before approving. What they approved: {})",
+            self.secrets.redact(text)
+        )
     }
 
     /// Why today's rules would refuse a parked card outright, if they would:
@@ -1401,6 +1503,11 @@ impl Agent {
                 }
                 // The user's answer belongs to the first call: the one parked on.
                 let resumed = answer.take();
+                let edited_note = resumed
+                    .as_ref()
+                    .and_then(|answer| answer.edited.as_deref())
+                    .map(|text| self.edited_note(text))
+                    .unwrap_or_default();
                 // An approved message stays sendable for a few calls only.
                 state.armed = state.armed.take().and_then(|mut armed| {
                     armed.remaining = armed.remaining.checked_sub(1)?;
@@ -1442,9 +1549,10 @@ impl Agent {
                     if let guard::Repeat::Stop(answer) = state.loops.record(&name, &raw, &refusal) {
                         break 'task Outcome::Finished(answer, "stuck");
                     }
+                    let content = format!("{refusal}{edited_note}");
                     state
                         .messages
-                        .push(json!({"role": "tool", "tool_call_id": call["id"], "content": refusal}));
+                        .push(json!({"role": "tool", "tool_call_id": call["id"], "content": content}));
                     continue;
                 }
                 // A resumed call was shown when it was first made.
@@ -1562,9 +1670,11 @@ impl Agent {
                         guard::label_untrusted("read_text", notes.join("\n"))
                     )
                 };
+                // After the label: these are the user's words, not outside content.
+                let content = format!("{result}{edited_note}");
                 state
                     .messages
-                    .push(json!({"role": "tool", "tool_call_id": call["id"], "content": result}));
+                    .push(json!({"role": "tool", "tool_call_id": call["id"], "content": content}));
                 match repeat {
                     guard::Repeat::Fine => {}
                     guard::Repeat::Nudge(text) => nudge = Some(text),
@@ -1789,8 +1899,9 @@ impl Agent {
                 // In a message field, approving the text also approves sending it.
                 let message = !submit && self.policy.message_field(element.role.as_deref(), &element.label);
                 let card = json!({
-                    "action": "type", "target": element.label, "role": element.role, "text": truncate(value, 4000),
-                    "submit": submit, "sends": message, "site": site,
+                    "action": "type", "target": element.label, "role": element.role,
+                    "text": truncate(value, CARD_TEXT_MAX_CHARS),
+                    "submit": submit, "sends": message, "site": site, "editable": true,
                 });
                 match self.gate(task_id, gate, card, resumed, schedule.is_some())? {
                     Err(refusal) => Ok(refusal),
@@ -1940,11 +2051,7 @@ impl Agent {
             }
             "run_shell" if self.cfg.shell_tool => {
                 let timeout = number("timeout").map_or(120, |n| n.max(1) as u64);
-                let asked: Vec<String> = match &args["secrets"] {
-                    Value::Array(names) => names.iter().filter_map(Value::as_str).map(String::from).collect(),
-                    Value::String(name) => vec![name.clone()],
-                    _ => Vec::new(),
-                };
+                let asked = asked_secrets(args);
                 // Any command: whether it changed something can't be told.
                 self.acted(task_id);
                 // "Run without asking", read now: turning it off applies at once.
@@ -2215,6 +2322,7 @@ impl Agent {
             let card = json!({
                 "kind": "schedule", "name": name, "text": prompt, "when": when, "next_run": timing.next_run,
                 "reason": "was asked for after reading outside content (a page, an email or command output)",
+                "editable": true,
             });
             if !matches!(self.approve(task_id, card, resumed, false)?, Decision::Approved) {
                 return Ok("denied: the user did not approve this schedule. Don't try another way.".into());
@@ -2770,7 +2878,7 @@ impl Agent {
             // outside content they may be steered, so the card says so (`tainted`).
             let mut card = json!({
                 "kind": "shell", "command": command, "reason": reason, "secrets": keys,
-                "summary": summary.and_then(clip_summary), "tainted": tainted,
+                "summary": summary.and_then(clip_summary), "tainted": tainted, "editable": true,
             });
             // Only when set, so cards parked before this was added still match.
             if direct {
@@ -3303,7 +3411,7 @@ impl Agent {
     ) -> Result<(), StartError> {
         match self.store.parked(id) {
             Ok(Some(parked)) if parked.card["kind"] == "secret" && parked.card["name"] == name => {
-                self.answer_approval(id, true, by)
+                self.answer_approval(id, true, None, by)
             }
             _ => Err(StartError::NotFound),
         }
@@ -3496,7 +3604,7 @@ mod tests {
         let id = park(&agent, "t1", card, &agent.policy_version());
         agent.update_settings(None, Some(false), None, None).unwrap();
         assert!(matches!(
-            agent.answer_approval(&id, true, Some("me".into())),
+            agent.answer_approval(&id, true, None, Some("me".into())),
             Err(StartError::NotFound)
         ));
         let resolved = events(&agent, "approval.resolved");
@@ -3519,7 +3627,7 @@ mod tests {
         let card = json!({"kind": "shell", "command": "sudo apt install jq", "reason": "runs as root"});
         // Under other rules (an older version), but today's would still only ask.
         let id = park(&agent, "t2", card, "0000000000000000");
-        assert!(agent.answer_approval(&id, true, Some("me".into())).is_ok());
+        assert!(agent.answer_approval(&id, true, None, Some("me".into())).is_ok());
         assert_eq!(events(&agent, "approval.resolved")[0]["approved"], true);
         assert_eq!(events(&agent, "task.resumed").len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
@@ -3734,6 +3842,7 @@ mod tests {
                 approved,
                 card: card.clone(),
                 by: None,
+                edited: None,
             })
         };
 
@@ -3969,6 +4078,235 @@ mod tests {
             .await
             .unwrap_err();
         assert!(asked.downcast::<Park>().is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The state a task parks in, with `args` as the call it parked on.
+    fn parked_on(tool: &str, args: &Value) -> RunState {
+        serde_json::from_value(json!({
+            "task": "t1", "model": "m", "allow_actions": true, "messages": [], "step": 1,
+            "tainted": true, "reminded": false, "loops": guard::LoopDetector::default(),
+            "usage": Usage::default(), "seconds": 0.0,
+            "queue": [{"id": "c1", "function": {"name": tool, "arguments": args.to_string()}}],
+        }))
+        .unwrap()
+    }
+
+    fn call_args(state: &RunState) -> Value {
+        serde_json::from_str(state.queue[0]["function"]["arguments"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_edited_command_is_what_runs_and_counts_as_approved() {
+        let (agent, dir) = test_agent();
+        agent
+            .secrets
+            .put("GITHUB_TOKEN", "ghp_test_value_123456")
+            .unwrap();
+        let (_stop, mut cancel) = watch::channel(false);
+        let original = "rm -rf ./old";
+        let park = agent
+            .run_shell(
+                "t1",
+                original,
+                Some("Clear the old build"),
+                &[],
+                10,
+                false,
+                false,
+                false,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap_err()
+            .downcast::<Park>()
+            .unwrap();
+        assert_eq!(park.card["editable"], true);
+        let mut state = parked_on(
+            "run_shell",
+            &json!({"command": original, "summary": "Clear the old build"}),
+        );
+        let mut card = park.card;
+        // Still risky, and now naming a saved key: the card has to agree with the call.
+        let edited = "rm -rf ./older; echo $GITHUB_TOKEN";
+        assert_eq!(
+            agent.apply_edit(&mut state, &mut card, edited).as_deref(),
+            Some(edited)
+        );
+        let args = call_args(&state);
+        assert_eq!(args["command"], edited);
+        assert_eq!(
+            args["summary"], "Clear the old build",
+            "the rest of the call stays"
+        );
+        let reply = agent
+            .run_shell(
+                "t1",
+                edited,
+                Some("Clear the old build"),
+                &[],
+                10,
+                false,
+                false,
+                false,
+                false,
+                Some(Answer {
+                    approved: true,
+                    card,
+                    by: None,
+                    edited: Some(edited.into()),
+                }),
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert!(reply.starts_with("exit code 0"), "{reply}");
+        assert!(
+            reply.contains("[secret GITHUB_TOKEN]"),
+            "the key reached it: {reply}"
+        );
+        // The model hears what ran, and never a key's value, even one typed into the edit.
+        let note = agent.edited_note("echo ghp_test_value_123456");
+        assert!(
+            note.contains("[secret GITHUB_TOKEN]") && !note.contains("ghp_test"),
+            "{note}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_matches_nothing_does_not_run_the_agents_words() {
+        let (agent, dir) = test_agent();
+        let (_stop, mut cancel) = watch::channel(false);
+        let park = agent
+            .run_shell(
+                "t1",
+                "rm -rf ./old",
+                Some("Clear the old build"),
+                &[],
+                10,
+                false,
+                false,
+                false,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap_err()
+            .downcast::<Park>()
+            .unwrap();
+        // Approved for one command: another one isn't covered.
+        let reply = agent
+            .run_shell(
+                "t1",
+                "rm -rf ./other",
+                Some("Clear the old build"),
+                &[],
+                10,
+                false,
+                false,
+                false,
+                false,
+                Some(Answer {
+                    approved: true,
+                    card: park.card,
+                    by: None,
+                    edited: None,
+                }),
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert!(reply.starts_with("denied"), "{reply}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn typed_text_can_be_edited_however_long_it_is() {
+        let (agent, dir) = test_agent();
+        let mut state = parked_on(
+            "type_text",
+            &json!({"role": "textbox", "name": "Message Lawrence", "text": "Hi there"}),
+        );
+        let mut card = json!({
+            "kind": "browser", "action": "type", "target": "Message Lawrence", "role": "textbox",
+            "text": "Hi there", "submit": false, "sends": true, "site": "slack.com", "editable": true,
+        });
+        // Longer than a card shows, with its lines and spaces as written.
+        let long = format!("  Hi Lawrence,\n\n{}", "more ".repeat(1000));
+        assert!(agent.apply_edit(&mut state, &mut card, &long).is_some());
+        assert_eq!(call_args(&state)["text"], long.as_str());
+        // What the call makes when it runs again is the card they approved.
+        let again = json!({
+            "kind": "browser", "action": "type", "target": "Message Lawrence", "role": "textbox",
+            "text": truncate(&long, CARD_TEXT_MAX_CHARS), "submit": false, "sends": true, "site": "slack.com",
+        });
+        assert!(same_request(&card, &again));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_edited_schedule_keeps_its_name_and_uses_the_new_instructions() {
+        let (agent, dir) = test_agent();
+        // The model gave no name, so the card's came from its instructions.
+        let args = json!({"prompt": "Check everything", "cron": "0 8 * * *"});
+        let park = agent
+            .schedule_task("t1", &args, true, None)
+            .unwrap_err()
+            .downcast::<Park>()
+            .unwrap();
+        assert_eq!(park.card["editable"], true);
+        let mut state = parked_on("schedule_task", &args);
+        let mut card = park.card;
+        assert_eq!(
+            agent
+                .apply_edit(&mut state, &mut card, "  Check only Cloudflare \n")
+                .as_deref(),
+            Some("Check only Cloudflare")
+        );
+        let reply = agent
+            .schedule_task(
+                "t1",
+                &call_args(&state),
+                true,
+                Some(Answer {
+                    approved: true,
+                    card,
+                    by: None,
+                    edited: Some("Check only Cloudflare".into()),
+                }),
+            )
+            .unwrap();
+        assert!(reply.starts_with("scheduled #"), "{reply}");
+        let saved = agent.store.schedules().unwrap();
+        assert_eq!(saved[0].prompt, "Check only Cloudflare");
+        assert_eq!(saved[0].name, "Check everything");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_card_that_says_so_takes_an_edit() {
+        let (agent, dir) = test_agent();
+        let mut state = parked_on("click", &json!({"text": "Send"}));
+        for mut card in [
+            json!({"kind": "browser", "action": "click", "target": "Send", "editable": true}),
+            json!({"kind": "access", "hosts": ["a.example.com"], "editable": true}),
+            json!({"kind": "secret", "name": "A_KEY", "editable": true}),
+            // Parked by an older agentd, which wouldn't say.
+            json!({"kind": "shell", "command": "ls"}),
+        ] {
+            assert!(
+                agent.apply_edit(&mut state, &mut card, "other").is_none(),
+                "{card}"
+            );
+        }
+        let mut card = json!({"kind": "shell", "command": "ls", "editable": true});
+        let mut shell = parked_on("run_shell", &json!({"command": "ls"}));
+        assert!(agent.apply_edit(&mut shell, &mut card, " \n ").is_none(), "blank");
+        assert_eq!(call_args(&shell)["command"], "ls", "nothing changed");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4763,6 +5101,7 @@ mod setup_schedule_tests {
             approved: true,
             card: park.card,
             by: None,
+            edited: None,
         };
         let made = agent.schedule_task("t2", &after, true, Some(approved)).unwrap();
         assert!(made.starts_with("scheduled #"), "{made}");
@@ -5121,6 +5460,7 @@ mod access_tests {
             approved: true,
             card: park.card,
             by: Some("me@acme.com".into()),
+            edited: None,
         };
         let reply = agent
             .request_access("t1", &args, true, Some(answer), false)
@@ -5193,6 +5533,7 @@ mod access_tests {
             approved: false,
             card,
             by: None,
+            edited: None,
         };
         let reply = agent
             .request_access(

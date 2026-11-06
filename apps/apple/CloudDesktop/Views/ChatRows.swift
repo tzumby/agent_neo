@@ -233,6 +233,59 @@ struct CopyButton: View {
 
 // MARK: - Approval
 
+/// The person's own version of a card's text, while they edit it.
+private struct CardDraft {
+    var editing = false
+    var text = ""
+
+    /// What to send with the approval: nothing if they didn't change it.
+    func changed(from original: String) -> String? {
+        editing && text != original ? text : nil
+    }
+
+    /// Blank text can't be approved: Deny says no.
+    var isBlank: Bool {
+        editing && text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+/// "Edit", then "Undo changes", which goes back to the agent's words.
+private struct DraftToggle: View {
+    @Binding var draft: CardDraft
+    let original: String
+
+    var body: some View {
+        Button {
+            withAnimation(.snappy(duration: 0.2)) {
+                draft.text = original
+                draft.editing.toggle()
+            }
+        } label: {
+            Label(draft.editing ? "Undo changes" : "Edit", systemImage: draft.editing ? "arrow.uturn.backward" : "pencil")
+                .font(.app(.footnote).weight(.medium))
+                .foregroundStyle(.secondary)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct DraftField: View {
+    let label: String
+    @Binding var text: String
+    var monospaced = false
+
+    var body: some View {
+        TextField(label, text: $text, axis: .vertical)
+            .lineLimit(3...12)
+            .font(monospaced ? .app(.footnote).monospaced() : .app(.body))
+            .textFieldStyle(.plain)
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.inset, in: .rect(cornerRadius: 12))
+    }
+}
+
 /// A command that needs the user's OK: what it does in plain words and why
 /// it needs the OK; the command itself only when asked for.
 private struct ApprovalCard: View {
@@ -240,6 +293,7 @@ private struct ApprovalCard: View {
     @Environment(\.chatStore) private var store
     @Environment(\.agentClient) private var client
     @State private var showCommand = false
+    @State private var draft = CardDraft()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -259,21 +313,31 @@ private struct ApprovalCard: View {
                 .font(.app(.caption))
                 .foregroundStyle(.orange)
             }
-            Button {
-                withAnimation(.snappy(duration: 0.2)) { showCommand.toggle() }
-            } label: {
-                HStack(spacing: 4) {
-                    Text(showCommand ? "Hide the command" : "Show the command")
-                    Image(systemName: "chevron.right")
-                        .font(.app(.caption2).weight(.bold))
-                        .rotationEffect(.degrees(showCommand ? 90 : 0))
+            HStack {
+                if !draft.editing {
+                    Button {
+                        withAnimation(.snappy(duration: 0.2)) { showCommand.toggle() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(showCommand ? "Hide the command" : "Show the command")
+                            Image(systemName: "chevron.right")
+                                .font(.app(.caption2).weight(.bold))
+                                .rotationEffect(.degrees(showCommand ? 90 : 0))
+                        }
+                        .font(.app(.footnote).weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .font(.app(.footnote).weight(.medium))
-                .foregroundStyle(.secondary)
-                .contentShape(.rect)
+                Spacer()
+                if approval.editable {
+                    DraftToggle(draft: $draft, original: approval.command)
+                }
             }
-            .buttonStyle(.plain)
-            if showCommand {
+            if draft.editing {
+                DraftField(label: "The command", text: $draft.text, monospaced: true)
+            } else if showCommand {
                 Text(approval.command)
                     .font(.app(.footnote).monospaced())
                     .textSelection(.enabled)
@@ -290,6 +354,7 @@ private struct ApprovalCard: View {
                     Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
                 }
                 .primaryGlass()
+                .disabled(draft.isBlank)
             }
             .controlSize(.large)
         }
@@ -298,7 +363,8 @@ private struct ApprovalCard: View {
 
     private func answer(_ approved: Bool) {
         guard let store, let client else { return }
-        Task { await store.answer(approval, approved: approved, client: client) }
+        let text = approved ? draft.changed(from: approval.command) : nil
+        Task { await store.answer(approval, approved: approved, text: text, client: client) }
     }
 }
 
@@ -322,6 +388,7 @@ private struct BrowserApprovalCard: View {
     let action: BrowserAction
     @Environment(\.chatStore) private var store
     @Environment(\.agentClient) private var client
+    @State private var draft = CardDraft()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -334,19 +401,27 @@ private struct BrowserApprovalCard: View {
                 }
             }
             // What the agent would do, shown as a quote or a key, not a box that
-            // looks like a text field: the card asks for a yes or a no.
+            // looks like a text field: the card asks for a yes or a no, until
+            // the person chooses to edit it.
             switch action.action {
             case "type":
                 if !action.target.isEmpty {
                     Text("In “\(action.target)”").font(.app(.footnote)).foregroundStyle(.secondary).lineLimit(2)
                 }
-                HStack(alignment: .top, spacing: 10) {
-                    Capsule().fill(.orange.opacity(0.6)).frame(width: 3)
-                    Text(action.text ?? "")
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                if draft.editing {
+                    DraftField(label: "What to write", text: $draft.text)
+                } else {
+                    HStack(alignment: .top, spacing: 10) {
+                        Capsule().fill(.orange.opacity(0.6)).frame(width: 3)
+                        Text(action.text ?? "")
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
                 }
-                .fixedSize(horizontal: false, vertical: true)
+                if approval.editable {
+                    DraftToggle(draft: $draft, original: action.text ?? "")
+                }
             case "key":
                 HStack(spacing: 8) {
                     KeyCap(key: action.key ?? "?")
@@ -377,6 +452,7 @@ private struct BrowserApprovalCard: View {
                     Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
                 }
                 .primaryGlass()
+                .disabled(draft.isBlank)
             }
             .controlSize(.large)
         }
@@ -411,7 +487,8 @@ private struct BrowserApprovalCard: View {
 
     private func answer(_ approved: Bool) {
         guard let store, let client else { return }
-        Task { await store.answer(approval, approved: approved, client: client) }
+        let text = approved ? draft.changed(from: action.text ?? "") : nil
+        Task { await store.answer(approval, approved: approved, text: text, client: client) }
     }
 }
 
@@ -434,6 +511,7 @@ private struct ScheduleApprovalCard: View {
     let proposal: ScheduleProposal
     @Environment(\.chatStore) private var store
     @Environment(\.agentClient) private var client
+    @State private var draft = CardDraft()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -445,15 +523,23 @@ private struct ScheduleApprovalCard: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(proposal.name).font(.app(.subheadline).weight(.semibold))
                 Text(proposal.when).font(.app(.subheadline))
-                Text(proposal.prompt)
-                    .font(.app(.footnote))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(8)
-                    .textSelection(.enabled)
+                if !draft.editing {
+                    Text(proposal.prompt)
+                        .font(.app(.footnote))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(8)
+                        .textSelection(.enabled)
+                }
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Theme.inset, in: .rect(cornerRadius: 14))
+            if draft.editing {
+                DraftField(label: "What to do each time", text: $draft.text)
+            }
+            if approval.editable {
+                DraftToggle(draft: $draft, original: proposal.prompt)
+            }
             Text("The agent asked for this after reading outside content. Approve only if you asked for it.")
                 .font(.app(.footnote))
                 .foregroundStyle(.secondary)
@@ -464,6 +550,7 @@ private struct ScheduleApprovalCard: View {
                     Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
                 }
                 .primaryGlass()
+                .disabled(draft.isBlank)
             }
             .controlSize(.large)
         }
@@ -472,7 +559,8 @@ private struct ScheduleApprovalCard: View {
 
     private func answer(_ approved: Bool) {
         guard let store, let client else { return }
-        Task { await store.answer(approval, approved: approved, client: client) }
+        let text = approved ? draft.changed(from: proposal.prompt) : nil
+        Task { await store.answer(approval, approved: approved, text: text, client: client) }
     }
 }
 

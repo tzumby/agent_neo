@@ -245,6 +245,64 @@ async def main(out):
             await p.js(f"{sites}.find(r => r.textContent.includes('status.example.com')).querySelector('button').click()")
             p.check(await p.until(f"!{sites}.some(r => r.textContent.includes('status.example.com'))"), "…and Remove takes it off")
 
+            # A card about text can be edited: what's approved is what happens.
+            await p.js("location.hash = '#/chat'")
+            await p.until("!document.querySelector('#view-chat').hidden")
+            async def say(text):
+                # While the desktop is busy, the send button stops it.
+                await p.until("fetch('/api/v1/status').then(r => r.json()).then(s => !s.busy)", 15)
+                await asyncio.sleep(0.5)
+                await p.js(f"""(() => {{ const t = document.querySelector('.composer textarea');
+                    t.value = {json.dumps(text)}; t.dispatchEvent(new Event('input')); }})()""")
+                await p.js("document.querySelector('.composer .send').click()")
+            def press(card, label):
+                return p.js(f"[...{card}.querySelectorAll('button')].find(b => b.textContent === '{label}').click()")
+            def said(text):
+                return p.until(f"[...document.querySelectorAll('.row-agent')].some(r => r.textContent.includes({json.dumps(text)}))", 15)
+            await say("Write a message to Lawrence")
+            card = "[...document.querySelectorAll('.card-needs')].find(c => c.textContent.includes('Hello from the agent'))"
+            p.check(await p.until(f"!!{card}", 20), "writing a message: the card shows the text")
+            await press(card, "Edit")
+            box = "document.querySelector('.card-needs .card-edit:not([hidden])')"
+            p.check(await p.js(f"{box}.value") == "Hello from the agent", "Edit starts from the agent's words")
+            await p.js(f"(() => {{ const b = {box}; b.value = '   '; b.dispatchEvent(new Event('input')); }})()")
+            approve = f"[...{box}.closest('.card-needs').querySelectorAll('button')].find(b => b.textContent === 'Approve')"
+            p.check(await p.js(f"{approve}.disabled") is True, "…blank text can't be approved")
+            await p.js(f"(() => {{ const b = {box}; b.value = 'Hello from a person'; b.dispatchEvent(new Event('input')); }})()")
+            await p.shot(f"{out}/smoke-edit.png")
+            await p.js(f"{approve}.click()")
+            p.check(await said("On the page: Hello from a person"), "…and the edited message is what's written on the page")
+
+            await say("Run the risky command")
+            card = "[...document.querySelectorAll('.card-needs')].find(c => c.textContent.includes('rm -rf ./old-build'))"
+            p.check(await p.until(f"!!{card}", 15), "a command: the card has it")
+            await press(card, "Edit")
+            p.check(await p.js(f"{card}.querySelector('details').open") is True, "…Edit shows it")
+            await p.js(f"(() => {{ const b = {card}.querySelector('.card-edit'); b.value = 'echo edited-by-a-person'; b.dispatchEvent(new Event('input')); }})()")
+            await press(card, "Approve")
+            p.check(await said("edited-by-a-person"), "…and the edited command is what runs")
+
+            # A refusal still applies to what the person wrote.
+            await say("Run the risky command")
+            p.check(await p.until(f"!!{card}", 15), "the command again")
+            await press(card, "Edit")
+            await p.js(f"(() => {{ const b = {card}.querySelector('.card-edit'); b.value = 'crontab -l'; b.dispatchEvent(new Event('input')); }})()")
+            await press(card, "Approve")
+            p.check(await said("don't schedule with the shell"), "an edited command that's never allowed is still refused")
+
+            await say("Make a schedule after reading the logs")
+            card = "[...document.querySelectorAll('.card-needs')].find(c => c.textContent.includes('Schedule this?'))"
+            p.check(await p.until(f"!!{card}", 15), "a schedule after outside content: the card asks")
+            await press(card, "Edit")
+            await p.js(f"(() => {{ const b = {card}.querySelector('.card-edit'); b.value = 'Check only Cloudflare'; b.dispatchEvent(new Event('input')); }})()")
+            await press(card, "Approve")
+            await said("scheduled #")
+            schedules = await p.js("fetch('/api/v1/schedules').then(r => r.json())")
+            made = [s for s in schedules["schedules"] if s["name"] == "Morning check"]
+            p.check(bool(made) and made[0]["prompt"] == "Check only Cloudflare", "…and the edited instructions are what's scheduled")
+            if made:
+                await p.js(f"fetch('/api/v1/schedules/{made[0]['id']}', {{method: 'DELETE'}})")
+
             # A card the desktop doesn't know (a sample one): it expires.
             await p.js("location.hash = '#/chat'")
             await p.until("!document.querySelector('#view-chat').hidden")

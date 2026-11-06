@@ -45,7 +45,7 @@ export const api = {
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     return request("POST", "/api/v1/messages", { text, timezone, utc_offset: -new Date().getTimezoneOffset() * 60 });
   },
-  answer: (id, approved) => request("POST", `/api/v1/approvals/${enc(id)}`, { approved }),
+  answer: (id, approved, text) => request("POST", `/api/v1/approvals/${enc(id)}`, { approved, text }),
   resolve: (id, done) => request("POST", `/api/v1/actions/${enc(id)}`, { choice: done ? "done" : "skip" }),
   stop: () => request("POST", "/api/v1/stop", {}),
   settings: () => request("GET", "/api/v1/settings"),

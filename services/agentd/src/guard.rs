@@ -164,6 +164,18 @@ pub const SUMMARY_REFUSAL: &str = "not run: this command needs the user's OK, an
      plain words for someone who doesn't read shell (like \"Install the jq tool\" or \"Delete last week's build \
      files\"), with no commands, flags or symbols.";
 
+pub const BROWSER_SUMMARY_REFUSAL: &str = "not run: this needs the user's OK, and a button's name or a key doesn't \
+     tell them what it does. Call it again, the same way, with a summary: what it does and why, in a few plain words \
+     for someone who can't see the page, like \"Delete the old-build branch on GitHub\" or \"Pay the March invoice \
+     from Acme\".";
+
+/// Whether a click or key has a reason worth showing: more than its own label.
+/// Lighter than a command's: page words often hold symbols ("Pay $20").
+pub fn says_why(summary: Option<&str>, label: &str) -> bool {
+    let summary = summary.unwrap_or_default().trim();
+    !summary.is_empty() && !summary.eq_ignore_ascii_case(label.trim())
+}
+
 /// Whether a command's summary is plain words the user can decide on: not
 /// missing, not the command itself, no shell symbols or flags, and not
 /// starting with a program's name. A command that needs approval without one

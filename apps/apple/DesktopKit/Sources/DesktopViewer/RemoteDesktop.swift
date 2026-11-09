@@ -42,10 +42,10 @@ public final class RemoteDesktop {
     /// The latest frame. Frames bypass SwiftUI: the view sets `onFrame`.
     @ObservationIgnored public private(set) var frame: CGImage?
     @ObservationIgnored public var onFrame: ((CGImage) -> Void)?
-    /// Text the desktop put on its clipboard (x11vnc sends selections as they change).
-    @ObservationIgnored public var onClipboard: ((String) -> Void)?
 
     @ObservationIgnored private var client: RFBClient?
+    @ObservationIgnored private var copy = DesktopCopy()
+    @ObservationIgnored private var deliverCopy: (@MainActor (String?) -> Void)?
 
     /// A view that draws the frames itself (swift-rfb's Metal view on the
     /// Mac): it gets every event, and each connection's client, through which
@@ -88,7 +88,7 @@ public final class RemoteDesktop {
                         guard let image = framebuffer.makeImage() else { return client.framebufferConsumed() }
                         DispatchQueue.main.async { MainActor.assumeIsolated { self?.show(image, from: client) } }
                     case .clipboard(let text):
-                        DispatchQueue.main.async { MainActor.assumeIsolated { self?.onClipboard?(text) } }
+                        DispatchQueue.main.async { MainActor.assumeIsolated { self?.received(clipboard: text) } }
                     default:
                         break
                     }
@@ -147,6 +147,37 @@ public final class RemoteDesktop {
 
     private func pointer(x: Int, y: Int, buttons: RFBButtons) {
         client?.pointer(x: max(0, x), y: max(0, y), buttons: buttons)
+    }
+
+    // MARK: Clipboard
+
+    /// Copies what's selected on the desktop to this device: presses Ctrl+C, then
+    /// `deliver` gets the text, or nil if the desktop has nothing to give.
+    public func copySelection(deliver: @escaping @MainActor (String?) -> Void) {
+        let control: UInt32 = 0xFFE3
+        key(0x63, modifiers: [control])
+        awaitCopy(deliver: deliver)
+    }
+
+    /// After Ctrl+C or Ctrl+X was pressed some other way: `deliver` gets what the
+    /// desktop copied.
+    public func awaitCopy(deliver: @escaping @MainActor (String?) -> Void) {
+        let pressed = copy.begin()
+        deliverCopy = deliver
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard let self else { return }
+            let ended = copy.expired(pressed)
+            guard ended.open else { return }
+            deliverCopy = nil
+            deliver(ended.text)
+        }
+    }
+
+    private func received(clipboard text: String) {
+        guard let text = copy.received(text) else { return }
+        deliverCopy?(text)
+        deliverCopy = nil
     }
 
     // MARK: Keyboard

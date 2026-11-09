@@ -63,6 +63,10 @@ struct MacTakeOverView: View {
                         .help(desktop.state == .live ? "Connected" : "Connecting")
                 }
                 ToolbarItemGroup(placement: .primaryAction) {
+                    Button("Copy", systemImage: "doc.on.doc") {
+                        desktop.copySelection { if let text = $0 { Clipboard.copy(text) } }
+                    }
+                    .help("Copy what's selected on the desktop to the Mac (⌘C)")
                     Button("Paste", systemImage: "doc.on.clipboard") {
                         if let text = NSPasteboard.general.string(forType: .string) { desktop.type(text) }
                     }

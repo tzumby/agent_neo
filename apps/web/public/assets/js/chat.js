@@ -271,8 +271,18 @@ function browserCard(card, ctx) {
   } else if (b.action === "key") {
     what = h("p", { class: "card-text" }, h("kbd", null, b.key || "?"), b.target ? ` in “${b.target}”` : "");
   } else {
-    what = h("p", { class: "card-text card-target" }, `“${b.target}”`);
+    const name = b.target ? `“${b.target}”` : "without a name";
+    const role = b.role ? `${b.role[0].toUpperCase()}${b.role.slice(1)} ` : "";
+    what = h("p", { class: "card-text card-target" }, `${role}${name}`);
   }
+  // A click or key says little by itself: the agent's reason first, then what the
+  // page itself shows, which the agent's words can't change.
+  const said = b.action !== "type" && card.summary ? h("p", { class: "card-text strong" }, `The agent says: ${card.summary}`) : null;
+  const facts = b.action === "type" ? null : [
+    b.around ? h("div", { class: "card-inset" }, h("p", { class: "strong" }, "Around it on the page"), h("p", { class: "muted" }, b.around)) : null,
+    b.page || b.url ? h("p", { class: "card-text muted" }, [b.page, b.url].filter(Boolean).join(", ")) : null,
+    b.image ? picture(b.image, "The page, with what it would click outlined") : null,
+  ];
   const note = b.action === "type" && b.submit ? warning("Then presses Enter, which may send it.")
     : b.action === "type" && b.sends ? warning("Approving also lets it send this.")
     : b.action !== "type" && card.reason ? h("p", { class: "card-text muted" }, `It ${card.reason}.`) : null;
@@ -280,7 +290,7 @@ function browserCard(card, ctx) {
     h("div", { class: "card-head" },
       h("h3", { class: "card-title" }, icon(b.action === "click" ? "click" : "keyboard"), title),
       b.site ? h("span", { class: "card-site" }, icon("globe"), site(b.site)) : null),
-    what, note, answerButtons(card, ctx, edit));
+    said, what, facts, note, answerButtons(card, ctx, edit));
 }
 
 function scheduleCard(card, ctx) {

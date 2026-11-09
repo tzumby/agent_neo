@@ -36,15 +36,21 @@ struct ChatRow: View, Equatable {
 
 private struct UserBubble: View {
     let text: String
+    @State private var selecting = false
 
     var body: some View {
         Text(text)
+            #if os(macOS)
+            .textSelection(.enabled)
+            #endif
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
             .background(Theme.userBubble, in: .rect(cornerRadius: 22))
             .contextMenu {
                 Button("Copy", systemImage: "doc.on.doc") { Clipboard.copy(text) }
+                Button("Select Text", systemImage: "text.cursor") { selecting = true }
             }
+            .selectTextSheet(text, isPresented: $selecting)
             .frame(maxWidth: .infinity, alignment: .trailing)
             .padding(.leading, 56)
     }
@@ -58,10 +64,107 @@ private struct AssistantMessage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             MarkdownView(text: text)
-            CopyButton(text: text).font(.app(.footnote))
+            MessageActions(text: text)
         }
     }
 }
+
+/// Under an answer: copy it, or open its text to select any part.
+private struct MessageActions: View {
+    let text: String
+    @State private var selecting = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            CopyButton(text: text)
+            Button {
+                selecting = true
+            } label: {
+                Image(systemName: "text.cursor")
+                    .frame(width: 28, height: 28)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("Select text")
+            .help("Select text")
+            .selectTextSheet(text, isPresented: $selecting)
+        }
+        .font(.app(.footnote))
+    }
+}
+
+extension View {
+    fileprivate func selectTextSheet(_ text: String, isPresented: Binding<Bool>) -> some View {
+        sheet(isPresented: isPresented) { SelectableTextSheet(text: text) }
+    }
+}
+
+/// A message as plain text, to select any part of it and copy that.
+private struct SelectableTextSheet: View {
+    let text: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            SelectableText(text: text)
+                .navigationTitle("Select text")
+                #if os(iOS)
+                .navigationBarTitleDisplayMode(.inline)
+                #endif
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("Copy all", systemImage: "doc.on.doc") {
+                            Clipboard.copy(text)
+                            dismiss()
+                        }
+                    }
+                }
+        }
+        #if os(macOS)
+        .frame(minWidth: 520, minHeight: 420)
+        #endif
+    }
+}
+
+#if os(iOS)
+/// UITextView: SwiftUI's selectable Text only offers the whole text on a phone.
+private struct SelectableText: UIViewRepresentable {
+    let text: String
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.isEditable = false
+        view.isSelectable = true
+        view.backgroundColor = .clear
+        view.adjustsFontForContentSizeCategory = true
+        view.font = .preferredFont(forTextStyle: .body)
+        view.textColor = .label
+        view.textContainerInset = UIEdgeInsets(top: 16, left: 12, bottom: 24, right: 12)
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        if view.text != text { view.text = text }
+    }
+}
+#else
+private struct SelectableText: View {
+    let text: String
+
+    var body: some View {
+        ScrollView {
+            Text(text)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+        }
+    }
+}
+#endif
 
 /// A scheduled run's report, not a message from the user: the schedule and
 /// when, its instructions on a tap, then what it found. A run that found
@@ -78,7 +181,7 @@ private struct ReportRow: View {
                 header
                 if showInstructions { instructions }
                 MarkdownView(text: answer.text)
-                CopyButton(text: answer.text).font(.app(.footnote))
+                MessageActions(text: answer.text)
             }
             .card()
         } else {
@@ -400,6 +503,11 @@ private struct BrowserApprovalCard: View {
                     Label(site, systemImage: "globe").font(.app(.caption)).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
+            // A click or key says little by itself. The agent's reason first, then
+            // what the page itself shows, which the agent's words can't change.
+            if action.action != "type", let summary = approval.summary {
+                Text("The agent says: \(summary)").font(.app(.subheadline).weight(.medium))
+            }
             // What the agent would do, shown as a quote or a key, not a box that
             // looks like a text field: the card asks for a yes or a no, until
             // the person chooses to edit it.
@@ -431,7 +539,10 @@ private struct BrowserApprovalCard: View {
                 }
                 .font(.app(.callout))
             default:
-                Text("“\(action.target)”").font(.app(.callout).weight(.medium)).lineLimit(3)
+                Text(clickTarget).font(.app(.callout).weight(.medium)).lineLimit(3)
+            }
+            if action.action != "type" {
+                pageFacts
             }
             if action.action == "type", action.submit {
                 Label("Then presses Enter, which may send it", systemImage: "return")
@@ -457,6 +568,39 @@ private struct BrowserApprovalCard: View {
             .controlSize(.large)
         }
         .card()
+    }
+
+    @ViewBuilder private var pageFacts: some View {
+        if !action.around.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Around it on the page").font(.app(.caption).weight(.semibold))
+                Text(action.around)
+                    .font(.app(.footnote))
+                    .lineLimit(6)
+                    .textSelection(.enabled)
+            }
+            .foregroundStyle(.secondary)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.inset, in: .rect(cornerRadius: 14))
+        }
+        if !action.page.isEmpty || !action.url.isEmpty {
+            VStack(alignment: .leading, spacing: 1) {
+                if !action.page.isEmpty { Text(action.page).lineLimit(1) }
+                if !action.url.isEmpty { Text(action.url).lineLimit(1).truncationMode(.middle) }
+            }
+            .font(.app(.caption))
+            .foregroundStyle(.secondary)
+        }
+        if let path = action.imagePath {
+            RemoteImage(path: path)
+        }
+    }
+
+    /// Button “Confirm”
+    private var clickTarget: String {
+        let name = action.target.isEmpty ? "without a name" : "“\(action.target)”"
+        return action.role.isEmpty ? name : "\(action.role.prefix(1).uppercased())\(action.role.dropFirst()) \(name)"
     }
 
     private var title: String {

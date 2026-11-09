@@ -68,9 +68,10 @@ private struct BlockView: View {
     }
 }
 
-/// Inline text: styles, links, and `code` as chips. No .textSelection here:
-/// selectable text skips custom renderers (no code chips). Long-press copies
-/// the whole answer instead; code blocks stay selectable.
+/// Inline text: styles, links, and `code` as chips. Selectable on the Mac, where
+/// dragging over text is what people try, though selectable text skips custom
+/// renderers (no chip behind inline code). On the phone it would only ever select
+/// a whole paragraph, so chips stay and the answer's Select button opens its text.
 private struct Prose: View {
     let text: AttributedString
     let source: String
@@ -81,6 +82,9 @@ private struct Prose: View {
             .textRenderer(CodeChipRenderer())
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
+            #if os(macOS)
+            .textSelection(.enabled)
+            #endif
             .contextMenu {
                 Button("Copy", systemImage: "doc.on.doc") { Clipboard.copy(source) }
             }

@@ -101,8 +101,9 @@ a role, a name and a ref. click and type_text take a ref (preferred), or a role 
     them take over the screen, while a text reply ends the task. Never type passwords or codes yourself. \
 After the user takes over, they tell you to continue or to skip.
 - Browser changes (typing on a page, pressing Enter, clicking Send, Delete and the like) wait for the \
-    user's approval, or are blocked in read-only mode. If one is denied or blocked, don't look for another \
-    way; say what you would have done. When asked to draft something, type it but don't send it; send only \
+    user's approval, or are blocked in read-only mode. A click or key that could change something needs a \
+    summary: what it does and why, in plain words, since a button's name rarely says. If one is denied or \
+    blocked, don't look for another way; say what you would have done. When asked to draft something, type it but don't send it; send only \
 when the user asked you to send. To send a message, type it into the message field; the user's approval \
 of the text also covers sending it with Enter or Send right after, so they're asked once.
 - Opening a page, clicking and pressing keys already wait for the page to load and stop changing \
@@ -202,6 +203,12 @@ pub fn schemas(shell: bool, skills: bool, memory_v2: bool, scheduled: bool) -> V
     });
     let mut click = target.clone();
     click["text"] = json!({"type": "string", "description": "visible text, if you have no ref"});
+    let says_why = json!({
+        "type": "string",
+        "description": "What this does and why, in a few plain words for someone who can't see the page, like \
+                        \"Delete the old-build branch on GitHub\" (shown when the user is asked to approve it)",
+    });
+    click["summary"] = says_why.clone();
     let mut type_text = target.clone();
     type_text["text"] = json!({"type": "string"});
     type_text["submit"] = json!({"type": "boolean", "description": "press Enter afterwards"});
@@ -252,7 +259,7 @@ pub fn schemas(shell: bool, skills: bool, memory_v2: bool, scheduled: bool) -> V
         tool(
             "press_key",
             "Press a key such as PageDown, Escape or Enter. Keys other than navigation keys need the user's approval.",
-            json!({"key": {"type": "string"}}),
+            json!({"key": {"type": "string"}, "summary": says_why}),
             &["key"],
         ),
         tool(

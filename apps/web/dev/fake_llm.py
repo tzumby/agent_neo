@@ -49,6 +49,15 @@ SCRIPTS = {
         ("type_text", {"role": "textbox", "name": "Message Lawrence", "text": "Hello from the agent"}),
         ("read_text", {}),
     ],
+    "pay without saying why": [
+        ("open_url", {"url": "http://form.test/form"}),
+        ("click", {"role": "button", "name": "Confirm payment"}),
+    ],
+    "pay the invoice": [
+        ("open_url", {"url": "http://form.test/form"}),
+        ("click", {"role": "button", "name": "Confirm payment", "summary": "Pay the March invoice from Acme"}),
+        ("read_text", {}),
+    ],
     "risky command": [("run_shell", {"command": "rm -rf ./old-build", "summary": "Clear the old build"})],
     "schedule after reading": [
         ("run_shell", {"command": "echo some outside content"}),
@@ -58,7 +67,9 @@ SCRIPTS = {
 
 # A page with a message field, which run.sh's Chrome reaches as http://form.test/form.
 FORM = b"""<!doctype html><title>Message Lawrence</title><p id="echo">Nothing written yet.</p>
-<textarea aria-label="Message Lawrence" oninput="document.getElementById('echo').textContent = 'On the page: ' + this.value"></textarea>"""
+<textarea aria-label="Message Lawrence" oninput="document.getElementById('echo').textContent = 'On the page: ' + this.value"></textarea>
+<table><tr><td>Invoice for March from Acme, $120</td>
+<td><button onclick="document.getElementById('echo').textContent = 'On the page: paid'">Confirm payment</button></td></tr></table>"""
 
 
 def reply(messages, tools=()):

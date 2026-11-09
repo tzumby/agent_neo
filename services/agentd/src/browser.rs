@@ -17,6 +17,46 @@ use crate::policy::{Gate, Policy};
 
 /// The element with keyboard focus: its role (explicit, or implied by the
 /// tag) and its label.
+/// The text around an element: the dialog, row or form it's in, else the
+/// nearest parent with more to say than the element itself.
+const AROUND: &str = r#"function() {
+    const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
+    const own = clean(this.innerText || (this.getAttribute && this.getAttribute('aria-label')));
+    const holder = this.closest && this.closest(
+        'dialog,[role=dialog],[role=alertdialog],tr,[role=row],li,[role=listitem],article,[role=article],form');
+    let around = holder ? clean(holder.innerText) : '';
+    if (!around || around === own) {
+        around = '';
+        for (let e = this.parentElement, i = 0; e && e !== document.body && i < 6; e = e.parentElement, i++) {
+            const text = clean(e.innerText);
+            if (text && text !== own) { around = text; break; }
+        }
+    }
+    return around.length > 300 ? around.slice(0, 300) + '…' : around;
+}"#;
+/// Outlines an element and returns its style attribute, to put back.
+const OUTLINE: &str = r#"function() {
+    const before = this.getAttribute('style');
+    this.style.setProperty('outline', '3px solid #FF5A1F', 'important');
+    this.style.setProperty('outline-offset', '2px', 'important');
+    return before;
+}"#;
+const OUTLINE_OFF: &str = r#"function(before) {
+    // Blink writes a changed style attribute lazily. Reading it first writes it:
+    // removing one that isn't written yet would leave style="" behind.
+    this.getAttribute('style');
+    if (before === null) this.removeAttribute('style');
+    else this.setAttribute('style', before);
+}"#;
+
+/// Where an element is, for an approval card (Browser::place_of).
+#[derive(Default)]
+pub struct Place {
+    pub title: String,
+    pub url: String,
+    pub around: String,
+}
+
 pub struct Focused {
     pub role: Option<String>,
     pub label: String,
@@ -433,6 +473,78 @@ impl Browser {
     }
 
     /// What has the keyboard focus (its label), for approving a key press.
+    /// Where an element is, for an approval card: the page, and the text around
+    /// it (the dialog, row or form it's in), which often says more than its
+    /// label. With no element, the focused one. The page writes all of this, so
+    /// it's shown as the page's words. Empty when it can't be read.
+    pub async fn place_of(&self, element: Option<&Element>) -> Place {
+        let Ok(page) = self.page() else {
+            return Place::default();
+        };
+        let here = page
+            .eval("({title: document.title, url: location.host + location.pathname})")
+            .await
+            .unwrap_or(Value::Null);
+        let around = match element {
+            Some(element) => self.call_on(element, AROUND, json!([])).await,
+            None => {
+                page.eval(&format!(
+                    "({AROUND}).call(document.activeElement || document.body)"
+                ))
+                .await
+            }
+        };
+        let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+        Place {
+            title: text(&here["title"]),
+            url: text(&here["url"]),
+            around: around.map(|value| text(&value)).unwrap_or_default(),
+        }
+    }
+
+    /// The page as it is, with the element outlined for a moment, for an
+    /// approval card.
+    pub async fn picture_of(&self, element: Option<&Element>) -> Result<Vec<u8>> {
+        let Some(element) = element else {
+            return self.screenshot_jpeg().await;
+        };
+        let _ = self
+            .page()?
+            .call(
+                "DOM.scrollIntoViewIfNeeded",
+                json!({"backendNodeId": element.node}),
+            )
+            .await;
+        let before = self.call_on(element, OUTLINE, json!([])).await;
+        let shot = self.screenshot_jpeg().await;
+        if let Ok(before) = before {
+            let _ = self
+                .call_on(element, OUTLINE_OFF, json!([{"value": before}]))
+                .await;
+        }
+        shot
+    }
+
+    /// Runs a function on an element, with `this` as the element.
+    async fn call_on(&self, element: &Element, function: &str, arguments: Value) -> Result<Value> {
+        let page = self.page()?;
+        let resolved = page
+            .call("DOM.resolveNode", json!({"backendNodeId": element.node}))
+            .await?;
+        let object = resolved["object"]["objectId"]
+            .as_str()
+            .ok_or_else(|| anyhow!("the element isn't on the page"))?;
+        let result = page.call(
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object, "functionDeclaration": function,
+                "arguments": arguments, "returnByValue": true,
+            }),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(2), result).await??;
+        Ok(result["result"]["value"].clone())
+    }
+
     pub async fn focused(&self) -> Focused {
         const FOCUSED: &str = "(() => { const e = document.activeElement; if (!e || e === document.body) return null; \
             const label = e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.getAttribute('name') || ''; \
@@ -1086,6 +1198,49 @@ mod tests {
         let result = browser.click(&off).await.unwrap();
         println!("{result}");
         assert!(result.contains("disabled"), "{result}");
+    }
+
+    /// What a click card shows, against a real Chrome (CDP_URL): the text around
+    /// the element, and a picture that leaves the page exactly as it was.
+    #[tokio::test]
+    #[ignore = "needs CDP_URL pointing at a Chrome"]
+    async fn live_a_cards_picture_leaves_the_page_as_it_was() {
+        let cdp = Cdp::new(&std::env::var("CDP_URL").expect("CDP_URL")).unwrap();
+        let target = cdp.new_page().await.unwrap();
+        let mut browser = Browser::new(cdp.clone(), true, Arc::new(Policy::defaults()));
+        browser.switch_to(&target).await.unwrap();
+        let page = "data:text/html,<title>Invoices</title>\
+            <table><tr><td>March from Acme, $120</td><td><button>Plain</button></td></tr></table>\
+            <button style='color: red'>Styled</button><button style=''>Empty</button>";
+        browser.open_url(page, false).await.unwrap();
+        for (name, expected) in [
+            ("Plain", Value::Null),
+            ("Styled", json!("color: red")),
+            ("Empty", json!("")),
+        ] {
+            let element = browser
+                .find(None, Some("button"), Some(name), None)
+                .await
+                .unwrap();
+            let picture = browser.picture_of(Some(&element)).await.unwrap();
+            assert!(!picture.is_empty());
+            let style = browser
+                .page()
+                .unwrap()
+                .eval(&format!(
+                    "[...document.querySelectorAll('button')].find(b => b.textContent === '{name}').getAttribute('style')"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(style, expected, "{name}");
+        }
+        let plain = browser
+            .find(None, Some("button"), Some("Plain"), None)
+            .await
+            .unwrap();
+        let place = browser.place_of(Some(&plain)).await;
+        assert_eq!(place.title, "Invoices");
+        assert!(place.around.contains("March from Acme, $120"), "{}", place.around);
     }
 
     #[tokio::test]

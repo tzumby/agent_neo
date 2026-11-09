@@ -103,6 +103,7 @@ export class Timeline {
           card.browser = {
             action: str(d.action), target: str(d.target), text: d.text ?? null, key: d.key ?? null,
             submit: d.submit === true, sends: d.sends === true, site: str(d.site),
+            role: str(d.role), page: str(d.page), url: str(d.url), around: str(d.around), image: d.image || null,
           };
         }
         this.approvalIndex.set(id, this.items.length);

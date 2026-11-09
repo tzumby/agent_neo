@@ -12,11 +12,7 @@ import RFBMetal
 public final class MacDesktopView: NSView {
     private let screen: RFBView
     private var monitor: Any?
-    /// When ⌘C or ⌘X was last sent, while waiting for the desktop's clipboard.
-    private var copying: ContinuousClock.Instant?
-    /// The desktop's clipboard as last sent: x11vnc sends nothing new when
-    /// copying what it already sent (a selection, say).
-    private var lastClipboard: String?
+    private let desktop: RemoteDesktop
 
     /// Run the desktop's session with this, so the view draws it.
     public let renderer: RemoteDesktop.Renderer
@@ -24,13 +20,13 @@ public final class MacDesktopView: NSView {
     public init?(desktop: RemoteDesktop) {
         guard let screen = RFBView() else { return nil }
         self.screen = screen
+        self.desktop = desktop
         renderer = RemoteDesktop.Renderer(
             events: screen.eventHandler,
             attach: { [weak screen] client in screen?.client = client })
         super.init(frame: .zero)
         screen.autoresizingMask = [.width, .height]
         addSubview(screen)
-        desktop.onClipboard = { [weak self] text in self?.received(text) }
     }
 
     @available(*, unavailable)
@@ -73,7 +69,7 @@ public final class MacDesktopView: NSView {
                 if let text = NSPasteboard.general.string(forType: .string) { screen.typeText(text) }
             case .send(let keysym, let control, let copies):
                 send(keysym, control: control)
-                if copies { awaitClipboard() }
+                if copies { desktop.awaitCopy { if let text = $0 { Self.putOnMac(text) } } }
             case nil:
                 break
             }
@@ -90,26 +86,6 @@ public final class MacDesktopView: NSView {
         client.key(keysym, down: true)
         client.key(keysym, down: false)
         if control { client.key(ctrl, down: false) }
-    }
-
-    /// Waits a moment for the desktop to send what was copied, else takes
-    /// what it sent last (the same text, so x11vnc didn't send it again).
-    private func awaitClipboard() {
-        let started = ContinuousClock.now
-        copying = started
-        Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(600))
-            guard let self, copying == started else { return }
-            copying = nil
-            if let lastClipboard { Self.putOnMac(lastClipboard) }
-        }
-    }
-
-    private func received(_ text: String) {
-        lastClipboard = text
-        guard let copying, ContinuousClock.now - copying < .seconds(3) else { return }
-        self.copying = nil
-        Self.putOnMac(text)
     }
 
     private static func putOnMac(_ text: String) {

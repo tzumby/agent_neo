@@ -41,6 +41,13 @@ test("card kinds keep their fields", () => {
   const [browser, schedule, secret, action] = t.visible();
   assert.equal(browser.browser.sends, true);
   assert.equal(browser.editable, false, "only a card that says it takes an edit offers one");
+  const click = new Timeline([ev("approval.requested", {
+    id: "c", kind: "browser", action: "click", target: "Confirm", role: "button", summary: "Pay the March invoice",
+    page: "Invoices", url: "acme.com/invoices", around: "March, $120 Confirm", image: "/api/v1/images/ab",
+  })]).visible()[0];
+  assert.equal(click.summary, "Pay the March invoice");
+  assert.deepEqual([click.browser.role, click.browser.page, click.browser.url, click.browser.around, click.browser.image],
+    ["button", "Invoices", "acme.com/invoices", "March, $120 Confirm", "/api/v1/images/ab"]);
   assert.equal(new Timeline([ev("approval.requested", { id: "e", kind: "browser", action: "type", text: "hi", editable: true })]).visible()[0].editable, true);
   assert.equal(schedule.schedule.when, "Weekdays at 08:00");
   assert.equal(secret.secret.host, "dash.cloudflare.com");

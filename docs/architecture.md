@@ -794,9 +794,9 @@ For each tool call:
 | `open_url` | `url`, `new_tab` | Navigates, waits until the page is ready (§6.9) and says whether it's a sign-in page | No. Only http(s), and never localhost, `.localhost`, `.internal`, private, link-local, CGNAT (Tailscale) or IPv6 ULA/link-local addresses |
 | `read_text` | `max_chars` (12,000; 500–100,000) | `document.body.innerText`, truncated | No |
 | `snapshot` | `max_chars` | The accessibility tree, one line per element: role, name, `ref` (backend DOM node id) | No |
-| `click` | `ref`, or `role` + `name`, or `text` | Scrolls into view, checks it's actionable, clicks at its centre | Yes for risky labels (send, delete, archive, buy, pay, submit, confirm, sign out…), unless it's a navigation role (link, row, tab, option, treeitem, gridcell, heading) or the Send button of a message just approved. Refused in read-only mode |
+| `click` | `ref`, or `role` + `name`, or `text`; `summary` (§6.11) | Scrolls into view, checks it's actionable, clicks at its centre | Yes for risky labels (send, delete, archive, buy, pay, submit, confirm, sign out…), unless it's a navigation role (link, row, tab, option, treeitem, gridcell, heading) or the Send button of a message just approved. Refused in read-only mode |
 | `type_text` | `ref` or `role` + `name`, `text`, `submit` | Focuses and inserts text, then optionally presses Enter | Yes, except in search fields. In a message field (Message…, Reply…, Comment…), approving the text also lets it press Enter or Send within the next 3 calls ("one approval per message") |
-| `press_key` | `key` | A key press | Navigation keys never ask; Enter in a search box or combobox doesn't either. Other keys ask (letters are app shortcuts). Only navigation keys in read-only mode |
+| `press_key` | `key`, `summary` (§6.11) | A key press | Navigation keys never ask; Enter in a search box or combobox doesn't either. Other keys ask (letters are app shortcuts). Only navigation keys in read-only mode |
 | `wait_for` | `text`, `timeout` (10 s; 1–25) | Until the text appears, or the page is idle without it | No |
 | `show_screenshot` | `caption` | Saves a JPEG and shows it in the chat | No |
 | `needs_user` | `reason` | Ends the task with an Action needed card: screenshot, page and push | Not an approval: the user signs in or solves the CAPTCHA, then I'm done, Skip or Take over |
@@ -963,11 +963,17 @@ These patterns are a speed bump against mistakes and injected instructions, not 
 | Kind | Shows | Notification |
 |---|---|---|
 | `shell` | Command, reason, keys used, plain summary, taint | "Run a command?": the summary and the reason ("…, asked after reading outside content" when tainted), with Approve/Deny on the notification. Without a summary, "Run this command?" and the command |
-| `browser` | Action (type, key or click), target, the exact text, submit/sends, site, reason | "Write this on slack.com?" etc., with Approve/Deny |
+| `browser` | Action (type, key or click), target, the exact text, submit/sends, site, reason. A click or key also has the agent's `summary`, the page's `page` and `url`, the text `around` it, and an `image` | "Write this on slack.com?" etc., with Approve/Deny |
 | `schedule` | Name, prompt, when | "Schedule this?", with Approve/Deny |
 | `secret` | Label, why, how (Markdown), link and its host, replace, tainted | "GitHub token needed"; opens the app (no buttons: a value is needed) |
 
 Each answer records who gave it (`by`, from `X-Tailscale-User`).
+
+**What a click or key card shows** (0.15.14). A button's name rarely says enough ("Confirm"), so these cards carry two kinds of information, and the apps keep them apart.
+- **The agent's reason:** `summary`, what it does and why, in plain words. Without one, or with only the button's name, the model is told to call again with one, and no card is shown (`BROWSER_SUMMARY_REFUSAL`). A fooled model can write a misleading one, so the apps show it as "The agent says".
+- **What the page shows, which the model can't change:** the title and address (without the query, which can hold tokens), the text around the element (the dialog, row or form it's in, at most 300 characters), and a screenshot with the element outlined for a moment (`Browser::place_of`, `picture_of`). All of it is redacted like any event, though the screenshot can show whatever's on the page.
+- **Still the same action?** `same_request` also compares the text around it. Found by name, "Delete" could be another row's by the time the person answers. A row that changes by itself (a live counter) gives "the page changed", and the agent asks again.
+- A scheduled run or Auto approve shows no card, so none of this is gathered for them.
 
 **Editing a card** (0.15.13). On a card about text the agent wrote, the person can change it before approving: a command, what to type in the browser, or a schedule's instructions (not its name or time). The apps offer Edit only on a card with `editable: true`, because an older agentd would ignore the edit and run the agent's words. `POST /api/v1/approvals/{id}` takes `text` alongside `approved`; blank text or a card that can't be edited gets a 400, and nothing runs.
 - **It goes through the same checks:** the task resumes by running its parked call again, so the edit is written into that call (`apply_edit`), not just the card. A command the person edits to something refused outright (§6.10) stays refused, and one that now needs no approval simply runs. The card is rebuilt to match, including which saved keys the command names, so the action still counts as the one approved. A schedule keeps its name.
@@ -1634,7 +1640,7 @@ None of them imports UIKit; the app targets hold everything platform-specific ex
 - **Rows:**
   - user bubbles;
   - **scheduled runs as reports**, not as the user speaking: a header with a clock, the schedule's name and the time ("APX attack spike watch · 1:00 PM"); tapping it shows the instructions (the run's prompt). A report that found something is a card with the answer as Markdown and Copy. A run that found nothing is one grey line in its own words ("No spike: 5.5k total…"); runs of one schedule that found nothing, one after another, fold into the latest ("4 checks, 9:00 AM–12:00 PM", "3 earlier checks" opens them). The header's context menu copies the report or the instructions;
-  - answers rendered as Markdown, with code chips, tables that scroll sideways, code blocks with Copy, and long-press to copy the answer;
+  - answers rendered as Markdown, with code chips, tables that scroll sideways, code blocks with Copy, and under each answer Copy and Select text (a sheet with its plain text, to copy any part). Long-press also copies the answer. On the Mac the text itself is selectable too, at the cost of the chip behind inline code;
   - cards, only while they wait for the user (answered, they leave the chat):
     - **Needs your OK** for a command: what it does in plain words (the model's `summary`), why it needs the OK, a warning when the agent read outside content before asking (its words could be steered), and the command behind "Show the command";
     - **Write this? / Write and send this? / Press Enter? / Click this?**, with the site and the exact text;
@@ -1667,6 +1673,7 @@ None of them imports UIKit; the app targets hold everything platform-specific ex
     - long-press, then drag: drag.
   - A hidden key input (secure entry, so the iOS keyboard doesn't learn what's typed), with hardware keys and a key bar (Esc, Tab, sticky Ctrl/Alt, arrows).
   - Paste types the phone's clipboard as keystrokes (`PasteButton`, so iOS shows no prompt).
+  - Copy presses Ctrl+C on the desktop and puts what comes back on the phone's clipboard, the same way as the Mac (below). Long-press and drag selects text. With nothing to copy, it says so.
   - **I'm done** resolves the action, and the agent carries on.
 
 ### 10.6 Notifications in the app
@@ -1715,10 +1722,10 @@ The same screens as the iPhone's, in Mac form:
   - ⌘ itself never reaches the desktop (it would be Super);
   - ⌘ plus a key becomes Ctrl plus that key (⌘C, ⌘T, ⌘L, ⌘F, ⌘Z…), and ⌘←/⌘→/⌘↑/⌘↓ become Home, End, Ctrl+Home and Ctrl+End;
   - ⌘V types the Mac's clipboard as keystrokes, like the iPhone's Paste (x11vnc drops clients that use the extended clipboard);
-  - after ⌘C or ⌘X, the text x11vnc sends within 3 s goes onto the Mac's clipboard (or, after 0.6 s with nothing new, the last text it sent: x11vnc doesn't resend a selection it already sent). Only then: a page can't fill the Mac's clipboard by itself;
+  - after ⌘C or ⌘X, or Copy in the toolbar (`RemoteDesktop.copySelection`, `DesktopCopy`, shared with the iPhone), the text x11vnc sends goes onto the Mac's clipboard (or, after 0.6 s with nothing new, the last text it sent: x11vnc doesn't resend a selection it already sent). Only then: a page can't fill the Mac's clipboard by itself;
   - ⌘Q, ⌘W, ⌘H, ⌘M, ⌘, and ⌘` stay with the Mac.
 
-  The toolbar has the connection dot, Paste, and I'm done while the card waits; I'm done resolves it and closes the window. The window's subtitle is the card's reason.
+  The toolbar has the connection dot, Copy, Paste, and I'm done while the card waits; I'm done resolves it and closes the window. The window's subtitle is the card's reason.
 - **Text sizes:** macOS's text styles are fixed and small (body 13 points) and it has no Dynamic Type, so the screens use `Font.app(_:)`: the system style on the iPhone, two points larger on the Mac (body 15, subheadline 13, caption 12, title3 17…). The Mac windows set the larger body as their default font.
 - **Before macOS 26:** `glass(_:)` draws the regular material with a hairline edge, and buttons are capsules in the iPhone's colours (white for the main action, a faint white for others), since the system's bordered buttons ignore a white tint.
 

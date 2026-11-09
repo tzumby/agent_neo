@@ -214,11 +214,14 @@ tailnet), `ChatCore` (turns the event stream into the chat timeline) and
 `DesktopViewer` (VNC to the desktop through the node's SOCKS5 proxy).
 
 The app opens on a chat with the first desktop tagged `tag:cloud-desktop`, at
-the newest message; older ones load as you scroll up. It shows your messages and
+the newest message; older ones load as you scroll up. Under an answer, Copy takes
+all of it and Select text opens it to copy any part; on the Mac you can also drag
+over the text. It shows your messages and
 the agent's replies, three dots while it works (its steps and commands stay out of
 the chat), Approve/Deny cards for risky commands (what the command does in plain
 words and why it needs your OK, the command itself a tap away) and for anything the agent types
-or sends in the browser (you see the exact text first), and "Action needed" cards
+or sends in the browser (you see the exact text first; a click or key shows the agent's
+reason, the page, the text around the button and a picture with it outlined), and "Action needed" cards
 with a screenshot when a site needs you to sign in (Skip / I'm done / Take over).
 A card leaves the chat once answered. Stop cancels the running task.
 
@@ -227,8 +230,8 @@ full screen over VNC through the app's own Tailscale node (`DesktopViewer`, usin
 swift-rfb). Tap to click, two-finger tap to right-click, pinch to zoom, drag to
 move around, two-finger drag to scroll the page, and long-press then drag to drag.
 The keyboard button opens the iPhone keyboard with Esc, Tab, Ctrl, Alt and arrow
-keys. Paste types the phone's clipboard on the desktop, and I'm done tells the
-agent to carry on. Settings (gear) has the model, the browser-actions switch and
+keys. Paste types the phone's clipboard on the desktop, Copy brings what's selected there
+to the phone (long-press and drag to select), and I'm done tells the agent to carry on. Settings (gear) has the model, the browser-actions switch and
 Tailscale log out. After a disconnect the app resumes from the last event it saw.
 
 **The Mac app** has the same chat, cards, Settings, Memory, Schedules and Keys,
@@ -237,7 +240,7 @@ isn't used). Return sends (⌥Return for a new line), ⌘, opens Settings, and l
 rows have right-click menus. Take over opens the desktop in its own window with
 the Mac's pointer, scroll wheel and keyboard: ⌘ shortcuts act as Ctrl on the
 desktop (⌘C, ⌘T, ⌘L…; ⌘← and ⌘→ are Home and End), ⌘V types the Mac's
-clipboard, and what you copy there with ⌘C comes back to the Mac. ⌘Q, ⌘W, ⌘H,
+clipboard, and what you copy there with ⌘C or the toolbar's Copy comes back to the Mac. ⌘Q, ⌘W, ⌘H,
 ⌘M and ⌘, stay with the Mac. The app keeps running with its windows closed, so
 notifications still come (with banners while it isn't in front), and it
 reconnects after the Mac wakes.

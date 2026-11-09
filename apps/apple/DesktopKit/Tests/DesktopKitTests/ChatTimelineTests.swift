@@ -114,6 +114,22 @@ private func aTask() throws -> [AgentEvent] {
     #expect(timeline.visibleItems == [.assistant(Message(id: 5, text: "Stopped.", task: "t1"))])
 }
 
+@Test func aClickCardKeepsWhatThePageShows() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(
+        try event(
+            1, "approval.requested",
+            #"{"task":"t1","id":"c1","kind":"browser","action":"click","target":"Confirm","role":"button","site":"acme.com","summary":"Pay the March invoice","page":"Invoices","url":"acme.com/invoices","around":"March, $120 Confirm","image":"/api/v1/images/ab"}"#
+        ))
+    guard case .approval(let card) = timeline.visibleItems.last, let action = card.browser else {
+        Issue.record("no click card")
+        return
+    }
+    #expect(card.summary == "Pay the March invoice")
+    #expect(action.role == "button" && action.page == "Invoices" && action.url == "acme.com/invoices")
+    #expect(action.around == "March, $120 Confirm" && action.imagePath == "/api/v1/images/ab")
+}
+
 @Test func aCardSaysWhetherItTakesAnEdit() throws {
     var timeline = ChatTimeline()
     timeline.apply(

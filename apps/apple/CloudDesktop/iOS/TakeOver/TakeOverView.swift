@@ -11,7 +11,7 @@ struct TakeOverRequest: Identifiable {
 }
 
 /// The desktop full screen with the native keyboard, as in Grok's "Take over":
-/// a bottom bar with Paste, I'm done and the keyboard toggle.
+/// a bottom bar with Copy, Paste, I'm done and the keyboard toggle.
 struct TakeOverView: View {
     let endpoint: DesktopEndpoint
     let actionID: String?
@@ -22,6 +22,8 @@ struct TakeOverView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var desktop = RemoteDesktop()
     @State private var keyboardUp = false
+    /// What Copy just did, shown for a moment.
+    @State private var copyNote: String?
 
     /// The action as it is now (it may have been resolved meanwhile).
     private var action: Action? {
@@ -35,6 +37,7 @@ struct TakeOverView: View {
         NavigationStack {
             DesktopCanvas(desktop: desktop, keyboardUp: $keyboardUp)
                 .overlay(alignment: .top) { status }
+                .overlay(alignment: .bottom) { copied }
                 .background(Color.black)
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -88,10 +91,45 @@ struct TakeOverView: View {
         }
     }
 
-    /// Floating glass controls, as in Grok: paste, I'm done, keyboard.
+    @ViewBuilder private var copied: some View {
+        if let copyNote {
+            Text(copyNote)
+                .font(.subheadline.weight(.medium))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .glassEffect(.regular, in: .capsule)
+                .padding(.bottom, 12)
+                .transition(.opacity)
+        }
+    }
+
+    /// Brings what's selected on the desktop to the phone, and only when asked.
+    private func copySelection() {
+        desktop.copySelection { text in
+            if let text { Clipboard.copy(text) }
+            let note = text == nil ? "Nothing selected. Long-press and drag over the text first." : "Copied to your phone"
+            withAnimation { copyNote = note }
+            Task {
+                try? await Task.sleep(for: .seconds(2.5))
+                if copyNote == note { withAnimation { copyNote = nil } }
+            }
+        }
+    }
+
+    /// Floating glass controls, as in Grok: copy, paste, I'm done, keyboard.
     private var bottomBar: some View {
         GlassEffectContainer(spacing: 12) {
             HStack(spacing: 12) {
+                Button(action: copySelection) {
+                    Image(systemName: "doc.on.doc")
+                        .font(.title3)
+                        .frame(width: 30, height: 30)
+                }
+                .accessibilityLabel("Copy what's selected on the desktop")
+                .buttonStyle(.glass)
+                .buttonBorderShape(.circle)
+                .controlSize(.large)
+
                 // Types the phone's clipboard on the desktop (PasteButton needs no
                 // clipboard permission prompt).
                 PasteButton(payloadType: String.self) { strings in
@@ -134,6 +172,7 @@ struct TakeOverView: View {
             .padding(.vertical, 8)
         }
         .sensoryFeedback(.impact(weight: .light), trigger: keyboardUp)
+        .sensoryFeedback(.success, trigger: copyNote) { _, note in note != nil }
     }
 }
 

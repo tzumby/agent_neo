@@ -273,6 +273,23 @@ async def main(out):
             await p.js(f"{approve}.click()")
             p.check(await said("On the page: Hello from a person"), "…and the edited message is what's written on the page")
 
+            # A click says what it does, and shows what the page shows.
+            await say("Pay without saying why")
+            p.check(await said("a button's name or a key doesn't"), "a click with no reason: the agent is asked again, with no card")
+            await say("Pay the invoice")
+            card = "[...document.querySelectorAll('.card-needs')].find(c => c.textContent.includes('Click this?'))"
+            p.check(await p.until(f"!!{card}", 20), "a click that could change something: the card asks")
+            words = await p.js(f"{card}.textContent")
+            p.check("The agent says: Pay the March invoice from Acme" in words, "…with the agent's reason")
+            p.check("Button “Confirm payment”" in words, "…what it would click")
+            p.check("Invoice for March from Acme, $120" in words, "…the text around it on the page")
+            p.check("form.test/form" in words and "Message Lawrence" in words, "…and which page")
+            p.check(await p.until(f"{card}.querySelector('img')?.naturalWidth > 0", 8), "…and a picture of the page")
+            await p.js(f"{card}.querySelector('img').scrollIntoView({{block: 'center'}})")
+            await p.shot(f"{out}/smoke-click.png")
+            await press(card, "Approve")
+            p.check(await said("On the page: paid"), "…and approving clicks it")
+
             await say("Run the risky command")
             card = "[...document.querySelectorAll('.card-needs')].find(c => c.textContent.includes('rm -rf ./old-build'))"
             p.check(await p.until(f"!!{card}", 15), "a command: the card has it")

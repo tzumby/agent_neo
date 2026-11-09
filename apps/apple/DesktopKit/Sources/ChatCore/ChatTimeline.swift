@@ -139,10 +139,16 @@ public struct ChatTimeline: Sendable, Equatable {
                 approval.access = AccessRequest(
                     hosts: data["hosts"]?.array?.compactMap(\.string) ?? [], why: data["why"]?.string ?? "")
             } else if data["kind"]?.string == "browser" {
-                approval.browser = BrowserAction(
+                var action = BrowserAction(
                     action: data["action"]?.string ?? "", target: data["target"]?.string ?? "",
                     text: data["text"]?.string, key: data["key"]?.string, submit: data["submit"]?.bool ?? false,
                     sends: data["sends"]?.bool ?? false, site: data["site"]?.string ?? "")
+                action.role = data["role"]?.string ?? ""
+                action.page = data["page"]?.string ?? ""
+                action.url = data["url"]?.string ?? ""
+                action.around = data["around"]?.string ?? ""
+                action.imagePath = data["image"]?.string
+                approval.browser = action
             }
             approvalIndex[id] = items.count
             items.append(.approval(approval))
@@ -380,6 +386,15 @@ public struct BrowserAction: Sendable, Equatable {
     public let sends: Bool
     /// The page's host, e.g. app.slack.com.
     public let site: String
+    /// What it is ("button"), for a click.
+    public var role = ""
+    /// The page's title and address, for a click or key.
+    public var page = ""
+    public var url = ""
+    /// The text around it on the page: the dialog, row or form it's in.
+    public var around = ""
+    /// The page, with what it would click outlined.
+    public var imagePath: String?
 }
 
 /// "Action needed": the agent stopped for something only the user can do.

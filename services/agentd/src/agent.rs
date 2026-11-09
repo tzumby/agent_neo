@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast, watch};
 
 use crate::access;
-use crate::browser::Browser;
+use crate::browser::{Browser, Element};
 use crate::cdp::Cdp;
 use crate::clock::UserClock;
 use crate::config::Config;
@@ -433,7 +433,9 @@ fn unix_now() -> i64 {
 }
 
 /// Whether an action, looked at again when its task resumes, is the one the
-/// user approved: same kind, element, text, key, site or command.
+/// user approved: same kind, element and what's around it, text, key, site or
+/// command. What's around it matters: found by name, "Delete" could be another
+/// row's by then.
 /// The model's plain words for a command, as the card shows them: one line,
 /// at most 120 characters; none when empty.
 fn clip_summary(summary: &str) -> Option<String> {
@@ -472,8 +474,8 @@ fn asked_secrets(args: &Value) -> Vec<String> {
 
 fn same_request(approved: &Value, now: &Value) -> bool {
     [
-        "kind", "action", "role", "target", "text", "key", "submit", "site", "command", "direct", "when",
-        "name", "secrets", "hosts",
+        "kind", "action", "role", "target", "around", "text", "key", "submit", "site", "command", "direct",
+        "when", "name", "secrets", "hosts",
     ]
     .iter()
     .all(|key| approved[key] == now[key])
@@ -1874,9 +1876,14 @@ impl Agent {
                 }
                 let gate = browser.click_gate(&element);
                 let changes = !matches!(gate, Gate::Allow);
-                let card = json!({
+                let mut card = json!({
                     "action": "click", "target": element.label, "role": element.role, "site": site,
+                    "summary": text("summary").and_then(clip_summary),
                 });
+                if self.will_ask(&gate, schedule.is_some()) {
+                    self.explain_card(browser, Some(&element), &mut card, resumed.is_some())
+                        .await;
+                }
                 match self.gate(task_id, gate, card, resumed, schedule.is_some())? {
                     Err(refusal) => Ok(refusal),
                     Ok(_) => {
@@ -1942,9 +1949,14 @@ impl Agent {
                 }
                 let gate = browser.key_gate(key, &focused);
                 let changes = !matches!(gate, Gate::Allow);
-                let card = json!({
+                let mut card = json!({
                     "action": "key", "key": key, "target": focused.label, "role": focused.role, "site": site,
+                    "summary": text("summary").and_then(clip_summary),
                 });
+                if self.will_ask(&gate, schedule.is_some()) {
+                    self.explain_card(browser, None, &mut card, resumed.is_some())
+                        .await;
+                }
                 match self.gate(task_id, gate, card, resumed, schedule.is_some())? {
                     Err(refusal) => Ok(refusal),
                     Ok(_) => {
@@ -2972,6 +2984,44 @@ impl Agent {
         Ok(result)
     }
 
+    /// Whether this gate ends with a card a person sees.
+    fn will_ask(&self, gate: &Gate, unattended: bool) -> bool {
+        matches!(gate, Gate::Ask(_)) && !unattended && !self.settings().auto_approve
+    }
+
+    /// What a click or key card says besides its target, so the person can tell
+    /// what they're approving: the page, the text around it, and a picture with
+    /// it outlined. These come from the page, not the model's account of it.
+    /// When a task resumes, only what `same_request` checks is needed.
+    async fn explain_card(
+        &self,
+        browser: &Browser,
+        element: Option<&Element>,
+        card: &mut Value,
+        resumed: bool,
+    ) {
+        let place = browser.place_of(element).await;
+        card["page"] = json!(place.title);
+        card["url"] = json!(place.url);
+        card["around"] = json!(place.around);
+        // Asked again for a reason first: no picture yet.
+        if resumed
+            || !guard::says_why(
+                card["summary"].as_str(),
+                card["target"].as_str().unwrap_or_default(),
+            )
+        {
+            return;
+        }
+        match browser.picture_of(element).await {
+            Ok(jpeg) => match self.save_image(&jpeg) {
+                Ok(id) => card["image"] = json!(format!("/api/v1/images/{id}")),
+                Err(err) => tracing::warn!(%err, "couldn't save a card's picture"),
+            },
+            Err(err) => tracing::warn!(err = %format!("{err:#}"), "couldn't take a card's picture"),
+        }
+    }
+
     /// Runs a browser action's gate: `Ok(Ok(asked))` to go ahead (`asked`: the
     /// user approved it), `Ok(Err(text for the model))` if refused or not
     /// approved; a Park error to ask.
@@ -2989,6 +3039,18 @@ impl Agent {
             Gate::Ask(reason) => {
                 card["kind"] = json!("browser");
                 card["reason"] = json!(reason);
+                // A click or key says little by itself: asked again for a reason,
+                // as a command is. Nobody needs one if nobody's asked.
+                if card["action"] != "type"
+                    && resumed.is_none()
+                    && self.will_ask(&Gate::Ask(reason), unattended)
+                    && !guard::says_why(
+                        card["summary"].as_str(),
+                        card["target"].as_str().unwrap_or_default(),
+                    )
+                {
+                    return Ok(Err(guard::BROWSER_SUMMARY_REFUSAL.to_string()));
+                }
                 Ok(match self.approve(task_id, card, resumed, unattended)? {
                     Decision::Approved => Ok(true),
                     Decision::Changed => Err(PAGE_CHANGED.into()),
@@ -3479,9 +3541,21 @@ fn approval_push(task_id: &str, id: &str, details: &Value) -> Push {
             format!("Write this on {site}?"),
             format!("In “{}”: {}", text("target"), text("text")),
         ),
+        (Some("browser"), Some("key")) if !text("summary").is_empty() => (
+            format!("Press {} on {site}?", text("key")),
+            format!(
+                "{}. In “{}”.",
+                text("summary").trim_end_matches('.'),
+                text("target")
+            ),
+        ),
         (Some("browser"), Some("key")) => (
             format!("Press {} on {site}?", text("key")),
             format!("In “{}”. It {}.", text("target"), text("reason")),
+        ),
+        (Some("browser"), _) if !text("summary").is_empty() => (
+            format!("Click this on {site}?"),
+            format!("{}. “{}”.", text("summary").trim_end_matches('.'), text("target")),
         ),
         (Some("browser"), _) => (
             format!("Click this on {site}?"),
@@ -4308,6 +4382,89 @@ mod tests {
         assert!(agent.apply_edit(&mut shell, &mut card, " \n ").is_none(), "blank");
         assert_eq!(call_args(&shell)["command"], "ls", "nothing changed");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_click_that_asks_has_to_say_why() {
+        let (agent, dir) = test_agent();
+        let ask = |card: Value, resumed: Option<Answer>, unattended: bool| {
+            agent.gate(
+                "t1",
+                Gate::Ask("may send, delete or change something"),
+                card,
+                resumed,
+                unattended,
+            )
+        };
+        // No reason, or only its own label: the model is asked again, and nobody sees a card.
+        for summary in [json!(null), json!("  "), json!("Confirm")] {
+            let card = json!({"action": "click", "target": "Confirm", "summary": summary, "site": "x.com"});
+            let refusal = ask(card, None, false).unwrap().unwrap_err();
+            assert!(refusal.starts_with("not run:"), "{refusal}");
+            assert_eq!(refusal, guard::BROWSER_SUMMARY_REFUSAL);
+        }
+        // A key too.
+        let refusal = ask(
+            json!({"action": "key", "key": "Enter", "target": ""}),
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(refusal, guard::BROWSER_SUMMARY_REFUSAL);
+        // With one, it asks. Symbols are fine: pages have them.
+        let card =
+            json!({"action": "click", "target": "Confirm", "summary": "Pay $20 to Acme", "site": "x.com"});
+        let park = ask(card.clone(), None, false)
+            .unwrap_err()
+            .downcast::<Park>()
+            .unwrap();
+        assert_eq!(park.card["summary"], "Pay $20 to Acme");
+        // Typing shows its text, so it needs none.
+        assert!(ask(json!({"action": "type", "text": "hi"}), None, false).is_err());
+        // Nobody asked, nothing to explain: a scheduled run refuses as it always did…
+        let refusal = ask(json!({"action": "click", "target": "Confirm"}), None, true)
+            .unwrap()
+            .unwrap_err();
+        assert!(refusal.contains("a scheduled run can't wait"), "{refusal}");
+        // …and Auto approve goes ahead.
+        agent.update_settings(None, None, Some(true), None).unwrap();
+        assert_eq!(
+            ask(json!({"action": "click", "target": "Confirm"}), None, false).unwrap(),
+            Ok(true)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_row_that_changed_is_not_the_one_approved() {
+        let approved =
+            json!({"kind": "browser", "action": "click", "target": "Delete", "around": "old-build Delete"});
+        let same =
+            json!({"kind": "browser", "action": "click", "target": "Delete", "around": "old-build Delete"});
+        let other =
+            json!({"kind": "browser", "action": "click", "target": "Delete", "around": "main Delete"});
+        assert!(same_request(&approved, &same));
+        assert!(!same_request(&approved, &other));
+    }
+
+    #[test]
+    fn a_notification_leads_with_what_a_click_does() {
+        let push = approval_push(
+            "t1",
+            "c1",
+            &json!({"kind": "browser", "action": "click", "target": "Confirm", "site": "acme.com",
+                    "reason": "may send, delete or change something", "summary": "Pay the March invoice."}),
+        );
+        assert_eq!(push.title, "Click this on acme.com?");
+        assert_eq!(push.body, "Pay the March invoice. “Confirm”.");
+        let push = approval_push(
+            "t1",
+            "c1",
+            &json!({"kind": "browser", "action": "key", "key": "Enter", "target": "Search", "site": "acme.com",
+                    "reason": "may send or submit what's typed"}),
+        );
+        assert!(push.body.starts_with("In “Search”. It may send"), "{}", push.body);
     }
 
     #[test]

@@ -666,7 +666,7 @@ struct NewSchedule {
     #[serde(default)]
     utc_offset: Option<i64>,
     /// "Run without asking": on unless the request turns it off. A person
-    /// set it up, so its runs don't wait for them (§6.21).
+    /// set it up, so its runs don't wait for them (§6.14).
     #[serde(default = "run_without_asking")]
     auto_approve: bool,
 }

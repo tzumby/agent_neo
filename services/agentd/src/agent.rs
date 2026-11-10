@@ -2247,7 +2247,7 @@ impl Agent {
         let origin = if tainted { "agent_tainted" } else { "user" };
         self.store
             .set_schedule_origin(saved.id, &self.policy_version(), origin)?;
-        // Runs without asking, as every schedule a person sets up does (§6.21),
+        // Runs without asking, as every schedule a person sets up does (§6.14),
         // unless outside content may have asked for it: then its runs skip
         // whatever would ask.
         if !tainted {

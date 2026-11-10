@@ -1,5 +1,5 @@
 variable "region" {
-  description = "AWS region for the state bucket."
+  description = "AWS region for the state bucket. The Makefile sets it from AWS_REGION (TF_VAR_region)."
   type        = string
   default     = "ca-central-1"
 }
@@ -10,8 +10,8 @@ variable "project" {
   default     = "cloud-desktops"
 }
 
-variable "account_id" {
-  description = "For a customer's account (make bootstrap ENV=<customer>): the only account this may touch. Empty: ours (the default workspace)."
+variable "env" {
+  description = "The deployment this bucket holds the state of. The Makefile sets it from ENV (TF_VAR_env)."
   type        = string
-  default     = ""
+  default     = "personal"
 }

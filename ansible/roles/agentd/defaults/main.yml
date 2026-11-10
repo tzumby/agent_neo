@@ -21,10 +21,6 @@ agentd_guarded_ports: [9222, 5900, 6080]
 agentd_egress_proxy_port: 3128
 # Days of Squid's request log kept (rotated daily, compressed).
 agentd_squid_log_days: 14
-# agentd's egress gate (services/agentd/src/egress.rs): while a scheduled
-# run's command runs, the shell user reaches Squid only through it, and it
-# swaps in the saved keys on Cloudflare's and Datadog's APIs.
-agentd_egress_gate_port: 3129
 agentd_shell_allowed_domains:
   - .github.com
   - .githubusercontent.com
@@ -47,8 +43,8 @@ agentd_shell_allowed_domains:
   - api.together.xyz
   # Nix: the binary cache, the flake registry, source tarballs.
   - .nixos.org
-# More hosts for some desktops (group_vars), e.g. a customer deployment's
-# Cloudflare and Datadog APIs.
+# More hosts for some desktops (group_vars or -e), e.g. an API your own
+# tools call. The user can also allow sites one by one in the app.
 agentd_shell_extra_domains: []
 # The sites the user allows in the app, beyond those (the agent asks with a
 # card, or they add them in Settings): agentd writes this file, Squid reads it.

@@ -2,10 +2,7 @@ module cloud-desktops/tailnet-proxy
 
 go 1.27.3
 
-require (
-	cloud-desktops/front-door v0.0.0
-	tailscale.com v1.104.4
-)
+require tailscale.com v1.104.4
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
@@ -52,5 +49,3 @@ require (
 	golang.zx2c4.com/wireguard/windows v1.0.1 // indirect
 	gvisor.dev/gvisor v0.0.0-20260915211658-a6f909f08a72 // indirect
 )
-
-replace cloud-desktops/front-door => ../front-door

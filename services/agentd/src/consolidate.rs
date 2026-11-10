@@ -2,8 +2,8 @@
 //! finish, a background job writes a one-line work-log entry for each task
 //! that changed something, merges memories that say the same thing and
 //! expires ones the tasks show are no longer true. It runs as the
-//! `consolidate` effect, on GLM-5.3-Flash by default, through the attested
-//! gateway like every model call.
+//! `consolidate` effect, on GLM-5.3-Flash by default, through the same model
+//! client as every task.
 //!
 //! Since 0.15.2 (the user's decisions, 2026-11-02) it is smaller, and nothing
 //! it does waits for the user:
@@ -62,8 +62,7 @@ const AGENT: &str = "main";
 pub const DEFAULT_MODEL: &str = "zai-org/GLM-5.3-Flash";
 /// The reply's limit, thinking included: GLM thinks before it answers, and
 /// thinking about 20 tasks used up 4,096 tokens on the dev desktop, leaving no
-/// JSON. The gateway's maximum (gatewayd `MAX_TOKENS`); at Flash's prices at
-/// most about a cent per call.
+/// JSON. At Flash's prices at most about a cent per call.
 const REPLY_TOKENS: u32 = 16_384;
 pub const DEFAULT_DAILY_CAP_USD: f64 = 0.50;
 

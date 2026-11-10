@@ -1,71 +1,28 @@
 // The web app: a chat with your agent, and its desktop, schedules, keys and
-// settings. Served by front-door from the desktop itself, behind Cloudflare
-// Access (docs/customer-cloud.md).
+// settings. Served by tailnet-proxy from the desktop itself, on your tailnet.
 
 import { api } from "./api.js";
 import { mountChat } from "./chat.js";
-import { mountDesktop, mountKeys, mountSchedules, mountSettings, mountUpdates } from "./pages.js";
-import { mountSetup } from "./setup.js";
+import { mountDesktop, mountKeys, mountSchedules, mountSettings } from "./pages.js";
 import { Store } from "./store.js";
 
 const store = new Store(api);
 const $ = (selector) => document.querySelector(selector);
-// Who's signed in, and where signing out goes: Cloudflare Access's logout;
-// none on a tailnet, where Tailscale signs in the device, not the page.
-const session = { email: "", sign_out: "" };
+// Who's signed in: Tailscale signs in the device, not the page.
+const session = { email: "" };
 
 const views = {
   chat: { el: $("#view-chat"), title: "Chat" },
-  setup: { el: $("#view-setup"), title: "Setup" },
   desktop: { el: $("#view-desktop"), title: "Desktop" },
   schedules: { el: $("#view-schedules"), title: "Schedules" },
-  updates: { el: $("#view-updates"), title: "Updates" },
   keys: { el: $("#view-keys"), title: "Keys and tokens" },
   settings: { el: $("#view-settings"), title: "Settings" },
 };
 
 const keys = mountKeys(store, views.keys.el);
-const updates = mountUpdates(store, views.updates.el);
-// From Setup: Updates with Slack or Teams chosen; back to the guide (in the
-// chat or on the Setup page) once a channel is added, on its next step.
-const openUpdates = (kind, onAdded) => {
-  const back = location.hash || "#/chat";
-  updates.choose(kind, async () => {
-    location.hash = back;
-    await onAdded?.();
-  });
-  location.hash = "#/updates";
-};
-const openChat = () => (location.hash = "#/chat");
-// The Setup page, and the same cards in an empty chat until they're done.
-const showProgress = (done, total) => {
-  const progress = $("#nav-setup-progress");
-  progress.textContent = `${done} of ${total}`;
-  progress.hidden = done === total;
-};
-const setup = mountSetup(store, views.setup.el.querySelector(".page-body"), { openUpdates, openChat, onProgress: showProgress });
-const firstRun = mountSetup(store, $(".empty-setup"), {
-  openUpdates,
-  openChat,
-  intro: true,
-  onProgress: (done, total) => {
-    showProgress(done, total);
-    if (done < total) {
-      $(".empty-setup").hidden = false;
-      $(".empty-suggest").hidden = true;
-    }
-  },
-  // Gone through (or set up before): the chat's usual suggestions.
-  onComplete: () => {
-    $(".empty-setup").hidden = true;
-    $(".empty-suggest").hidden = false;
-  },
-});
 const pages = {
-  setup,
   desktop: mountDesktop(store, views.desktop.el),
   schedules: mountSchedules(store, views.schedules.el),
-  updates,
   keys,
   settings: mountSettings(store, views.settings.el, session),
 };
@@ -94,10 +51,7 @@ function route() {
   document.body.classList.remove("nav-open");
   current = next;
   pages[next]?.enter?.();
-  if (next === "chat") {
-    $(".composer textarea").focus({ preventScroll: true });
-    if (store.connection === "live") firstRun.refresh();
-  }
+  if (next === "chat") $(".composer textarea").focus({ preventScroll: true });
 }
 window.addEventListener("hashchange", route);
 $("#menu").addEventListener("click", () => document.body.classList.toggle("nav-open"));
@@ -115,15 +69,6 @@ const STAGES = {
   scheduled: ["A schedule is due", "idle"],
   idle: ["Ready", "idle"],
 };
-
-// The first-run cards, once the desktop answers.
-let setupLoaded = false;
-store.subscribe(() => {
-  if (!setupLoaded && store.connection === "live") {
-    setupLoaded = true;
-    firstRun.refresh();
-  }
-});
 
 store.subscribe(() => {
   const status = store.status;
@@ -161,8 +106,6 @@ store.onNotice((text) => {
 api.session().then((s) => {
   Object.assign(session, s);
   $("#who").textContent = s.email;
-  $("#sign-out").hidden = !s.sign_out;
-  if (s.sign_out) $("#sign-out").href = s.sign_out;
 }).catch(() => {});
 
 store.run();

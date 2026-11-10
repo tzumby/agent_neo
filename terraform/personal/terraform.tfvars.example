@@ -1,0 +1,11 @@
+# Optional: copy to terraform.tfvars to change any default (variables.tf).
+# region and env come from the Makefile (AWS_REGION, ENV).
+
+# desktop_arch          = "amd64"
+# desktop_instance_type = "t3a.medium"
+# disk_size_gb          = 20
+# tailnet_hostname      = "neo-agent"
+
+# Internet access: fck-nat (default, cheapest) or AWS's NAT gateway.
+# enable_nat_instance = true
+# enable_nat_gateway  = false

@@ -6,12 +6,6 @@ table inet cloud_desktop_guard
 delete table inet cloud_desktop_guard
 
 table inet cloud_desktop_guard {
-  # The shell user while a scheduled run's command runs (agentd adds and
-  # removes it; services/agentd/src/agent.rs, lock_egress).
-  set squid_locked {
-    typeof meta skuid
-  }
-
   # The shell user while a command the user approved to connect on its own runs
   # (agentd adds and removes it; services/agentd/src/agent.rs, open_direct).
   # Entries expire by themselves, so this closes even if agentd stops.
@@ -24,9 +18,9 @@ table inet cloud_desktop_guard {
     type filter hook output priority filter; policy accept;
 
     # The instance metadata service hands out the instance role's AWS
-    # credentials: only root (the SSM agent) and agentd (the push relay).
-    ip daddr 169.254.169.254 meta skuid != { 0, {{ agentd_uid }} } counter reject
-    ip6 daddr fd00:ec2::254 meta skuid != { 0, {{ agentd_uid }} } counter reject
+    # credentials: only root (the SSM agent).
+    ip daddr 169.254.169.254 meta skuid != 0 counter reject
+    ip6 daddr fd00:ec2::254 meta skuid != 0 counter reject
 
     # The shell user can't reach the desktop's controls on localhost (Chrome
     # DevTools, VNC, noVNC), so it can't drive the logged-in browser around
@@ -48,17 +42,9 @@ table inet cloud_desktop_guard {
     # DNS lookups.
     meta skuid {{ agentd_shell_uid }} meta l4proto { tcp, udp } th dport 53 counter reject
 
-    # During a scheduled run's command, Squid is closed to it: its way out
-    # is agentd's egress gate, which passes on to Squid and puts the user's own
-    # keys on Cloudflare's and Datadog's APIs.
-    meta skuid @squid_locked tcp dport {{ agentd_egress_proxy_port }} counter reject
-
     # Local services (a dev server it started, the egress proxy) are fine;
     # everything else goes through the proxy.
     meta skuid {{ agentd_shell_uid }} oifname "lo" accept
     meta skuid {{ agentd_shell_uid }} counter reject
-
-    # The egress gate is the shell user's alone (root and agentd aside).
-    oifname "lo" tcp dport {{ agentd_egress_gate_port }} meta skuid != { 0, {{ agentd_uid }}, {{ agentd_shell_uid }} } counter reject
   }
 }

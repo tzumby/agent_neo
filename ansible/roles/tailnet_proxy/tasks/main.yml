@@ -2,53 +2,6 @@
 # the web app (role web_app, a dependency), the agent's API, the noVNC viewer
 # and raw VNC to allowed Tailscale logins.
 
-- name: Check this desktop's tailnet settings
-  ansible.builtin.assert:
-    that:
-      - desktop_owner | default('') is match('^[a-z][a-z0-9-]{1,19}$')
-    fail_msg: >-
-      This desktop joins the desktops tailnet, so it needs its user's name (EC2 tag User)
-      for its key at {{ tailnet_proxy_params }}/auth_key and its rule (tag:user-<name>):
-      scripts/new-desktop.sh sets both up.
-    quiet: true
-  when: tailnet_proxy_desktops_tailnet | bool
-
-# --- Migration from viewer-proxy (keeps the same tailnet device) --------------
-
-- name: Check for the old viewer-proxy
-  ansible.builtin.stat:
-    path: /etc/systemd/system/viewer-proxy.service
-  register: tailnet_proxy_old_unit
-
-- name: Stop the old viewer-proxy
-  ansible.builtin.systemd_service:
-    name: viewer-proxy
-    state: stopped
-    enabled: false
-  when: tailnet_proxy_old_unit.stat.exists
-
-- name: Move the old node identity
-  ansible.builtin.command: mv /var/lib/viewer-proxy /var/lib/tailnet-proxy
-  args:
-    removes: /var/lib/viewer-proxy
-    creates: /var/lib/tailnet-proxy
-
-- name: Remove the old viewer-proxy files
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: absent
-  loop:
-    - /etc/systemd/system/viewer-proxy.service
-    - /usr/local/bin/viewer-proxy
-    - /etc/viewer-proxy.env
-
-- name: Remove the old viewer-proxy user
-  ansible.builtin.user:
-    name: viewer-proxy
-    state: absent
-
-# --- tailnet-proxy ---------------------------------------------------------------
-
 # Members of this group can open agentd's socket.
 - name: Create the agentd group
   ansible.builtin.group:

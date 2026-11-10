@@ -1,102 +1,93 @@
 AWS_PROFILE ?= default
 AWS_REGION  ?= ca-central-1
-ENV         ?= dev
-# Desktops' architecture (Terraform: desktop_arch): amd64 or arm64.
+# This deployment's name: in resource names, tags, SSM paths
+# (/cloud-desktops/<env>/...) and the state bucket. A second deployment in the
+# same account needs its own (ENV=other).
+ENV         ?= personal
+# The desktop's architecture (Terraform: desktop_arch): amd64 or arm64.
 DESKTOP_ARCH ?= amd64
 DESKTOP_RUST_TARGET = $(if $(filter arm64,$(DESKTOP_ARCH)),aarch64,x86_64)-unknown-linux-musl
 export AWS_PROFILE AWS_REGION
+# Terraform reads these as var.region and var.env.
+export TF_VAR_region := $(AWS_REGION)
+export TF_VAR_env    := $(ENV)
 
 TF_BOOTSTRAP := terraform -chdir=$(CURDIR)/terraform/bootstrap
-TF           := terraform -chdir=$(CURDIR)/terraform/envs/$(ENV)
+TF           := terraform -chdir=$(CURDIR)/terraform/personal
+SSM_PREFIX   := /cloud-desktops/$(ENV)
 
-# Any other ENV is a customer's deployment, in their sandbox account
-# (docs/customer-cloud.md): its state bucket is in that account (the bootstrap
-# stack's workspace of the same name), and the AWS profile is named every
-# time, never the default.
-CUSTOMER   := $(filter-out dev,$(ENV))
-ACCOUNT_ID := $(if $(CUSTOMER),$(shell sed -n 's/^account_id *= *"\([0-9]*\)".*/\1/p' terraform/envs/$(ENV)/terraform.tfvars 2>/dev/null))
-BOOTSTRAP_WORKSPACE := $(or $(CUSTOMER),default)
-ifneq ($(CUSTOMER),)
-ifeq ($(AWS_PROFILE),default)
-$(error ENV=$(ENV) is a customer's account: name the AWS profile for it, e.g. AWS_PROFILE=$(ENV))
-endif
-endif
-
-# Instance to target with viewer/shell/logs/soak: the test desktop, or
-# DESKTOP=<name>'s (terraform output desktop_instance_ids).
-INSTANCE ?= $(if $(DESKTOP),$(shell $(TF) output -json desktop_instance_ids 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("$(DESKTOP)",""))'),$(shell $(TF) output -raw test_desktop_instance_id 2>/dev/null))
-# Playbooks run on every running desktop; LIMIT=<instance id> (or DESKTOP=<name>) for one.
-# An unknown DESKTOP matches no host rather than all of them.
-LIMIT ?= $(if $(DESKTOP),$(or $(INSTANCE),no-desktop-named-$(DESKTOP)),)
-PLAYBOOK_LIMIT = $(if $(LIMIT),--limit $(LIMIT),)
+INSTANCE   = $(shell $(TF) output -raw desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init new-customer web-test web-dev web-smoke front-door-test front-door-build front-door-deploy plan apply destroy fmt lint galaxy desktop screenshot llm-keys agentd-test agentd-build agentd-deploy agentd-evals agentd-soak agentd-reset agentd-logs tailnet-build tailnet-deploy tailscale-key tailscale-oauth apns-key gatewayd-test gatewayd-build gateway-image app-tailscalekit app-test app-sim app-device app-mac app-release-mac app-testflight new-desktop tester-link tailnet-rules cdp viewer shell
+.PHONY: help bootstrap init plan apply destroy fmt lint galaxy inventory deploy desktop screenshot \
+  model-key tailscale-key tailscale-allow agentd-test agentd-build agentd-deploy agentd-evals agentd-reset agentd-logs \
+  tailnet-test tailnet-build tailnet-deploy web-test web-dev web-smoke stop start cdp viewer shell
 
 help: ## Show targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
 
 # --- Terraform ---------------------------------------------------------------
 
-bootstrap: ## Create the S3 state bucket (one time per account; local state)
+bootstrap: ## Create the S3 state bucket (one time; its own state stays local, in terraform/bootstrap)
 	$(TF_BOOTSTRAP) init
-	$(TF_BOOTSTRAP) workspace select -or-create $(BOOTSTRAP_WORKSPACE)
-	$(TF_BOOTSTRAP) apply $(if $(CUSTOMER),-var account_id=$(or $(ACCOUNT_ID),$(error no account_id in terraform/envs/$(ENV)/terraform.tfvars)))
+	$(TF_BOOTSTRAP) workspace select -or-create $(ENV)
+	$(TF_BOOTSTRAP) apply
 
-init: ## terraform init the env against the state bucket
-	$(TF) init -backend-config="bucket=$$(TF_WORKSPACE=$(BOOTSTRAP_WORKSPACE) $(TF_BOOTSTRAP) output -raw state_bucket)" -backend-config="region=$(AWS_REGION)"
+init: ## terraform init against the state bucket
+	$(TF) init -reconfigure -backend-config="bucket=$$(TF_WORKSPACE=$(ENV) $(TF_BOOTSTRAP) output -raw state_bucket)" -backend-config="region=$(AWS_REGION)"
 
-new-customer: ## A customer deployment's Terraform env (no AWS calls): NAME=<name> ACCOUNT=<their sandbox account id>
-	scripts/new-customer-env.sh $(NAME) $(ACCOUNT)
-
-plan: ## terraform plan the env, saved to tfplan
+plan: ## terraform plan, saved to tfplan
 	$(TF) plan -out=tfplan
 
 apply: ## Apply the saved tfplan
 	$(TF) apply tfplan
 
-destroy: ## terraform destroy the env
+destroy: ## terraform destroy (the state bucket stays: prevent_destroy)
 	$(TF) destroy
 
 fmt: ## Format Terraform code
 	terraform fmt -recursive terraform
 
-lint: ## Check formatting, validate Terraform, syntax-check playbooks
+lint: inventory ## Check formatting, validate Terraform, syntax-check playbooks
 	terraform fmt -check -recursive terraform
 	$(TF) validate
-	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/tailnet-proxy.yml playbooks/agentd.yml playbooks/front-door.yml
+	cd ansible && ansible-playbook --syntax-check playbooks/desktops.yml playbooks/screenshot.yml playbooks/tailnet-proxy.yml playbooks/agentd.yml
+
+# --- Keys (SSM, prompted, never echoed) --------------------------------------
+
+model-key: ## Store your Together AI API key in SSM
+	scripts/put-secret.py $(SSM_PREFIX)/llm/together_api_key
+
+tailscale-key: ## Store a Tailscale auth key (tagged tag:cloud-desktop) in SSM
+	scripts/put-secret.py $(SSM_PREFIX)/tailscale/auth_key
+
+tailscale-allow: ## Optional: only these Tailscale logins get in (comma-separated), then make tailnet-deploy
+	scripts/put-secret.py $(SSM_PREFIX)/tailscale/allowed_logins
 
 # --- Ansible -----------------------------------------------------------------
 
 # On macOS, forked Ansible workers segfault when botocore looks up the system
 # proxy settings (_scproxy). no_proxy='*' skips that lookup.
 ANSIBLE_PLAYBOOK := cd ansible && no_proxy='*' OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ansible-playbook
+ANSIBLE_ARGS      = -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
 
 galaxy: ## Install the Ansible collections
 	cd ansible && ansible-galaxy collection install -r requirements.yml
 
-new-desktop: ## A desktop for someone else on the desktops tailnet, step by step, with setup links: NAME=<name> (docs/onboarding.md)
-	scripts/new-desktop.sh $(NAME)
+# The EC2 inventory plugin can't read the region or env from the environment.
+inventory:
+	@sed -e 's/@REGION@/$(AWS_REGION)/' -e 's/@ENV@/$(ENV)/' ansible/inventory/aws_ec2.yml.tmpl > ansible/inventory/aws_ec2.yml
 
-tester-link: ## New setup links for a tester's devices (each works once, 3 days): NAME=<name> [DEVICES=2]
-	scripts/tailnet.py link $(NAME) --devices $(or $(DEVICES),2)
+deploy: desktop agentd-deploy tailnet-deploy ## Everything on the desktop, in order: desktop, agentd, tailnet-proxy
 
-tailnet-rules: ## Write the desktops tailnet's access rules from Terraform's desktops (shows them, asks first)
-	scripts/tailnet.py policy
+desktop: inventory ## The desktop itself: hardening, X, XFCE, Chrome, VNC (TAGS=chrome_policy for just Chrome's policy)
+	$(ANSIBLE_PLAYBOOK) playbooks/desktops.yml $(if $(TAGS),--tags $(TAGS)) $(ANSIBLE_ARGS)
 
-desktop: ## Run the desktop playbook against running desktops (LIMIT= or DESKTOP= for one; TAGS=chrome_policy for just Chrome's policy)
-	$(ANSIBLE_PLAYBOOK) playbooks/desktops.yml $(PLAYBOOK_LIMIT) $(if $(TAGS),--tags $(TAGS)) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
+screenshot: inventory ## Download a screenshot of the desktop to screenshots/
+	$(ANSIBLE_PLAYBOOK) playbooks/screenshot.yml $(ANSIBLE_ARGS)
 
-screenshot: ## Download a screenshot of each desktop to screenshots/
-	$(ANSIBLE_PLAYBOOK) playbooks/screenshot.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
-
-# --- Agent -------------------------------------------------------------------
-
-llm-keys: ## Store the Together API key in SSM (prompted, not echoed)
-	scripts/put-secret.py /cloud-desktops/$(ENV)/llm/together_api_key
-
-# --- agentd and the tailnet ------------------------------------------------------
+# --- agentd ------------------------------------------------------------------
 
 agentd-test: ## Format check, clippy and unit tests for agentd
 	cd services/agentd && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
@@ -104,100 +95,53 @@ agentd-test: ## Format check, clippy and unit tests for agentd
 agentd-build: ## Build agentd for the desktop (static linux binary for DESKTOP_ARCH)
 	cd services/agentd && cargo zigbuild --release --target $(DESKTOP_RUST_TARGET)
 
-agentd-deploy: agentd-build ## Install agentd on running desktops (LIMIT= or DESKTOP= for one)
-	$(ANSIBLE_PLAYBOOK) playbooks/agentd.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
-
-agentd-evals: ## Memory evals on this Mac (cents per scenario): MEMORY_V2=on|off SCENARIO=name MODEL=id PROVIDER=together|bedrock
-	cd services/agentd && cargo build --quiet
-	$(if $(filter bedrock,$(PROVIDER)),,TOGETHER_API_KEY="$${TOGETHER_API_KEY:-$$(aws ssm get-parameter --name /cloud-desktops/$(ENV)/llm/together_api_key \
-	  --with-decryption --query Parameter.Value --output text)}") \
-	  services/agentd/evals/run.py --agentd services/agentd/target/debug/agentd \
-	  --memory-v2 $(or $(MEMORY_V2),off) $(if $(SCENARIO),--scenario $(SCENARIO)) $(if $(MODEL),--model $(MODEL)) \
-	  $(if $(PROVIDER),--provider $(PROVIDER)) $(if $(BEDROCK_REGION),--region $(BEDROCK_REGION))
-
-agentd-soak: ## Memory v2 soak report for the desktop (read-only): SINCE=YYYY-MM-DD, the day the soak started
-	scripts/agentd-soak.py $(INSTANCE) $(if $(SINCE),--since $(SINCE))
-
-agentd-reset: ## Wipe a desktop clean: agentd's chat, memories, schedules, keys, and Chrome's cookies and profile (asks first): DESKTOP=name FILES=1 KEEP_COPY=1 RESTORE=1 DRY_RUN=1
-	scripts/agentd-reset.py $(or $(INSTANCE),no-desktop-named-$(DESKTOP)) $(if $(FILES),--files) $(if $(KEEP_COPY),--keep-copy) \
-	  $(if $(RESTORE),--restore) $(if $(DRY_RUN),--dry-run)
+agentd-deploy: agentd-build inventory ## Install agentd on the desktop (needs make model-key first)
+	$(ANSIBLE_PLAYBOOK) playbooks/agentd.yml $(ANSIBLE_ARGS)
 
 agentd-logs: ## Show agentd's recent log
 	aws ssm start-session --target $(INSTANCE) --document-name AWS-StartInteractiveCommand \
 	  --parameters '{"command":["sudo journalctl -u agentd -n 50 --no-pager"]}'
 
+agentd-reset: ## Wipe the agent clean: chat, memories, schedules, keys, and Chrome's profile (asks first): FILES=1 KEEP_COPY=1 RESTORE=1 DRY_RUN=1
+	scripts/agentd-reset.py $(INSTANCE) $(if $(FILES),--files) $(if $(KEEP_COPY),--keep-copy) \
+	  $(if $(RESTORE),--restore) $(if $(DRY_RUN),--dry-run)
+
+agentd-evals: ## Memory evals on this machine against Together (cents per scenario): MEMORY_V2=on|off SCENARIO=name MODEL=id PROVIDER=together|bedrock
+	cd services/agentd && cargo build --quiet
+	$(if $(filter bedrock,$(PROVIDER)),,TOGETHER_API_KEY="$${TOGETHER_API_KEY:-$$(aws ssm get-parameter --name $(SSM_PREFIX)/llm/together_api_key \
+	  --with-decryption --query Parameter.Value --output text)}") \
+	  services/agentd/evals/run.py --agentd services/agentd/target/debug/agentd \
+	  --memory-v2 $(or $(MEMORY_V2),off) $(if $(SCENARIO),--scenario $(SCENARIO)) $(if $(MODEL),--model $(MODEL)) \
+	  $(if $(PROVIDER),--provider $(PROVIDER)) $(if $(BEDROCK_REGION),--region $(BEDROCK_REGION))
+
+# --- tailnet-proxy and the web app -------------------------------------------
+
+tailnet-test: ## Vet and test tailnet-proxy (and package door)
+	cd services/tailnet-proxy && go vet ./... && go test ./...
+
 tailnet-build: ## Build tailnet-proxy (tsnet) for the desktop (linux, DESKTOP_ARCH)
 	cd services/tailnet-proxy && CGO_ENABLED=0 GOOS=linux GOARCH=$(DESKTOP_ARCH) \
 	  go build -trimpath -ldflags "-s -w" -o build/tailnet-proxy-linux-$(DESKTOP_ARCH) .
 
+tailnet-deploy: tailnet-build inventory ## Put the desktop on your tailnet: the web app, agent API, noVNC, VNC (deploy agentd first; needs make tailscale-key)
+	$(ANSIBLE_PLAYBOOK) playbooks/tailnet-proxy.yml $(ANSIBLE_ARGS)
+
 web-test: ## Unit tests for the web app's chat rules, Markdown and key detector (node)
 	node --test apps/web/test/*.test.mjs
 
-web-dev: ## The web app on this Mac, end to end: agentd with a scripted model, front-door, a stand-in for Cloudflare Access (http://127.0.0.1:8088/)
+web-dev: ## The web app on this machine, end to end: agentd with a scripted model, served by devdoor (http://127.0.0.1:8088/)
 	apps/web/dev/run.sh
 
 web-smoke: ## Click through the web app in headless Chrome (with make web-dev running)
 	uv run -q --with websockets apps/web/dev/smoke.py $(or $(OUT),/tmp)
 
-front-door-test: ## Vet and test front-door (a customer deployment's way in, behind Cloudflare Access)
-	cd services/front-door && go vet ./... && go test ./...
+# --- Power -------------------------------------------------------------------
 
-front-door-build: ## Build front-door for the desktop (linux, DESKTOP_ARCH)
-	cd services/front-door && CGO_ENABLED=0 GOOS=linux GOARCH=$(DESKTOP_ARCH) \
-	  go build -trimpath -ldflags "-s -w" -o build/front-door-linux-$(DESKTOP_ARCH) .
+stop: ## Stop the desktop to save money (its disk stays; schedules don't run while it's off)
+	aws ec2 stop-instances --instance-ids $(INSTANCE) --query 'StoppingInstances[0].CurrentState.Name' --output text
 
-front-door-deploy: front-door-build ## Put a customer deployment's desktops behind Cloudflare: front-door and cloudflared; deploy agentd first (ENV=<customer>)
-	$(ANSIBLE_PLAYBOOK) playbooks/front-door.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
-
-gatewayd-test: ## Format check, clippy and unit tests for gatewayd (the model gateway)
-	cd services/gatewayd && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
-
-gatewayd-build: ## Build gatewayd for the gateway image (static linux/arm64 binary)
-	cd services/gatewayd && cargo zigbuild --release --target aarch64-unknown-linux-musl
-
-gateway-image: gatewayd-build ## Build the model gateway's image (AMI) on a temporary builder; prints the AMI and its measurements
-	ENV=$(ENV) scripts/build-gateway-image.sh
-
-apns-key: ## Store the APNs push key in SSM: make apns-key FILE=AuthKey_XXXXXXXXXX.p8 KEY_ID=XXXXXXXXXX
-	SSM_PREFIX=/cloud-desktops/$(ENV) scripts/put-apns-key.py "$(FILE)" "$(KEY_ID)"
-
-tailscale-key: ## Store your personal tailnet's auth key (tagged tag:cloud-desktop) for the test desktop in SSM (prompted, not echoed)
-	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/auth_key
-
-tailscale-oauth: ## Store the desktops tailnet's OAuth client (id, then secret; prompted, not echoed)
-	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/desktops/oauth_client_id
-	scripts/put-secret.py /cloud-desktops/$(ENV)/tailscale/desktops/oauth_client_secret
-
-tailnet-deploy: tailnet-build ## Put desktops on their tailnets (agent API, noVNC, VNC); deploy agentd first (LIMIT= or DESKTOP= for one)
-	$(ANSIBLE_PLAYBOOK) playbooks/tailnet-proxy.yml $(PLAYBOOK_LIMIT) -e ansible_aws_ssm_bucket_name=$(SSM_BUCKET)
-
-# --- Apple apps (apps/apple) -------------------------------------------------------
-
-app-tailscalekit: ## Build TailscaleKit.xcframework from libtailscale (Go + Xcode, a few minutes)
-	apps/apple/scripts/build-tailscalekit.sh
-
-app-test: ## Unit tests for DesktopKit (macOS)
-	cd apps/apple/DesktopKit && swift test
-
-app-sim: ## Build the iPhone app for the Simulator
-	cd apps/apple && xcodegen generate --quiet && xcodebuild -project CloudDesktop.xcodeproj \
-	  -scheme CloudDesktop -destination 'generic/platform=iOS Simulator' -derivedDataPath build/sim build -quiet
-
-app-device: ## Build, install and launch the iPhone app on your paired iPhone (unlock it first)
-	apps/apple/scripts/run-on-device.sh
-
-app-mac: ## Build the Mac app, install it in /Applications and open it (first run registers this Mac)
-	apps/apple/scripts/run-on-mac.sh
-
-# notarytool's keychain profile: credentials are per Apple ID and team, not per
-# app, so the one made for Selecta (same team, 4UVAPZYV4Q) works here.
-NOTARY_PROFILE ?= selecta-notary
-
-app-release-mac: ## The Mac app for others: Developer ID, notarized, in a DMG (docs/onboarding.md; NOTARY_PROFILE=)
-	NOTARY_PROFILE=$(NOTARY_PROFILE) apps/apple/scripts/release-mac.sh
-
-app-testflight: ## The iPhone app for TestFlight: archive and upload to App Store Connect (docs/onboarding.md)
-	apps/apple/scripts/release-ios.sh
+start: ## Start the desktop again (back on your tailnet in a minute or two)
+	aws ec2 start-instances --instance-ids $(INSTANCE) --query 'StartingInstances[0].CurrentState.Name' --output text
 
 # --- Access (SSM only) -------------------------------------------------------
 

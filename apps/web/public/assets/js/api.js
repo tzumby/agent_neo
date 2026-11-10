@@ -1,5 +1,5 @@
-// agentd's API (docs/architecture.md §6.4), through front-door on the same
-// host: Cloudflare Access's session cookie goes along by itself.
+// agentd's API (docs/architecture.md §6.4), through tailnet-proxy on the same
+// host, which knows who's calling from their Tailscale identity.
 
 export class ApiError extends Error {
   constructor(status, message) {
@@ -18,8 +18,8 @@ async function request(method, path, body) {
   try {
     response = await fetch(path, init);
   } catch {
-    // Offline, or Cloudflare sent the request to its sign-in page.
-    throw new ApiError(0, "Can't reach your desktop. Check your connection, or reload to sign in again.");
+    // Offline, or this device dropped off the tailnet.
+    throw new ApiError(0, "Can't reach your desktop. Check your connection and that Tailscale is on.");
   }
   const text = await response.text();
   let data = null;
@@ -52,18 +52,12 @@ export const api = {
   updateSettings: (settings) => request("PUT", "/api/v1/settings", settings),
   schedules: async () => (await request("GET", "/api/v1/schedules")).schedules,
   addSchedule: (schedule) => request("POST", "/api/v1/schedules", schedule),
-  setup: () => request("GET", "/api/v1/setup"),
-  saveSetup: (skipped) => request("PUT", "/api/v1/setup", { skipped }),
   deleteSchedule: (id) => request("DELETE", `/api/v1/schedules/${enc(id)}`, {}),
   pauseSchedule: (id, paused) => request("POST", `/api/v1/schedules/${enc(id)}/${paused ? "pause" : "resume"}`, {}),
   secrets: async () => (await request("GET", "/api/v1/secrets")).secrets,
   saveSecret: (name, value, label, approval) =>
     request("PUT", `/api/v1/secrets/${enc(name)}`, { value, label, ...(approval ? { approval } : {}) }),
   deleteSecret: (name) => request("DELETE", `/api/v1/secrets/${enc(name)}`, {}),
-  destinations: async () => (await request("GET", "/api/v1/destinations")).destinations,
-  saveDestination: (name, body) => request("PUT", `/api/v1/destinations/${enc(name)}`, body),
-  deleteDestination: (name) => request("DELETE", `/api/v1/destinations/${enc(name)}`, {}),
-  testDestination: (name) => request("POST", `/api/v1/destinations/${enc(name)}/test`, {}),
   access: () => request("GET", "/api/v1/access"),
   allowSite: (host) => request("POST", "/api/v1/access", { host }),
   removeSite: (host) => request("DELETE", `/api/v1/access/${enc(host)}`, {}),

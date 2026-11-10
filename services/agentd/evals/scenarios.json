@@ -543,7 +543,7 @@
   },
   {
     "name": "scheduled-nothing-new-is-quiet",
-    "about": "A scheduled check with nothing to report ends with outcome=nothing (a quiet row, no push).",
+    "about": "A scheduled check with nothing to report ends with outcome=nothing (a quiet row).",
     "steps": [
       {
         "run_schedule": {

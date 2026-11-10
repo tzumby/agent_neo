@@ -70,7 +70,7 @@ export function mountChat(store, view, { openDesktop, openKeys }) {
     empty.hidden = items.length > 0 || store.busy;
     older.hidden = !store.hasOlder;
 
-    // An empty chat holds the first-run guide: it reads from its top.
+    // An empty chat holds the suggestions: it reads from its top.
     if (!items.length) scroll.scrollTop = 0;
     else if (stick) scroll.scrollTop = scroll.scrollHeight;
     else if (anchor?.isConnected) scroll.scrollTop += anchor.getBoundingClientRect().top - anchorTop;

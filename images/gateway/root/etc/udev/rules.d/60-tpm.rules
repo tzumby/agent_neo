@@ -1,3 +1,0 @@
-# gatewayd (group tss) asks the NitroTPM for attestation documents.
-KERNEL=="tpm[0-9]*", GROUP="tss", MODE="0660"
-KERNEL=="tpmrm[0-9]*", GROUP="tss", MODE="0660"

@@ -1,16 +1,12 @@
-# Step 1: Chrome opens this page on start. Later the agent daemon's
-# /chrome/open replaces this.
+# Chrome opens this page on start.
 chrome_start_url: "https://www.google.com"
 
-# Memory v2 (docs/memory-v2.md) on the dev desktop, to try it in the app
-# before the phase 6 soak; the role's default stays "off".
+# Memory v2 (docs/memory-v2.md): kinds, trust, retrieval and consolidation.
+# It passes more of the memory evals than v1; the agentd role's default
+# stays "off".
 agentd_memory_v2: "on"
 
-# Security monitoring (skill security-monitoring): the agent reads Cloudflare
-# security events and Datadog logs with read-only keys saved in the web app's
-# Setup, so its shell may reach those APIs, on every desktop.
-agentd_shell_extra_domains:
-  - api.cloudflare.com
-  # Datadog's sites: datadoghq.com (US1, US3, US5, AP1, AP2) and datadoghq.eu.
-  - .datadoghq.com
-  - .datadoghq.eu
+# More hosts the agent's shell may reach, beyond the agentd role's list
+# (agentd_shell_allowed_domains). A leading dot also allows subdomains. Sites
+# you allow from the web app's Settings don't need to be here.
+agentd_shell_extra_domains: []

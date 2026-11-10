@@ -1,8 +1,8 @@
 //! Scheduled tasks: something the user wants done later or on a repeat ("every
 //! weekday at 8, summarize my inbox", "tomorrow at 9, check the PR"). agentd
 //! starts each run itself, at those times in the user's time zone. A run is an
-//! ordinary task (same tools, same approvals) whose answer reaches the app and
-//! the phone. The shell's crontab isn't used: it would run commands with no
+//! ordinary task (same tools, same approvals) whose answer reaches the chat.
+//! The shell's crontab isn't used: it would run commands with no
 //! approvals, no model and no way to tell the user.
 //!
 //! A due run joins a queue in the database (`runs` rows, `queued`), and a
@@ -31,6 +31,43 @@ pub const MIN_INTERVAL_SECS: i64 = 15 * 60;
 pub const MAX_LATE_SECS: i64 = 3600;
 /// One-time runs at most this far ahead.
 const MAX_AHEAD_SECS: i64 = 366 * 86_400;
+
+/// What a scheduled run reported with `report_outcome` (docs/memory-v2.md §11).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Reported {
+    /// result, nothing or blocked.
+    pub outcome: String,
+    /// At most 180 characters, plain text on one line.
+    pub summary: String,
+}
+
+/// Cuts text to one plain line: Markdown's marks dropped, at most
+/// `max_chars` characters.
+pub fn clip(text: &str, max_chars: usize) -> String {
+    let flat = plain(text).split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    let kept: String = flat.chars().take(max_chars - 1).collect();
+    format!("{}…", kept.trim_end())
+}
+
+/// Markdown's marks dropped: headings and quotes lose their marks, list
+/// items become "•", links their text, and bold, strikethrough and code marks go.
+fn plain(text: &str) -> String {
+    static BLOCK: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?m)^\s*(?:#{1,6}\s+|>\s?)").expect("valid pattern"));
+    static ITEM: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?m)^\s*[-*+]\s+").expect("valid pattern"));
+    static LINK: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"!?\[([^\]]*)\]\([^)]*\)").expect("valid pattern"));
+    static MARKS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\*\*|__|~~|`").expect("valid pattern"));
+    let text = BLOCK.replace_all(text, "");
+    let text = ITEM.replace_all(&text, "• ");
+    let text = LINK.replace_all(&text, "$1");
+    MARKS.replace_all(&text, "").into_owned()
+}
 
 /// When a new schedule runs: checked, with its first run.
 #[derive(Debug, PartialEq)]
@@ -393,6 +430,26 @@ fn advance(agent: &Agent, schedule: &Schedule, now: i64, ran: Option<i64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clips_long_text() {
+        assert_eq!(clip("short", 10), "short");
+        assert_eq!(clip("one\ntwo   three", 50), "one two three");
+        assert_eq!(clip("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn summaries_are_plain_text() {
+        assert_eq!(
+            clip(
+                "## Blogs\n\n**Hacker News:** a new `db`\n- one\n* two\n> quoted [the post](https://x.y/z)",
+                180
+            ),
+            "Blogs Hacker News: a new db • one • two quoted the post"
+        );
+        // Single marks stay: they're more often maths or names than emphasis.
+        assert_eq!(clip("2 * 3 and snake_case", 50), "2 * 3 and snake_case");
+    }
 
     #[tokio::test]
     async fn a_schedule_from_older_rules_runs_and_says_so_once() {

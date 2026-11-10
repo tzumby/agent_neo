@@ -1,34 +1,25 @@
-# Dynamic inventory: running instances tagged Project=cloud-desktops, grouped by
-# their Role tag (desktop, control_plane). Hosts are reached over SSM by
-# instance id. Credentials come from AWS_PROFILE.
+# Dynamic inventory: this deployment's running desktop (tags Project and Env
+# from Terraform), reached over SSM by instance id. Credentials come from
+# AWS_PROFILE.
+#
+# The Makefile writes inventory/aws_ec2.yml from this file before each
+# playbook, with your AWS_REGION and ENV filled in (the plugin can't read
+# them from the environment). Edit this file, not the generated one.
 plugin: amazon.aws.aws_ec2
 regions:
-  - ca-central-1 # keep in sync with terraform var.region
+  - "ca-central-1"
 filters:
   tag:Project: cloud-desktops
+  tag:Env: "personal"
   instance-state-name: running
 hostnames:
   - instance-id
 keyed_groups:
   - key: ec2_tags.Role
     separator: ""
-  # How people reach it: access_tailnet (tailnet-proxy, our desktops) or
-  # access_cloudflare (front-door, a customer deployment:
-  # docs/customer-cloud.md).
-  - key: ec2_tags.Access | default('tailnet')
-    prefix: access
 compose:
   ansible_aws_ssm_instance_id: instance_id
-  # Whose desktop, and which tailnet it joins (Terraform tags): "shared" is the
-  # operator's personal tailnet; "desktops" is the desktops tailnet, where its
-  # user's devices join with setup links (scripts/tailnet.py). Untagged: the
-  # operator's test desktop.
-  # The person, not the Linux account: the desktop role's desktop_user (the
-  # account Chrome and the session run as, "agent") must keep its default.
-  desktop_owner: ec2_tags.User | default('')
-  desktop_tailnet: ec2_tags.Tailnet | default('shared')
-  desktop_tailnet_name: ec2_tags.TailnetName | default('cloud-desktop-dev')
-  # Its environment (Terraform's Env tag: dev, or a customer's), which picks
-  # its SSM paths, and its name in a customer deployment.
-  desktop_env: ec2_tags.Env | default('dev')
-  desktop_name: ec2_tags.DesktopName | default('')
+  # Its environment (Terraform's Env tag), which picks its SSM paths
+  # (/cloud-desktops/<env>/...), and its device name on your tailnet.
+  desktop_env: ec2_tags.Env
+  desktop_tailnet_name: ec2_tags.TailnetName | default('neo-agent')

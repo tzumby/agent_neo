@@ -2,9 +2,7 @@
 # parameter /cloud-desktops/<env>/tailscale/auth_key (`make tailscale-key`)
 # and the binary from `make tailnet-build`. Deploy agentd first.
 - name: Deploy tailnet-proxy
-  # Not a customer deployment's desktops: people reach those through
-  # Cloudflare (playbooks/front-door.yml).
-  hosts: desktop:!access_cloudflare
+  hosts: desktop
   become: true
   roles:
     - tailnet_proxy

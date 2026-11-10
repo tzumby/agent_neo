@@ -11,8 +11,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::destinations::Destination;
-
 #[derive(Clone, Debug, Serialize)]
 pub struct Event {
     pub seq: i64,
@@ -267,8 +265,8 @@ impl Store {
                  created TEXT NOT NULL DEFAULT ({NOW}),
                  updated TEXT NOT NULL DEFAULT ({NOW}),
                  last_used TEXT);
-             -- Where updates go (destinations.rs); their tokens and URLs
-             -- are files of their own, not here.
+             -- Slack and Teams updates (destinations, posts): unused here,
+             -- kept so a database moves between versions with and without them.
              CREATE TABLE IF NOT EXISTS destinations (
                  name TEXT PRIMARY KEY,
                  kind TEXT NOT NULL,
@@ -278,7 +276,6 @@ impl Store {
                  created_by TEXT,
                  last_post INTEGER,
                  last_error TEXT);
-             -- Updates posted: for threads, the rate limit and duplicates.
              CREATE TABLE IF NOT EXISTS posts (
                  id TEXT PRIMARY KEY,
                  destination TEXT NOT NULL,
@@ -682,109 +679,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    // --- Destinations (destinations.rs) -----------------------------------------
-
-    pub fn destinations(&self) -> Result<Vec<Destination>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT name, kind, channel, link, created, created_by, last_post, last_error
-             FROM destinations ORDER BY name",
-        )?;
-        let rows = stmt.query_map([], destination_row)?;
-        Ok(rows.filter_map(|r| r.ok().flatten()).collect())
-    }
-
-    pub fn destination(&self, name: &str) -> Result<Option<Destination>> {
-        Ok(self.destinations()?.into_iter().find(|d| d.name == name))
-    }
-
-    /// Adds or changes one; a change clears its last error.
-    pub fn save_destination(&self, d: &Destination) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO destinations (name, kind, channel, link, created, created_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(name) DO UPDATE SET kind = excluded.kind, channel = excluded.channel,
-                 link = excluded.link, last_error = NULL",
-            params![d.name, d.kind.as_str(), d.channel, d.link, d.created, d.by],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_destination(&self, name: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM posts WHERE destination = ?1", params![name])?;
-        Ok(conn.execute("DELETE FROM destinations WHERE name = ?1", params![name])? > 0)
-    }
-
-    /// How its last post went: when it worked, or why it didn't.
-    pub fn destination_result(&self, name: &str, at: i64, error: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        match error {
-            None => conn.execute(
-                "UPDATE destinations SET last_post = ?2, last_error = NULL WHERE name = ?1",
-                params![name, at],
-            )?,
-            Some(error) => conn.execute(
-                "UPDATE destinations SET last_error = ?2 WHERE name = ?1",
-                params![name, error],
-            )?,
-        };
-        Ok(())
-    }
-
-    pub fn record_post(&self, post: &Post) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO posts (id, destination, title, hash, ts, task, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![post.id, post.destination, post.title, post.hash, post.ts, post.task, post.created],
-        )?;
-        Ok(())
-    }
-
-    pub fn posts_since(&self, destination: &str, since: i64) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM posts WHERE destination = ?1 AND created >= ?2",
-            params![destination, since],
-            |row| row.get(0),
-        )?)
-    }
-
-    /// When the same update last went to this destination, since `since`.
-    pub fn same_post_since(&self, destination: &str, hash: &str, since: i64) -> Result<Option<i64>> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn
-            .query_row(
-                "SELECT MAX(created) FROM posts WHERE destination = ?1 AND hash = ?2 AND created >= ?3",
-                params![destination, hash, since],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    pub fn post(&self, id: &str) -> Result<Option<Post>> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn
-            .query_row(
-                "SELECT id, destination, title, hash, ts, task, created FROM posts WHERE id = ?1",
-                params![id],
-                |row| {
-                    Ok(Post {
-                        id: row.get(0)?,
-                        destination: row.get(1)?,
-                        title: row.get(2)?,
-                        hash: row.get(3)?,
-                        ts: row.get(4)?,
-                        task: row.get(5)?,
-                        created: row.get(6)?,
-                    })
-                },
-            )
-            .optional()?)
-    }
-
     pub fn delete_secret(&self, name: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute("DELETE FROM secrets WHERE name = ?1", params![name])? > 0)
@@ -1148,37 +1042,6 @@ fn schedule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
         created_from: row.get(10)?,
         auto_approve: row.get(11)?,
     })
-}
-
-/// An update posted (destinations.rs).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Post {
-    pub id: String,
-    pub destination: String,
-    pub title: String,
-    pub hash: String,
-    /// Slack's message ts: replies go in its thread.
-    pub ts: Option<String>,
-    pub task: Option<String>,
-    pub created: i64,
-}
-
-/// None for a kind this version doesn't know.
-fn destination_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Destination>> {
-    let kind: String = row.get(1)?;
-    let Some(kind) = crate::destinations::Kind::parse(&kind) else {
-        return Ok(None);
-    };
-    Ok(Some(Destination {
-        name: row.get(0)?,
-        kind,
-        channel: row.get(2)?,
-        link: row.get(3)?,
-        created: row.get(4)?,
-        by: row.get(5)?,
-        last_post: row.get(6)?,
-        last_error: row.get(7)?,
-    }))
 }
 
 fn secret_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SecretInfo> {
@@ -1731,7 +1594,7 @@ mod tests {
             .unwrap();
         let first = store.due_effects(1_000, 10).unwrap().remove(0);
         store
-            .effect_again(&first, 150, Some("gateway answered 503"))
+            .effect_again(&first, 150, Some("the model answered 503"))
             .unwrap();
         // A later trigger replaces payload and due, and keeps the attempts.
         store

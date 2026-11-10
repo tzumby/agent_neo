@@ -1,5 +1,4 @@
-// The chat as the web app shows it, built from agentd's event log. The same
-// rules as the iPhone and Mac apps (DesktopKit's ChatTimeline): the user's
+// The chat as the web app shows it, built from agentd's event log: the user's
 // messages, the agent's answers and pictures, scheduled runs as reports, and
 // the cards waiting for the user. What the agent does on the way (steps,
 // commands, saves) stays out; `busy` only says that it's working.

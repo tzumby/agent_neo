@@ -1,8 +1,6 @@
-//! HTTP API for the apps. Only the desktop's way in can reach it (Unix socket):
-//! `tailnet-proxy`, which sets `X-Tailscale-User` from the caller's Tailscale
-//! identity, or in a customer deployment `front-door`, which sets
-//! `X-Agent-User` from their Cloudflare Access sign-in. Each removes any copy
-//! the caller sent.
+//! HTTP API for the web app. Only the desktop's way in can reach it (Unix
+//! socket): `tailnet-proxy`, which sets `X-Tailscale-User` from the caller's
+//! Tailscale identity and removes any copy the caller sent.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -40,7 +38,6 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/images/{id}", get(image))
         .route("/api/v1/screenshot", get(screenshot))
         .route("/api/v1/settings", get(settings).put(put_settings))
-        .route("/api/v1/devices", post(register_device))
         .route("/api/v1/memory", get(memories))
         .route("/api/v1/memory/search", get(search_memory))
         .route("/api/v1/memory/consolidate", post(consolidate_now))
@@ -53,7 +50,6 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/memory/{id}/approve", post(confirm_memory))
         .route("/api/v1/memory/{id}/history", get(memory_history))
         .route("/api/v1/schedules", get(schedules).post(add_schedule))
-        .route("/api/v1/setup", get(get_setup).put(put_setup))
         .route(
             "/api/v1/schedules/{id}",
             delete(delete_schedule).put(update_schedule),
@@ -62,12 +58,6 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/schedules/{id}/resume", post(resume_schedule))
         .route("/api/v1/secrets", get(list_secrets))
         .route("/api/v1/secrets/{name}", put(save_secret).delete(delete_secret))
-        .route("/api/v1/destinations", get(list_destinations))
-        .route(
-            "/api/v1/destinations/{name}",
-            put(save_destination).delete(delete_destination),
-        )
-        .route("/api/v1/destinations/{name}/test", post(test_destination))
         .route("/api/v1/access", get(access_list).post(allow_host))
         .route("/api/v1/access/{host}", delete(remove_host))
         .with_state(agent)
@@ -75,9 +65,9 @@ pub fn router(agent: Arc<Agent>) -> Router {
 
 /// Who made the request, for attribution (`by`), as the proxy in front set it.
 fn caller(headers: &HeaderMap) -> Option<String> {
-    ["x-tailscale-user", "x-agent-user"]
-        .iter()
-        .find_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
+    headers
+        .get("x-tailscale-user")
+        .and_then(|v| v.to_str().ok())
         .map(String::from)
 }
 
@@ -207,54 +197,6 @@ async fn messages(State(agent): App, Query(query): Query<Limit>) -> Response {
             Json(json!({"messages": history})).into_response()
         }
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
-    }
-}
-
-#[derive(Deserialize)]
-struct Device {
-    /// The APNs device token, as hex.
-    token: String,
-    #[serde(default)]
-    name: String,
-    /// The APNs servers the token belongs to: "sandbox" (Xcode installs) or
-    /// "production" (TestFlight, the notarized Mac app). Older apps send none:
-    /// the relay's default (sandbox).
-    #[serde(default)]
-    environment: Option<String>,
-}
-
-/// The apps register for push notifications here.
-async fn register_device(State(agent): App, headers: HeaderMap, Json(body): Json<Device>) -> Response {
-    let token = body.token.trim().to_ascii_lowercase();
-    if token.len() < 32 || token.len() > 200 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
-        return error(StatusCode::BAD_REQUEST, "token must be the device token in hex");
-    }
-    let Some(relay) = agent.push.clone() else {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "push notifications aren't set up on this desktop",
-        );
-    };
-    let name: String = body.name.chars().take(80).collect();
-    let environment = match body.environment.as_deref() {
-        None => None,
-        Some(env @ ("sandbox" | "production")) => Some(env),
-        Some(_) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "environment must be sandbox or production",
-            );
-        }
-    };
-    match relay.register(&token, &name, environment).await {
-        Ok(()) => {
-            tracing::info!(device = %name, environment = ?environment, by = ?caller(&headers), "device registered for push");
-            Json(json!({"ok": true})).into_response()
-        }
-        Err(err) => {
-            tracing::warn!(%err, "couldn't register a device with the push relay");
-            error(StatusCode::BAD_GATEWAY, "couldn't reach the push relay")
-        }
     }
 }
 
@@ -714,23 +656,6 @@ async fn memory_history(State(agent): App, Path(id): Path<i64>) -> Response {
     }
 }
 
-async fn get_setup(State(agent): App) -> Json<Value> {
-    Json(json!({"steps": crate::agent::SETUP_STEPS, "skipped": agent.setup_skipped()}))
-}
-
-#[derive(Deserialize)]
-struct SetupUpdate {
-    skipped: Vec<String>,
-}
-
-/// The Setup steps skipped, all of them (a step left out isn't skipped).
-async fn put_setup(State(agent): App, headers: HeaderMap, Json(body): Json<SetupUpdate>) -> Response {
-    match agent.set_setup_skipped(&body.skipped, caller(&headers)) {
-        Ok(skipped) => Json(json!({"steps": crate::agent::SETUP_STEPS, "skipped": skipped})).into_response(),
-        Err(problem) => error(StatusCode::BAD_REQUEST, &problem),
-    }
-}
-
 #[derive(Deserialize)]
 struct NewSchedule {
     name: String,
@@ -772,7 +697,7 @@ async fn update_schedule(
     }
 }
 
-/// A repeating schedule set up in the web app (Setup's examples).
+/// A repeating schedule set up in the web app.
 async fn add_schedule(State(agent): App, headers: HeaderMap, Json(body): Json<NewSchedule>) -> Response {
     let clock = match (body.timezone.as_deref(), body.utc_offset) {
         (Some(timezone), Some(offset)) => crate::clock::UserClock::from_app(timezone, offset),
@@ -967,62 +892,6 @@ async fn delete_secret(State(agent): App, Path(name): Path<String>, headers: Hea
     }
 }
 
-async fn list_destinations(State(agent): App) -> Response {
-    match agent.store.destinations() {
-        Ok(destinations) => Json(json!({"destinations": destinations})).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
-    }
-}
-
-#[derive(Deserialize)]
-struct NewDestination {
-    kind: String,
-    #[serde(default)]
-    channel: String,
-    /// The Slack bot token or the Teams webhook URL; absent keeps the saved one.
-    #[serde(default)]
-    credential: Option<String>,
-    /// The web app's own address, for the link back in each post.
-    #[serde(default)]
-    link: String,
-}
-
-/// From the web app. The body (it holds a token or a webhook URL) is never logged.
-async fn save_destination(
-    State(agent): App,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<NewDestination>,
-) -> Response {
-    match agent.save_destination(
-        &name,
-        &body.kind,
-        &body.channel,
-        body.credential.as_deref(),
-        &body.link,
-        caller(&headers),
-    ) {
-        Ok(destination) => Json(json!({"destination": destination})).into_response(),
-        Err(problem) => error(StatusCode::BAD_REQUEST, &problem),
-    }
-}
-
-async fn delete_destination(State(agent): App, Path(name): Path<String>, headers: HeaderMap) -> Response {
-    match agent.delete_destination(&name, caller(&headers)) {
-        Ok(true) => Json(json!({"ok": true})).into_response(),
-        Ok(false) => error(StatusCode::NOT_FOUND, "no such destination"),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
-    }
-}
-
-/// Posts a fixed test message: 502 with the reason, in plain words, if it fails.
-async fn test_destination(State(agent): App, Path(name): Path<String>) -> Response {
-    match agent.test_destination(&name).await {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(problem) => error(StatusCode::BAD_GATEWAY, &problem),
-    }
-}
-
 async fn image(State(agent): App, Path(id): Path<String>) -> Response {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit()) {
         return error(StatusCode::BAD_REQUEST, "bad image id");
@@ -1094,12 +963,12 @@ mod tests {
     }
 
     #[test]
-    fn the_caller_comes_from_either_proxy() {
+    fn the_caller_comes_from_tailnet_proxy() {
         let mut headers = HeaderMap::new();
         assert_eq!(caller(&headers), None);
+        // Only tailnet-proxy's header counts.
         headers.insert("x-agent-user", "me@acme.com".parse().unwrap());
-        assert_eq!(caller(&headers).as_deref(), Some("me@acme.com"));
-        // tailnet-proxy only strips its own headers, so its identity wins.
+        assert_eq!(caller(&headers), None);
         headers.insert("x-tailscale-user", "me@example.com".parse().unwrap());
         assert_eq!(caller(&headers).as_deref(), Some("me@example.com"));
     }

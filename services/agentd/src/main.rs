@@ -4,23 +4,16 @@
 mod access;
 mod agent;
 mod api;
-mod attest;
-mod aws;
 mod browser;
 mod cdp;
 mod clock;
 mod config;
 mod consolidate;
-mod destinations;
 mod effects;
-mod egress;
-mod gateway;
 mod guard;
 mod llm;
 mod memory;
-mod monitoring;
 mod policy;
-mod push;
 mod schedule;
 mod secrets;
 mod shell;
@@ -47,12 +40,6 @@ async fn main() -> Result<()> {
     if std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0) {
         anyhow::bail!("agentd must not run as root (it runs as the agentd user, under systemd)");
     }
-    if std::env::args()
-        .nth(1)
-        .is_some_and(|arg| arg == "--check-gateway")
-    {
-        return check_gateway().await;
-    }
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("agentd=info")))
         .with_ansi(std::io::stdout().is_terminal()) // plain text in the journal
@@ -61,7 +48,8 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(cfg.state_dir.join("images")).context("creating the state directory")?;
     let agent = Arc::new(agent::Agent::new(cfg.clone())?);
     let app = api::router(agent.clone());
-    start_egress_gate(&cfg, &agent).await;
+    // A direct command's opening left by an agentd that stopped mid-command.
+    agent.clear_direct_egress();
 
     if let Some(path) = cfg.listen.strip_prefix("unix:") {
         // Only agentd and tailnet-proxy (via the socket's group) can connect;
@@ -108,59 +96,10 @@ async fn serve_until_stopped(
     Ok(())
 }
 
-/// `agentd --check-gateway` (as the agentd user): checks the model gateway
-/// the way a model call would, without sending a prompt.
-async fn check_gateway() -> Result<()> {
-    let cfg = config::Config::load()?;
-    anyhow::ensure!(!cfg.gateway_url.is_empty(), "GATEWAY_URL isn't set");
-    let gateway = gateway::ModelGateway::new(
-        &cfg.gateway_url,
-        &cfg.aws_region,
-        &cfg.gateway_audience,
-        cfg.gateway_trust,
-        std::time::Duration::from_secs(30),
-    )?;
-    println!("{}: {}", cfg.gateway_url, gateway.check().await?);
-    Ok(())
-}
-
 async fn shutdown() {
     let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
-    }
-}
-
-/// The egress gate, scheduled runs' way out (egress.rs). If it can't start,
-/// scheduled commands reach nothing (Squid is closed to them while they run)
-/// and their reports say so.
-async fn start_egress_gate(cfg: &config::Config, agent: &Arc<agent::Agent>) {
-    // A lock left by an agentd that stopped mid-command.
-    agent.clear_egress_locks();
-    if cfg.egress_gate_listen.is_empty() {
-        return;
-    }
-    let weak = Arc::downgrade(agent);
-    let keys: egress::Keys = Box::new(move |name| weak.upgrade()?.secrets.get(name));
-    let started = async {
-        let gate = Arc::new(egress::EgressGate::new(
-            keys,
-            &cfg.egress_gate_squid,
-            cfg.egress_gate_upstream.clone(),
-        )?);
-        gate.write_bundle(&cfg.state_dir.join(agent::EGRESS_BUNDLE))?;
-        let listener = tokio::net::TcpListener::bind(&cfg.egress_gate_listen)
-            .await
-            .with_context(|| format!("binding {}", cfg.egress_gate_listen))?;
-        tokio::spawn(gate.clone().serve(listener));
-        anyhow::Ok(gate)
-    };
-    match started.await {
-        Ok(gate) => {
-            let _ = agent.gate.set(gate);
-            tracing::info!(listen = %cfg.egress_gate_listen, "egress gate for scheduled runs");
-        }
-        Err(err) => tracing::error!(err = %format!("{err:#}"), "the egress gate didn't start"),
     }
 }

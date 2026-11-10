@@ -8,7 +8,7 @@ StartLimitIntervalSec=0
 [Service]
 User=tailnet-proxy
 EnvironmentFile=/etc/tailnet-proxy.env
-ExecStart=/usr/local/bin/tailnet-proxy -hostname {{ tailnet_proxy_hostname }} -state-dir /var/lib/tailnet-proxy -novnc {{ tailnet_proxy_novnc }} -agentd {{ tailnet_proxy_agentd_socket }} -vnc {{ tailnet_proxy_vnc }} -web {{ web_app_dir }}{% if tailnet_proxy_allow %} -allow {{ tailnet_proxy_allow }}{% endif %}{% if tailnet_proxy_allow_tags %} -allow-tags {{ tailnet_proxy_allow_tags }}{% endif %}
+ExecStart=/usr/local/bin/tailnet-proxy -hostname {{ tailnet_proxy_hostname }} -state-dir /var/lib/tailnet-proxy -novnc {{ tailnet_proxy_novnc }} -agentd {{ tailnet_proxy_agentd_socket }} -vnc {{ tailnet_proxy_vnc }} -web {{ web_app_dir }}{% if tailnet_proxy_allow %} -allow {{ tailnet_proxy_allow }}{% endif %}
 
 Restart=always
 RestartSec=5

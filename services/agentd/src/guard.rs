@@ -122,8 +122,7 @@ pub const SHELL_SCHEDULE_REFUSAL: &str = "not run: don't schedule with the shell
 
 pub const EGRESS_REFUSAL: &str = "not run: the shell's internet access (the proxy's allowlist and the \
      desktop's firewall) is part of the desktop's setup and can't be changed from here, even with the user's \
-     OK. If a job needs a host that's blocked, tell the user which one and why. To post to Slack or Teams, use \
-     post_update with a channel the user added under Updates in the web app.";
+     OK. If a job needs a host that's blocked, tell the user which one and why.";
 
 /// The desktop's egress controls: Squid (its configuration or its control
 /// commands) and the guard firewall. Refused even with approval: they're
@@ -137,26 +136,6 @@ pub fn touches_egress_policy(command: &str) -> bool {
         .expect("valid regex")
     });
     EGRESS.is_match(command)
-}
-
-pub const MESSAGING_API_REFUSAL: &str = "not run: don't call Slack's or Teams' APIs from the shell. Post updates \
-     with post_update, to a channel the user added under Updates in the web app. If there's none, tell the user \
-     to add one there: the app walks them through it and sends a test. Never ask for a Slack token in the chat.";
-
-/// Slack's or Teams' APIs and webhooks from the shell: updates go through
-/// post_update and its checks (destinations.rs), never around them.
-pub fn calls_messaging_api(command: &str) -> bool {
-    use std::sync::LazyLock;
-    static MESSAGING: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?ix)
-            https?://([a-z0-9-]+\.)*slack\.com\b
-            | \b(curl|wget|http|xh)\b [^\n]* \bslack\.com\b
-            | ([a-z0-9-]+\.)+ (logic\.azure\.com|api\.powerplatform\.com|webhook\.office\.com)\b",
-        )
-        .expect("valid regex")
-    });
-    MESSAGING.is_match(command)
 }
 
 pub const SUMMARY_REFUSAL: &str = "not run: this command needs the user's OK, and their card shows your summary, \
@@ -383,7 +362,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_egress_policy_and_messaging_apis_are_off_limits() {
+    fn the_egress_policy_is_off_limits() {
         for egress in [
             "sudo sed -i 's/^acl allowed dstdomain/& .slack.com/' /etc/squid/squid.conf && sudo squid -k reconfigure",
             "echo 'acl x dstdomain slack.com' | sudo tee -a /etc/squid/conf.d/slack.conf",
@@ -392,26 +371,11 @@ mod tests {
             "sudo systemctl stop cloud-desktop-guard",
             // Holding the firewall open past the one command the user approved.
             "sudo nft add element inet cloud_desktop_guard direct_egress '{ 1002 timeout 1d }'",
-            "sudo nft flush set inet cloud_desktop_guard squid_locked",
+            "sudo nft flush set inet cloud_desktop_guard direct_egress",
         ] {
             assert!(touches_egress_policy(egress), "{egress}");
         }
         assert!(!touches_egress_policy("curl -s https://api.github.com/repos/x/y"));
-        for messaging in [
-            "curl -s -H \"Authorization: Bearer $SLACK_BOT_TOKEN\" https://slack.com/api/auth.test",
-            "curl -X POST https://hooks.slack.com/services/T0/B0/x -d '{}'",
-            "curl -sI slack.com",
-            "python3 -c 'import urllib.request; urllib.request.urlopen(\"https://api.slack.com/api/chat.postMessage\")'",
-            "curl -X POST 'https://prod-27.westus.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke'",
-        ] {
-            assert!(calls_messaging_api(messaging), "{messaging}");
-        }
-        for fine in [
-            "grep -c 'slack' access.log",
-            "curl -s https://api.cloudflare.com/client/v4/zones",
-        ] {
-            assert!(!calls_messaging_api(fine), "{fine}");
-        }
     }
 
     #[test]

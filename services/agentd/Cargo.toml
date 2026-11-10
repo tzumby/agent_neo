@@ -7,28 +7,19 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-aws-credential-types = "1"
 aws-lc-rs = "1.19.0"
-aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
 axum = "0.8"
 base64 = "0.22"
-ciborium = "0.2.2"
 croner = { version = "4", default-features = false, features = ["jiff"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
 jiff = "0.2"
-rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
-rustls = "0.23.46"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-rustls = "0.26.6"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = "0.30"
 toml = "0.9"
@@ -36,7 +27,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-x509-parser = "0.18.1"
 
 [profile.release]
 lto = true

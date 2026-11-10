@@ -8,6 +8,8 @@ terraform.tfvars
 
 # Ansible
 *.retry
+# Written by the Makefile from aws_ec2.yml.tmpl
+ansible/inventory/aws_ec2.yml
 
 # Local output
 screenshots/
@@ -17,24 +19,19 @@ __pycache__/
 
 # Go build output
 services/tailnet-proxy/build/
-services/front-door/build/
 
 # Rust build output
 services/agentd/target/
-services/agentd/target/deps
-services/gatewayd/target/
-services/gatewayd/target/deps
-
 target/
+services/agentd/evals/results/
 
-# Apple apps (generated or built)
-apps/apple/vendor/
-apps/apple/DesktopKit/Vendor/
-apps/apple/DesktopKit/.build/
-apps/apple/*.xcodeproj/
-apps/apple/build/
-terraform/envs/*/.build/
+# Build output of components that aren't in this edition (gateway, Apple
+# apps, front-door, the dev env), kept ignored so a checkout shared with the
+# full repo doesn't list them.
+services/front-door/build/
+services/gatewayd/target/
+apps/apple/
+terraform/envs/
 xcuserdata/
 DerivedData/
 *.xcuserstate
-services/agentd/evals/results/

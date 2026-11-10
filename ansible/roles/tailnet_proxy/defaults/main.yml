@@ -1,27 +1,19 @@
 # Built by `make tailnet-build` (services/tailnet-proxy).
 tailnet_proxy_binary: "{{ playbook_dir }}/../../services/tailnet-proxy/build/tailnet-proxy-linux-{{ 'arm64' if ansible_facts.architecture == 'aarch64' else 'amd64' }}"
-tailnet_proxy_hostname: "{{ desktop_tailnet_name | default('cloud-desktop-dev') }}"
+# The device name: https://<this>.<your tailnet>.ts.net (Terraform's
+# tailnet_hostname, through the TailnetName tag).
+tailnet_proxy_hostname: "{{ desktop_tailnet_name | default('neo-agent') }}"
 tailnet_proxy_novnc: http://127.0.0.1:6080
 tailnet_proxy_agentd_socket: /run/agentd/agentd.sock
 tailnet_proxy_vnc: 127.0.0.1:5900
 
-tailnet_proxy_ssm_prefix: "/cloud-desktops/{{ desktop_env | default('dev') }}"
 tailnet_proxy_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"
+# auth_key (`make tailscale-key`) and, optionally, allowed_logins.
+tailnet_proxy_params: "/cloud-desktops/{{ desktop_env | default('personal') }}/tailscale"
 
-# A desktop on the desktops tailnet (inventory: desktop_tailnet "desktops")
-# reads its auth key from tailscale/users/<user>/auth_key, made for it by
-# scripts/tailnet.py, never the operator's: a missing key fails the play. Only
-# its user's devices (tag:user-<user>) get in.
-tailnet_proxy_desktops_tailnet: "{{ (desktop_tailnet | default('shared')) == 'desktops' }}"
-tailnet_proxy_params: >-
-  {{ tailnet_proxy_ssm_prefix ~ '/tailscale'
-     ~ (('/users/' ~ desktop_owner) if tailnet_proxy_desktops_tailnet | bool else '') }}
-tailnet_proxy_allow_tags: "{{ ('tag:user-' ~ desktop_owner) if tailnet_proxy_desktops_tailnet | bool else '' }}"
-
-# On the operator's tailnet: Tailscale login names let in (comma-separated),
-# from SSM so they stay out of git. Empty or missing: anyone the tailnet
-# policy lets through. Not used on the desktops tailnet.
+# Tailscale login names let in (comma-separated), from SSM so they stay out
+# of git (`make tailscale-allow`). Empty or missing: anyone your tailnet's
+# access rules let through to the desktop.
 tailnet_proxy_allow: >-
-  {{ '' if tailnet_proxy_desktops_tailnet | bool else
-     lookup('amazon.aws.ssm_parameter', tailnet_proxy_params ~ '/allowed_logins',
+  {{ lookup('amazon.aws.ssm_parameter', tailnet_proxy_params ~ '/allowed_logins',
             region=tailnet_proxy_ssm_region, on_missing='skip') | default('', true) }}

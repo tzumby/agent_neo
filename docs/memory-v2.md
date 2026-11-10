@@ -1,5 +1,7 @@
 # agentd Memory v2 and Borrowed Patterns — Development Plan
 
+> **In this personal edition** there's no model gateway, push relay or iPhone app, and the web app has no Memory screen yet. Model calls go straight to Together AI, and with no notifications the attention budget (§11) is gone too. The memory design itself (kinds, trust, retrieval, consolidation, the effects queue) is what agentd runs.
+
 *2026-11-01 · Razvan Draghici. Filed from the Claude doc [agentd Memory v2 and Borrowed Patterns](https://claude.ai/artifact/RSHkSqTRP897X5V3YxFQs2); this copy is kept current with decisions as the phases land.*
 
 > **Changed 2026-11-02 (agentd 0.15.2), the user's decisions: nothing waits for the user's approval, and tidying up is smaller.** The user never approves memories; the Memory screen is only for fixing or forgetting something. Tidying up writes no facts and skips scheduled runs, which see their own last reports instead. Where the sections below describe pending memories, proposals, "Review first" (`observe`) or a review stage, [§19 "No approvals, smaller tidying up"](#no-approvals-smaller-tidying-up-2026-11-02) replaces them.

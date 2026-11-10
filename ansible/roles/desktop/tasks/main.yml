@@ -80,8 +80,8 @@
     mode: "0755"
   tags: [chrome_policy]
 
-# Users log in to sites themselves through the viewer; the browser must never
-# store their passwords (PLAN.MD ground rule 4). Chrome picks up changes here
+# You log in to sites yourself through the viewer; the browser must never
+# store your passwords, where the agent could reach them. Chrome picks up changes here
 # without a restart.
 - name: Install the Chrome policy
   ansible.builtin.copy:

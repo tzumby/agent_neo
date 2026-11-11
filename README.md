@@ -95,7 +95,18 @@ on every `make` gives a second, separate deployment in the same account.
 ## Using it
 
 - **Chat**: ask for something. The agent works in its own browser and shell.
-  Three dots mean it's working, and Stop cancels the task.
+  Three dots mean it's working, with how long it's been at it, and Stop cancels
+  the task. On anything with three or more steps the agent writes a **plan**,
+  which shows as a checklist that ticks off as it goes.
+- **Long tasks**: there's no cap on steps. Instead, a **supervisor** checks on a
+  running task every 30 minutes of work or 60 model turns, whichever comes
+  first (`agentd_review_every_minutes`, `agentd_review_every_steps`). The
+  supervisor is a separate model call that sees your request, the plan and
+  what the agent did since the last check. If it's progressing, nothing
+  happens. If it's going in circles, the agent gets advice. If it looks stuck,
+  you get a **Looks stuck** card with the reason: **Keep going** or **Stop**
+  (Stop ends with what's done and what's left). A stuck scheduled run, with
+  nobody to ask, stops with that summary.
 - **Approval cards**: risky commands, commands as root, anything the agent
   types or sends in the browser, new sites for the shell, and schedules set up
   after it read outside content all wait for you. On a card about text (a

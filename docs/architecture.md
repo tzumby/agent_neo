@@ -624,7 +624,7 @@ POST /approvals/{id} ──► answer_approval(): load the checkpoint, remove th
   - **consolidation** waits while either lane is working (`is_working`), and doesn't let a scheduled run in progress hold back the chat's tasks;
   - **`/api/v1/status`:** `busy` is the chat's; `background` says which run is in progress and how many are queued. The maintenance reboot (§5.2) and `agentd-reset` wait for either.
 - **Parking.** A task that needs an answer saves its whole `RunState` and frees the desktop:
-  - `RunState` holds the messages, the queue of tool calls not yet run, the step count, `tainted`, the loop detector, usage, time worked, an armed send and the schedule name.
+  - `RunState` holds the messages, the queue of tool calls not yet run, the step count, `tainted`, the loop detector, usage, time worked, an armed send, the schedule name, the plan, the supervisor's clock (when it last checked, and a stuck card's reason and advice) and the count of empty replies in a row.
   - The answer resumes it, after an agentd restart too.
   - The call it parked on runs again with the answer. For it to go ahead, the action as it would run now must match the card (`same_request` compares kind, action, role, target, the text around it, text, key, submit, site, command, direct, when, name, secrets and hosts). If the page changed while you decided, nothing is done and the model is told so.
 - **Expiry.** An answer more than 24 hours after the card abandons the task instead: the context is stale. Starting a new message or pressing Stop also abandons parked tasks (at most 16 at a time). Their cards expire and each task finishes as `cancelled`.
@@ -638,7 +638,7 @@ POST /approvals/{id} ──► answer_approval(): load the checkpoint, remove th
   - **nudge:** the advice goes to the agent as a user-role note, and the task carries on;
   - **stuck:** a chat task parks on a **stuck** card (the reason, working minutes, steps, plan progress). Keep going resumes it with the advice; Stop ends it with a wrap-up. Auto approve never answers this card: it's about whether to keep spending, not a permission. A scheduled run, with nobody to ask, ends with a wrap-up. Status `stuck`.
 
-  A check that gives no usable verdict is tried again before the next turn; two in a row count as stuck, so a broken check can't leave a task running unchecked. Each check is a `review` event and adds to the task's usage. The loop detector (§6.12) still catches the same failing call repeated, at once. A **wrap-up** is one more turn with no tools (`tool_choice: none`, 8,192 tokens), told why the task has to end: the model reports what it did, what's left and why.
+  A check that gives no usable verdict is tried again before the next turn; two in a row count as stuck, so a broken check can't leave a task running unchecked. Each check is a `review` event and adds to the task's usage. The loop detector (§6.7) still catches the same failing call repeated, at once. A **wrap-up** is one more turn with no tools (`tool_choice: none`, 8,192 tokens), told why the task has to end: the model reports what it did, what's left and why.
 
 ### 6.7 The model loop
 
@@ -708,6 +708,7 @@ For each tool call:
 | `wait_for` | `text`, `timeout` (10 s; 1–25) | Until the text appears, or the page is idle without it | No |
 | `show_screenshot` | `caption` | Saves a JPEG and shows it in the chat | No |
 | `needs_user` | `reason` | Ends the task with an Action needed card: a screenshot and the page | Not an approval: you sign in or solve the CAPTCHA, then I'm done, Skip or Take over |
+| `update_plan` | `items` ([{step ≤ 120 characters, status: pending, in_progress or done}], 1–20) | Replaces the task's plan; a chat task's goes to the web app as a `plan` event, the checklist. The prompt asks for one on tasks of three or more steps. The supervisor reads it to judge progress | No |
 | `remember` / `forget` | `text` / `id` | Long-term memory (§6.13) | Not an approval, but memories saved after outside content are unverified |
 | `remember` / `forget` / `search_memory` (memory v2) | `text`, `kind` (rule, preference, fact), `replaces`, `valid_until` / `id` or `query` / `query`, `kinds`, `limit` | Memory v2 (§6.13): save with a kind, possibly replacing a note; forget by id or by a clear description; search beyond the notes in the prompt | No: nothing waits for approval since 0.15.2. Outside content makes a rule or preference an inferred fact (§6.13) |
 | `schedule_task` | `name`, `prompt`, `cron` or `at` | Sets up a scheduled task (§6.14) | Only after outside content. Refused in scheduled runs |

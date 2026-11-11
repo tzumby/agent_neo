@@ -10,25 +10,14 @@ use secrecy::SecretString;
 pub struct Config {
     /// `unix:/run/agentd/agentd.sock` (production) or `127.0.0.1:8765` (local dev).
     pub listen: String,
-    /// Only for local development: on desktops, model calls go through the
-    /// model gateway and no key is here. Never printed (Debug shows [REDACTED]).
-    /// LLM_API_KEY, else TOGETHER_API_KEY.
-    pub api_key: Option<SecretString>,
-    /// Only for local development, with the key above: an OpenAI-compatible
-    /// chat completions URL (default Together's; the evals use Bedrock's).
-    /// Ignored when GATEWAY_URL is set: the gateway is then the only way out.
+    /// The model provider's key: LLM_API_KEY, else TOGETHER_API_KEY. On a
+    /// desktop it's in AGENTD_SECRETS (/etc/agentd/secrets.env, root:agentd
+    /// 0640, written by Ansible from SSM), which the shell user can't read.
+    /// Never printed (Debug shows [REDACTED]).
+    pub api_key: SecretString,
+    /// An OpenAI-compatible chat completions URL (default Together's; the
+    /// evals can use Bedrock's).
     pub llm_url: String,
-    /// The model gateway (https://<address>:8443). When set, model calls go
-    /// only there, over a connection pinned to its certificate.
-    pub gateway_url: String,
-    /// How agentd knows the gateway's certificate (gateway.rs): the images it
-    /// accepts (GATEWAY_MEASUREMENTS), else the SSM parameter gatewayd
-    /// publishes it to (GATEWAY_CERTIFICATE_PARAMETER).
-    pub gateway_trust: crate::gateway::Trust,
-    /// Signed into this desktop's identity proofs for the gateway.
-    pub gateway_audience: String,
-    /// For the identity proof (STS in this region).
-    pub aws_region: String,
     pub model: String,
     /// Memory tidy-up's model when the user hasn't picked one.
     pub consolidation_model: String,
@@ -45,34 +34,31 @@ pub struct Config {
     pub shell_cpu_quota: String,
     /// The shell user's egress proxy, e.g. http://127.0.0.1:3128 (empty: none).
     pub shell_proxy: String,
-    /// The egress gate (egress.rs), scheduled runs' way out: where it listens
-    /// (host:port on localhost; empty: not started, and scheduled commands go
-    /// out like any other) and where it sends traffic on (Squid, host:port).
-    pub egress_gate_listen: String,
-    pub egress_gate_squid: String,
     /// The file of sites the user allowed, which Squid reads (access.rs);
     /// empty: the agent can't ask for new sites on this desktop.
     pub egress_user_hosts: String,
     /// The deployment's list (Ansible's), as Squid has it: shown in Settings
     /// and checked before asking.
     pub egress_base_hosts: Vec<String>,
-    /// Local development and tests only: the gate sends opened-up requests
-    /// to `{this}/{host}{path}` instead of the real hosts.
-    pub egress_gate_upstream: Option<String>,
     pub policy_path: PathBuf,
     /// Skills: Markdown how-tos the agent reads on demand (skills.rs).
     pub skills_dir: PathBuf,
-    pub max_steps: u32,
+    /// The supervisor checks on a running task after this much working time
+    /// (seconds) or this many model turns, whichever comes first (supervise.rs).
+    /// There's no cap on steps: a task runs until it's done, is stopped, or the
+    /// supervisor finds it stuck. 0 turns that trigger off.
+    pub review_every_secs: u64,
+    pub review_every_steps: u32,
+    /// Notifications (notify.rs): the contact push services see in each
+    /// request's VAPID token (a mailto: or https: URL).
+    pub vapid_subject: String,
+    /// Local development only: subscriptions may point at http://127.0.0.1.
+    pub push_dev_endpoints: bool,
     pub shell_tool: bool,
     pub desktop_name: String,
-    /// The push relay's function URL; push is off without it.
-    pub push_relay_url: String,
     /// Memory v2 (docs/memory-v2.md): kinds, trust, retrieval, consolidation.
     /// Off: the v1 memory path, on the v2 schema (which is always migrated).
     pub memory_v2: bool,
-    /// Slack's Web API (destinations.rs). Local development only points it
-    /// at a stand-in; plain http is then allowed for posts.
-    pub slack_api: String,
 }
 
 fn read_kv(path: &Path, into: &mut HashMap<String, String>) -> Result<()> {
@@ -113,26 +99,13 @@ impl Config {
         let api_key = Some(get("LLM_API_KEY", ""))
             .filter(|k| !k.is_empty())
             .unwrap_or_else(|| get("TOGETHER_API_KEY", ""));
-        let gateway_url = get("GATEWAY_URL", "");
-        if api_key.is_empty() && gateway_url.is_empty() {
-            bail!("set GATEWAY_URL (or TOGETHER_API_KEY for local development)");
+        if api_key.is_empty() {
+            bail!("set TOGETHER_API_KEY (or LLM_API_KEY) in /etc/agentd/secrets.env or the environment");
         }
-        let gateway_trust = if gateway_url.is_empty() {
-            crate::gateway::Trust::Attested(Vec::new())
-        } else {
-            crate::gateway::Trust::parse(
-                &get("GATEWAY_MEASUREMENTS", ""),
-                &get("GATEWAY_CERTIFICATE_PARAMETER", ""),
-            )?
-        };
         Ok(Self {
             listen: get("LISTEN", "unix:/run/agentd/agentd.sock"),
-            api_key: (!api_key.is_empty()).then(|| api_key.into()),
+            api_key: api_key.into(),
             llm_url: get("LLM_URL", crate::llm::TOGETHER_URL),
-            gateway_url,
-            gateway_trust,
-            gateway_audience: get("GATEWAY_AUDIENCE", "cloud-desktops/model-gateway"),
-            aws_region: get("AWS_REGION", "ca-central-1"),
             model: get("MODEL", "zai-org/GLM-5.3"),
             consolidation_model: get("CONSOLIDATION_MODEL", crate::consolidate::DEFAULT_MODEL),
             cdp_url: get("CDP_URL", "http://127.0.0.1:9222"),
@@ -143,9 +116,6 @@ impl Config {
             shell_tasks_max: get("SHELL_TASKS_MAX", "512"),
             shell_cpu_quota: get("SHELL_CPU_QUOTA", "200%"),
             shell_proxy: get("SHELL_PROXY", ""),
-            egress_gate_listen: get("EGRESS_GATE_LISTEN", ""),
-            egress_gate_squid: get("EGRESS_GATE_SQUID", "127.0.0.1:3128"),
-            egress_gate_upstream: Some(get("EGRESS_GATE_UPSTREAM", "")).filter(|u| !u.is_empty()),
             egress_user_hosts: get("EGRESS_USER_HOSTS", ""),
             egress_base_hosts: get("EGRESS_BASE_HOSTS", "")
                 .split_whitespace()
@@ -153,12 +123,17 @@ impl Config {
                 .collect(),
             policy_path: get("POLICY", "/etc/agentd/policy.toml").into(),
             skills_dir: get("SKILLS_DIR", "/etc/agentd/skills").into(),
-            max_steps: get("MAX_STEPS", "40").parse().context("MAX_STEPS")?,
+            review_every_secs: get("REVIEW_EVERY_SECS", "1800")
+                .parse()
+                .context("REVIEW_EVERY_SECS")?,
+            review_every_steps: get("REVIEW_EVERY_STEPS", "60")
+                .parse()
+                .context("REVIEW_EVERY_STEPS")?,
+            vapid_subject: get("VAPID_SUBJECT", "mailto:neo-agent@example.com"),
+            push_dev_endpoints: get("PUSH_DEV_ENDPOINTS", "off") == "on",
             shell_tool: get("SHELL_TOOL", "on") == "on",
             desktop_name: get("DESKTOP_NAME", "cloud-desktop"),
-            push_relay_url: get("PUSH_RELAY_URL", ""),
             memory_v2: get("MEMORY_V2", "off") == "on",
-            slack_api: get("SLACK_API_URL", "https://slack.com/api"),
         })
     }
 }

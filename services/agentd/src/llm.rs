@@ -1,15 +1,13 @@
-//! Together AI chat completions (OpenAI-compatible API): through the attested
-//! model gateway (production: the desktop holds no API key), or directly with
-//! a key (local development: Together, or another OpenAI-compatible endpoint
-//! at LLM_URL, such as Bedrock's for the evals).
+//! Together AI chat completions (OpenAI-compatible API), with the key in
+//! agentd's secrets file (config.rs): Together, or another OpenAI-compatible
+//! endpoint at LLM_URL, such as Bedrock's for the evals.
 
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::config::Config;
-use crate::gateway::ModelGateway;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -19,8 +17,7 @@ const RETRYABLE: [u16; 5] = [429, 500, 502, 503, 504];
 const MAX_RETRY_DELAY_SECS: u64 = 30;
 
 /// USD per 1M tokens: input, cached input, output (Together serverless;
-/// GLM and Kimi 2026-10-30, DeepSeek 2026-11-02). Keep in step with the
-/// gateway's prices (terraform/envs/dev/main.tf), which allow the models.
+/// GLM and Kimi 2026-10-30, DeepSeek 2026-11-02), for the cost of each task.
 pub fn prices(model: &str) -> Option<(f64, f64, f64)> {
     match model {
         "zai-org/GLM-5.3-Flash" => Some((0.15, 0.03, 0.50)),
@@ -29,8 +26,7 @@ pub fn prices(model: &str) -> Option<(f64, f64, f64)> {
         "deepseek-ai/DeepSeek-V4-Pro-0813" => Some((1.32, 0.13, 3.96)),
         "deepseek-ai/DeepSeek-V4.1-Flash-1017" => Some((0.30, 0.006, 1.20)),
         // Bedrock us-east-1 (AWS Price List, 2026-11-02; no cached-input
-        // price). Only for the evals (LLM_URL): not in KNOWN_MODELS, and the
-        // gateway calls Together.
+        // price). Only for the evals (LLM_URL): not in KNOWN_MODELS.
         "zai.glm-4.7-flash" => Some((0.07, 0.07, 0.40)),
         _ => None,
     }
@@ -67,59 +63,33 @@ pub fn for_history(message: &Value, model: &str) -> Value {
 }
 
 pub struct Together {
-    backend: Backend,
-}
-
-enum Backend {
-    /// The gateway holds the key; prompts go only to its pinned TLS
-    /// certificate, with this desktop's identity proof.
-    Gateway(Box<ModelGateway>),
-    Direct {
-        http: reqwest::Client,
-        api_key: SecretString,
-        url: String,
-    },
+    http: reqwest::Client,
+    api_key: SecretString,
+    url: String,
 }
 
 impl Together {
     pub fn new(cfg: &Config) -> Result<Self> {
-        // The gateway, when configured, is the only way out: no fallback
-        // that would send prompts somewhere unverified.
-        let backend = if !cfg.gateway_url.is_empty() {
-            Backend::Gateway(Box::new(ModelGateway::new(
-                &cfg.gateway_url,
-                &cfg.aws_region,
-                &cfg.gateway_audience,
-                cfg.gateway_trust.clone(),
-                Duration::from_secs(200),
-            )?))
-        } else if let Some(api_key) = cfg.api_key.clone() {
-            let http = reqwest::Client::builder()
-                // Cloudflare in front of the API rejects some default User-Agents (error 1010).
-                .user_agent("cloud-desktops-agentd/0.1")
-                .timeout(Duration::from_secs(180))
-                .build()?;
-            Backend::Direct {
-                http,
-                api_key,
-                url: cfg.llm_url.clone(),
-            }
-        } else {
-            bail!("set GATEWAY_URL (or TOGETHER_API_KEY for local development)");
-        };
-        Ok(Self { backend })
+        let http = reqwest::Client::builder()
+            // Cloudflare in front of the API rejects some default User-Agents (error 1010).
+            .user_agent("cloud-desktops-agentd/0.1")
+            .timeout(Duration::from_secs(180))
+            .build()?;
+        Ok(Self {
+            http,
+            api_key: cfg.api_key.clone(),
+            url: cfg.llm_url.clone(),
+        })
     }
 
     async fn send(&self, body: &Value) -> Result<reqwest::Response> {
-        match &self.backend {
-            Backend::Gateway(gateway) => gateway.chat(&serde_json::to_vec(body)?).await,
-            Backend::Direct { http, api_key, url } => Ok(http
-                .post(url)
-                .bearer_auth(api_key.expose_secret())
-                .json(body)
-                .send()
-                .await?),
-        }
+        Ok(self
+            .http
+            .post(&self.url)
+            .bearer_auth(self.api_key.expose_secret())
+            .json(body)
+            .send()
+            .await?)
     }
 
     /// POST a chat completion, retrying rate limits and outages.

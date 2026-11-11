@@ -14,8 +14,8 @@
 //!   `EFFECT_MAX_ATTEMPTS` failures the row stays, given up, and `/status`
 //!   reports it; enqueuing the same key again starts it over.
 //!
-//! Kinds: `purge` (daily), `consolidate` (consolidate.rs) and `push` (a
-//! notification through the relay).
+//! Kinds: `purge` (daily), `consolidate` (consolidate.rs) and `web_push`
+//! (notify.rs). `push` rows, from the old push relay, are dropped.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -46,15 +46,11 @@ fn unix_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// The wait before the next try after `attempts` failures: doubling from a
-/// first wait to a cap, per kind.
-pub fn backoff(kind: &str, attempts: i64) -> Duration {
-    let (first, cap) = match kind {
-        "push" => (5, 300),
-        _ => (2, 60),
-    };
+/// The wait before the next try after `attempts` failures: doubling from
+/// 2 s to a minute.
+pub fn backoff(attempts: i64) -> Duration {
     let doublings = attempts.saturating_sub(1).clamp(0, 16) as u32;
-    Duration::from_secs((first * 2u64.pow(doublings)).min(cap))
+    Duration::from_secs((2 * 2u64.pow(doublings)).min(60))
 }
 
 /// Runs effects until agentd stops. Started once the socket is bound, next to
@@ -113,7 +109,7 @@ fn settle(store: &Store, effect: &Effect, outcome: Outcome) {
             } else {
                 tracing::warn!(kind = %effect.kind, key = %effect.key, attempts, "effect failed; will retry");
             }
-            let due = unix_now() + backoff(&effect.kind, attempts).as_secs() as i64;
+            let due = unix_now() + backoff(attempts).as_secs() as i64;
             store.effect_again(effect, due, Some(error))
         }
     };
@@ -126,24 +122,11 @@ async fn handle(agent: &Agent, effect: &Effect) -> Outcome {
     match effect.kind.as_str() {
         "purge" => purge(&agent.store),
         "consolidate" => crate::consolidate::run(agent).await,
-        "push" => push(agent, effect).await,
+        "web_push" => crate::notify::deliver(agent, effect).await,
+        // A notification queued by an agentd that still had the push relay: nowhere to send it.
+        "push" => Outcome::Done,
         // From a newer agentd (after a rollback): keep it for that version.
         other => Outcome::Failed(format!("unknown effect kind {other}")),
-    }
-}
-
-/// Sends a notification through the push relay. With no relay configured
-/// (any more), there's nothing to do.
-async fn push(agent: &Agent, effect: &Effect) -> Outcome {
-    let Some(relay) = agent.push.clone() else {
-        return Outcome::Done;
-    };
-    let Some(notification) = crate::push::Push::from_payload(&effect.payload) else {
-        return Outcome::Done; // malformed: retrying wouldn't help
-    };
-    match relay.notify(&notification).await {
-        Ok(()) => Outcome::Done,
-        Err(err) => Outcome::Failed(format!("{err:#}")),
     }
 }
 
@@ -183,7 +166,7 @@ mod tests {
         let store = store();
         let now = unix_now();
         store
-            .ensure_effect("push", "task:t1:none", &json!({"title": "Done"}), now)
+            .ensure_effect("consolidate", "main", &json!({}), now)
             .unwrap();
 
         // Later: due again, not a failure.
@@ -193,13 +176,13 @@ mod tests {
         assert!(later.due >= now + 60 && store.due_effects(now, 10).unwrap().is_empty());
 
         // Failed: counts, backs off, keeps the error.
-        settle(&store, &later, Outcome::Failed("relay answered 502".into()));
+        settle(&store, &later, Outcome::Failed("the model answered 502".into()));
         let failed = only(&store);
         assert_eq!(
             (failed.attempts, failed.last_error.as_deref()),
-            (1, Some("relay answered 502"))
+            (1, Some("the model answered 502"))
         );
-        assert!(failed.due >= now + 5);
+        assert!(failed.due >= now + 2);
 
         // Ten failures: given up, reported, no longer due.
         let mut effect = failed;
@@ -216,7 +199,7 @@ mod tests {
 
         // Enqueued again, it starts over; Done removes it.
         store
-            .enqueue_effect("push", "task:t1:none", &json!({"title": "Again"}), now)
+            .enqueue_effect("consolidate", "main", &json!({"again": true}), now)
             .unwrap();
         let fresh = only(&store);
         assert_eq!((fresh.attempts, fresh.last_error.clone()), (0, None));
@@ -238,11 +221,9 @@ mod tests {
     }
 
     #[test]
-    fn backoff_doubles_to_a_cap_per_kind() {
-        let waits = |kind| (1..=8).map(|n| backoff(kind, n).as_secs()).collect::<Vec<_>>();
-        assert_eq!(waits("consolidate"), [2, 4, 8, 16, 32, 60, 60, 60]);
-        assert_eq!(waits("purge"), [2, 4, 8, 16, 32, 60, 60, 60]);
-        assert_eq!(waits("push"), [5, 10, 20, 40, 80, 160, 300, 300]);
-        assert_eq!(backoff("push", 0).as_secs(), 5);
+    fn backoff_doubles_to_a_cap() {
+        let waits = (1..=8).map(|n| backoff(n).as_secs()).collect::<Vec<_>>();
+        assert_eq!(waits, [2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(backoff(0).as_secs(), 2);
     }
 }

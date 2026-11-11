@@ -1,6 +1,5 @@
-# Step 1 only holds the bucket Ansible's aws_ssm connection uses for file
-# transfer. The launch template, DynamoDB table and AMI SSM parameter are added
-# with the Packer milestone.
+# The bucket Ansible's aws_ssm connection moves files through. Objects expire
+# after a day.
 
 data "aws_caller_identity" "current" {}
 

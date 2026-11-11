@@ -148,7 +148,8 @@ class Desktop:
             "POLICY": "/nonexistent",
             "SKILLS_DIR": "/nonexistent",
             "MODEL": model,
-            "MAX_STEPS": "15",
+            # No step cap any more: the supervisor checks a scenario that runs long.
+            "REVIEW_EVERY_STEPS": "15",
             "MEMORY_V2": memory_v2,
             "DESKTOP_NAME": "eval",
             "RUST_LOG": "agentd=info",

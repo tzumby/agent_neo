@@ -6,8 +6,8 @@
 //! cookie keep them out). Commands starting with `sudo` run as root, only
 //! after the user approved them.
 //!
-//! Each command has a `Route` to the internet. A scheduled run's go out
-//! through the egress gate (egress.rs) and trust its CA next to the system's.
+//! Each command has a `Route` to the internet: through Squid, or (one the
+//! user approved) directly.
 //!
 //! The unit's hardening follows moltis' container settings (MIT License,
 //! Copyright (c) the moltis contributors; crates/tools/src/sandbox/docker.rs):
@@ -35,10 +35,6 @@ pub struct Shell {
     /// lets the shell user out only through it; it allows listed hosts, refuses
     /// internal addresses and logs every request.
     pub proxy: String,
-    /// The egress gate, e.g. http://127.0.0.1:3129 (empty: none), and the CA
-    /// bundle gated commands trust (the system's CAs and the gate's).
-    pub gate_proxy: String,
-    pub gate_bundle: PathBuf,
 }
 
 /// The longest a command may run.
@@ -49,8 +45,6 @@ pub const MAX_COMMAND_SECS: u64 = 900;
 pub enum Route {
     /// Through Squid, the usual way.
     Proxy,
-    /// A scheduled run's: through the egress gate.
-    Gate,
     /// One the user approved to connect on its own: no proxy settings. The
     /// guard firewall is opened for it (Agent::open_direct).
     Direct,
@@ -114,19 +108,6 @@ fn with_keys(command: &str, keys: &[KeyFile]) -> String {
     script
 }
 
-/// The variables that make programs trust a CA bundle (curl, OpenSSL,
-/// Python requests, Node, git).
-const CA_VARIABLES: &[&str] = &[
-    "CURL_CA_BUNDLE",
-    "SSL_CERT_FILE",
-    "REQUESTS_CA_BUNDLE",
-    "NODE_EXTRA_CA_CERTS",
-    "GIT_SSL_CAINFO",
-];
-
-/// The gate's CA bundle, as a gated unit's credential.
-const GATE_BUNDLE: &str = "agentd-egress-ca";
-
 /// `sudo apt install jq` → (true, "apt install jq").
 pub fn split_sudo(command: &str) -> (bool, &str) {
     match command.trim_start().strip_prefix("sudo ") {
@@ -161,11 +142,6 @@ impl Shell {
 
     /// The command line: a transient unit through `sudo systemd-run`, or a
     /// plain `bash` in local development.
-    /// Whether a gated command goes through the gate (it's configured).
-    fn gated(&self, route: Route, as_root: bool) -> bool {
-        route == Route::Gate && !as_root && !self.gate_proxy.is_empty()
-    }
-
     fn argv(
         &self,
         unit: &str,
@@ -175,7 +151,6 @@ impl Shell {
         keys: &[KeyFile],
         route: Route,
     ) -> Vec<String> {
-        let gated = self.gated(route, as_root);
         let workdir = self.workdir.to_string_lossy();
         if self.local(as_root) {
             // Keys come through the environment here (run()).
@@ -207,8 +182,7 @@ impl Shell {
             }
             let proxy: &str = match route {
                 Route::Direct => "",
-                _ if gated => &self.gate_proxy,
-                _ => &self.proxy,
+                Route::Proxy => &self.proxy,
             };
             if !proxy.is_empty() {
                 for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
@@ -228,18 +202,7 @@ impl Shell {
                 key.path.display()
             ));
         }
-        let mut script = with_keys(command, keys);
-        if gated {
-            argv.push(format!(
-                "--property=LoadCredential={GATE_BUNDLE}:{}",
-                self.gate_bundle.display()
-            ));
-            let exports: String = CA_VARIABLES
-                .iter()
-                .map(|name| format!("export {name}=\"$CREDENTIALS_DIRECTORY/{GATE_BUNDLE}\"\n"))
-                .collect();
-            script = exports + &script;
-        }
+        let script = with_keys(command, keys);
         argv.extend(["--", "bash", "-lc"].map(String::from));
         argv.push(script);
         argv
@@ -257,7 +220,6 @@ impl Shell {
         let timeout_secs = timeout_secs.clamp(1, MAX_COMMAND_SECS);
         let unit = format!("agentd-cmd-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
         let argv = self.argv(&unit, command, as_root, timeout_secs, keys, route);
-        let gated = self.gated(route, as_root);
         let local = self.local(as_root);
 
         let mut process = tokio::process::Command::new(&argv[0]);
@@ -277,15 +239,6 @@ impl Shell {
             for key in keys {
                 let value = std::fs::read_to_string(&key.path)?;
                 process.env(&key.name, value.trim());
-            }
-            if gated {
-                // Local development: the gate's settings, without the firewall.
-                for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-                    process.env(name, &self.gate_proxy);
-                }
-                for name in CA_VARIABLES {
-                    process.env(name, &self.gate_bundle);
-                }
             }
         }
         let started = Instant::now();
@@ -340,8 +293,6 @@ mod tests {
             tasks_max: "512".into(),
             cpu_quota: "200%".into(),
             proxy: "http://127.0.0.1:3128".into(),
-            gate_proxy: "http://127.0.0.1:3129".into(),
-            gate_bundle: "/var/lib/agentd/egress-ca-bundle.pem".into(),
         }
     }
 
@@ -370,7 +321,7 @@ mod tests {
 
     #[test]
     fn approved_root_commands_run_as_root_without_the_shell_limits() {
-        let argv = shell("worker").argv("agentd-cmd-y", "apt install -y jq", true, 300, &[], Route::Gate);
+        let argv = shell("worker").argv("agentd-cmd-y", "apt install -y jq", true, 300, &[], Route::Proxy);
         assert!(
             !argv
                 .iter()
@@ -412,46 +363,6 @@ mod tests {
             argv.last().unwrap(),
             "export GITHUB_TOKEN=\"$(< \"$CREDENTIALS_DIRECTORY/GITHUB_TOKEN\")\"\ngh repo clone acme/api"
         );
-    }
-
-    #[test]
-    fn gated_commands_go_out_through_the_gate_and_trust_its_ca() {
-        let keys = [KeyFile {
-            name: "DD_API_KEY".into(),
-            path: "/var/lib/agentd/secrets/DD_API_KEY".into(),
-        }];
-        let argv = shell("worker").argv(
-            "agentd-cmd-g",
-            "curl -s https://api.datadoghq.eu/api/v1/validate",
-            false,
-            60,
-            &keys,
-            Route::Gate,
-        );
-        let has = |s: &str| argv.iter().any(|a| a == s);
-        assert!(has("--uid=worker") && has("--setenv=HTTPS_PROXY=http://127.0.0.1:3129"));
-        assert!(!has("--setenv=HTTPS_PROXY=http://127.0.0.1:3128"));
-        assert!(has(
-            "--property=LoadCredential=agentd-egress-ca:/var/lib/agentd/egress-ca-bundle.pem"
-        ));
-        // Keys come as usual (the gate swaps Cloudflare's and Datadog's).
-        assert!(has(
-            "--property=LoadCredential=DD_API_KEY:/var/lib/agentd/secrets/DD_API_KEY"
-        ));
-        let script = argv.last().unwrap();
-        assert!(script.starts_with("export CURL_CA_BUNDLE=\"$CREDENTIALS_DIRECTORY/agentd-egress-ca\"\n"));
-        assert!(script.ends_with("curl -s https://api.datadoghq.eu/api/v1/validate"));
-        // Root commands (never in scheduled runs) and an unconfigured gate: as before.
-        let unconfigured = Shell {
-            gate_proxy: String::new(),
-            ..shell("worker")
-        };
-        let argv = unconfigured.argv("agentd-cmd-h", "ls", false, 60, &[], Route::Gate);
-        assert!(
-            argv.iter()
-                .any(|a| a == "--setenv=HTTPS_PROXY=http://127.0.0.1:3128")
-        );
-        assert!(!argv.iter().any(|a| a.contains("agentd-egress-ca")));
     }
 
     #[tokio::test]

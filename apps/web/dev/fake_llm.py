@@ -6,12 +6,16 @@ last user message, with no real model and no key.
 - "sign in" or "action": calls needs_user (an Action needed card)
 - "schedule" or "report": schedules a one-time run in two minutes (a report)
 - "slow": takes 6 seconds (the working dots)
-- "post": posts an update to the first destination set up (post_update)
 - "status site": asks to reach status.example.com (request_access: a card)
+- "make a plan": writes a three-step plan with update_plan and ticks it off,
+  a second per step (the plan checklist)
+- "keep checking": reads the same page over and over (the supervisor finds it
+  stuck: run.sh has it check every 6 steps)
 - anything else: a Markdown answer with a table, a list and code
 
-It also stands in for Slack's chat.postMessage (agentd's SLACK_API_URL), and
-GET /slack-posts lists what was posted there.
+It also answers agentd's supervisor (a system prompt starting "(agentd
+supervisor)"): stuck when the task it's shown says "keep checking", otherwise
+progressing; and the summary agentd asks for when a task is stopped.
 """
 
 import datetime
@@ -20,30 +24,44 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-ANSWER = """Here's the last 24 hours from Cloudflare:
+ANSWER = """Here's how the test suite did overnight:
 
-| Rule | Blocked | Change |
+| Suite | Passed | Failed |
 |:--|--:|--:|
-| SQL injection (OWASP) | 1,204 | +38% |
-| Bad bots | 9,771 | −4% |
-| Rate limit `/api/login` | 312 | +210% |
+| `auth` | 212 | 3 |
+| `billing` | 98 | 0 |
+| `api/login` | 41 | 7 |
 
 Two things need a look:
-1. **Credential stuffing on `/api/login`**: 312 blocked bursts from 41 addresses, mostly one ASN.
-2. A *new* path probed 2,400 times: `/wp-admin/` (you don't run WordPress, so it's noise).
+1. **`/api/login` times out** under the new rate limiter: 7 tests hit the 5 s limit.
+2. A *flaky* test in `auth`: `session refresh` passed on retry twice this week.
 
 ```bash
-curl -s https://api.cloudflare.com/client/v4/zones/$ZONE/firewall/events | jq '.result | length'
+npm test -- --grep 'api/login'
 ```
 
-I'd tighten the login rate limit to 5 per minute. Want me to draft the rule?"""
+I'd raise the limiter's burst size for the test environment. Want me to draft the change?"""
 
 
-SLACK_POSTS = []
+def plan(*statuses):
+    steps = ["Read the build setup", "Port the layouts", "Build and check the site"]
+    return ("update_plan", {"items": [{"step": step, "status": status} for step, status in zip(steps, statuses)]})
 
 
-# Each ends in a card that asks about text, to try editing it.
+# Paced a second a step, so the checklist can be watched filling in.
+SLOW_SCRIPTS = {"make a plan"}
+
+# Each ends in a card that asks about text, to try editing it (but the plan's
+# and the endless check's).
 SCRIPTS = {
+    "make a plan": [
+        plan("pending", "pending", "pending"),
+        plan("in_progress", "pending", "pending"),
+        plan("done", "in_progress", "pending"),
+        plan("done", "done", "in_progress"),
+        plan("done", "done", "done"),
+    ],
+    "keep checking": [("open_url", {"url": "http://form.test/form"})] + [("read_text", {})] * 39,
     "write a message": [
         ("open_url", {"url": "http://form.test/form"}),
         ("type_text", {"role": "textbox", "name": "Message Lawrence", "text": "Hello from the agent"}),
@@ -72,40 +90,63 @@ FORM = b"""<!doctype html><title>Message Lawrence</title><p id="echo">Nothing wr
 <td><button onclick="document.getElementById('echo').textContent = 'On the page: paid'">Confirm payment</button></td></tr></table>"""
 
 
-def reply(messages, tools=()):
+SUPERVISOR = "(agentd supervisor)"
+STUCK = {"verdict": "stuck", "reason": "It has read the same page 6 times without anything changing.",
+         "advice": "Stop re-reading the page."}
+PROGRESSING = {"verdict": "progressing", "reason": "Making progress.", "advice": ""}
+
+# Notifications agentd sent (Web Push, to an endpoint here: run.sh lets it with
+# PUSH_DEV_ENDPOINTS). The body is encrypted for the browser, so only its size
+# and the headers are kept. GET /pushes lists them.
+PUSHES = []
+SUMMARY = """**Done so far:** opened the page and read it several times.
+
+**Left:** nothing on the page changed, so there was nothing more to find."""
+
+
+def reply(messages, tools=(), body=None):
+    body = body or {}
+    first = messages[0] if messages else {}
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
     text = last_user.get("content") if isinstance(last_user.get("content"), str) else json.dumps(last_user.get("content"))
+    # agentd's supervisor, checking on a task: a verdict as JSON.
+    if first.get("role") == "system" and str(first.get("content", "")).startswith(SUPERVISOR):
+        verdict = STUCK if "keep checking" in (text or "").lower() else PROGRESSING
+        return {"role": "assistant", "content": json.dumps(verdict)}
+    # A task stopped (or out of time): what's done and what's left, no tools.
+    if tools and body.get("tool_choice") == "none" and (text or "").startswith("(agentd)"):
+        return {"role": "assistant", "content": SUMMARY}
+    # The task's own request: agentd's notes to the model (a nudge, the user's
+    # "keep going" on a stuck card) don't change what it's doing.
+    def own(m):
+        return m.get("role") == "user" and not str(m.get("content", "")).startswith("(agentd)")
+    request = next((m for m in reversed(messages) if own(m)), last_user)
+    text = request.get("content") if isinstance(request.get("content"), str) else json.dumps(request.get("content"))
     text = (text or "").lower()
     after_tool = messages and messages[-1].get("role") == "tool"
     # Calls one after another, each once the last one has answered.
     done = 0
     for message in reversed(messages):
-        if message.get("role") == "user":
+        if own(message):
             break
         done += message.get("role") == "tool"
     for trigger, steps in SCRIPTS.items():
         if trigger in text and done < len(steps):
+            if trigger in SLOW_SCRIPTS:
+                time.sleep(1)
             return call(*steps[done])
     if after_tool:
         result = str(messages[-1].get("content", ""))[:300]
         return {"role": "assistant", "content": f"Done. The tool said: {result}"}
     if "slow" in text:
         time.sleep(6)
-    post = next((t for t in tools if t.get("function", {}).get("name") == "post_update"), None)
-    if "post" in text and post:
-        destination = post["function"]["parameters"]["properties"]["destination"]["enum"][0]
-        return call("post_update", {"destination": destination, "severity": "warning",
-                                    # A new title each time: agentd refuses the same update twice.
-                                    "title": f"Credential stuffing on /api/login ({time.strftime('%H:%M:%S')})",
-                                    "body": "**312** bursts blocked from 41 addresses, mostly one ASN.\n"
-                                            "```\nPOST /api/login 429 from https://bad.example.net\n```"})
     if "status site" in text:
         return call("request_access", {"hosts": ["status.example.com"], "why": "To read the status page's API for the incident timeline."})
     if "sign in" in text or "action" in text:
-        return call("needs_user", {"reason": "Sign in to the Cloudflare dashboard so I can read the firewall events."})
+        return call("needs_user", {"reason": "Sign in to Gmail so I can read your inbox."})
     if "schedule" in text or "report" in text:
         at = (datetime.datetime.now() + datetime.timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M")
-        return call("schedule_task", {"name": "Spike watch", "prompt": "Check Cloudflare for attack spikes since the last check.", "at": at})
+        return call("schedule_task", {"name": "Status check", "prompt": "Check the status page for new incidents since the last check.", "at": at})
     return {"role": "assistant", "content": ANSWER}
 
 
@@ -127,8 +168,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path == "/slack-posts":
-            self.send_json(SLACK_POSTS)
+        if self.path == "/pushes":
+            self.send_json(PUSHES)
         elif self.path == "/form":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -139,15 +180,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-        if self.path == "/api/chat.postMessage":
-            if not self.headers.get("Authorization", "").startswith("Bearer xoxb-"):
-                self.send_json({"ok": False, "error": "invalid_auth"})
-                return
-            SLACK_POSTS.append(body)
-            self.send_json({"ok": True, "ts": f"{time.time():.6f}", "channel": "C0FAKE"})
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.path.startswith("/push/"):
+            PUSHES.append({
+                "name": self.path[len("/push/"):],
+                "content_encoding": self.headers.get("Content-Encoding", ""),
+                "ttl": self.headers.get("TTL", ""),
+                "urgency": self.headers.get("Urgency", ""),
+                "authorization": self.headers.get("Authorization", "")[:12],
+                "length": len(raw),
+            })
+            self.send_response(201)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
-        message = reply(body.get("messages", []), body.get("tools", []))
+        body = json.loads(raw)
+        message = reply(body.get("messages", []), body.get("tools", []), body)
         answer = {
             "id": "fake", "object": "chat.completion", "model": body.get("model", "fake"),
             "choices": [{"index": 0, "message": message,

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Clicks through the web app in headless Chrome against `make web-dev`
 (apps/web/dev/run.sh): sends a message and waits for the answer, answers a
-card, saves a key and opens each page. Prints a line per check; exits 1 if
+card, saves a key, follows a task's plan, stops a task the supervisor finds
+stuck and opens each page. Prints a line per check; exits 1 if
 one fails. Screenshots go to the folder given (default: the current one).
 
   uv run --with websockets apps/web/dev/smoke.py [screenshots-dir]
@@ -15,7 +16,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.parse
 import urllib.request
 
 import websockets
@@ -101,71 +101,16 @@ async def main(out):
                 p.check(at_end, "at its end, as it appears")
             else:
                 await asyncio.sleep(0.5)
-                p.check(await p.js("document.querySelector('.chat-scroll').scrollTop") == 0, "an empty chat opens at the top of its guide")
-            p.check(await p.js("document.querySelector('#who').textContent") == "you@example.com", "signed in as the Access user")
+                p.check(await p.js("document.querySelector('.chat-scroll').scrollTop") == 0, "an empty chat opens at its top")
+            p.check(await p.js("document.querySelector('#who').textContent") == "you@example.com", "signed in as the tailnet user")
 
-            # First run: the setup steps in the empty chat, one at a time (a fresh desktop only).
-            fresh = await p.until("!document.querySelector('.empty-setup').hidden && !!document.querySelector('.empty-setup .setup-step')", 5)
-            if fresh:
-                g = "document.querySelector('.empty-setup')"
-                open_step = f"[...{g}.querySelectorAll('.setup-step')].findIndex(s => s.classList.contains('is-open'))"
-                p.check(await p.js(f"{g}.querySelectorAll('.setup-step').length") == 4 and await p.js(open_step) == 0,
-                        "a fresh desktop opens on the first of four steps, and only that one")
-                await p.shot(f"{out}/smoke-setup.png")
-                skip = f"(() => [...{g}.querySelectorAll('.setup-step.is-open button')].find(b => b.textContent === 'Skip this step').click())()"
-                await p.js(skip)
-                p.check(await p.until(f"{open_step} === 1 && {g}.querySelectorAll('.setup-step')[0].classList.contains('is-skipped')"), "a step can be skipped, and the next one opens")
-                # Cloudflare: its token page with the permissions filled in, and the permissions to copy.
-                cf_link = await p.js(f"[...{g}.querySelectorAll('.setup-step.is-open a')].find(a => a.textContent.includes('Create the token')).href")
-                keys = [k["key"] for k in json.loads(urllib.parse.parse_qs(urllib.parse.urlparse(cf_link).query)["permissionGroupKeys"][0])]
-                p.check(keys == ["account_analytics", "zone", "analytics", "firewall_services"], "Cloudflare's link fills in the four read permissions")
-                p.check(await p.js(f"{g}.querySelectorAll('.setup-step.is-open .copy-row').length") == 4, "…and lists them, each to copy")
-                # The clipboard needs a focused page, which a person's click gives; headless needs telling.
-                await p.call("Browser.grantPermissions", permissions=["clipboardReadWrite", "clipboardSanitizedWrite"], origin="http://127.0.0.1:8088")
-                await p.call("Emulation.setFocusEmulationEnabled", enabled=True)
-                await p.js(f"{g}.querySelector('.setup-step.is-open .copy-one').click()", gesture=True)
-                await asyncio.sleep(0.3)
-                p.check(await p.js("navigator.clipboard.readText().catch(() => '')", gesture=True) == "Account Analytics", "Copy puts it on the clipboard")
-                await p.js(f"""(() => {{ const f = {g}.querySelector('.setup-step.is-open form');
-                    f.querySelector('[aria-label="Cloudflare API token"]').value = 'cf-test-token-123456789'; f.querySelector('button[type=submit]').click(); }})()""")
-                p.check(await p.until(f"{open_step} === 2 && {g}.querySelectorAll('.setup-step')[1].classList.contains('is-done')"), "saving Cloudflare's token goes on to the next step")
-                # Datadog: its key pages, on the site chosen; the scopes to copy.
-                pages = await p.js(f"""(() => {{ const s = {g}.querySelector('.setup-step.is-open [aria-label="Datadog site"]');
-                    s.value = 'datadoghq.eu'; s.dispatchEvent(new Event('change'));
-                    return [...{g}.querySelectorAll('.setup-step.is-open a.setup-link')].map(a => a.href); }})()""")
-                p.check(pages == ["https://app.datadoghq.eu/organization-settings/api-keys", "https://app.datadoghq.eu/organization-settings/application-keys"], "Datadog's key pages follow the site chosen")
-                p.check(await p.js(f"[...{g}.querySelectorAll('.setup-step.is-open .copy-row code')].map(c => c.textContent).join(',')") == "logs_read_data,logs_read_index_data,metrics_read,monitors_read,events_read", "…and its scopes are listed to copy")
-                await p.js(skip)
-                p.check(await p.until(f"{open_step} === 3"), "no Datadog: skipped, on to the checks")
-                buttons = await p.js(f"[...{g}.querySelectorAll('.setup-examples .list-row')].map(r => r.querySelector('.strong').textContent + ':' + r.querySelector('button').disabled)")
-                p.check("Attack spike watch:false" in buttons and "Error spike watch:true" in buttons, "checks that need Datadog wait for it")
-                attack = f"[...{g}.querySelectorAll('.setup-examples .list-row')].find(r => r.textContent.includes('Attack spike watch'))"
-                p.check(await p.js(f"!{attack}.querySelector('input[type=checkbox]')"), "no Run without asking box: it's the default")
-                await p.js(f"{attack}.querySelector('button').click()")
-                p.check(await p.until(f"{g}.textContent.includes('All set') && !!{g}.querySelector('.setup-summary')"), "the guide ends on All set")
-                setup = await p.js("fetch('/api/v1/setup').then(r => r.json())")
-                p.check(sorted(setup["skipped"]) == ["datadog", "updates"], "the skipped steps are kept on the desktop")
-                schedules = await p.js("fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules.map(s => s.name))")
-                p.check("Attack spike watch" in schedules, "the check is a schedule on the desktop")
-                auto = await p.js("fetch('/api/v1/schedules').then(r => r.json()).then(d => d.schedules.find(s => s.name === 'Attack spike watch').auto_approve)")
-                p.check(auto is True, "…that runs without asking")
-                await p.js(f"[...{g}.querySelectorAll('button')].find(b => b.textContent === 'Start using your agent').click()")
-                p.check(await p.until("document.querySelector('.empty-setup').hidden && !document.querySelector('.empty-suggest').hidden"), "Start using your agent: the chat")
-                # A skipped step, set up after all, from the Setup page.
-                await p.js("location.hash = '#/setup'")
-                await p.until("document.querySelectorAll('#view-setup .setup-step').length === 4")
-                await p.js("document.querySelectorAll('#view-setup .setup-step')[2].querySelector('.setup-head').click()")
-                await p.js("""(() => { const f = document.querySelector('#view-setup .setup-step.is-open form');
-                    f.querySelector('[aria-label="Datadog site"]').value = 'datadoghq.eu';
-                    f.querySelector('[aria-label="Datadog API key"]').value = 'dd-api-key-test-1234';
-                    f.querySelector('[aria-label="Datadog application key"]').value = 'dd-app-key-test-5678';
-                    f.querySelector('button[type=submit]').click(); })()""")
-                p.check(await p.until("document.querySelectorAll('#view-setup .setup-step')[2].classList.contains('is-done')"), "a skipped step can still be done later")
-                labels = await p.js("fetch('/api/v1/secrets').then(r => r.json()).then(d => d.secrets.map(s => s.label))")
-                p.check("Datadog API key (site datadoghq.eu)" in labels, "the Datadog site is in the keys' labels, for the agent")
-                await p.js("location.hash = '#/chat'")
-                await p.until("!document.querySelector('#view-chat').hidden")
-                p.check(await p.js("!document.body.innerHTML.includes('dd-api-key-test') && !document.body.innerHTML.includes('cf-test-token')"), "no key is on the page")
+            # A fresh desktop: the empty chat offers suggestions, which go into the composer.
+            if not rows:
+                p.check(await p.until("!document.querySelector('.empty').hidden && document.querySelectorAll('.suggestions button').length === 3", 5),
+                        "an empty chat offers three suggestions")
+                await p.js("document.querySelector('.suggestions button').click()")
+                p.check((await p.js("document.querySelector('.composer textarea').value")).startswith("Open Hacker News"), "…and one goes into the composer to edit")
+                await p.js("""(() => { const t = document.querySelector('.composer textarea'); t.value = ''; t.dispatchEvent(new Event('input')); })()""")
 
             rows = await p.js("document.querySelectorAll('.rows > li').length")
             await p.js("""(() => { const t = document.querySelector('.composer textarea');
@@ -187,39 +132,6 @@ async def main(out):
             p.check(await p.until("[...document.querySelectorAll('.list-row')].some(r => r.textContent.includes('$GITHUB_TOKEN'))"), "the key is saved and listed")
             p.check(await p.js("!document.body.textContent.includes('ghp_')"), "its value is nowhere on the page")
             await p.shot(f"{out}/smoke-keys.png")
-
-            # Updates: add Slack (the stand-in), its test arrives, then the agent posts.
-            def slack_posts():
-                return json.load(urllib.request.urlopen("http://127.0.0.1:8091/slack-posts"))
-            before = len(slack_posts())
-            await p.js("location.hash = '#/updates'")
-            p.check(await p.until("!!document.querySelector('#view-updates form')"), "the updates page opens")
-            await p.js("""(() => { const f = document.querySelector('#view-updates form');
-                const set = (label, v) => { const i = f.querySelector(`[aria-label="${label}"]`); i.value = v; };
-                set('Name', 'security'); set('Slack channel', '#security'); set('Bot token', 'xoxb-test-token-12345');
-                f.querySelector('button[type=submit]').click(); })()""")
-            p.check(await p.until("[...document.querySelectorAll('#view-updates .list-row')].some(r => r.textContent.includes('Slack #security'))"), "Slack is added")
-            for _ in range(50):
-                if len(slack_posts()) > before:
-                    break
-                await asyncio.sleep(0.2)
-            p.check(len(slack_posts()) == before + 1, "its test post reached Slack")
-            p.check(await p.js("!document.body.innerHTML.includes('xoxb-test-token')"), "the token is nowhere on the page")
-            await p.shot(f"{out}/smoke-updates.png")
-            await p.js("location.hash = '#/chat'")
-            await p.until("!document.querySelector('#view-chat').hidden")
-            await p.js("""(() => { const t = document.querySelector('.composer textarea');
-                t.value = 'Post an update about the login abuse'; t.dispatchEvent(new Event('input')); })()""")
-            await p.js("document.querySelector('.composer .send').click()")
-            p.check(await p.until("[...document.querySelectorAll('.row-agent')].some(r => r.textContent.includes('posted to security'))", 15), "the agent posts an update")
-            for _ in range(50):
-                if len(slack_posts()) > before + 1:
-                    break
-                await asyncio.sleep(0.2)
-            posted = slack_posts()[-1]
-            text = json.dumps(posted)
-            p.check(len(slack_posts()) == before + 2 and posted["channel"] == "#security", "…to #security")
-            p.check("hxxps://bad[.]example[.]net" in text and "https://bad" not in text and posted["unfurl_links"] is False, "…with its links defanged")
 
             # A site the proxy refuses: the agent asks with a card; Allow opens it, Settings lists it.
             await p.js("location.hash = '#/chat'")
@@ -311,14 +223,95 @@ async def main(out):
             card = "[...document.querySelectorAll('.card-needs')].find(c => c.textContent.includes('Schedule this?'))"
             p.check(await p.until(f"!!{card}", 15), "a schedule after outside content: the card asks")
             await press(card, "Edit")
-            await p.js(f"(() => {{ const b = {card}.querySelector('.card-edit'); b.value = 'Check only Cloudflare'; b.dispatchEvent(new Event('input')); }})()")
+            await p.js(f"(() => {{ const b = {card}.querySelector('.card-edit'); b.value = 'Check only the status page'; b.dispatchEvent(new Event('input')); }})()")
             await press(card, "Approve")
             await said("scheduled #")
             schedules = await p.js("fetch('/api/v1/schedules').then(r => r.json())")
             made = [s for s in schedules["schedules"] if s["name"] == "Morning check"]
-            p.check(bool(made) and made[0]["prompt"] == "Check only Cloudflare", "…and the edited instructions are what's scheduled")
+            p.check(bool(made) and made[0]["prompt"] == "Check only the status page", "…and the edited instructions are what's scheduled")
             if made:
                 await p.js(f"fetch('/api/v1/schedules/{made[0]['id']}', {{method: 'DELETE'}})")
+
+            # A task with steps: its plan shows right away, ticks off live, and folds once it's done.
+            plans = "document.querySelectorAll('.row-plan').length"
+            before = await p.js(plans)
+            await say("Make a plan for porting the blog")
+            p.check(await p.until(f"{plans} > {before}", 15), "a task's plan appears in the chat")
+            last = "[...document.querySelectorAll('.row-plan')].pop()"
+            p.check(await p.until(f"!!{last}.querySelector('section.plan .plan-step.is-in-progress')", 10),
+                    "…with the step it's on marked as it works")
+            await p.shot(f"{out}/smoke-plan.png")
+            p.check(await p.until(f"{last}.querySelector('details.plan-finished summary')?.textContent === 'Plan · 3 of 3 done'", 15),
+                    "…and folds as 3 of 3 done when the task ends")
+            p.check(await p.js(f"{last}.querySelectorAll('.plan-step.is-done').length") == 3, "…every step ticked")
+
+            # Going in circles: the supervisor's card; Stop ends it with a summary.
+            await say("Keep checking the form page")
+            card = "[...document.querySelectorAll('.card-needs')].find(c => c.getAttribute('aria-label') === 'Looks stuck')"
+            p.check(await p.until(f"!!{card}", 40), "a task going in circles: the supervisor's card asks")
+            words = await p.js(f"{card}.textContent")
+            p.check("read the same page" in words, "…saying why it looks stuck")
+            p.check("steps" in words, "…and how far it got")
+            p.check(await p.js(f"![...{card}.querySelectorAll('button')].some(b => b.textContent === 'Edit')"), "…with nothing to edit")
+            await p.shot(f"{out}/smoke-stuck.png")
+            # Keep going: the task carries on, and the next check finds it stuck again.
+            stuck_cards = """fetch('/api/v1/events/page?limit=500&kinds=approval.requested').then(r => r.json())
+                .then(d => d.events.filter(e => e.data.kind === 'stuck').length)"""
+            asked = await p.js(stuck_cards)
+            await press(card, "Keep going")
+            p.check(await p.until(f"{stuck_cards}.then(n => n > {asked})", 40) and await p.until(f"!!{card}", 10),
+                    "Keep going: it carries on, and the next check asks again")
+            summaries = "[...document.querySelectorAll('.row-agent')].filter(r => r.textContent.includes('Done so far')).length"
+            had = await p.js(summaries)
+            await press(card, "Stop")
+            p.check(await p.until(f"{summaries} > {had}", 20), "Stop ends it with what's done and what's left")
+            finished = await p.js("""fetch('/api/v1/events/page?limit=5&kinds=task.finished').then(r => r.json())
+                .then(d => d.events.reduce((a, e) => (e.seq > a.seq ? e : a)).data.status)""")
+            p.check(finished == "stuck", "…and the task ends as stuck")
+
+            # Notifications (Web Push): a device's subscription, made in the page
+            # with WebCrypto (headless Chrome has no push service), pointing at the
+            # model's stand-in; agentd sends it a test, then a card's.
+            name = f"smoke-{int(time.time() * 1000)}"
+            def pushes():
+                every = json.load(urllib.request.urlopen("http://127.0.0.1:8091/pushes"))
+                return [x for x in every if x["name"] == name]
+            async def pushed(count, seconds=10):
+                for _ in range(int(seconds / 0.2)):
+                    if len(pushes()) >= count:
+                        return True
+                    await asyncio.sleep(0.2)
+                return False
+            sub_id = await p.js(rf"""(async () => {{
+                const pair = await crypto.subtle.generateKey({{ name: "ECDH", namedCurve: "P-256" }}, true, ["deriveBits"]);
+                const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+                const auth = crypto.getRandomValues(new Uint8Array(16));
+                const b64 = (b) => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+                const r = await fetch("/api/v1/push/subscriptions", {{ method: "POST", headers: {{ "Content-Type": "application/json" }},
+                    body: JSON.stringify({{ endpoint: "http://127.0.0.1:8091/push/{name}", keys: {{ p256dh: b64(raw), auth: b64(auth) }}, label: "Smoke test" }}) }});
+                return r.ok ? (await r.json()).id : "";
+            }})()""")
+            p.check(bool(sub_id), "a device subscribes to notifications")
+            listed = await p.js("fetch('/api/v1/push').then(r => r.json())")
+            p.check(any(s["id"] == sub_id and s["label"] == "Smoke test" for s in listed.get("subscriptions", []))
+                    and len(listed.get("public_key", "")) == 87, "…and the desktop lists it, with its key")
+            await p.js(f"fetch('/api/v1/push/test', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{id: '{sub_id}'}})}})")
+            p.check(await pushed(1), "a test notification goes out")
+            first = (pushes() or [{}])[0]
+            p.check(first.get("content_encoding") == "aes128gcm" and first.get("authorization", "").startswith("vapid t=")
+                    and first.get("length", 0) > 100, "…encrypted, with the desktop's VAPID signature")
+            await say("Run the risky command")
+            card = "[...document.querySelectorAll('.card-needs')].find(c => c.textContent.includes('rm -rf ./old-build'))"
+            p.check(await p.until(f"!!{card}", 15) and await pushed(2), "a card that needs you sends a notification")
+            await press(card, "Deny")
+            gone = await p.js(f"fetch('/api/v1/push/subscriptions/{sub_id}', {{method: 'DELETE'}}).then(r => r.ok)")
+            after = await p.js("fetch('/api/v1/push').then(r => r.json())")
+            p.check(gone and not any(s["id"] == sub_id for s in after.get("subscriptions", [])), "…and a device can be removed")
+            await p.js("location.hash = '#/settings'")
+            p.check(await p.until("[...document.querySelectorAll('#view-settings h2')].some(h => h.textContent === 'Notifications')", 10),
+                    "Settings has Notifications")
+            await p.until("![...document.querySelectorAll('#view-settings section[aria-label=Notifications] p')].some(x => x.textContent === 'Loading…')", 5)
+            await p.shot(f"{out}/smoke-notifications.png")
 
             # A card the desktop doesn't know (a sample one): it expires.
             await p.js("location.hash = '#/chat'")
@@ -338,10 +331,6 @@ async def main(out):
                 await asyncio.sleep(0.8)
                 await p.shot(f"{out}/smoke-{page}.png")
             p.check(await p.js("!!document.querySelector('.desk-frame iframe')"), "the desktop view embeds the viewer")
-            await p.js("location.hash = '#/setup'")
-            p.check(await p.until("document.querySelectorAll('#view-setup .setup-step').length === 4"), "the Setup page lists the four steps")
-            if fresh:
-                p.check(await p.until("document.querySelectorAll('#view-setup .setup-step.is-done').length === 4 && document.querySelector('#nav-setup-progress').hidden"), "…all done after this run (Slack added since)")
             await p.js("location.hash = '#/settings'")
             await p.until("!!document.querySelector('#view-settings select')")
             set_theme = """(value) => { const s = [...document.querySelectorAll('#view-settings select')]

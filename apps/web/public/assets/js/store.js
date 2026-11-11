@@ -1,4 +1,4 @@
-// Keeps the chat in sync, as the apps' ChatStore does: the newest page of the
+// Keeps the chat in sync: the newest page of the
 // chat first (so it opens at its end), older pages as the person scrolls up,
 // then agentd's live events after the last one seen, reconnecting and
 // resuming after it. Sends the person's commands.

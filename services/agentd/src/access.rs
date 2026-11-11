@@ -1,5 +1,5 @@
 //! Sites the agent's shell may reach, beyond the deployment's list
-//! (docs/architecture.md §6.22).
+//! (docs/architecture.md §6.20).
 //!
 //! The shell reaches the internet only through Squid, which allows the hosts
 //! Ansible lists (`EGRESS_BASE_HOSTS`, read-only here) and the ones the user

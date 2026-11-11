@@ -1,348 +1,244 @@
-# cloud-desktops
+# Neo Agent, personal edition
 
-Always-on Linux desktops (XFCE + Google Chrome; x86_64 by default, `desktop_arch`) on AWS for AI agents.
-See [PLAN.MD](PLAN.MD) for the full design and milestones.
+An AI agent with its own always-on Linux desktop (XFCE and Google Chrome) in
+**your own AWS account**. You chat with it from a web app on your
+[Tailscale](https://tailscale.com) tailnet, from a laptop or a phone. It
+browses in its own logged-in Chrome, runs shell commands in a sandbox,
+remembers what you tell it, and runs scheduled tasks. Anything risky waits for
+your OK.
 
-**Current state:** one test desktop, configured by Ansible over SSM, runs Chrome
-on a virtual display with **agentd** (the agent), a model gateway that holds the model key, a
-push relay, and iPhone and Mac apps that reach the desktop over your tailnet. No
-Packer, launch template, data volume or control plane yet. The full picture is in
-[docs/architecture.md](docs/architecture.md).
+This is a trimmed edition of the full project, for one person. It leaves out
+the model gateway, the push relay and the iPhone and Mac apps (notifications
+come to your browsers by Web Push instead), Slack and Teams updates, the Cloudflare and Datadog monitoring with its setup guide, the
+Cloudflare Access front door, and the tooling for running desktops for other
+people.
 
-## Prerequisites
+## What gets deployed
 
-- AWS CLI v2 and a profile for the target account
-- [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
-  (`brew install --cask session-manager-plugin`)
-- Terraform ≥ 1.10 (`brew install hashicorp/tap/terraform`; Homebrew core is stuck on 1.5)
-- Ansible ≥ 2.17 with boto3 in its Python, then `make galaxy`
+In your AWS account, in one region:
 
-The Makefile defaults to `AWS_PROFILE=default AWS_REGION=ca-central-1`;
-override either on the command line, e.g. `make plan AWS_PROFILE=other`.
+- A VPC with private subnets. Outbound internet goes through a fck-nat
+  instance (a t4g.nano), or AWS's NAT gateway with `enable_nat_gateway`.
+- **One desktop** (a t3a.medium by default) in a private subnet: no public IP,
+  no inbound rules, its own IAM role (SSM only) and its own KMS key for its
+  disk. You administer it with SSM Session Manager only; there's no SSH.
+- An S3 bucket for Terraform's state, one for Ansible's file transfers, and
+  two SSM parameters you create yourself: your Together AI key and a Tailscale
+  auth key.
 
-## Deploy (step 1)
-
-```sh
-make bootstrap             # one time: S3 state bucket (local state in terraform/bootstrap)
-cp terraform/envs/dev/terraform.tfvars.example terraform/envs/dev/terraform.tfvars
-make init
-make plan                  # review
-make apply
-make galaxy
-make desktop               # Ansible: common + desktop roles over SSM
-```
-
-## Look at the desktop
-
-```sh
-make screenshot            # → screenshots/<instance-id>.png
-make viewer                # then open http://localhost:6080/vnc.html
-make shell                 # shell over SSM
-```
-
-## Drive the browser from the Mac
-
-`make cdp` forwards the VM's Chrome debugging port to `localhost:9222`;
-`scripts/browser.py` (run by `uv`, no browser download) attaches to that Chrome,
-so it uses the desktop's logged-in profile.
-
-```sh
-make cdp                                   # keep running; Ctrl-C to close
-scripts/browser.py tabs                    # * marks the tab commands act on
-scripts/browser.py open https://mail.google.com [--new]
-scripts/browser.py text                    # visible text of the page
-scripts/browser.py screenshot screenshots/page.png
-scripts/browser.py click 'text=Inbox'      # Playwright selectors
-scripts/browser.py type 'textarea[name=q]' 'query' --enter
-scripts/browser.py close
-```
-
-While the tunnel is open, any process on the Mac can control the logged-in
-browser, so close it when you're done.
-
-## agentd and the tailnet (phone, anywhere)
-
-**`services/agentd`** (Rust) is the agent on the desktop: the model loop
-(Together), browser tools on Chrome's DevTools Protocol, a shell tool, chat
-history in SQLite (`/var/lib/agentd`), and an HTTP + Server-Sent Events API for
-the apps (see `docs/native-app-plan.md` §4.1). It runs as its own user:
-
-- it holds none of our keys. Model calls go only to the **attested model
-  gateway** (`services/gatewayd` on `images/gateway`; see
-  `docs/operator-isolation.md`): an instance nobody can log into, which agentd
-  checks before sending anything (AWS's signature on its attestation, the
-  published image measurements, its TLS certificate). It holds the Together
-  key, allows known models and keeps a daily budget per desktop
-  (`model_daily_budget_usd`). A new gateway image: `enable_image_builder =
-  true`, apply, `make gateway-image`, set `gateway_ami`, apply, `make
-  agentd-deploy`. Notifications go through the **push relay**, a Lambda behind
-  an IAM-authenticated function URL that agentd signs with the desktop's own
-  role; it holds the APNs key. Each desktop has its own IAM role
-  (`desktop_identity`), denied our SSM secrets; its state is readable only by
-  `agentd`;
-- the shell user installs software with **Nix** (single-user, `/nix` owned by
-  `worker`, packages from nixpkgs-unstable through the egress proxy; uv, node,
-  gh, jq and ripgrep preinstalled). `curl … | bash` is refused. **Skills**
-  (`services/agentd/skills`, deployed to `/etc/agentd/skills`) are how-tos the
-  agent reads on demand: installing software, Python with uv, Node, git and
-  GitHub tokens, opencode with Together AI, and authorized penetration
-  testing of our own systems (methodology, recon, web/API, code audit,
-  cloud, detection checks);
-- the agent **remembers** facts across conversations (`remember` / `forget`,
-  shown in each task's instructions). Facts saved after it read outside content
-  stay unverified until confirmed in the app's Settings → Memory;
-- the agent runs **scheduled tasks**: ask "every weekday at 8, summarize my
-  inbox" or "tomorrow at 9, check PR 12" and it calls `schedule_task` (a
-  five-field cron pattern or a one-time local time, in your time zone with
-  daylight saving; at most every 15 minutes, 25 schedules). agentd starts each
-  run itself as an ordinary task with just the saved prompt, so approvals still
-  apply, and the answer arrives as a notification titled with the schedule's
-  name. A run that's over an hour late (desktop off or busy) is skipped with a
-  note in the chat. Schedules set up after the agent read outside content need
-  your approval; the shell's crontab, `at` and systemd timers are refused.
-  Settings → Schedules lists them, with pause and cancel;
-- **keys and tokens** (a GitHub token, an API key) go to the desktop without
-  passing through the model or the chat. When a job needs one, the agent calls
-  `request_secret`: the app shows a card with why, how to create it (GitHub's
-  token page comes pre-filled) and a secure field with Paste. The value travels
-  over the tailnet to agentd, which keeps it in `/var/lib/agentd/secrets/NAME`
-  (mode 0600; names and labels in SQLite). A command gets a key only when it
-  names it (`$GITHUB_TOKEN`, or run_shell's `secrets`), through systemd
-  `LoadCredential`, never on a command line or in the unit's properties. agentd
-  replaces every saved value with `[secret NAME]` in tool results, the event
-  log, the chat history and notifications, so the model never sees one. The API
-  is write-only (`PUT`/`DELETE /api/v1/secrets/{name}`, `GET` lists names).
-  Settings → Keys & tokens adds, replaces and deletes keys, and a message that
-  looks like it holds a key (`ghp_…`, `sk-…`) offers to save it instead. Names
-  with PASSWORD are refused: sites are still signed in to in the browser.
-  `api.together.ai` and `api.together.xyz` are on the shell's allowlist for
-  tools that use a Together key;
-- a message takes **one approval**: approving what it types into a message
-  field (Slack's "Message …", "Reply…") also lets it press Enter or Send right
-  after;
-- the agent's shell commands run as `worker` (no sudo), each in its own hardened
-  systemd unit (no privilege escalation, no capabilities, private `/tmp`, limits on
-  memory, processes, CPU and time; Stop kills the whole unit). `worker` is cut off
-  from the desktop session: a firewall (`cloud-desktop-guard`) blocks it from
-  Chrome DevTools, VNC and noVNC, the X display needs a cookie only `agent` can
-  read, and `/home/agent` (the Chrome profile) is private. Only root and agentd
-  can reach the EC2 metadata service (AWS credentials). `worker` reaches the
-  internet only through a local Squid proxy: listed hosts
-  (`agentd_shell_allowed_domains`: code hosts and package registries), never
-  internal addresses, every request in `/var/log/squid/access.log`, and no DNS
-  of its own. The one exception is a single command the user approves on a card
-  to connect directly (public addresses only, logged, never in a scheduled run);
-- `open_url` only opens http(s) sites, never `file://`, localhost or internal
-  addresses (the logged-in Chrome would hand over its profile or DevTools);
-- commands starting with `sudo`, risky ones, and (after the agent has read a web
-  page or command output) ones that can send data out (`curl`, `scp`, `git push`,
-  `gh` commands that write such as `gh gist create` or `gh api`, `npm publish`,
-  ...) wait for approval in the app; approvals record who answered. On a card
-  about text (a command, a message to write, a schedule's instructions) you can
-  edit it first, and your version is what runs, through the same checks;
-- **Auto approve** (Settings, off by default) stops all of that asking, in chats and
-  scheduled runs: root commands, direct connections, browser changes, new sites and
-  schedules go ahead, with each one recorded in the event log. Keys still come from
-  a person, and outright refusals stay (`docs/architecture.md` §6.11);
-- a task waiting for approval parks: its state is saved in `/var/lib/agentd`,
-  the desktop is free, and the answer resumes it, after a restart too (only if
-  the action is still the one on the card; a day-old approval expires). A new
-  message or Stop gives up on it. A task that runs out of steps ends with a
-  summary of what it did and what's left;
-- browser actions wait for exactly what they set off, on events with no quiet
-  timers: a new document's DOMContentLoaded and first paint, the main frame's own
-  requests finishing (iframes and workers, which finish in other processes, don't
-  count), then two animation frames with no new elements or requests. Pages are
-  ready 0.1–1 s after navigating (Slack ~0.9 s, GitHub ~0.4 s), with the final
-  content there. Before a click it checks the target, Playwright-style: visible,
-  enabled, steady across two frames, not covered (a cookie banner is named to the
-  model). `wait_for` returns when its text appears or the page is idle without it;
-  shell `sleep`s are refused unseen;
-- web pages and command output reach the model wrapped in `<untrusted>` tags; old
-  tool output is trimmed past a budget, and a model repeating the same failing
-  call is nudged, then stopped (patterns adapted from moltis, MIT);
-- its API listens on `/run/agentd/agentd.sock`, which only `tailnet-proxy` can open
-  (so the agent can't approve its own commands).
-
-**`services/tailnet-proxy`** (Go, Tailscale's tsnet) is the desktop's only presence
-on your tailnet, at `https://cloud-desktop-dev.<tailnet>.ts.net`:
+On the desktop:
 
 | | |
 |---|---|
-| `/api/*` | agentd's API, with your Tailscale identity in `X-Tailscale-User` |
-| `/vnc.html` | the noVNC viewer (browser fallback) |
-| port 5900 | raw VNC, for native viewers (the apps) |
+| **agentd** | The agent (`services/agentd`, Rust): the model loop, browser control over Chrome's DevTools Protocol, a sandboxed shell, memory, schedules and approvals. It calls Together AI directly with your key. |
+| **tailnet-proxy** | The desktop's only presence on your tailnet (`services/tailnet-proxy`, Go, Tailscale's tsnet), at `https://neo-agent.<your tailnet>.ts.net`. It serves the web app, agentd's API and the desktop viewer, and port 5900 for a native VNC viewer. The rest of the VM, including the agent's commands, can't reach your other tailnet devices. |
+| **The web app** | `apps/web` (static files, no build step): the chat, approval cards, the desktop (take over), schedules, keys and tokens, and settings. |
+| Chrome, Xvfb, XFCE, x11vnc, noVNC | The desktop the agent works in, on localhost only. |
+| Squid, nftables | The agent's shell reaches the internet only through an allowlisting proxy. A firewall keeps the shell away from Chrome's DevTools, VNC and the instance's AWS credentials. |
 
-Only Tailscale logins in `/cloud-desktops/<env>/tailscale/allowed_logins` get in.
-The VM and the agent's commands can't reach your other tailnet devices. It
-connects outbound only; no security-group change.
+## What you need
 
-One-time, in the Tailscale admin console: enable MagicDNS and HTTPS
-certificates, create the tag `tag:cloud-desktop` (owner `autogroup:admin`) and a
-pre-approved auth key with that tag. Then:
+- An AWS account, and a profile for it in AWS CLI v2 that can create VPCs,
+  EC2, IAM roles, KMS keys, S3 buckets and SSM parameters. You also need the
+  [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+  (`brew install --cask session-manager-plugin`).
+- Terraform ≥ 1.10 (`brew install hashicorp/tap/terraform`).
+- Ansible ≥ 2.17, with boto3 in its Python.
+- [uv](https://docs.astral.sh/uv/), for `scripts/put-secret.py`.
+- Rust (rustup installs the pinned 1.93.1), [zig](https://ziglang.org) and
+  `cargo install cargo-zigbuild`, to build agentd as a static Linux binary.
+- Go ≥ 1.27, for tailnet-proxy.
+- A [Together AI](https://api.together.ai) API key.
+- A Tailscale account (the free personal plan is enough).
 
-```sh
-make tailscale-key      # paste the auth key (hidden input)
-make agentd-test        # fmt, clippy, unit tests
-make agentd-deploy      # static binary for DESKTOP_ARCH (cargo-zigbuild), user, unit
-make tailnet-deploy     # tailnet-proxy (deploy agentd first)
-make agentd-logs        # recent log
-make agentd-evals       # memory evals on this Mac against Together (cents per scenario)
-make agentd-soak SINCE=2026-11-01   # memory v2 soak report for the desktop (read-only)
-make agentd-reset        # wipe agentd's chat, memories, schedules, keys and Chrome's profile (asks first; DRY_RUN=1, KEEP_COPY=1, RESTORE=1, FILES=1)
-```
+### Tailscale, once
 
-**Rolling agentd back.** Schema changes are additive, so an older agentd runs on
-a newer database (0.14.0 was tested on 0.15.0's). Check out the older commit and
-`make agentd-deploy`. Each upgrade first copies the database to
-`/var/lib/agentd/agentd.db.pre-<version>-<time>` (SQLite online backup; the last 3 are
-kept). Restore one, with agentd stopped, only to undo what the newer version wrote.
+In the [admin console](https://login.tailscale.com/admin):
 
-The earlier Python agent and its Telegram bot were removed on 2026-10-31; agentd
-and the apps replace them. Each `make agentd-deploy` makes sure the bot is gone
-from the desktop.
+1. **DNS**: turn on MagicDNS and HTTPS Certificates.
+2. **Access controls**: add a tag for the desktop. Under `tagOwners`, add
+   `"tag:cloud-desktop": ["autogroup:admin"]`. A tagged device doesn't expire
+   with your login.
+3. **Settings → Keys → Generate auth key**, tagged `tag:cloud-desktop`, and
+   pre-approved if you use device approval. tailnet-proxy only uses it the
+   first time it joins; after that, the node keeps its own identity.
 
-## Apple apps (`apps/apple`)
+With the default access rules, every device of yours on the tailnet can reach
+the desktop. If you share your tailnet with others, use `make tailscale-allow`
+(below) or tighten your rules.
 
-SwiftUI apps for iPhone (iOS 26+, dark, Liquid Glass) and Mac (macOS 15.6+, Apple
-silicon; Liquid Glass from macOS 26), generated with XcodeGen from
-`apps/apple/project.yml`. They share their screens (`CloudDesktop/`, with
-`iOS/` and `macOS/` for what only one has). `DesktopKit` holds the rest of the shared code: `Tailnet`
-(the app's own Tailscale node via TailscaleKit; you sign in with Tailscale in the
-app, no Tailscale app needed), `AgentAPI` (agentd's API and event stream over the
-tailnet), `ChatCore` (turns the event stream into the chat timeline) and
-`DesktopViewer` (VNC to the desktop through the node's SOCKS5 proxy).
-
-The app opens on a chat with the first desktop tagged `tag:cloud-desktop`, at
-the newest message; older ones load as you scroll up. Under an answer, Copy takes
-all of it and Select text opens it to copy any part; on the Mac you can also drag
-over the text. It shows your messages and
-the agent's replies, three dots while it works (its steps and commands stay out of
-the chat), Approve/Deny cards for risky commands (what the command does in plain
-words and why it needs your OK, the command itself a tap away) and for anything the agent types
-or sends in the browser (you see the exact text first; a click or key shows the agent's
-reason, the page, the text around the button and a picture with it outlined), and "Action needed" cards
-with a screenshot when a site needs you to sign in (Skip / I'm done / Take over).
-A card leaves the chat once answered. Stop cancels the running task.
-
-**Take over** (on a card, or the desktop button in the toolbar) shows the desktop
-full screen over VNC through the app's own Tailscale node (`DesktopViewer`, using
-swift-rfb). Tap to click, two-finger tap to right-click, pinch to zoom, drag to
-move around, two-finger drag to scroll the page, and long-press then drag to drag.
-The keyboard button opens the iPhone keyboard with Esc, Tab, Ctrl, Alt and arrow
-keys. Paste types the phone's clipboard on the desktop, Copy brings what's selected there
-to the phone (long-press and drag to select), and I'm done tells the agent to carry on. Settings (gear) has the model, the browser-actions switch and
-Tailscale log out. After a disconnect the app resumes from the last event it saw.
-
-**The Mac app** has the same chat, cards, Settings, Memory, Schedules and Keys,
-with its own Tailscale node (you sign in in your browser; the Mac's Tailscale app
-isn't used). Return sends (⌥Return for a new line), ⌘, opens Settings, and list
-rows have right-click menus. Take over opens the desktop in its own window with
-the Mac's pointer, scroll wheel and keyboard: ⌘ shortcuts act as Ctrl on the
-desktop (⌘C, ⌘T, ⌘L…; ⌘← and ⌘→ are Home and End), ⌘V types the Mac's
-clipboard, and what you copy there with ⌘C or the toolbar's Copy comes back to the Mac. ⌘Q, ⌘W, ⌘H,
-⌘M and ⌘, stay with the Mac. The app keeps running with its windows closed, so
-notifications still come (with banners while it isn't in front), and it
-reconnects after the Mac wakes.
+## Deploy
 
 ```sh
-make app-tailscalekit   # once: build TailscaleKit.xcframework (Go + Xcode)
-make app-test           # DesktopKit unit tests (AGENTD_URL=http://127.0.0.1:8765 adds a live test against a local agentd;
-                        # VNC_ADDR=127.0.0.1:15900 one against x11vnc through an SSM port forward)
-make app-device         # build, sign (team 4UVAPZYV4Q), install and launch on your iPhone
-make app-mac            # build the Mac app, install it in /Applications and open it
-                        # (its first run registers this Mac in the developer account, for push)
-make app-release-mac    # for others: Developer ID, notarized and stapled, in a DMG
-make app-testflight     # for others: archive and upload the iPhone app to TestFlight
+export AWS_PROFILE=<your profile> AWS_REGION=<region>   # e.g. us-east-1; default ca-central-1
+make galaxy          # once: Ansible's AWS collections
+make bootstrap       # once: the S3 bucket for Terraform's state
+make init
+make plan            # review what it will create
+make apply           # VPC, NAT, the desktop (a few minutes)
+make model-key       # paste your Together AI key (hidden input; stored in SSM)
+make tailscale-key   # paste the auth key from above
+make deploy          # the desktop, agentd, then tailnet-proxy (first run: 15-20 minutes)
 ```
 
-**Someone else (a tester)** gets their own desktop and the apps through a
-notarized DMG and TestFlight: [docs/onboarding.md](docs/onboarding.md) walks
-through it. `make new-desktop NAME=<name>` sets the desktop up from your laptop,
-asking before each change, on a desktops tailnet of yours that its API
-manages (`scripts/tailnet.py`). It prints setup links: the tester taps one per
-device and needs no Tailscale account. With more than one desktop, deploys
-reach all of them unless `DESKTOP=<name>` (or `LIMIT=<instance id>`) picks one.
+Wait a minute or two after `make apply` for the desktop to register with SSM
+before `make deploy`. Then open `https://neo-agent.<your tailnet>.ts.net` on
+any device on your tailnet. To find your tailnet's name, look under DNS in the
+admin console.
 
-**Push notifications** (approvals with Approve/Deny on the notification, Action
-needed, finished tasks) go through a push relay in the AWS account, so the APNs
-key never sits on a desktop. agentd signs its calls to the relay with the VM's
-instance role, and the relay sends only to devices registered through that
-desktop.
+Settings you might change are in `terraform/personal/variables.tf`. Copy
+`terraform.tfvars.example` to `terraform.tfvars` to set them. These are the
+instance type, disk size, `desktop_arch` (`arm64` is about 13% cheaper; build
+with `DESKTOP_ARCH=arm64` too), the tailnet hostname and the NAT. `ENV=<name>`
+on every `make` gives a second, separate deployment in the same account.
+
+## Using it
+
+- **Chat**: ask for something. The agent works in its own browser and shell.
+  Three dots mean it's working, with how long it's been at it, and Stop cancels
+  the task. On anything with three or more steps the agent writes a **plan**,
+  which shows as a checklist that ticks off as it goes.
+- **Long tasks**: there's no cap on steps. Instead, a **supervisor** checks on a
+  running task every 30 minutes of work or 60 model turns, whichever comes
+  first (`agentd_review_every_minutes`, `agentd_review_every_steps`). The
+  supervisor is a separate model call that sees your request, the plan and
+  what the agent did since the last check. If it's progressing, nothing
+  happens. If it's going in circles, the agent gets advice. If it looks stuck,
+  you get a **Looks stuck** card with the reason: **Keep going** or **Stop**
+  (Stop ends with what's done and what's left). A stuck scheduled run, with
+  nobody to ask, stops with that summary.
+- **Approval cards**: risky commands, commands as root, anything the agent
+  types or sends in the browser, new sites for the shell, and schedules set up
+  after it read outside content all wait for you. On a card about text (a
+  command, a message, a schedule's instructions) you can edit it first, and your
+  version is what runs. **Auto approve** in Settings (off by default) stops the
+  asking; keys still come from you, and outright refusals stay.
+- **Signing in to sites**: when a site needs you (a login, 2FA, a CAPTCHA),
+  an "Action needed" card offers **Take over**. That opens the desktop in the
+  page, and the agent carries on when you're done. Chrome stays signed in.
+- **Keys and tokens** (a GitHub token, an API key) go to the desktop without
+  passing through the model or the chat. The agent asks for one with a card,
+  or you add it under Keys and tokens. A command gets a key only when it names
+  it (`$GITHUB_TOKEN`), and agentd replaces every saved value with
+  `[secret NAME]` before the model sees anything.
+- **Schedules**: "every weekday at 8, summarize my inbox" or "tomorrow at 9,
+  check PR 12". Each run is an ordinary task with the saved instructions, and
+  its answer lands in the chat. The Schedules page pauses and cancels them.
+- **Notifications**: under Settings → Notifications, turn them on for each
+  device you use. You get one when a card needs you (an approval, a key, a
+  stuck task), when Action needed comes up, when a chat task that ran over a
+  minute finishes, and when a scheduled run finds something. agentd sends
+  them by Web Push, encrypted to your browser, with no relay and no app-store
+  account. On iPhone or iPad, add the web app to your Home Screen first (Share
+  → Add to Home Screen), open it from there, then turn them on. iOS only
+  allows Web Push for Home Screen apps. `agentd_push_contact` sets the contact
+  address the push services see.
+- **Memory**: the agent remembers facts across conversations, and tidies up
+  duplicates and things that are no longer true.
+- **Skills** (`services/agentd/skills`) are how-tos the agent reads when it
+  needs them. They cover installing software (Nix, no `curl | bash`), Python
+  with uv, Node, git and GitHub, opencode with Together AI, deploying to Fly,
+  and authorized penetration testing of your own systems.
+
+From your machine, over SSM:
 
 ```sh
-make apns-key FILE=AuthKey_XXXXXXXXXX.p8 KEY_ID=XXXXXXXXXX   # once: the key from developer.apple.com → SSM
-make plan && make apply                                    # the relay: Lambda, function URL, DynamoDB
-make agentd-deploy                                         # agentd picks up the relay's URL from SSM
-(cd services/push-relay && node --test test/lib.test.mjs)  # relay unit tests
+make viewer         # the desktop in your browser: http://localhost:6080/vnc.html
+make shell          # a shell on the desktop
+make screenshot     # → screenshots/<instance-id>.png
+make agentd-logs    # agentd's recent log
+make cdp            # Chrome's DevTools on localhost:9222, for scripts/browser.py
+make stop / start   # stop the desktop when you don't need it (the disk stays)
+make agentd-reset   # wipe the chat, memories, schedules, keys and Chrome's profile (asks first)
 ```
+
+## Updating
+
+```sh
+git pull
+make agentd-deploy      # agentd (copies its database first; schema changes are additive)
+make tailnet-deploy     # tailnet-proxy and the web app
+make desktop            # OS hardening, the display stack, Chrome
+```
+
+To rotate the model key, run `make model-key` and then `make agentd-deploy`.
+
+## How it keeps things apart
+
+- **Nothing comes in.** The desktop has no public IP and no inbound rules.
+  tailnet-proxy dials out to Tailscale and SSM's agent dials out to AWS. Only
+  devices on your tailnet reach the web app, and with `make tailscale-allow`,
+  only the logins you list.
+- **The model key** is a SecureString in SSM. Ansible reads it on your machine
+  and writes it to `/etc/agentd/secrets.env` (root:agentd, 0640), so on the
+  desktop only agentd can read it. The desktop's own IAM role is denied the
+  project's SSM parameters. Prompts go straight from agentd to Together AI;
+  there is no gateway in between. So anyone with root on the desktop can read
+  the key, and that's you, over SSM.
+- **The agent's shell** runs as `worker`, without sudo, each command in its own
+  hardened systemd unit (no privilege escalation, private `/tmp`, memory, CPU,
+  process and time limits). It reaches the internet only through Squid's
+  allowlist (`agentd_shell_allowed_domains`, plus the sites you allow in
+  Settings), with every request logged. It can't reach Chrome's DevTools, VNC,
+  noVNC, the X display, the Chrome profile, or the instance's AWS
+  credentials.
+- **Outside content** (web pages, command output) reaches the model wrapped as
+  untrusted. After the agent has read any, commands that could send data out
+  wait for your OK.
+- **The API** listens on a Unix socket only tailnet-proxy can open, so the
+  agent can't approve its own requests.
+- **The disk** is encrypted with its own KMS key. Deleting the key makes the
+  disk and its snapshots unreadable.
+
+## Cost
+
+Roughly, on demand in ca-central-1: the t3a.medium desktop (~$31/month), its
+20 GB gp3 disk (~$2), the fck-nat t4g.nano with its public IPv4 address (~$7)
+and the KMS key ($1). That's about **$40/month** while it runs, plus what you
+spend on Together AI. `make stop` brings the desktop's part to just its disk.
+Unlimited CPU credits (`cpu_credits`) can add to it under sustained load.
+
+## Developing
+
+```sh
+make agentd-test    # fmt, clippy, unit tests
+make tailnet-test   # go vet and tests for tailnet-proxy and package door
+make web-test       # the web app's chat rules, Markdown and key detector
+make web-dev        # the whole thing on this machine, with a scripted model: http://127.0.0.1:8088/
+make web-smoke      # with web-dev running: clicks through it in headless Chrome
+make agentd-evals   # memory evals against Together (cents per scenario)
+make lint           # Terraform fmt and validate, playbook syntax
+```
+
+`make web-dev` runs agentd with a fake model (`apps/web/dev/fake_llm.py`) and
+`devdoor`. devdoor is a local stand-in for tailnet-proxy that signs every
+request in as `you@example.com`, so it's for this machine only and never
+deployed.
 
 ## Teardown
 
 ```sh
-make destroy               # dev env. The state bucket is protected (prevent_destroy).
+make destroy
 ```
+
+The state bucket stays (`prevent_destroy`); delete it in the S3 console if you
+want it gone. Then delete the SSM parameters under `/cloud-desktops/personal/`
+and remove the device in Tailscale's admin console.
 
 ## Notes
 
-- [docs/architecture.md](docs/architecture.md): how everything that's built fits
-  together, in detail (AWS, the desktop VM, agentd, the gateway, the relay,
-  tailnet-proxy, the app, flows, security model, operations, known gaps).
-- Design docs: [PLAN.MD](PLAN.MD) (overall build plan) and
-  [docs/agent-control.md](docs/agent-control.md) (how an agent controls a desktop:
-  a model-agnostic runner with an optional Claude checker).
-- [docs/native-app-plan.md](docs/native-app-plan.md): `agentd` (Rust agent on each
-  user's VM) and the iPhone + Mac apps (TailscaleKit, chat, native take-over view)
-  (replaced the earlier Python agent and Telegram bot).
-- [docs/memory-v2.md](docs/memory-v2.md): the plan for agentd's memory v2 (kinds,
-  trust, retrieval, consolidation) and the effects queue, policy versions,
-  attention budget and stage; phases 0–5 are built and phase 6 (soak and launch)
-  is under way (agentd 0.15.2, `MEMORY_V2=off` by default, on for the dev desktop;
-  v2 passes 41/41 memory evals, v1 33/37. Since 0.15.2 nothing waits for your
-  approval (the Memory screen is for fixing or forgetting), and tidying up only
-  notes tasks that changed something, merges duplicates and drops what's no longer
-  true: no facts, nothing from scheduled runs, which see their own last reports
-  instead; it's on by default; notifications go through the effects queue and follow the
-  attention rules; `make agentd-soak` reports the soak).
-- [docs/agents-and-bots.md](docs/agents-and-bots.md): the plan for bots (2026-11-02,
-  not built yet): agents you create, each its own chat and Unix user with the main
-  agent's tools; the main agent reads their chats and memories, corrects their
-  memories, changes their schedules after your OK, and hands them work only when
-  you name them.
-- [docs/onboarding.md](docs/onboarding.md): giving a tester a desktop, setup links for
-  their devices (no Tailscale account), the notarized Mac app and the iPhone app
-  through TestFlight (2026-11-02).
-- [docs/operator-isolation.md](docs/operator-isolation.md): design for keeping users'
-  prompts and data unreadable to us: the attested gateway (built, off by default) and the plan for
-  attested desktops that customers verify and approve updates for (§11).
-- [docs/customer-cloud.md](docs/customer-cloud.md): the agent in a customer's own
-  AWS sandbox account, reached through their Cloudflare Access (front-door), with
-  their Together key; [deploy/customer-aws/](deploy/customer-aws/README.md) is what
-  the customer reviews and runs to give us temporary, limited access (2026-11-03).
-- **No public IPs on desktops:** they sit in private subnets and reach the
-  internet through a fck-nat instance (`enable_nat_instance`, a t4g.nano; switch
-  to `enable_nat_gateway` when the product needs high availability). No inbound
-  rules, no SSH; administration is SSM Session Manager only.
-- **Each user's disks use their own KMS key** (`users`; deleting the key makes
-  them unreadable).
+- [docs/architecture.md](docs/architecture.md) covers how it all fits
+  together in detail; [docs/memory-v2.md](docs/memory-v2.md) covers the
+  agent's memory.
 - Ansible `become` uses classic sudo (`sudo.ws`). Ubuntu 26.04's default
   `sudo-rs` swallows the SSM connection plugin's end-of-command marker, so
-  every privileged task hangs until timeout. See `ansible/inventory/group_vars/all.yml`.
-- Group vars live in `ansible/inventory/group_vars/` (Ansible only reads
-  `group_vars` next to the inventory or the playbook).
-- On macOS the Makefile runs Ansible with `no_proxy='*'`. Without it, forked
-  workers segfault in the system proxy lookup ("A worker was found in a dead
-  state").
-- The Chrome package owns `/etc/apt/sources.list.d/google-chrome.sources` once
-  installed. Ansible only writes it for the first install.
-- `openssh-server` is removed from desktops; access is SSM only.
-- The VNC password is off (`vnc_password_enabled: false`) and noVNC listens on
-  127.0.0.1 only: it's reachable through SSM port forwarding and tailnet-proxy
-  (your tailnet), nothing else. The control-plane milestone brings its own
-  per-session auth.
-- Cost while step 1 is up: one t3a.medium desktop (~$0.042/h in ca-central-1) with a
-  20 GB gp3 volume, the model gateway (t4g.micro, ~$0.0092/h), plus the shared
-  fck-nat t4g.nano and its Elastic IP.
-- Desktops are x86_64 (`desktop_arch = "amd64"`): many Linux desktop apps (Slack,
-  Zoom, Discord) ship only for it. arm64 (Graviton) is ~13% cheaper and still
-  supported (`desktop_arch = "arm64"`, `DESKTOP_ARCH=arm64` for the builds).
+  every privileged task would hang until timeout.
+- The Makefile writes `ansible/inventory/aws_ec2.yml` from
+  `aws_ec2.yml.tmpl` with your region and `ENV`, since the EC2 inventory plugin
+  can't read them from the environment. On macOS it also runs Ansible with
+  `no_proxy='*'`. Without that, forked workers segfault in the system proxy
+  lookup.
+- The VNC password is off and noVNC listens on 127.0.0.1 only. You reach the
+  desktop through tailnet-proxy (your tailnet) or SSM port forwarding.
+- The desktop is x86_64 by default, because many Linux desktop apps ship only
+  for it.

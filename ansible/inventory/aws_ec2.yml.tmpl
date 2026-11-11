@@ -1,0 +1,25 @@
+# Dynamic inventory: this deployment's running desktop (tags Project and Env
+# from Terraform), reached over SSM by instance id. Credentials come from
+# AWS_PROFILE.
+#
+# The Makefile writes inventory/aws_ec2.yml from this file before each
+# playbook, with your AWS_REGION and ENV filled in (the plugin can't read
+# them from the environment). Edit this file, not the generated one.
+plugin: amazon.aws.aws_ec2
+regions:
+  - "@REGION@"
+filters:
+  tag:Project: cloud-desktops
+  tag:Env: "@ENV@"
+  instance-state-name: running
+hostnames:
+  - instance-id
+keyed_groups:
+  - key: ec2_tags.Role
+    separator: ""
+compose:
+  ansible_aws_ssm_instance_id: instance_id
+  # Its environment (Terraform's Env tag), which picks its SSM paths
+  # (/cloud-desktops/<env>/...), and its device name on your tailnet.
+  desktop_env: ec2_tags.Env
+  desktop_tailnet_name: ec2_tags.TailnetName | default('neo-agent')

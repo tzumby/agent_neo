@@ -23,20 +23,18 @@ use crate::browser::{Browser, Element};
 use crate::cdp::Cdp;
 use crate::clock::UserClock;
 use crate::config::Config;
-use crate::destinations::{self, Destination, Kind, Poster, Severity, Update};
-use crate::egress::EgressGate;
 use crate::guard;
 use crate::llm::{self, Together, Usage, truncate};
 use crate::memory;
-use crate::monitoring;
+use crate::plan;
 use crate::policy::Gate;
 use crate::policy::Policy;
-use crate::push::{self, Push, Relay};
 use crate::schedule;
 use crate::secrets::{self, Secrets};
 use crate::shell::{KeyFile, MAX_COMMAND_SECS, Route, Shell, split_sudo};
 use crate::skills::Skills;
-use crate::store::{Event, Pending, Post, QueuedRun, Schedule, SecretInfo, Store};
+use crate::store::{Event, Pending, QueuedRun, Schedule, SecretInfo, Store};
+use crate::supervise::{self, Verdict};
 use crate::tools;
 
 const HISTORY_LIMIT: i64 = 20;
@@ -56,7 +54,7 @@ const POLICY_CHANGED: &str =
 /// Added to a scheduled run's framing with memory v2 (docs/memory-v2.md §15).
 const REPORT_OUTCOME_RULE: &str = "End with report_outcome. Use outcome=nothing when there is nothing the user \
      needs to see, outcome=result with a summary under 180 characters when there is, and outcome=blocked when you \
-     could not finish. The user is not watching; a result they can use is worth a notification, nothing new is not.";
+     could not finish. The user is not watching; a result they can use is worth their attention, nothing new is not.";
 /// Added to a scheduled run's framing: it never waits on a card.
 const UNATTENDED_RULE: &str = "Nothing in this run can wait for the user's OK: anything that would need it \
      (a command as root, a risky command, one that could send data after you've read outside content, a browser \
@@ -80,8 +78,16 @@ const INTERRUPTED: &str =
 /// remember…?") just gets its answer again.
 /// The one reminder after a reply with neither text nor tool calls: usually the
 /// model's thinking used up `max_tokens` (finish_reason "length").
-const EMPTY_REPLY: &str = "(agentd) Your reply was empty: it was probably cut off while you were thinking. \
-     Give your answer now, briefly.";
+const EMPTY_REPLY: &str = "(agentd) Your last reply was cut off while you were still thinking, before you \
+     wrote anything. Think less this time: make your next tool call, or if the task is done, give your answer.";
+/// Empty replies in a row that are asked again, each with more room
+/// (`turn_max_tokens`), before the task ends with a summary instead.
+const EMPTY_RETRIES: u8 = 2;
+/// A model turn's output limit; doubled for each retry of an empty reply.
+const TURN_MAX_TOKENS: u32 = 8192;
+/// Supervisor checks in a row that can't give a verdict before the task is
+/// treated as stuck: a broken check doesn't leave a task running unchecked.
+const REVIEW_FAILURES: u8 = 2;
 const REMEMBER_NUDGE: &str = "(agentd) The user's message asked you to remember something, and you haven't \
      called remember. If they did, call remember with it now, then finish. If they only asked what you remember, \
      give your answer again.";
@@ -161,14 +167,51 @@ struct RunState {
     memory_block: Option<String>,
     /// A scheduled run's `report_outcome` (result, nothing or blocked).
     #[serde(default)]
-    reported: Option<push::Reported>,
-    /// Asked once for the answer after an empty reply.
+    reported: Option<schedule::Reported>,
+    /// Empty replies in a row so far (asked again, with more room each time).
     #[serde(default)]
-    asked_again: bool,
+    empty_retries: u8,
+    /// The agent's plan (update_plan): the user's checklist, the supervisor's
+    /// measure of progress.
+    #[serde(default)]
+    plan: Vec<plan::Item>,
+    /// When the supervisor last checked (supervise.rs).
+    #[serde(default)]
+    review: ReviewClock,
     /// What the user asked, or the schedule's prompt: a scheduled run's
     /// report shows it as its instructions.
     #[serde(default)]
     request: String,
+}
+
+/// When the supervisor last checked on a task, and what it said.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct ReviewClock {
+    /// The step, working seconds and conversation length at the last check.
+    at_step: u32,
+    at_secs: f64,
+    at_message: usize,
+    /// Checks in a row that gave no verdict.
+    failures: u8,
+    /// The last check's verdict and advice, when it wasn't "progressing".
+    previous: Option<String>,
+    /// A stuck card's reason and advice, for when the user answers it.
+    stuck: Option<(String, String)>,
+}
+
+impl ReviewClock {
+    fn checked(&mut self, step: u32, secs: f64, messages: usize) {
+        self.at_step = step;
+        self.at_secs = secs;
+        self.at_message = messages;
+        self.failures = 0;
+    }
+}
+
+/// A model turn's output limit: more room for each retry of an empty reply,
+/// which was most likely cut off while the model was thinking.
+fn turn_max_tokens(empty_retries: u8) -> u32 {
+    TURN_MAX_TOKENS << empty_retries.min(EMPTY_RETRIES)
 }
 
 /// The scheduled run the background worker is on.
@@ -322,37 +365,25 @@ pub struct Agent {
     /// Wakes the background worker when a run is queued.
     pub runs_queued: Notify,
     /// One shell command at a time, the chat's or a scheduled run's: a
-    /// scheduled run's command closes Squid to the shell user (lock_egress),
-    /// which would cut off a chat command running beside it.
+    /// direct command opens the firewall to the shell user (open_direct),
+    /// which would let a command running beside it out too.
     shell_turn: tokio::sync::Mutex<()>,
     thread: Mutex<Thread>,
-    /// Push notifications through the relay; None when it isn't configured.
-    pub push: Option<Arc<Relay>>,
     /// Wakes the scheduler when schedules are added or resumed.
     pub schedules_changed: Notify,
     /// Wakes the effects runner when an effect is enqueued (effects.rs).
     pub effects_changed: Notify,
     /// Keys and tokens the user saved; their values are redacted from
-    /// everything the model, the apps and notifications see.
+    /// everything the model and the apps see.
     pub secrets: Secrets,
-    /// Destinations' bot tokens and webhook URLs (destinations.rs): a store
-    /// of their own, given to no command, redacted like the keys.
-    pub destination_credentials: Secrets,
-    poster: Poster,
     /// The event seq of the tool call each task is running (a memory's source).
     step_seqs: Mutex<HashMap<String, i64>>,
-    /// The egress gate (egress.rs), set once it's listening (main.rs).
-    pub gate: std::sync::OnceLock<Arc<EgressGate>>,
-    /// The shell user's uid, for the guard firewall's sets.
+    /// The shell user's uid, for the guard firewall's `direct_egress` set.
     shell_uid: Option<u32>,
 }
 
-/// The web app's Setup steps (apps/web/public/assets/js/setup.js), in order.
-pub const SETUP_STEPS: &[&str] = &["updates", "cloudflare", "datadog", "watching"];
-
 /// Adds an entry to one of the guard firewall's sets, or deletes it:
-/// `squid_locked` (the shell user can't reach Squid, only the egress gate) or
-/// `direct_egress` (it may connect on its own).
+/// `direct_egress` (the shell user may connect on its own).
 fn nft_element(verb: &str, set: &str, element: &str) -> Result<()> {
     let status = std::process::Command::new("sudo")
         .args([
@@ -384,27 +415,6 @@ fn uid_of(user: &str) -> Option<u32> {
         .output()
         .ok()?;
     String::from_utf8(out.stdout).ok()?.trim().parse().ok()
-}
-
-/// The CA bundle gated commands trust (the system's and the egress gate's),
-/// in the state directory.
-pub const EGRESS_BUNDLE: &str = "egress-ca-bundle.pem";
-
-/// A scheduled command's way out, held while it runs (Agent::lock_egress).
-struct EgressLock {
-    gate: Arc<EgressGate>,
-    uid: Option<u32>,
-}
-
-impl Drop for EgressLock {
-    fn drop(&mut self) {
-        self.gate.set_pinning(false);
-        if let Some(uid) = self.uid
-            && let Err(err) = nft_element("delete", "squid_locked", &uid.to_string())
-        {
-            tracing::error!(err = %format!("{err:#}"), "couldn't reopen Squid to the shell user");
-        }
-    }
 }
 
 /// The firewall open for a command the user approved to connect on its own
@@ -486,22 +496,9 @@ impl Agent {
         let store = Store::open(&cfg.state_dir.join("agentd.db")).context("opening the state database")?;
         let policy = Arc::new(Policy::load(&cfg.policy_path)?);
         let (bus, _) = broadcast::channel(1024);
-        let push = Relay::from_config(&cfg)?.map(Arc::new);
-        if push.is_some() {
-            tracing::info!("push notifications on (relay)");
-        }
         let secrets = Secrets::open(&cfg.state_dir.join("secrets")).context("opening the saved keys")?;
-        let destination_credentials = Secrets::open(&cfg.state_dir.join("destinations"))
-            .context("opening the destinations' credentials")?;
-        // Plain http only for a stand-in Slack in local development or tests.
-        let local =
-            cfg.slack_api.starts_with("http://127.0.0.1") || cfg.slack_api.starts_with("http://localhost");
-        let poster = Poster::with(&cfg.slack_api, !local)?;
         let agent = Self {
-            push,
             secrets,
-            destination_credentials,
-            poster,
             llm: Together::new(&cfg)?,
             cdp: Cdp::new(&cfg.cdp_url)?,
             shell: Shell {
@@ -511,12 +508,6 @@ impl Agent {
                 tasks_max: cfg.shell_tasks_max.clone(),
                 cpu_quota: cfg.shell_cpu_quota.clone(),
                 proxy: cfg.shell_proxy.clone(),
-                gate_proxy: if cfg.egress_gate_listen.is_empty() {
-                    String::new()
-                } else {
-                    format!("http://{}", cfg.egress_gate_listen)
-                },
-                gate_bundle: cfg.state_dir.join(EGRESS_BUNDLE),
             },
             policy,
             skills: Skills::load(&cfg.skills_dir),
@@ -532,7 +523,6 @@ impl Agent {
             schedules_changed: Notify::new(),
             effects_changed: Notify::new(),
             step_seqs: Mutex::default(),
-            gate: std::sync::OnceLock::new(),
             shell_uid: uid_of(&cfg.run_as),
             cfg,
         };
@@ -579,10 +569,8 @@ impl Agent {
         if let Some(object) = data.as_object_mut() {
             object.entry("agent").or_insert_with(|| json!("main"));
         }
-        // No saved key's value reaches the log or the apps, nor a
-        // destination's token or URL.
+        // No saved key's value reaches the log or the apps.
         self.secrets.redact_json(&mut data);
-        self.destination_credentials.redact_json(&mut data);
         match self.store.append_event(kind, &data) {
             Ok(event) => {
                 let seq = event.seq;
@@ -694,7 +682,7 @@ impl Agent {
     }
 
     /// One model call outside a task (consolidation), through the same
-    /// backend: the attested gateway on desktops.
+    /// client as the tasks'.
     pub async fn complete(&self, request: &Value) -> Result<Value> {
         self.llm.chat(request).await
     }
@@ -1121,7 +1109,7 @@ impl Agent {
                 format!("[Scheduled task “{}”] {text}", schedule.name),
                 format!(
                     "(agentd) This is the scheduled task “{}” the user set up earlier ({}). They aren't \
-                     watching, so do it and end with a short report they can read in a notification.{} {}\n\n{text}",
+                     watching, so do it and end with a short report they can read later in the chat.{} {}\n\n{text}",
                     schedule.name,
                     schedule::describe(schedule.cron.as_deref(), schedule.next_run, &schedule.timezone),
                     if self.cfg.memory_v2 {
@@ -1210,6 +1198,7 @@ impl Agent {
             };
             self.recall(&task_id, &query, scheduled.as_ref().map(|s| s.id))
         });
+        let messages_len = messages.len();
         let state = RunState {
             task: task_id,
             model: settings.model,
@@ -1232,7 +1221,13 @@ impl Agent {
             nudged: false,
             memory_block,
             reported: None,
-            asked_again: false,
+            empty_retries: 0,
+            plan: Vec::new(),
+            review: ReviewClock {
+                // From the request on: the history before it isn't this task's work.
+                at_message: messages_len - 1,
+                ..ReviewClock::default()
+            },
             schedule_id: scheduled.as_ref().map(|s| s.id),
             scheduled: scheduled.map(|s| s.name),
             request: text,
@@ -1327,10 +1322,10 @@ impl Agent {
         self.store.set_run_status(&state.task, "waiting")
     }
 
-    /// Shows a parked task's approval card (and pushes it to the phone).
+    /// Shows a parked task's approval card.
     fn ask(&self, task_id: &str, park: Park) {
         tracing::info!(task = %task_id, approval = %park.id, "waiting for approval");
-        self.notify(approval_push(task_id, &park.id, &park.card));
+        self.notify_card(task_id, &park.card);
         self.emit("approval.requested", park.card);
         self.emit("task.paused", json!({"task": task_id, "approval": park.id}));
     }
@@ -1395,6 +1390,15 @@ impl Agent {
         if let Err(err) = self.store.finish_run(task_id, status, state.step, cost, answer) {
             tracing::error!(%err, "couldn't store the run's end");
         }
+        self.notify_finished(
+            task_id,
+            status,
+            state.seconds,
+            answer,
+            state.scheduled.as_deref(),
+            state.reported.as_ref().map(|r| r.summary.as_str()),
+            quiet,
+        );
         // Memory v2: fold the finished task into memory, later.
         crate::consolidate::trigger(self);
         let outcome = state.reported.as_ref().map(|r| r.outcome.as_str());
@@ -1403,26 +1407,11 @@ impl Agent {
             // Counted, so the scheduled-run prompt can be tuned.
             tracing::info!(task = %task_id, "report_outcome_missing");
         }
-        // The attention budget (push.rs): only what the user must act on or
-        // can use.
-        if let Some((title, body)) = push::on_finish(
-            &self.cfg.desktop_name,
-            state.scheduled.as_deref(),
-            status,
-            state.reported.as_ref(),
-            answer,
-        ) {
-            self.notify(Push {
-                title,
-                body,
-                category: None,
-                thread: task_id.clone(),
-                data: json!({"task": task_id}),
-            });
-        }
     }
 
     async fn run_loop(&self, state: &mut RunState, mut answer: Option<Answer>) -> Result<Outcome> {
+        // Working time: what the task had, plus this stretch (drive adds it on).
+        let loop_started = Instant::now();
         let now = self.user_clock().now();
         // The date and time as of now: a parked task may resume much later.
         let memories = if self.cfg.memory_v2 {
@@ -1444,8 +1433,7 @@ impl Agent {
         } else {
             self.memory_prompt()
         };
-        let destinations = self.store.destinations().unwrap_or_default();
-        let mut prompt = tools::system_prompt(
+        let prompt = tools::system_prompt(
             self.cfg.shell_tool,
             &now,
             &memories,
@@ -1453,16 +1441,42 @@ impl Agent {
             &self.keys_prompt(),
             self.cfg.memory_v2,
         );
-        if !destinations.is_empty() {
-            let listing: String = destinations
-                .iter()
-                .map(|d| format!("- {}: {}\n", d.name, d.describe()))
-                .collect();
-            prompt.push_str(&tools::updates_rule(&listing));
-        } else {
-            prompt.push_str(tools::NO_UPDATES_RULE);
-        }
         state.messages[0] = json!({"role": "system", "content": prompt});
+        let schemas = tools::schemas(
+            self.cfg.shell_tool,
+            !self.skills.is_empty(),
+            self.cfg.memory_v2,
+            self.cfg.memory_v2 && state.scheduled.is_some(),
+        );
+        // The user answered a stuck card (review): keep going with the
+        // supervisor's advice, or stop with a summary of where it got to
+        // (without the browser: it's no longer needed).
+        if answer.as_ref().is_some_and(|a| a.card["kind"] == "stuck") {
+            let answer = answer.take().expect("checked");
+            let (reason, advice) = state.review.stuck.take().unwrap_or_default();
+            if !answer.approved {
+                return Ok(self
+                    .wrap_up(
+                        state,
+                        &schemas,
+                        &format!("The user stopped this task after a check found it stuck: {reason}"),
+                        format!("Stopped: {reason}"),
+                        "stuck",
+                    )
+                    .await);
+            }
+            let advice = if advice.is_empty() {
+                String::new()
+            } else {
+                format!(" The check's advice: {advice}")
+            };
+            state.messages.push(json!({"role": "user", "content": format!(
+                "(agentd) A check on your progress found you may be stuck ({reason}), and the user chose to \
+                 keep going.{advice}"
+            )}));
+            let (step, secs, messages) = (state.step, state.seconds, state.messages.len());
+            state.review.checked(step, secs, messages);
+        }
         let background = state.scheduled.is_some();
         let mut browser = Browser::new(self.cdp.clone(), state.allow_actions, self.policy.clone());
         if background {
@@ -1473,18 +1487,6 @@ impl Agent {
             browser
                 .attach(self.store.setting("tab_target")?.as_deref())
                 .await?;
-        }
-        let mut schemas = tools::schemas(
-            self.cfg.shell_tool,
-            !self.skills.is_empty(),
-            self.cfg.memory_v2,
-            self.cfg.memory_v2 && state.scheduled.is_some(),
-        );
-        if !destinations.is_empty()
-            && let Some(list) = schemas.as_array_mut()
-        {
-            let names: Vec<String> = destinations.iter().map(|d| d.name.clone()).collect();
-            list.push(tools::post_update_tool(&names));
         }
         let lane = if background {
             &self.background_cancel
@@ -1531,13 +1533,9 @@ impl Agent {
                     Some(command) if name == "run_shell" && guard::is_shell_schedule(command) => {
                         Some(guard::SHELL_SCHEDULE_REFUSAL.to_string())
                     }
-                    // Not even with approval: the egress controls, and Slack's or
-                    // Teams' APIs around post_update.
+                    // Not even with approval: the egress controls.
                     Some(command) if name == "run_shell" && guard::touches_egress_policy(command) => {
                         Some(guard::EGRESS_REFUSAL.to_string())
-                    }
-                    Some(command) if name == "run_shell" && guard::calls_messaging_api(command) => {
-                        Some(guard::MESSAGING_API_REFUSAL.to_string())
                     }
                     Some(command) if name == "run_shell" && guard::is_bare_date(command) => Some(format!(
                         "not run: you don't need the shell for the date. It's now {now} for the user; \
@@ -1577,9 +1575,9 @@ impl Agent {
                     let outcome = args["outcome"].as_str().unwrap_or_default();
                     let summary = args["summary"].as_str().unwrap_or_default().trim();
                     if matches!(outcome, "result" | "nothing" | "blocked") {
-                        state.reported = Some(push::Reported {
+                        state.reported = Some(schedule::Reported {
                             outcome: outcome.to_string(),
-                            summary: push::clip(summary, 180),
+                            summary: schedule::clip(summary, 180),
                         });
                         // The answer stays the model's own text when it wrote one.
                         let text = state
@@ -1611,6 +1609,25 @@ impl Agent {
                         .to_string();
                     self.action_needed(&browser, &task_id, &reason).await;
                     break 'task Outcome::Finished(format!("I need you: {reason}"), "needs_user");
+                }
+                if name == "update_plan" {
+                    state.queue.remove(0);
+                    let content = match plan::parse(&args) {
+                        Ok(items) => {
+                            state.plan = items;
+                            // The web app's checklist: a scheduled run's isn't watched.
+                            if !background {
+                                self.emit("plan", json!({"task": task_id, "items": state.plan}));
+                            }
+                            let (done, total) = plan::progress(&state.plan);
+                            format!("ok: plan saved ({done} of {total} done)")
+                        }
+                        Err(why) => format!("error: {why}"),
+                    };
+                    state
+                        .messages
+                        .push(json!({"role": "tool", "tool_call_id": call["id"], "content": content}));
+                    continue;
                 }
                 let result = if args.is_object() {
                     let call = self.call_tool(
@@ -1690,8 +1707,18 @@ impl Agent {
             if *cancel.borrow() {
                 break 'task Outcome::Finished("Stopped.".into(), "cancelled");
             }
-            if state.step >= self.cfg.max_steps {
-                break 'task self.wrap_up(state, &schemas).await;
+            // No cap on steps: every so often the supervisor checks on the task.
+            let active = state.seconds + loop_started.elapsed().as_secs_f64();
+            if self.review_due(state, active) {
+                let outcome = tokio::select! {
+                    outcome = self.review(state, &schemas, active) => outcome,
+                    _ = stop.wait_for(|stopped| *stopped) => {
+                        break 'task Outcome::Finished("Stopped.".into(), "cancelled");
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    break 'task outcome;
+                }
             }
 
             // The model's next turn.
@@ -1701,16 +1728,32 @@ impl Agent {
             if cut > 0 {
                 tracing::info!(task = %task_id, step, cut, "trimmed old tool output from the context");
             }
-            let request = json!({
+            let max_tokens = turn_max_tokens(state.empty_retries);
+            let mut request = json!({
                 "model": state.model, "messages": state.messages, "tools": schemas,
-                "tool_choice": "auto", "max_tokens": 8192,
+                "tool_choice": "auto", "max_tokens": max_tokens,
             });
             // A stop interrupts the model call rather than waiting for its answer.
             let reply = tokio::select! {
-                reply = self.llm.chat(&request) => reply?,
+                reply = self.llm.chat(&request) => reply,
                 _ = stop.wait_for(|stopped| *stopped) => {
                     break 'task Outcome::Finished("Stopped.".into(), "cancelled");
                 }
+            };
+            // More room than the model or the account allows: the usual limit, then.
+            let reply = match reply {
+                Err(err) if max_tokens > TURN_MAX_TOKENS => {
+                    tracing::warn!(task = %task_id, step, max_tokens, err = %format!("{err:#}"),
+                        "a larger reply was refused: trying the usual limit");
+                    request["max_tokens"] = json!(TURN_MAX_TOKENS);
+                    tokio::select! {
+                        reply = self.llm.chat(&request) => reply?,
+                        _ = stop.wait_for(|stopped| *stopped) => {
+                            break 'task Outcome::Finished("Stopped.".into(), "cancelled");
+                        }
+                    }
+                }
+                reply => reply?,
             };
             state.usage.add(reply.get("usage"));
             let message = reply["choices"][0]["message"].clone();
@@ -1718,18 +1761,35 @@ impl Agent {
             // models that want it (GLM, Kimi) and without for the rest.
             state.messages.push(llm::for_history(&message, &state.model));
             let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
-            if calls.is_empty() {
-                // No text either: the thinking used up the reply. Ask once
-                // for the answer, rather than ending with "(empty answer)".
-                if is_empty_reply(&message) && !state.asked_again {
-                    state.asked_again = true;
-                    let finish = reply["choices"][0]["finish_reason"].as_str().unwrap_or("");
-                    tracing::info!(task = %task_id, step, finish, "empty reply: asking for the answer");
+            if calls.is_empty() && is_empty_reply(&message) {
+                // No text and no call: the thinking used up the reply. Ask
+                // again, with more room each time; then end with a summary.
+                let finish = reply["choices"][0]["finish_reason"].as_str().unwrap_or("");
+                if state.empty_retries < EMPTY_RETRIES {
+                    state.empty_retries += 1;
+                    tracing::info!(task = %task_id, step, finish, retry = state.empty_retries,
+                        "empty reply: asking again");
                     state
                         .messages
                         .push(json!({"role": "user", "content": EMPTY_REPLY}));
                     continue;
                 }
+                tracing::warn!(task = %task_id, step, finish, "empty replies: ending with a summary");
+                break 'task self
+                    .wrap_up(
+                        state,
+                        &schemas,
+                        "Your last replies were cut off before you wrote anything.",
+                        "The model's replies kept getting cut off before it wrote anything, so I stopped. Ask me \
+                         again, or pick another model in Settings."
+                            .into(),
+                        // Not "error": a scheduled run would be tried again and cut off again.
+                        "stuck",
+                    )
+                    .await;
+            }
+            state.empty_retries = 0;
+            if calls.is_empty() {
                 // Models sometimes ask for a sign-in in their answer, which ends the task
                 // with no way for the user to reach the tab. Remind them once.
                 if !state.reminded && browser.looks_like_sign_in().await {
@@ -1749,11 +1809,7 @@ impl Agent {
                         .push(json!({"role": "user", "content": REMEMBER_NUDGE}));
                     continue;
                 }
-                let answer = message["content"]
-                    .as_str()
-                    .unwrap_or("(empty answer)")
-                    .trim()
-                    .to_string();
+                let answer = message["content"].as_str().unwrap_or_default().trim().to_string();
                 break 'task Outcome::Finished(answer, "done");
             }
             state.queue = calls;
@@ -1773,17 +1829,24 @@ impl Agent {
         Ok(outcome)
     }
 
-    /// Out of steps: one last turn without tools, so the user hears what was
-    /// done and what's left rather than just "stopped".
-    async fn wrap_up(&self, state: &mut RunState, schemas: &Value) -> Outcome {
-        let fallback = format!("I stopped after {} steps without finishing.", self.cfg.max_steps);
+    /// The task has to end before it's done (`why`, for the model): one last
+    /// turn without tools, so the user hears what was done and what's left
+    /// rather than just "stopped". `fallback` if that turn gives nothing.
+    async fn wrap_up(
+        &self,
+        state: &mut RunState,
+        schemas: &Value,
+        why: &str,
+        fallback: String,
+        status: &'static str,
+    ) -> Outcome {
         state
             .messages
-            .push(json!({"role": "user", "content": tools::WRAP_UP}));
+            .push(json!({"role": "user", "content": tools::wrap_up(why)}));
         guard::enforce_budget(&mut state.messages, guard::TOOL_OUTPUT_BUDGET);
         let request = json!({
             "model": state.model, "messages": state.messages, "tools": schemas,
-            "tool_choice": "none", "max_tokens": 2048,
+            "tool_choice": "none", "max_tokens": TURN_MAX_TOKENS,
         });
         let answer = match self.llm.chat(&request).await {
             Ok(reply) => {
@@ -1799,7 +1862,112 @@ impl Agent {
                 fallback
             }
         };
-        Outcome::Finished(answer, "max_steps")
+        Outcome::Finished(answer, status)
+    }
+
+    /// Whether the supervisor should check on the task now: enough working
+    /// time or model turns since its last check.
+    fn review_due(&self, state: &RunState, active: f64) -> bool {
+        let (steps, secs) = (self.cfg.review_every_steps, self.cfg.review_every_secs);
+        (steps > 0 && state.step.saturating_sub(state.review.at_step) >= steps)
+            || (secs > 0 && active - state.review.at_secs >= secs as f64)
+    }
+
+    /// The supervisor's check (supervise.rs). None: carry on, after a nudge
+    /// with its advice in the conversation. Some: a chat task parks on a stuck
+    /// card for the user (never answered by Auto approve: it's about whether to
+    /// keep spending, not a permission), and a scheduled run ends with a summary.
+    async fn review(&self, state: &mut RunState, schemas: &Value, active: f64) -> Option<Outcome> {
+        let task_id = state.task.clone();
+        let minutes = (active / 60.0).round() as u64;
+        let digest = supervise::Digest {
+            request: &state.request,
+            plan: &state.plan,
+            steps: state.step,
+            minutes,
+            steps_since: state.step.saturating_sub(state.review.at_step),
+            since: state.messages.get(state.review.at_message..).unwrap_or_default(),
+            previous: state.review.previous.as_deref(),
+        }
+        .text();
+        let review = match self.llm.chat(&supervise::request(&state.model, &digest)).await {
+            Ok(reply) => {
+                state.usage.add(reply.get("usage"));
+                supervise::parse(&reply)
+            }
+            Err(err) => {
+                tracing::warn!(task = %task_id, err = %format!("{err:#}"), "the supervisor's check failed");
+                None
+            }
+        };
+        let review = match review {
+            Some(review) => review,
+            None => {
+                state.review.failures += 1;
+                self.emit("review", json!({"task": task_id, "verdict": "failed"}));
+                // Tried again before the next turn; twice in a row, it counts as stuck.
+                if state.review.failures < REVIEW_FAILURES {
+                    return None;
+                }
+                supervise::Review {
+                    verdict: Verdict::Stuck,
+                    reason: "The check on this task's progress failed twice in a row.".into(),
+                    advice: String::new(),
+                }
+            }
+        };
+        let reason = if review.reason.is_empty() {
+            "It doesn't seem to be getting anywhere.".to_string()
+        } else {
+            review.reason
+        };
+        tracing::info!(task = %task_id, step = state.step, minutes, verdict = review.verdict.as_str(), "supervisor's check");
+        self.emit(
+            "review",
+            json!({"task": task_id, "verdict": review.verdict.as_str(), "reason": reason}),
+        );
+        let (step, messages) = (state.step, state.messages.len());
+        state.review.checked(step, active, messages);
+        match review.verdict {
+            Verdict::Progressing => {
+                state.review.previous = None;
+                None
+            }
+            Verdict::Nudge => {
+                let advice = if review.advice.is_empty() {
+                    "Step back and try a different approach.".to_string()
+                } else {
+                    review.advice
+                };
+                state.review.previous = Some(format!("nudge: {advice}"));
+                state.messages.push(json!({"role": "user", "content": format!(
+                    "(agentd) A check on your progress: {reason} Try this: {advice}"
+                )}));
+                None
+            }
+            Verdict::Stuck if state.scheduled.is_some() => Some(
+                self.wrap_up(
+                    state,
+                    schemas,
+                    &format!("A check on your progress found you stuck: {reason}"),
+                    format!("Stopped: {reason}"),
+                    "stuck",
+                )
+                .await,
+            ),
+            Verdict::Stuck => {
+                state.review.previous = Some(format!("stuck: {reason}"));
+                state.review.stuck = Some((reason.clone(), review.advice));
+                let (done, total) = plan::progress(&state.plan);
+                let id = short_id();
+                let card = json!({
+                    "kind": "stuck", "id": id, "task": task_id, "reason": reason,
+                    "minutes": minutes, "steps": step,
+                    "plan": (total > 0).then(|| json!({"done": done, "total": total})),
+                });
+                Some(Outcome::Parked(Park { id, card }))
+            }
+        }
     }
 
     /// Runs a tool call. `resumed`: the user's answer, when the task parked on
@@ -2092,10 +2260,6 @@ impl Agent {
             "request_access" if self.cfg.shell_tool => {
                 self.request_access(task_id, args, tainted, resumed, schedule.is_some())
             }
-            "post_update" => {
-                self.acted(task_id);
-                Ok(self.post_update(Some(task_id), args).await)
-            }
             _ => Ok(format!("error: unknown tool {name}")),
         }
     }
@@ -2348,7 +2512,7 @@ impl Agent {
         let origin = if tainted { "agent_tainted" } else { "user" };
         self.store
             .set_schedule_origin(saved.id, &self.policy_version(), origin)?;
-        // Runs without asking, as every schedule a person sets up does (§6.21),
+        // Runs without asking, as every schedule a person sets up does (§6.14),
         // unless outside content may have asked for it: then its runs skip
         // whatever would ask.
         if !tainted {
@@ -2368,46 +2532,6 @@ impl Agent {
         ))
     }
 
-    /// The web app's Setup steps someone chose to skip (no Datadog, say), for
-    /// every browser of this desktop. Only the steps it knows.
-    pub fn setup_skipped(&self) -> Vec<String> {
-        self.store
-            .setting("setup_skipped")
-            .ok()
-            .flatten()
-            .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|step| SETUP_STEPS.contains(&step.as_str()))
-            .collect()
-    }
-
-    pub fn set_setup_skipped(&self, skipped: &[String], by: Option<String>) -> Result<Vec<String>, String> {
-        let mut steps: Vec<String> = Vec::new();
-        for step in skipped.iter().map(|s| s.trim()) {
-            if !SETUP_STEPS.contains(&step) {
-                return Err(format!(
-                    "there's no setup step {step:?} (the steps: {})",
-                    SETUP_STEPS.join(", ")
-                ));
-            }
-            if !steps.iter().any(|s| s == step) {
-                steps.push(step.to_string());
-            }
-        }
-        self.store
-            .set_setting(
-                "setup_skipped",
-                &serde_json::to_string(&steps).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-        tracing::info!(skipped = ?steps, by = ?by, "setup steps skipped");
-        Ok(steps)
-    }
-
-    /// A repeating schedule a person sets up in the web app (Setup's
-    /// examples): the same limits as schedule_task, no card (they chose it).
-    /// The app sends its time zone, remembered as a message's is.
     /// "Run without asking" for a schedule, set by a person in the web app (the
     /// agent has no way to): its runs then go ahead with what would ask,
     /// except root commands and browser changes. None: no such schedule.
@@ -2426,6 +2550,9 @@ impl Agent {
         Ok(Some(event))
     }
 
+    /// A repeating schedule a person sets up in the web app: the same limits
+    /// as schedule_task, no card (they chose it). The app sends its time zone,
+    /// remembered as a message's is.
     pub fn add_user_schedule(
         &self,
         name: &str,
@@ -2733,28 +2860,6 @@ impl Agent {
         Ok(())
     }
 
-    /// For a scheduled run's command: Squid closed to the shell user (the
-    /// guard firewall's `squid_locked` set), so its only way out is the egress
-    /// gate, which pins keys meanwhile. Undone when the lock is dropped. None
-    /// without a gate (local development without one, or tests).
-    fn lock_egress(&self) -> Result<Option<EgressLock>> {
-        let Some(gate) = self.gate.get() else {
-            return Ok(None);
-        };
-        let uid = if self.cfg.run_as.is_empty() {
-            None // local development: no firewall
-        } else {
-            let uid = self.shell_uid.context("the shell user's uid is unknown")?;
-            nft_element("add", "squid_locked", &uid.to_string())?;
-            Some(uid)
-        };
-        gate.set_pinning(true);
-        Ok(Some(EgressLock {
-            gate: gate.clone(),
-            uid,
-        }))
-    }
-
     /// For a command the user approved to connect on its own: the guard
     /// firewall lets the shell user out (its `direct_egress` set) until this
     /// is dropped. Commands run one at a time and each unit's processes end
@@ -2771,18 +2876,24 @@ impl Agent {
         Ok(Some(DirectEgress { uid }))
     }
 
-    /// At startup: what an agentd that stopped mid-command left in the guard
-    /// firewall's sets is undone.
-    pub fn clear_egress_locks(&self) {
+    /// At startup: a direct command's opening that an agentd which stopped
+    /// mid-command left in the guard firewall is closed.
+    pub fn clear_direct_egress(&self) {
         if !self.cfg.run_as.is_empty() {
-            for set in ["squid_locked", "direct_egress"] {
-                let _ = std::process::Command::new("sudo")
-                    .args(["-n", "nft", "flush", "set", "inet", "cloud_desktop_guard", set])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
+            let _ = std::process::Command::new("sudo")
+                .args([
+                    "-n",
+                    "nft",
+                    "flush",
+                    "set",
+                    "inet",
+                    "cloud_desktop_guard",
+                    "direct_egress",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
         }
     }
 
@@ -2829,11 +2940,9 @@ impl Agent {
             }))
         } else if let Some(danger) = danger {
             Some(danger.into())
-        } else if tainted && self.policy.sends_data(inner) && !monitoring::is_monitoring_read(inner, &keys) {
+        } else if tainted && self.policy.sends_data(inner) {
             // Injected instructions in a page could try to send data out (the
-            // card says it came after outside content: `tainted`). Reading the
-            // customer's own Cloudflare or Datadog, as monitoring does after
-            // reading their logs, doesn't ask (monitoring.rs).
+            // card says it came after outside content: `tainted`).
             Some(if keys.is_empty() {
                 "could send data off the desktop".into()
             } else {
@@ -2919,23 +3028,6 @@ impl Agent {
             turn = self.shell_turn.lock() => turn,
             _ = cancel.wait_for(|stopped| *stopped) => return Ok("not run: stopped".into()),
         };
-        // A scheduled run's commands go out only through the egress gate,
-        // which pins Cloudflare's and Datadog's keys (egress.rs).
-        let _egress = if unattended {
-            match self.lock_egress() {
-                Ok(lock) => lock,
-                Err(err) => {
-                    tracing::error!(err = %format!("{err:#}"), "couldn't lock the egress for a scheduled command");
-                    return Ok(
-                        "not run: agentd couldn't route a scheduled run's command through its egress gate. Say so \
-                         in your report."
-                            .into(),
-                    );
-                }
-            }
-        } else {
-            None
-        };
         // Only now, holding shell_turn, so no other command shares the opening.
         let _direct = if direct {
             match self.open_direct(timeout) {
@@ -2950,13 +3042,7 @@ impl Agent {
         } else {
             None
         };
-        let route = if direct {
-            Route::Direct
-        } else if unattended {
-            Route::Gate
-        } else {
-            Route::Proxy
-        };
+        let route = if direct { Route::Direct } else { Route::Proxy };
         let mut output = self
             .shell
             .run(inner, as_root, timeout, &files, route, cancel)
@@ -3123,13 +3209,7 @@ impl Agent {
             "action_needed",
             json!({"task": task_id, "id": id, "reason": reason, "page": page, "image": image}),
         );
-        self.notify(Push {
-            title: "Action needed".into(),
-            body: push::clip(reason, 180),
-            category: Some("ACTION"),
-            thread: task_id.to_string(),
-            data: json!({"task": task_id, "action": id}),
-        });
+        self.notify_action_needed(task_id, reason);
     }
 
     /// The saved keys, by name, for the system prompt.
@@ -3222,247 +3302,6 @@ impl Agent {
         Ok(removed || recorded)
     }
 
-    // --- Updates to Slack and Teams (destinations.rs) ------------------------------
-
-    /// Adds or changes a destination from the web app. The credential (a
-    /// Slack bot token, a Teams webhook URL) is kept apart from saved keys
-    /// and never shown again; without one, the saved one stays.
-    pub fn save_destination(
-        &self,
-        name: &str,
-        kind: &str,
-        channel: &str,
-        credential: Option<&str>,
-        link: &str,
-        by: Option<String>,
-    ) -> Result<Destination, String> {
-        destinations::check_name(name)?;
-        let kind = Kind::parse(kind).ok_or("kind is slack or teams")?;
-        let existing = self.store.destination(name).map_err(|e| e.to_string())?;
-        let all = self.store.destinations().map_err(|e| e.to_string())?;
-        if existing.is_none() && all.len() >= destinations::MAX_DESTINATIONS {
-            return Err(format!(
-                "there are already {} destinations; remove one first",
-                destinations::MAX_DESTINATIONS
-            ));
-        }
-        let credential = credential.map(str::trim).filter(|c| !c.is_empty());
-        let key = destinations::credential_name(name);
-        let changes_kind = existing.as_ref().is_some_and(|d| d.kind != kind);
-        if credential.is_none() && (!self.destination_credentials.has(&key) || changes_kind) {
-            return Err(match kind {
-                Kind::Slack => "paste the Slack app's bot token (xoxb-…)".into(),
-                Kind::Teams => "paste the Teams workflow's URL".into(),
-            });
-        }
-        let channel = match kind {
-            Kind::Slack => destinations::check_slack(channel, credential)?,
-            Kind::Teams => {
-                if let Some(url) = credential {
-                    destinations::check_teams(url)?;
-                }
-                String::new()
-            }
-        };
-        let destination = Destination {
-            name: name.to_string(),
-            kind,
-            channel,
-            link: destinations::check_link(link.trim())?,
-            created: existing.as_ref().map_or_else(unix_now, |d| d.created),
-            by: existing.as_ref().map_or(by.clone(), |d| d.by.clone()),
-            last_post: existing.as_ref().and_then(|d| d.last_post),
-            last_error: None,
-        };
-        if let Some(credential) = credential {
-            secrets::check_value(credential)?;
-            self.destination_credentials
-                .put(&key, credential)
-                .map_err(|e| format!("couldn't save it: {e}"))?;
-        }
-        self.store
-            .save_destination(&destination)
-            .map_err(|e| e.to_string())?;
-        tracing::info!(name, kind = kind.as_str(), by = ?by, "destination saved");
-        self.emit(
-            "destination.saved",
-            json!({"name": name, "kind": kind.as_str(), "channel": destination.channel, "by": by}),
-        );
-        Ok(destination)
-    }
-
-    pub fn delete_destination(&self, name: &str, by: Option<String>) -> Result<bool> {
-        let removed = self.store.delete_destination(name)?;
-        self.destination_credentials
-            .remove(&destinations::credential_name(name))?;
-        if removed {
-            tracing::info!(name, by = ?by, "destination removed");
-            self.emit("destination.deleted", json!({"name": name, "by": by}));
-        }
-        Ok(removed)
-    }
-
-    /// "Send a test message" in the web app: one fixed update, outside the
-    /// rate limit and the record.
-    pub async fn test_destination(&self, name: &str) -> Result<(), String> {
-        let destination = self
-            .store
-            .destination(name)
-            .map_err(|e| e.to_string())?
-            .ok_or("no such destination")?;
-        let body = format!("Updates from {} will appear here.", self.cfg.desktop_name);
-        let update = Update {
-            title: "Your agent can post here",
-            body: &body,
-            severity: Severity::Info,
-            follows: None,
-        };
-        let result = self.deliver(&destination, &update, None).await.map(|_| ());
-        let _ = self
-            .store
-            .destination_result(name, unix_now(), result.as_ref().err().map(String::as_str));
-        result
-    }
-
-    /// Sends one update; Slack's message ts when there is one.
-    async fn deliver(
-        &self,
-        d: &Destination,
-        update: &Update<'_>,
-        thread_ts: Option<&str>,
-    ) -> Result<Option<String>, String> {
-        let credential = self
-            .destination_credentials
-            .get(&destinations::credential_name(&d.name))
-            .ok_or("its token or URL is missing: set it up again in the app")?;
-        match d.kind {
-            Kind::Slack => {
-                let payload = destinations::slack_payload(
-                    &d.channel,
-                    update,
-                    &self.cfg.desktop_name,
-                    &d.link,
-                    thread_ts,
-                );
-                self.poster.slack(&credential, &payload).await.map(Some)
-            }
-            Kind::Teams => {
-                let payload = destinations::teams_payload(update, &self.cfg.desktop_name, &d.link);
-                self.poster.teams(&credential, &payload).await.map(|()| None)
-            }
-        }
-    }
-
-    /// The post_update tool. Whatever the model asks: only a destination a
-    /// person set up, the content checks of destinations.rs, at most
-    /// POSTS_PER_HOUR an hour, and never the same update twice in a row.
-    pub async fn post_update(&self, task: Option<&str>, args: &Value) -> String {
-        let name = args["destination"].as_str().unwrap_or_default().trim();
-        let Ok(Some(destination)) = self.store.destination(name) else {
-            let names: Vec<String> = self
-                .store
-                .destinations()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|d| d.name)
-                .collect();
-            return format!(
-                "not posted: there's no destination {name:?} (there are: {}). Only the user can add one, in the app",
-                if names.is_empty() {
-                    "none".to_string()
-                } else {
-                    names.join(", ")
-                }
-            );
-        };
-        let title = args["title"].as_str().unwrap_or_default().trim();
-        let body = args["body"].as_str().unwrap_or_default().trim();
-        if title.is_empty() || body.is_empty() {
-            return "not posted: an update needs a title and a body".into();
-        }
-        let now = unix_now();
-        let recent = self.store.posts_since(name, now - 3600).unwrap_or(0);
-        if recent >= destinations::POSTS_PER_HOUR {
-            return format!(
-                "not posted: {recent} updates went to {name} in the last hour, the limit. Put what's left into one \
-                 update later"
-            );
-        }
-        let digest = aws_lc_rs::digest::digest(
-            &aws_lc_rs::digest::SHA256,
-            format!("{name}\n{title}\n{body}").as_bytes(),
-        );
-        let hash = crate::attest::hex(digest.as_ref());
-        if let Ok(Some(at)) = self
-            .store
-            .same_post_since(name, &hash, now - destinations::DEDUPE_SECS)
-        {
-            return format!(
-                "not posted: the same update went to {name} {} minutes ago",
-                (now - at) / 60
-            );
-        }
-        let thread = match args["thread"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
-            None => None,
-            Some(id) => match self.store.post(id) {
-                Ok(Some(post)) if post.destination == name => Some(post),
-                _ => {
-                    return format!(
-                        "not posted: there's no earlier update {id} in {name}; post without thread"
-                    );
-                }
-            },
-        };
-        let update = Update {
-            title,
-            body,
-            severity: Severity::parse(args["severity"].as_str()),
-            follows: thread.as_ref().map(|p| p.title.as_str()),
-        };
-        let parent_ts = thread.as_ref().and_then(|p| p.ts.clone());
-        match self.deliver(&destination, &update, parent_ts.as_deref()).await {
-            Ok(ts) => {
-                let id = short_id();
-                let post = Post {
-                    id: id.clone(),
-                    destination: name.to_string(),
-                    title: title.chars().take(destinations::MAX_TITLE).collect(),
-                    hash,
-                    // A follow-up stays in the first update's thread.
-                    ts: parent_ts.or(ts),
-                    task: task.map(String::from),
-                    created: now,
-                };
-                if let Err(err) = self.store.record_post(&post) {
-                    tracing::warn!(%err, "couldn't record a post");
-                }
-                let _ = self.store.destination_result(name, now, None);
-                self.emit(
-                    "update.posted",
-                    json!({"task": task, "destination": name, "id": id, "title": post.title, "thread": thread.map(|p| p.id)}),
-                );
-                let follow = match destination.kind {
-                    Kind::Slack => format!("To follow up in its thread, pass thread: {id}."),
-                    Kind::Teams => {
-                        format!("Teams has no threads: a follow-up with thread: {id} says what it follows.")
-                    }
-                };
-                format!(
-                    "posted to {name} ({}) as update {id}. {follow}",
-                    destination.describe()
-                )
-            }
-            Err(problem) => {
-                let _ = self.store.destination_result(name, now, Some(&problem));
-                self.emit(
-                    "update.failed",
-                    json!({"task": task, "destination": name, "error": problem}),
-                );
-                format!("not posted to {name}: {problem}. Tell the user; don't try again more than once.")
-            }
-        }
-    }
-
     /// Resumes the task that asked for this key, now that it's saved. Only a
     /// request for this very key: never another kind of approval.
     pub fn answer_secret_request(
@@ -3498,116 +3337,18 @@ impl Agent {
         }
         text
     }
-
-    /// Notifies the user's devices through the relay: stored as a `push`
-    /// effect first, then sent with retries (effects.rs).
-    fn notify(&self, mut notification: Push) {
-        if self.push.is_none() {
-            return;
-        }
-        notification.title = self.secrets.redact(&notification.title).into_owned();
-        notification.body = self.secrets.redact(&notification.body).into_owned();
-        if let Err(err) = self.enqueue(
-            "push",
-            &notification.effect_key(),
-            &notification.payload(),
-            unix_now(),
-        ) {
-            tracing::error!(%err, "couldn't queue a notification");
-        }
-    }
-}
-
-/// The notification for an approval: what will run or be written, and where.
-fn approval_push(task_id: &str, id: &str, details: &Value) -> Push {
-    let text = |key: &str| details[key].as_str().unwrap_or_default().to_string();
-    let site = text("site");
-    let (title, body) = match (details["kind"].as_str(), details["action"].as_str()) {
-        // Opens the app, where the key is pasted: no Approve button here.
-        (Some("secret"), _) => {
-            return Push {
-                title: format!("{} needed", text("label")),
-                body: push::clip(&text("why"), 180),
-                category: None,
-                thread: task_id.to_string(),
-                data: json!({"task": task_id, "approval": id}),
-            };
-        }
-        (Some("schedule"), _) => (
-            "Schedule this?".to_string(),
-            format!("{}: {}", text("when"), text("text")),
-        ),
-        (Some("browser"), Some("type")) => (
-            format!("Write this on {site}?"),
-            format!("In “{}”: {}", text("target"), text("text")),
-        ),
-        (Some("browser"), Some("key")) if !text("summary").is_empty() => (
-            format!("Press {} on {site}?", text("key")),
-            format!(
-                "{}. In “{}”.",
-                text("summary").trim_end_matches('.'),
-                text("target")
-            ),
-        ),
-        (Some("browser"), Some("key")) => (
-            format!("Press {} on {site}?", text("key")),
-            format!("In “{}”. It {}.", text("target"), text("reason")),
-        ),
-        (Some("browser"), _) if !text("summary").is_empty() => (
-            format!("Click this on {site}?"),
-            format!("{}. “{}”.", text("summary").trim_end_matches('.'), text("target")),
-        ),
-        (Some("browser"), _) => (
-            format!("Click this on {site}?"),
-            format!("“{}”. It {}.", text("target"), text("reason")),
-        ),
-        _ if !text("summary").is_empty() => (
-            "Run a command?".into(),
-            format!(
-                "{}. It {}{}.",
-                text("summary").trim_end_matches('.'),
-                text("reason"),
-                if details["tainted"] == true {
-                    ", asked after reading outside content"
-                } else {
-                    ""
-                }
-            ),
-        ),
-        _ => (
-            "Run this command?".into(),
-            format!("{} (it {})", text("command"), text("reason")),
-        ),
-    };
-    Push {
-        title,
-        body: push::clip(&body, 180),
-        category: Some("APPROVAL"),
-        thread: task_id.to_string(),
-        data: json!({"task": task_id, "approval": id}),
-    }
 }
 
 #[cfg(test)]
-/// An agent on a scratch state directory: no Chrome, no relay, no model
-/// calls unless a task runs.
+/// An agent on a scratch state directory: no Chrome, no model calls unless a
+/// task runs.
 pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
-    test_agent_with("https://slack.com/api")
-}
-
-#[cfg(test)]
-/// test_agent, posting to a stand-in Slack (plain http on localhost).
-pub(crate) fn test_agent_with(slack_api: &str) -> (Arc<Agent>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("agentd-agent-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(dir.join("images")).unwrap();
     let cfg = Config {
         listen: "127.0.0.1:0".into(),
-        api_key: Some("test-key-not-used".to_string().into()),
+        api_key: "test-key-not-used".to_string().into(),
         llm_url: crate::llm::TOGETHER_URL.into(),
-        gateway_url: String::new(),
-        gateway_trust: crate::gateway::Trust::Attested(Vec::new()),
-        gateway_audience: String::new(),
-        aws_region: "ca-central-1".into(),
         model: "zai-org/GLM-5.3".into(),
         consolidation_model: crate::consolidate::DEFAULT_MODEL.into(),
         cdp_url: "http://127.0.0.1:1".into(),
@@ -3618,19 +3359,17 @@ pub(crate) fn test_agent_with(slack_api: &str) -> (Arc<Agent>, std::path::PathBu
         shell_tasks_max: "64".into(),
         shell_cpu_quota: "100%".into(),
         shell_proxy: String::new(),
-        egress_gate_listen: String::new(),
-        egress_gate_squid: String::new(),
-        egress_gate_upstream: None,
         egress_user_hosts: String::new(),
         egress_base_hosts: vec![".github.com".into(), "pypi.org".into()],
         policy_path: dir.join("no-policy.toml"),
         skills_dir: dir.join("no-skills"),
-        max_steps: 5,
+        review_every_secs: 1800,
+        review_every_steps: 5,
+        vapid_subject: "mailto:test@example.com".into(),
+        push_dev_endpoints: true,
         shell_tool: true,
         desktop_name: "test-desktop".into(),
-        push_relay_url: String::new(),
         memory_v2: true,
-        slack_api: slack_api.into(),
     };
     (Arc::new(Agent::new(cfg).unwrap()), dir)
 }
@@ -3713,7 +3452,7 @@ mod tests {
         let made = agent
             .add_user_schedule(
                 "Hourly check",
-                "Check Cloudflare",
+                "Check the build",
                 "0 * * * *",
                 None,
                 None,
@@ -3776,7 +3515,7 @@ mod tests {
         let reply = agent
             .request_secret(
                 "t11",
-                &json!({"name": "DD_API_KEY", "label": "Datadog API key", "why": "to read logs"}),
+                &json!({"name": "GITHUB_TOKEN", "label": "GitHub token", "why": "to read the repo"}),
                 true,
                 None,
                 true,
@@ -4337,9 +4076,9 @@ mod tests {
         let mut card = park.card;
         assert_eq!(
             agent
-                .apply_edit(&mut state, &mut card, "  Check only Cloudflare \n")
+                .apply_edit(&mut state, &mut card, "  Check only the build \n")
                 .as_deref(),
-            Some("Check only Cloudflare")
+            Some("Check only the build")
         );
         let reply = agent
             .schedule_task(
@@ -4350,13 +4089,13 @@ mod tests {
                     approved: true,
                     card,
                     by: None,
-                    edited: Some("Check only Cloudflare".into()),
+                    edited: Some("Check only the build".into()),
                 }),
             )
             .unwrap();
         assert!(reply.starts_with("scheduled #"), "{reply}");
         let saved = agent.store.schedules().unwrap();
-        assert_eq!(saved[0].prompt, "Check only Cloudflare");
+        assert_eq!(saved[0].prompt, "Check only the build");
         assert_eq!(saved[0].name, "Check everything");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4446,25 +4185,6 @@ mod tests {
             json!({"kind": "browser", "action": "click", "target": "Delete", "around": "main Delete"});
         assert!(same_request(&approved, &same));
         assert!(!same_request(&approved, &other));
-    }
-
-    #[test]
-    fn a_notification_leads_with_what_a_click_does() {
-        let push = approval_push(
-            "t1",
-            "c1",
-            &json!({"kind": "browser", "action": "click", "target": "Confirm", "site": "acme.com",
-                    "reason": "may send, delete or change something", "summary": "Pay the March invoice."}),
-        );
-        assert_eq!(push.title, "Click this on acme.com?");
-        assert_eq!(push.body, "Pay the March invoice. “Confirm”.");
-        let push = approval_push(
-            "t1",
-            "c1",
-            &json!({"kind": "browser", "action": "key", "key": "Enter", "target": "Search", "site": "acme.com",
-                    "reason": "may send or submit what's typed"}),
-        );
-        assert!(push.body.starts_with("In “Search”. It may send"), "{}", push.body);
     }
 
     #[test]
@@ -4675,17 +4395,6 @@ mod tests {
         assert_eq!(park.card["reason"], "runs as root");
         assert_eq!(park.card["tainted"], true); // the app says the words may be steered
 
-        let push = approval_push("t4", &park.id, &park.card);
-        assert_eq!(push.title, "Run a command?");
-        assert_eq!(
-            push.body,
-            "Check which proxy the shell uses. It runs as root, asked after reading outside content."
-        );
-        // No plain words (a model that left them out): the command, as before.
-        let mut bare = park.card.clone();
-        bare["summary"] = Value::Null;
-        assert!(approval_push("t4", "x", &bare).body.starts_with(command));
-
         assert_eq!(clip_summary(&"word ".repeat(40)).unwrap().chars().count(), 120);
         assert_eq!(clip_summary(" \n "), None);
         std::fs::remove_dir_all(dir).unwrap();
@@ -4704,7 +4413,7 @@ mod tests {
             "usage": Usage::default(), "seconds": 4.0, "scheduled": "Morning inbox", "schedule_id": 4,
         }))
         .unwrap();
-        state.reported = Some(push::Reported {
+        state.reported = Some(schedule::Reported {
             outcome: "nothing".into(),
             summary: "Inbox is clear".into(),
         });
@@ -4717,17 +4426,6 @@ mod tests {
         // A scheduled run's end isn't task.finished: the apps show that as the chat.
         assert!(events(&agent, "task.finished").is_empty());
         assert_eq!(events(&agent, "run.finished")[0]["outcome"], "nothing");
-        // And the attention rules keep the phone quiet for it (push.rs).
-        assert_eq!(
-            push::on_finish(
-                "d",
-                Some("Morning inbox"),
-                "done",
-                state.reported.as_ref(),
-                "Nothing new."
-            ),
-            None
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4812,6 +4510,8 @@ mod tests {
             "task": "t1", "model": "m", "allow_actions": true, "messages": [], "queue": [], "step": 3,
             "tainted": false, "reminded": false, "loops": guard::LoopDetector::default(),
             "usage": Usage::default(), "seconds": 1.0, "scheduled": "Morning inbox",
+            // Written by agentd before the supervisor: ignored now.
+            "asked_again": true,
         });
         let state: RunState = serde_json::from_value(old).unwrap();
         assert_eq!(
@@ -4820,11 +4520,12 @@ mod tests {
                 state.remembered,
                 state.nudged,
                 state.schedule_id,
-                state.asked_again
+                state.empty_retries
             ),
-            (false, false, false, None, false)
+            (false, false, false, None, 0)
         );
         assert_eq!(state.scheduled.as_deref(), Some("Morning inbox"));
+        assert!(state.plan.is_empty() && state.review.at_step == 0 && state.review.stuck.is_none());
     }
 
     #[test]
@@ -4859,330 +4560,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod destination_tests {
-    use std::sync::Mutex;
-
-    use axum::Router;
-    use axum::http::HeaderMap;
-    use axum::routing::post;
-
-    use super::*;
-
-    /// What the stand-ins for Slack and Teams were sent: (path, auth, body).
-    type Seen = Arc<Mutex<Vec<(String, String, Value)>>>;
-
-    /// Slack's chat.postMessage (#private answers not_in_channel) and a Teams
-    /// webhook, on localhost.
-    async fn stand_ins() -> (String, Seen) {
-        let seen: Seen = Arc::default();
-        let (slack, teams) = (seen.clone(), seen.clone());
-        let app = Router::new()
-            .route(
-                "/api/chat.postMessage",
-                post(move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
-                    let seen = slack.clone();
-                    async move {
-                        let auth = headers
-                            .get("authorization")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("")
-                            .to_string();
-                        let n = {
-                            let mut seen = seen.lock().unwrap();
-                            seen.push(("slack".into(), auth, body.clone()));
-                            seen.len()
-                        };
-                        if body["channel"] == "#private" {
-                            axum::Json(json!({"ok": false, "error": "not_in_channel"}))
-                        } else {
-                            axum::Json(json!({"ok": true, "ts": format!("1700000000.00010{n}")}))
-                        }
-                    }
-                }),
-            )
-            .route(
-                "/teams",
-                post(move |axum::Json(body): axum::Json<Value>| {
-                    let seen = teams.clone();
-                    async move {
-                        seen.lock().unwrap().push(("teams".into(), String::new(), body));
-                        axum::http::StatusCode::ACCEPTED
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (base, seen)
-    }
-
-    fn all_events(agent: &Agent) -> String {
-        serde_json::to_string(
-            &agent
-                .store
-                .events_after(0, 10_000)
-                .unwrap()
-                .iter()
-                .map(|e| (&e.kind, &e.data))
-                .collect::<Vec<_>>(),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn only_valid_destinations_are_saved() {
-        let (agent, _dir) = test_agent();
-        let save = |kind: &str, channel: &str, cred: Option<&str>| {
-            agent.save_destination(
-                "security",
-                kind,
-                channel,
-                cred,
-                "https://agent.acme.com/#/chat",
-                Some("me@acme.com".into()),
-            )
-        };
-        assert!(save("email", "#security", Some("xoxb-1")).is_err());
-        assert!(
-            save("slack", "#security", None)
-                .unwrap_err()
-                .contains("bot token")
-        );
-        assert!(
-            save("slack", "#security", Some("xoxp-a-user-token"))
-                .unwrap_err()
-                .contains("xoxb-")
-        );
-        assert!(
-            save("teams", "", Some("https://evil.example/hook"))
-                .unwrap_err()
-                .contains("Workflows")
-        );
-        let saved = save("slack", "Security", Some("xoxb-123-456-secretvalue")).unwrap();
-        assert_eq!(
-            (saved.channel.as_str(), saved.link.as_str()),
-            ("#security", "https://agent.acme.com")
-        );
-        // A change without a token keeps the saved one; to Teams it needs a URL.
-        assert!(save("slack", "#alerts", None).is_ok());
-        assert!(save("teams", "", None).is_err());
-        assert!(
-            agent
-                .save_destination("Bad Name", "slack", "#x", Some("xoxb-1-2-3456"), "", None)
-                .is_err()
-        );
-        let events = all_events(&agent);
-        assert!(
-            events.contains("destination.saved") && !events.contains("secretvalue"),
-            "{events}"
-        );
-        assert!(agent.delete_destination("security", None).unwrap());
-        assert!(
-            !agent
-                .destination_credentials
-                .has(&destinations::credential_name("security"))
-        );
-    }
-
-    #[tokio::test]
-    async fn posts_go_to_slack_in_threads_once_and_within_the_limit() {
-        let (base, seen) = stand_ins().await;
-        let (agent, _dir) = test_agent_with(&format!("{base}/api"));
-        agent
-            .save_destination(
-                "security",
-                "slack",
-                "#security",
-                Some("xoxb-123-456-secretvalue"),
-                "https://agent.acme.com",
-                None,
-            )
-            .unwrap();
-        let first = agent
-            .post_update(
-                Some("t1"),
-                &json!({"destination": "security", "title": "Credential stuffing on /api/login", "severity": "critical",
-                        "body": "**312** bursts from https://evil.example.com <!channel> token ghp_abcdefghijklmnopqrstuvwxyz0123456789"}),
-            )
-            .await;
-        assert!(
-            first.starts_with("posted to security (Slack #security) as update "),
-            "{first}"
-        );
-        let id = first
-            .split_whitespace()
-            .find(|w| w.len() == 13 && w.ends_with('.'))
-            .map(|w| w.trim_end_matches('.'))
-            .unwrap()
-            .to_string();
-        {
-            let seen = seen.lock().unwrap();
-            let (_, auth, body) = &seen[0];
-            assert_eq!(auth, "Bearer xoxb-123-456-secretvalue");
-            let text = body.to_string();
-            assert!(
-                text.contains("hxxps://evil[.]example[.]com") && !text.contains("https://evil"),
-                "{text}"
-            );
-            assert!(
-                !text.contains("<!channel>") && !text.contains("ghp_abc"),
-                "{text}"
-            );
-            assert_eq!(body["unfurl_links"], false);
-        }
-        // A follow-up goes into the first post's thread, and so does a follow-up of that one.
-        let second = agent
-            .post_update(Some("t2"), &json!({"destination": "security", "title": "Blocked", "body": "Rule tightened.", "thread": id}))
-            .await;
-        assert!(second.starts_with("posted"), "{second}");
-        let second_id = second
-            .split_whitespace()
-            .find(|w| w.len() == 13 && w.ends_with('.'))
-            .unwrap()
-            .trim_end_matches('.')
-            .to_string();
-        agent
-            .post_update(None, &json!({"destination": "security", "title": "Quiet again", "body": "No more bursts.", "thread": second_id}))
-            .await;
-        {
-            let seen = seen.lock().unwrap();
-            assert_eq!(seen[1].2["thread_ts"], "1700000000.000101");
-            assert_eq!(seen[2].2["thread_ts"], "1700000000.000101");
-        }
-        // The same update again, an unknown destination, a thread from nowhere.
-        let again = agent
-            .post_update(None, &json!({"destination": "security", "title": "Blocked", "body": "Rule tightened.", "thread": id}))
-            .await;
-        assert!(again.contains("the same update went"), "{again}");
-        assert!(
-            agent
-                .post_update(
-                    None,
-                    &json!({"destination": "attacker", "title": "x", "body": "y"})
-                )
-                .await
-                .contains("no destination")
-        );
-        assert!(
-            agent
-                .post_update(
-                    None,
-                    &json!({"destination": "security", "title": "x", "body": "y", "thread": "nope"})
-                )
-                .await
-                .contains("no earlier update")
-        );
-        // At most POSTS_PER_HOUR an hour.
-        for n in 3..destinations::POSTS_PER_HOUR {
-            let reply = agent
-                .post_update(
-                    None,
-                    &json!({"destination": "security", "title": format!("n{n}"), "body": "b"}),
-                )
-                .await;
-            assert!(reply.starts_with("posted"), "{reply}");
-        }
-        let over = agent
-            .post_update(
-                None,
-                &json!({"destination": "security", "title": "one more", "body": "b"}),
-            )
-            .await;
-        assert!(over.contains("the limit"), "{over}");
-        let events = all_events(&agent);
-        assert!(events.contains("update.posted") && !events.contains("secretvalue"));
-    }
-
-    #[tokio::test]
-    async fn slack_s_refusal_is_said_plainly_and_kept() {
-        let (base, _seen) = stand_ins().await;
-        let (agent, _dir) = test_agent_with(&format!("{base}/api"));
-        agent
-            .save_destination("private", "slack", "#private", Some("xoxb-1-2-3456789"), "", None)
-            .unwrap();
-        let reply = agent
-            .post_update(
-                None,
-                &json!({"destination": "private", "title": "t", "body": "b"}),
-            )
-            .await;
-        assert!(
-            reply.contains("isn't in #private") && reply.contains("invite"),
-            "{reply}"
-        );
-        let d = agent.store.destination("private").unwrap().unwrap();
-        assert!(d.last_error.unwrap().contains("invite") && d.last_post.is_none());
-        assert!(
-            agent
-                .test_destination("private")
-                .await
-                .unwrap_err()
-                .contains("invite")
-        );
-    }
-
-    #[tokio::test]
-    async fn teams_gets_a_card_and_its_url_stays_secret() {
-        let (base, seen) = stand_ins().await;
-        let (agent, _dir) = test_agent_with(&format!("{base}/api"));
-        // The stand-in isn't on Microsoft's hosts, so it's put in as saving would.
-        let url = format!("{base}/teams?sig=webhooksecretvalue");
-        agent
-            .store
-            .save_destination(&Destination {
-                name: "ops".into(),
-                kind: Kind::Teams,
-                channel: String::new(),
-                link: "https://agent.acme.com".into(),
-                created: 0,
-                by: None,
-                last_post: None,
-                last_error: None,
-            })
-            .unwrap();
-        agent
-            .destination_credentials
-            .put(&destinations::credential_name("ops"), &url)
-            .unwrap();
-        let first = agent
-            .post_update(
-                Some("t1"),
-                &json!({"destination": "ops", "title": "Spike", "body": "A spike.\n```\nGET /x 429\n```"}),
-            )
-            .await;
-        assert!(
-            first.starts_with("posted to ops (a Microsoft Teams channel)"),
-            "{first}"
-        );
-        assert!(agent.test_destination("ops").await.is_ok());
-        let card = seen.lock().unwrap()[0].2["attachments"][0]["content"].clone();
-        assert_eq!(card["type"], "AdaptiveCard");
-        assert!(card.to_string().contains("GET /x 429"));
-        // A failure's message wouldn't carry the URL either.
-        agent
-            .destination_credentials
-            .put(
-                &destinations::credential_name("ops"),
-                "http://127.0.0.1:9/teams?sig=webhooksecretvalue",
-            )
-            .unwrap();
-        let failed = agent
-            .post_update(None, &json!({"destination": "ops", "title": "t2", "body": "b2"}))
-            .await;
-        assert!(
-            failed.starts_with("not posted") && !failed.contains("webhooksecretvalue"),
-            "{failed}"
-        );
-        let events = all_events(&agent);
-        assert!(
-            !events.contains("webhooksecretvalue") && events.contains("update.failed"),
-            "{events}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod setup_schedule_tests {
+mod user_schedule_tests {
     use super::*;
 
     #[test]
@@ -5191,15 +4569,15 @@ mod setup_schedule_tests {
         let clock = UserClock::from_app("America/Toronto", -18000).unwrap();
         let made = agent
             .add_user_schedule(
-                "Morning security report",
-                "Summarize the last 24 hours of Cloudflare security events.",
+                "Morning inbox",
+                "Summarize the last 24 hours of email.",
                 "0 8 * * 1-5",
                 Some(&clock),
                 Some("me@acme.com".into()),
                 true,
             )
             .unwrap();
-        assert_eq!(made["name"], "Morning security report");
+        assert_eq!(made["name"], "Morning inbox");
         assert_eq!(made["auto_approve"], true);
         assert_eq!(made["timezone"], "America/Toronto");
         assert_eq!(
@@ -5213,7 +4591,7 @@ mod setup_schedule_tests {
         assert!(too_often.contains("15 minutes"), "{too_often}");
         assert!(
             agent
-                .add_user_schedule("Morning security report", "y", "0 9 * * *", None, None, false)
+                .add_user_schedule("Morning inbox", "y", "0 9 * * *", None, None, false)
                 .unwrap_err()
                 .contains("already")
         );
@@ -5240,7 +4618,7 @@ mod setup_schedule_tests {
     #[test]
     fn schedules_from_the_chat_run_without_asking_unless_outside_content_asked() {
         let (agent, dir) = test_agent();
-        let asked = json!({"name": "Daily check", "prompt": "Check Cloudflare.", "cron": "0 9 * * *"});
+        let asked = json!({"name": "Daily check", "prompt": "Check the build.", "cron": "0 9 * * *"});
         let made = agent.schedule_task("t1", &asked, false, None).unwrap();
         assert!(made.starts_with("scheduled #"), "{made}");
         let daily = agent.store.schedules().unwrap();
@@ -5271,40 +4649,6 @@ mod setup_schedule_tests {
             .unwrap();
         assert!(!hourly.auto_approve);
         assert_eq!(hourly.created_from, "agent_tainted");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod setup_skip_tests {
-    use super::*;
-
-    #[test]
-    fn skipped_setup_steps_are_kept_for_every_browser() {
-        let (agent, dir) = test_agent();
-        assert!(agent.setup_skipped().is_empty());
-        let skipped = [
-            "datadog".to_string(),
-            "datadog".to_string(),
-            "updates".to_string(),
-        ];
-        assert_eq!(
-            agent.set_setup_skipped(&skipped, None).unwrap(),
-            ["datadog", "updates"]
-        );
-        assert_eq!(agent.setup_skipped(), ["datadog", "updates"]);
-        assert!(
-            agent
-                .set_setup_skipped(&["email".to_string()], None)
-                .unwrap_err()
-                .contains("no setup step")
-        );
-        assert_eq!(
-            agent.setup_skipped(),
-            ["datadog", "updates"],
-            "a refused change changes nothing"
-        );
-        assert!(agent.set_setup_skipped(&[], None).unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -5381,7 +4725,7 @@ mod background_tests {
 
     fn a_schedule(agent: &Agent) -> Schedule {
         let made = agent
-            .add_user_schedule("Hourly check", "Check Cloudflare", "0 * * * *", None, None, true)
+            .add_user_schedule("Hourly check", "Check the build", "0 * * * *", None, None, true)
             .unwrap();
         agent
             .store
@@ -5459,7 +4803,7 @@ mod background_tests {
         let messages = events(&agent, "message");
         let n = messages.len();
         assert_eq!(messages[n - 2]["schedule"]["name"], "Hourly check");
-        assert_eq!(messages[n - 2]["text"], "Check Cloudflare");
+        assert_eq!(messages[n - 2]["text"], "Check the build");
         assert_eq!(messages[n - 1]["text"], "All quiet.");
         assert_eq!(events(&agent, "run.finished")[0]["status"], "done");
         assert_eq!(events(&agent, "task.finished").len(), 1); // the chat's only
@@ -5477,7 +4821,7 @@ mod background_tests {
         let (agent, dir) = test_agent();
         agent.open_thread("What's in my inbox?");
         agent.add_report_history(
-            "[Scheduled task “Hourly check”] Check Cloudflare".into(),
+            "[Scheduled task “Hourly check”] Check the build".into(),
             "All quiet.",
         );
         assert_eq!(agent.store.history(10).unwrap().len(), 1);
@@ -5494,7 +4838,7 @@ mod background_tests {
             [
                 "What's in my inbox?",
                 "Two new emails.",
-                "[Scheduled task “Hourly check”] Check Cloudflare",
+                "[Scheduled task “Hourly check”] Check the build",
                 "All quiet."
             ]
         );
@@ -5576,6 +4920,347 @@ mod background_tests {
         let again = Agent::new(agent.cfg.clone()).unwrap();
         assert!(again.store.claim_run(now).unwrap().is_none());
         assert!(events(&again, "message").is_empty()); // quietly
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A stand-in model that answers each request with `reply(request)`, and
+    /// keeps every request. A message with no content and no calls comes back
+    /// cut off (finish "length"), as when the thinking used up the reply.
+    async fn scripted_model(
+        reply: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let reply = Arc::new(reply);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let (reply, log) = (reply.clone(), log.clone());
+                async move {
+                    let message = reply(&body);
+                    log.lock().unwrap().push(body);
+                    let finish = if message["tool_calls"].is_array() {
+                        "tool_calls"
+                    } else if message["content"].is_null() {
+                        "length"
+                    } else {
+                        "stop"
+                    };
+                    axum::Json(json!({
+                        "choices": [{"message": message, "finish_reason": finish}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen)
+    }
+
+    fn is_review(request: &Value) -> bool {
+        request["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("(agentd supervisor)"))
+    }
+
+    fn is_wrap_up(request: &Value) -> bool {
+        request["tool_choice"] == "none"
+    }
+
+    /// The task's own turns (not the supervisor's, nor memory's tidying up,
+    /// which may run after a task ends).
+    fn is_turn(request: &Value) -> bool {
+        request["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("You are an assistant"))
+    }
+
+    fn says(text: &str) -> Value {
+        json!({"role": "assistant", "content": text})
+    }
+
+    fn cut_off() -> Value {
+        json!({"role": "assistant", "content": null})
+    }
+
+    /// A call that works without a browser, and never fails.
+    fn lists_schedules() -> Value {
+        json!({"role": "assistant", "content": null, "tool_calls": [{
+            "id": format!("c{}", short_id()), "type": "function",
+            "function": {"name": "list_schedules", "arguments": "{}"},
+        }]})
+    }
+
+    fn last_message(request: &Value) -> String {
+        request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Runs the "Hourly check" schedule ("Check the build") once, to its end.
+    async fn run_scheduled(model: &str) -> (Arc<Agent>, std::path::PathBuf) {
+        let (agent, dir) = agent_on(model);
+        let schedule = a_schedule(&agent);
+        let queued = queue(&agent, &schedule, "sched1");
+        agent.clone().run_queued(queued, schedule).await;
+        (agent, dir)
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_stops_a_scheduled_run_that_is_stuck() {
+        let (model, seen) = scripted_model(|request| {
+            if is_review(request) {
+                says(r#"{"verdict": "stuck", "reason": "It lists the schedules over and over.", "advice": ""}"#)
+            } else if is_wrap_up(request) {
+                says("I listed the schedules but never got to the build.")
+            } else {
+                lists_schedules()
+            }
+        })
+        .await;
+        let (agent, dir) = run_scheduled(&model).await;
+        // A check every 5 steps here (test_agent): the first one finds it stuck.
+        let finished = &events(&agent, "run.finished")[0];
+        assert_eq!(
+            (finished["status"].as_str(), finished["steps"].as_u64()),
+            (Some("stuck"), Some(5))
+        );
+        let reviews = events(&agent, "review");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["verdict"], "stuck");
+        assert_eq!(reviews[0]["reason"], "It lists the schedules over and over.");
+        let messages = events(&agent, "message");
+        assert_eq!(
+            messages.last().unwrap()["text"],
+            "I listed the schedules but never got to the build."
+        );
+        // The supervisor read the request and every call since the start; the
+        // wrap-up told the model why it had to stop.
+        let seen = seen.lock().unwrap();
+        let digest = seen.iter().find(|r| is_review(r)).unwrap()["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(digest.starts_with("The user's request:\nCheck the build"));
+        assert_eq!(digest.matches("- list_schedules {}").count(), 5);
+        let wrap_up = seen.iter().find(|r| is_turn(r) && is_wrap_up(r)).unwrap();
+        assert!(last_message(wrap_up).starts_with("(agentd) A check on your progress found you stuck"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_runs_go_on_and_a_nudge_reaches_the_agent() {
+        let reviews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reviews.clone();
+        let (model, seen) = scripted_model(move |request| {
+            if is_review(request) {
+                return match counted.fetch_add(1, Ordering::SeqCst) {
+                    0 => says(r#"{"verdict": "progressing", "reason": "Making progress.", "advice": ""}"#),
+                    _ => says(
+                        r#"{"verdict": "nudge", "reason": "It keeps listing schedules.", "advice": "Check the build log instead."}"#,
+                    ),
+                };
+            }
+            if last_message(request).starts_with("(agentd) A check on your progress") {
+                says("The build is green.")
+            } else {
+                lists_schedules()
+            }
+        })
+        .await;
+        let (agent, dir) = run_scheduled(&model).await;
+        // Past where the old cap (5 steps here) would have ended it.
+        let finished = &events(&agent, "run.finished")[0];
+        assert_eq!(
+            (finished["status"].as_str(), finished["steps"].as_u64()),
+            (Some("done"), Some(11))
+        );
+        let verdicts: Vec<Value> = events(&agent, "review")
+            .iter()
+            .map(|r| r["verdict"].clone())
+            .collect();
+        assert_eq!(verdicts, [json!("progressing"), json!("nudge")]);
+        assert_eq!(
+            events(&agent, "message").last().unwrap()["text"],
+            "The build is green."
+        );
+        let seen = seen.lock().unwrap();
+        let nudged = seen.iter().rfind(|r| is_turn(r)).unwrap();
+        assert_eq!(
+            last_message(nudged),
+            "(agentd) A check on your progress: It keeps listing schedules. Try this: Check the build log instead."
+        );
+        // The second check knew only the calls since the first.
+        let second = seen.iter().filter(|r| is_review(r)).nth(1).unwrap()["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(second.matches("- list_schedules {}").count(), 5);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_check_that_keeps_failing_counts_as_stuck() {
+        let (model, _) = scripted_model(|request| {
+            if is_review(request) {
+                says("I'd say it's fine.") // no verdict
+            } else if is_wrap_up(request) {
+                says("Stopped early.")
+            } else {
+                lists_schedules()
+            }
+        })
+        .await;
+        let (agent, dir) = run_scheduled(&model).await;
+        let verdicts: Vec<Value> = events(&agent, "review")
+            .iter()
+            .map(|r| r["verdict"].clone())
+            .collect();
+        assert_eq!(verdicts, [json!("failed"), json!("failed"), json!("stuck")]);
+        let finished = &events(&agent, "run.finished")[0];
+        assert_eq!(
+            (finished["status"].as_str(), finished["steps"].as_u64()),
+            (Some("stuck"), Some(6))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_reply_is_asked_again_with_more_room() {
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = turns.clone();
+        let (model, seen) = scripted_model(move |request| match counted.fetch_add(1, Ordering::SeqCst) {
+            _ if !is_turn(request) => says("{}"),
+            // A call, then twice cut off, then an answer.
+            0 => lists_schedules(),
+            1 | 2 => cut_off(),
+            _ => says("All quiet."),
+        })
+        .await;
+        let (agent, dir) = run_scheduled(&model).await;
+        assert_eq!(events(&agent, "run.finished")[0]["status"], "done");
+        assert_eq!(events(&agent, "message").last().unwrap()["text"], "All quiet.");
+        let seen = seen.lock().unwrap();
+        let turns: Vec<&Value> = seen.iter().filter(|r| is_turn(r)).collect();
+        let limits: Vec<u64> = turns.iter().map(|r| r["max_tokens"].as_u64().unwrap()).collect();
+        assert_eq!(limits, [8192, 8192, 16384, 32768]);
+        assert!(last_message(turns[2]).starts_with("(agentd) Your last reply was cut off"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replies_that_stay_cut_off_end_with_a_summary() {
+        // Even the summary is cut off: the fallback says what happened.
+        let (model, seen) = scripted_model(|_| cut_off()).await;
+        let (agent, dir) = run_scheduled(&model).await;
+        assert_eq!(events(&agent, "run.finished")[0]["status"], "stuck");
+        let answer = events(&agent, "message").last().unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            answer.starts_with("The model's replies kept getting cut off"),
+            "{answer}"
+        );
+        let seen = seen.lock().unwrap();
+        let turns: Vec<&Value> = seen.iter().filter(|r| is_turn(r)).collect();
+        let limits: Vec<u64> = turns.iter().map(|r| r["max_tokens"].as_u64().unwrap()).collect();
+        assert_eq!(limits, [8192, 16384, 32768, 8192]);
+        assert!(is_wrap_up(turns[3]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_larger_reply_falls_back_to_the_usual_limit() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                match body["max_tokens"].as_u64() {
+                    // As Together does when the account can't cover it.
+                    Some(n) if n > 8192 => (axum::http::StatusCode::PAYMENT_REQUIRED, "credit").into_response(),
+                    _ if body["messages"].as_array().unwrap().len() > 3 => axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": "All quiet."}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                    }))
+                    .into_response(),
+                    _ => axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": null}, "finish_reason": "length"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                    }))
+                    .into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (agent, dir) = run_scheduled(&model).await;
+        assert_eq!(events(&agent, "run.finished")[0]["status"], "done");
+        assert_eq!(events(&agent, "message").last().unwrap()["text"], "All quiet.");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_on_a_stuck_card_ends_the_task_with_a_summary() {
+        let (model, seen) = scripted_model(|request| {
+            if is_wrap_up(request) {
+                says("Done: cloned the repo. Left: the build, which kept failing.")
+            } else {
+                says("unexpected")
+            }
+        })
+        .await;
+        let (agent, dir) = agent_on(&model);
+        agent
+            .store
+            .start_run(
+                "t1",
+                "Deploy the blog",
+                None,
+                "zai-org/GLM-5.3",
+                &agent.policy_version(),
+                None,
+            )
+            .unwrap();
+        let state = json!({
+            "task": "t1", "model": "zai-org/GLM-5.3", "allow_actions": true,
+            "messages": [{"role": "system", "content": ""}, {"role": "user", "content": "Deploy the blog"}],
+            "queue": [], "step": 70, "tainted": false, "reminded": false, "loops": guard::LoopDetector::default(),
+            "usage": Usage::default(), "seconds": 2000.0, "request": "Deploy the blog",
+            "review": {"at_step": 70, "at_secs": 2000.0, "at_message": 2, "failures": 0,
+                       "previous": "stuck: The build fails the same way each time.",
+                       "stuck": ["The build fails the same way each time.", "Read the error."]},
+        });
+        let card = json!({"kind": "stuck", "id": "s1", "task": "t1", "reason": "The build fails the same way each time.",
+                          "minutes": 33, "steps": 70, "plan": null});
+        agent
+            .store
+            .park("s1", "t1", &card, &state.to_string(), &agent.policy_version())
+            .unwrap();
+        assert!(
+            agent
+                .answer_approval("s1", false, None, Some("me".into()))
+                .is_ok()
+        );
+        until("the task ends", || !events(&agent, "task.finished").is_empty()).await;
+        assert_eq!(events(&agent, "task.finished")[0]["status"], "stuck");
+        assert_eq!(
+            events(&agent, "message").last().unwrap()["text"],
+            "Done: cloned the repo. Left: the build, which kept failing."
+        );
+        let seen = seen.lock().unwrap();
+        let turns: Vec<&Value> = seen.iter().filter(|r| is_turn(r)).collect();
+        assert_eq!(turns.len(), 1);
+        assert!(is_wrap_up(turns[0]));
+        assert_eq!(
+            last_message(turns[0]),
+            tools::wrap_up(
+                "The user stopped this task after a check found it stuck: The build fails the same way each time."
+            )
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

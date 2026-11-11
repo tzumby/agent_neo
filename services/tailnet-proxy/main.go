@@ -5,18 +5,17 @@
 // agent, can't reach other tailnet devices or change Tailscale settings.
 //
 // On https://<hostname>.<tailnet>.ts.net (Tailscale certificate) it serves
-// what package door does, as front-door does for a customer deployment: the
-// web app (-web) at /, the agent's API (agentd, on a Unix socket) at /api/*
-// with the caller's Tailscale identity in X-Tailscale-User / X-Tailscale-Node,
-// and the noVNC viewer at /viewer/ (the web app's take-over).
+// what package door does: the web app (-web) at /, the agent's API (agentd,
+// on a Unix socket) at /api/* with the caller's Tailscale identity in
+// X-Tailscale-User / X-Tailscale-Node, and the noVNC viewer at /viewer/ (the
+// web app's take-over).
 //
-// On port 5900 it forwards raw VNC to x11vnc, for the apps' native viewer.
+// On port 5900 it forwards raw VNC to x11vnc, for a native VNC viewer.
 //
 // Every connection is checked against the tailnet identity (WhoIs) and the
-// -allow list of logins or the -allow-tags list of device tags (a tester's
-// devices join the desktops tailnet with a key, tagged, without a login). The
-// first run needs an auth key in TS_AUTHKEY; the node's identity is then kept
-// in -state-dir.
+// -allow list of logins or the -allow-tags list of device tags. The first run
+// needs an auth key in TS_AUTHKEY; the node's identity is then kept in
+// -state-dir.
 package main
 
 import (
@@ -35,7 +34,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 
-	"cloud-desktops/front-door/door"
+	"cloud-desktops/tailnet-proxy/door"
 )
 
 type gate struct {
@@ -84,7 +83,7 @@ func main() {
 	agentd := flag.String("agentd", "/run/agentd/agentd.sock", "agentd's Unix socket")
 	vnc := flag.String("vnc", "127.0.0.1:5900", "x11vnc to forward port 5900 to")
 	allow := flag.String("allow", "", "comma-separated Tailscale login names allowed in (default: whoever the tailnet policy lets through)")
-	allowTags := flag.String("allow-tags", "", "comma-separated device tags allowed in, e.g. tag:user-alex (as well as -allow)")
+	allowTags := flag.String("allow-tags", "", "comma-separated device tags allowed in, e.g. tag:laptop (as well as -allow)")
 	web := flag.String("web", "", "the web app's directory (index.html, assets/); empty: none")
 	flag.Parse()
 
@@ -131,7 +130,6 @@ func main() {
 		Agentd: *agentd,
 		NoVNC:  novncURL,
 		Web:    *web,
-		// Tailscale signs in the device: there's no signing out of the web app.
 	})))
 }
 

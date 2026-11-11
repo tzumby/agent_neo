@@ -1,6 +1,6 @@
 # {{ ansible_managed }}
-# Listens on {{ novnc_bind }}: localhost unless a control plane needs to reach
-# it (the desktop security group only admits the control plane).
+# Listens on {{ novnc_bind }}: localhost, reached through tailnet-proxy and SSM
+# port forwarding (the desktop takes no inbound connections).
 [Unit]
 Description=noVNC websocket proxy on :{{ novnc_port }}
 Wants=x11vnc.service

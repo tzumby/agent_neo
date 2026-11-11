@@ -1,16 +1,15 @@
-# S3 bucket that holds Terraform state for every env. This stack keeps its own
-# state locally (terraform/bootstrap/terraform.tfstate): don't lose it, or
-# re-import the bucket with `terraform import`.
+# The S3 bucket that holds the deployment's Terraform state. This stack keeps
+# its own state locally (terraform/bootstrap/terraform.tfstate.d/<env>/, one
+# workspace per env): don't lose it, or re-import the bucket with
+# `terraform import`.
 
 provider "aws" {
   region = var.region
-  # A customer's account (its own workspace): only that account.
-  allowed_account_ids = var.account_id == "" ? null : [var.account_id]
 
   default_tags {
     tags = {
       Project   = var.project
-      Env       = "shared"
+      Env       = var.env
       ManagedBy = "terraform"
     }
   }
@@ -19,7 +18,7 @@ provider "aws" {
 data "aws_caller_identity" "current" {}
 
 resource "aws_s3_bucket" "state" {
-  bucket = "${var.project}-tfstate-${data.aws_caller_identity.current.account_id}-${var.region}"
+  bucket = "${var.project}-${var.env}-tfstate-${data.aws_caller_identity.current.account_id}-${var.region}"
 
   lifecycle {
     prevent_destroy = true

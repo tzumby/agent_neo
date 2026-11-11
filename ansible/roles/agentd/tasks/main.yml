@@ -1,11 +1,7 @@
 # agentd: the agent on this desktop (services/agentd). It runs as its own
 # user and runs the agent's shell commands as the shell user (worker), which
-# can't read agentd's state, saved keys or socket, nor reach the desktop
-# session. Model calls go through the attested gateway, which holds the key.
-
-- name: Remove the retired Telegram bot
-  ansible.builtin.import_tasks: retire-telegram.yml
-  tags: [retire-telegram]
+# can't read agentd's state, saved keys, model key or socket, nor reach the
+# desktop session.
 
 - name: Create the agentd group
   ansible.builtin.group:
@@ -75,7 +71,6 @@
     group: root
     mode: "0644"
   vars:
-    agentd_uid: "{{ ansible_facts.getent_passwd['agentd'][1] }}"
     # In check mode the shell user isn't created yet: show a placeholder.
     agentd_shell_uid: "{{ ansible_facts.getent_passwd.get(agentd_shell_user, ['', 'NEW-USER'])[1] }}"
   notify: Reload the firewall rules
@@ -162,16 +157,6 @@
   changed_when: false
   when: agentd_binary_install.changed and agentd_db.stat.exists
 
-# The model gateway, once it exists: where it is, how to know its
-# certificate (the images to accept if it attests, else where it publishes
-# the certificate) and the audience to sign identity proofs for (none secret).
-- name: Look up the model gateway
-  ansible.builtin.set_fact:
-    agentd_gateway_url: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/gateway/url', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
-    agentd_gateway_measurements: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/gateway/measurements', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
-    agentd_gateway_certificate_parameter: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/gateway/certificate_parameter', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
-    agentd_gateway_audience: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/gateway/audience', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
-
 - name: Write the settings
   ansible.builtin.template:
     src: agentd.env.j2
@@ -181,16 +166,9 @@
     mode: "0640"
   notify: Restart agentd
 
-# With the gateway, the desktop holds no provider key: remove the old one.
-- name: Remove the model key from the desktop (the gateway holds it)
-  ansible.builtin.file:
-    path: /etc/agentd/secrets.env
-    state: absent
-  when: agentd_gateway_url | length > 0
-  notify: Restart agentd
-
-# Without a gateway (bootstrap only), read on the controller with your AWS credentials.
-- name: Write the secrets (from SSM)
+# The model key, read on the controller with your AWS credentials, never by
+# the desktop itself. root:agentd 0640: agentd reads it, the shell user can't.
+- name: Write the model key (from SSM)
   ansible.builtin.copy:
     dest: /etc/agentd/secrets.env
     content: |
@@ -199,7 +177,6 @@
     group: agentd
     mode: "0640"
   no_log: true
-  when: agentd_gateway_url | length == 0
   notify: Restart agentd
 
 - name: Install the agent's skills

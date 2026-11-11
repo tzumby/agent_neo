@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { findKey, isValidName, normalizedName } from "../public/assets/js/keys.js";
 import { inline, parse, safeHref } from "../public/assets/js/markdown.js";
-import { Timeline, rowKey } from "../public/assets/js/timeline.js";
+import { Timeline, duration, rowKey, workingFor } from "../public/assets/js/timeline.js";
 
 let seq = 0;
 const ev = (kind, data = {}) => ({ seq: ++seq, ts: "2026-11-03T08:00:00Z", kind, data });
@@ -145,4 +145,89 @@ test("keys pasted into a message are spotted", () => {
   assert.equal(normalizedName("Cloudflare api-token"), "CLOUDFLARE_API_TOKEN");
   assert.equal(isValidName("DD_API_KEY"), true);
   assert.equal(isValidName("MY_PASSWORD"), false);
+});
+
+test("a task's plan: after its message, the latest wins, folded once the task ends", () => {
+  const steps = (...statuses) => statuses.map((status, i) => ({ step: `Step ${i + 1}`, status }));
+  const t = new Timeline([
+    ev("message", { role: "user", text: "Migrate the blog", task: "t1" }),
+    ev("task.started", { task: "t1" }),
+    ev("approval.requested", { id: "a1", task: "t1", kind: "shell", command: "npm i", reason: "installs" }),
+    ev("plan", { task: "t1", items: steps("in_progress", "pending", "pending") }),
+  ]);
+  assert.deepEqual(t.visible().map((i) => i.type), ["user", "plan", "approval"], "right after its message");
+  t.apply(ev("plan", { task: "t1", items: steps("done", "done", "in_progress") }));
+  const plan = t.visible()[1];
+  assert.deepEqual(plan.steps.map((s) => s.status), ["done", "done", "in_progress"], "each event is the whole plan");
+  assert.equal(plan.finished, false);
+  assert.equal(rowKey(plan), "plan-t1");
+  // Another task's plan doesn't touch this one.
+  t.apply(ev("approval.resolved", { id: "a1", approved: true }));
+  t.apply(ev("message", { role: "assistant", text: "Done.", task: "t1" }));
+  t.apply(ev("task.finished", { task: "t1", status: "done" }));
+  t.apply(ev("message", { role: "user", text: "Next", task: "t2" }));
+  t.apply(ev("task.started", { task: "t2" }));
+  t.apply(ev("plan", { task: "t2", items: steps("pending") }));
+  const [, first, , , second] = t.visible();
+  assert.deepEqual(t.visible().map((i) => i.type), ["user", "plan", "assistant", "user", "plan"]);
+  assert.equal(first.finished, true, "folded once its task ended");
+  assert.equal(first.steps.length, 3);
+  assert.equal(second.finished, false);
+  // Bad statuses become pending; blank steps are dropped; no steps, no row.
+  t.apply(ev("plan", { task: "t2", items: [{ step: "Build", status: "weird" }, { step: "  ", status: "done" }] }));
+  assert.deepEqual(t.visible()[4].steps, [{ step: "Build", status: "pending" }]);
+  t.apply(ev("plan", { task: "t2", items: [] }));
+  assert.deepEqual(t.visible().map((i) => i.type), ["user", "plan", "assistant", "user"]);
+});
+
+test("a plan whose message is on an older page still shows", () => {
+  const t = new Timeline([
+    ev("task.resumed", { task: "t9" }),
+    ev("plan", { task: "t9", items: [{ step: "Deploy", status: "in_progress" }] }),
+  ]);
+  assert.deepEqual(t.visible().map((i) => i.type), ["plan"]);
+});
+
+test("the stuck card: shown with its facts, gone once answered", () => {
+  const t = new Timeline([
+    ev("message", { role: "user", text: "Fix the build", task: "t1" }),
+    ev("task.started", { task: "t1" }),
+    ev("approval.requested", {
+      id: "s1", task: "t1", kind: "stuck", reason: "It has run the same failing build 9 times.",
+      minutes: 34, steps: 120, plan: { done: 2, total: 5 },
+    }),
+    ev("task.paused", { task: "t1", approval: "s1" }),
+  ]);
+  const card = t.visible()[1];
+  assert.equal(card.kind, "stuck");
+  assert.deepEqual(card.stuck, { reason: "It has run the same failing build 9 times.", minutes: 34, steps: 120, plan: { done: 2, total: 5 } });
+  assert.equal(t.busy, false, "parked on it: the desktop is free");
+  t.apply(ev("approval.resolved", { id: "s1", approved: false }));
+  t.apply(ev("task.resumed", { task: "t1" }));
+  t.apply(ev("message", { role: "assistant", text: "Done so far: …", task: "t1" }));
+  t.apply(ev("task.finished", { task: "t1", status: "stuck" }));
+  assert.deepEqual(t.visible().map((i) => i.type), ["user", "assistant"]);
+  // No plan: none on the card.
+  const bare = new Timeline([ev("approval.requested", { id: "s2", kind: "stuck", reason: "x", minutes: 0, steps: 60, plan: null })]);
+  assert.equal(bare.visible()[0].stuck.plan, null);
+});
+
+test("how long the task has worked", () => {
+  assert.equal(duration(0.5), "");
+  assert.equal(duration(1), "1 min");
+  assert.equal(duration(24.9), "24 min");
+  assert.equal(duration(65), "1 h 5 min");
+  assert.equal(duration(120), "2 h");
+  const start = "2026-11-03T08:00:00Z";
+  assert.equal(workingFor(start, Date.parse("2026-11-03T08:00:40Z")), "");
+  assert.equal(workingFor(start, Date.parse("2026-11-03T08:24:10Z")), "24 min");
+  assert.equal(workingFor(null), "");
+  const t = new Timeline([{ seq: 1, ts: start, kind: "task.started", data: { task: "t1" } }]);
+  assert.equal(t.workingSince, start);
+  t.apply({ seq: 2, ts: "2026-11-03T08:05:00Z", kind: "task.paused", data: { task: "t1" } });
+  assert.equal(t.workingSince, null, "waiting on you: not working");
+  t.apply({ seq: 3, ts: "2026-11-03T08:09:00Z", kind: "task.resumed", data: { task: "t1" } });
+  assert.equal(t.workingSince, start, "counts from when it started");
+  t.apply({ seq: 4, ts: "2026-11-03T08:10:00Z", kind: "task.finished", data: { task: "t1" } });
+  assert.equal(t.workingSince, null);
 });

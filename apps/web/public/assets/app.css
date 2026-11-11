@@ -158,7 +158,26 @@ a { color: inherit; }
 .row-user { display: flex; justify-content: flex-end; }
 .bubble { max-width: 85%; background: var(--bubble); padding: 0.6rem 0.95rem; border-radius: 1.1rem 1.1rem 0.35rem 1.1rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 .answer { overflow-wrap: anywhere; }
-.working { display: flex; gap: 0.35rem; padding: 1.2rem 0 0.2rem; }
+.working { display: flex; align-items: center; gap: 0.35rem; padding: 1.2rem 0 0.2rem; }
+.working-time { margin-left: 0.5rem; color: var(--slate); font-size: 0.86rem; font-variant-numeric: tabular-nums; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+/* A task's plan: the agent's steps, ticked off as it goes. */
+.plan { background: var(--surface); border: 1px solid var(--rule); border-radius: 0.9rem; padding: 0.8rem 1rem 0.85rem; }
+.plan-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: 0.45rem; }
+.plan-title { font-weight: 650; font-stretch: 106%; }
+.plan-count { color: var(--slate); font-size: 0.86rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.plan-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }
+.plan-step { display: grid; grid-template-columns: 1.2rem minmax(0, 1fr); gap: 0.45rem; align-items: baseline; }
+.plan-mark { font-weight: 700; text-align: center; color: var(--slate); }
+.plan-text { overflow-wrap: anywhere; }
+.plan-step.is-done .plan-mark { color: var(--ok); }
+.plan-step.is-done .plan-text { color: var(--slate); }
+.plan-step.is-in-progress .plan-mark { color: var(--signal-text); }
+.plan-step.is-in-progress .plan-text { font-weight: 600; }
+.plan-finished { padding: 0.55rem 1rem; background: transparent; }
+.plan-finished summary { cursor: pointer; color: var(--slate); font-size: 0.9rem; width: fit-content; }
+.plan-finished[open] .plan-steps { margin-top: 0.5rem; }
 
 .empty { padding: 14vh 0 2rem; }
 .empty h2 { margin: 0 0 1.2rem; font-size: clamp(1.45rem, 1.1rem + 1.2vw, 1.9rem); font-weight: 600; font-stretch: 112%; letter-spacing: -0.01em; line-height: 1.2; }

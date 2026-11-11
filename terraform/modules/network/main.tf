@@ -22,7 +22,7 @@ resource "aws_internet_gateway" "this" {
   }
 }
 
-# --- Public subnets: ALB and NAT gateways. /24 each. -------------------------
+# --- Public subnets: the NAT (instance or gateways). /24 each. ---------------
 
 resource "aws_subnet" "public" {
   count = length(var.azs)
@@ -59,7 +59,7 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# --- Private subnets: desktops and control plane. /20 each. ------------------
+# --- Private subnets: the desktop. /20 each. ---------------------------------
 
 resource "aws_subnet" "private" {
   count = length(var.azs)

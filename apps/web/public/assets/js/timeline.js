@@ -1,6 +1,7 @@
 // The chat as the web app shows it, built from agentd's event log: the user's
-// messages, the agent's answers and pictures, scheduled runs as reports, and
-// the cards waiting for the user. What the agent does on the way (steps,
+// messages, the agent's answers and pictures, scheduled runs as reports, the
+// cards waiting for the user, and a task's plan (the steps the agent wrote for
+// itself, ticked off as it goes). What the agent does on the way (tool calls,
 // commands, saves) stays out; `busy` only says that it's working.
 // Pure: apply events in order. Replaying the later part of the log gives the
 // chat of that part, so pages can be loaded from the newest.
@@ -8,8 +9,25 @@
 /** The event kinds it reads: the app asks agentd for these only. */
 export const KINDS = [
   "message", "image", "task.started", "task.paused", "task.resumed", "task.stopping", "task.finished",
-  "approval.requested", "approval.resolved", "action_needed", "action.resolved", "secret.saved",
+  "approval.requested", "approval.resolved", "action_needed", "action.resolved", "secret.saved", "plan",
 ];
+
+const PLAN_STATUSES = ["pending", "in_progress", "done"];
+
+/** "1 min", "24 min", "1 h 5 min" for whole minutes; "" under one. */
+export function duration(minutes) {
+  const m = Math.floor(minutes);
+  if (!(m >= 1)) return "";
+  if (m < 60) return `${m} min`;
+  const rest = m % 60;
+  return rest ? `${Math.floor(m / 60)} h ${rest} min` : `${Math.floor(m / 60)} h`;
+}
+
+/** How long the running task has worked, from when it started ("" under a minute). */
+export function workingFor(since, now = Date.now()) {
+  const start = Date.parse(since || "");
+  return Number.isFinite(start) ? duration((now - start) / 60000) : "";
+}
 
 /** A scheduled run's answer that found nothing new, in a line. */
 export function isOneLine(text) {
@@ -25,6 +43,9 @@ export class Timeline {
     this.approvalIndex = new Map();
     this.actionIndex = new Map();
     this.reportIndex = new Map();
+    this.planIndex = new Map();
+    // The running chat task, and when it started (for "Working · 24 min").
+    this.running = null;
     for (const event of events) this.apply(event);
   }
 
@@ -66,6 +87,7 @@ export class Timeline {
       case "task.started":
         this.busy = true;
         this.stopping = false;
+        this.running = { task: d.task ?? null, since: event.ts ?? null };
         break;
       case "task.paused": // parked on a card: the desktop is free meanwhile
         this.busy = false;
@@ -73,6 +95,8 @@ export class Timeline {
         break;
       case "task.resumed":
         this.busy = true;
+        // Its start is on an older page: count from here.
+        if (!this.running || this.running.task !== (d.task ?? null)) this.running = { task: d.task ?? null, since: event.ts ?? null };
         break;
       case "task.stopping":
         this.stopping = this.busy;
@@ -80,12 +104,28 @@ export class Timeline {
       case "task.finished":
         this.busy = false;
         this.stopping = false;
+        this.running = null;
+        if (d.task != null) this.update(this.planIndex, d.task, { finished: true });
         break;
+      case "plan": {
+        // Each one is the whole plan: the latest wins.
+        if (d.task == null || !Array.isArray(d.items)) break;
+        const steps = d.items
+          .filter((i) => i && typeof i.step === "string" && i.step.trim())
+          .map((i) => ({ step: i.step, status: PLAN_STATUSES.includes(i.status) ? i.status : "pending" }));
+        if (this.planIndex.has(d.task)) {
+          this.update(this.planIndex, d.task, { steps });
+        } else {
+          this.planIndex.set(d.task, this.items.length);
+          this.items.push({ type: "plan", id: d.task, task: d.task, steps, finished: false });
+        }
+        break;
+      }
       case "approval.requested": {
         const id = str(d.id);
         const card = {
           type: "approval", id, seq: event.seq, state: "pending",
-          kind: ["secret", "schedule", "browser", "access"].includes(d.kind) ? d.kind : "shell",
+          kind: ["secret", "schedule", "browser", "access", "stuck"].includes(d.kind) ? d.kind : "shell",
           command: str(d.command), reason: str(d.reason), summary: d.summary || null, tainted: d.tainted === true,
           editable: d.editable === true,
         };
@@ -98,6 +138,10 @@ export class Timeline {
           card.schedule = { name: str(d.name), prompt: str(d.text), when: str(d.when) };
         } else if (card.kind === "access") {
           card.access = { hosts: Array.isArray(d.hosts) ? d.hosts.map(str) : [], why: str(d.why) };
+        } else if (card.kind === "stuck") {
+          const plan = d.plan && Number.isFinite(d.plan.done) && Number.isFinite(d.plan.total) && d.plan.total > 0
+            ? { done: d.plan.done, total: d.plan.total } : null;
+          card.stuck = { reason: str(d.reason), minutes: num(d.minutes), steps: num(d.steps), plan };
         } else if (card.kind === "browser") {
           card.browser = {
             action: str(d.action), target: str(d.target), text: d.text ?? null, key: d.key ?? null,
@@ -157,15 +201,32 @@ export class Timeline {
     if (i !== undefined) this.items[i] = { ...this.items[i], ...change };
   }
 
+  /** When the running chat task started, while it works (else null). */
+  get workingSince() {
+    return this.busy ? this.running?.since ?? null : null;
+  }
+
   /**
-   * What the chat shows: messages, pictures, reports, and the cards still
-   * waiting (answered, they leave the chat). Runs of one schedule that found
-   * nothing, one after another, fold into the latest; the row keeps the first
-   * one's id.
+   * What the chat shows: messages, pictures, reports, the cards still
+   * waiting (answered, they leave the chat), and each task's plan right after
+   * its message. Runs of one schedule that found nothing, one after another,
+   * fold into the latest; the row keeps the first one's id.
    */
   visible() {
     const shown = [];
+    // A plan goes right after its task's message, when that's loaded.
+    const asked = new Set(this.items.filter((i) => i.type === "user" && i.task != null).map((i) => i.task));
+    const plans = new Map();
+    for (const item of this.items) if (item.type === "plan" && item.steps.length) plans.set(item.task, item);
     for (const item of this.items) {
+      if (item.type === "plan") {
+        if (item.steps.length && !asked.has(item.task)) shown.push(item);
+        continue;
+      }
+      if (item.type === "user" && plans.has(item.task)) {
+        shown.push(item, plans.get(item.task));
+        continue;
+      }
       if ((item.type === "approval" || item.type === "action") && item.state !== "pending") continue;
       if (item.type === "report" && item.answer?.quiet) {
         const previous = shown[shown.length - 1];
@@ -192,4 +253,8 @@ export function rowKey(item) {
 
 function str(value) {
   return typeof value === "string" ? value : "";
+}
+
+function num(value) {
+  return Number.isFinite(value) ? value : 0;
 }

@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::guard;
 use crate::llm::{self, Together, Usage, truncate};
 use crate::memory;
+use crate::plan;
 use crate::policy::Gate;
 use crate::policy::Policy;
 use crate::schedule;
@@ -33,6 +34,7 @@ use crate::secrets::{self, Secrets};
 use crate::shell::{KeyFile, MAX_COMMAND_SECS, Route, Shell, split_sudo};
 use crate::skills::Skills;
 use crate::store::{Event, Pending, QueuedRun, Schedule, SecretInfo, Store};
+use crate::supervise::{self, Verdict};
 use crate::tools;
 
 const HISTORY_LIMIT: i64 = 20;
@@ -76,8 +78,16 @@ const INTERRUPTED: &str =
 /// remember…?") just gets its answer again.
 /// The one reminder after a reply with neither text nor tool calls: usually the
 /// model's thinking used up `max_tokens` (finish_reason "length").
-const EMPTY_REPLY: &str = "(agentd) Your reply was empty: it was probably cut off while you were thinking. \
-     Give your answer now, briefly.";
+const EMPTY_REPLY: &str = "(agentd) Your last reply was cut off while you were still thinking, before you \
+     wrote anything. Think less this time: make your next tool call, or if the task is done, give your answer.";
+/// Empty replies in a row that are asked again, each with more room
+/// (`turn_max_tokens`), before the task ends with a summary instead.
+const EMPTY_RETRIES: u8 = 2;
+/// A model turn's output limit; doubled for each retry of an empty reply.
+const TURN_MAX_TOKENS: u32 = 8192;
+/// Supervisor checks in a row that can't give a verdict before the task is
+/// treated as stuck: a broken check doesn't leave a task running unchecked.
+const REVIEW_FAILURES: u8 = 2;
 const REMEMBER_NUDGE: &str = "(agentd) The user's message asked you to remember something, and you haven't \
      called remember. If they did, call remember with it now, then finish. If they only asked what you remember, \
      give your answer again.";
@@ -158,13 +168,50 @@ struct RunState {
     /// A scheduled run's `report_outcome` (result, nothing or blocked).
     #[serde(default)]
     reported: Option<schedule::Reported>,
-    /// Asked once for the answer after an empty reply.
+    /// Empty replies in a row so far (asked again, with more room each time).
     #[serde(default)]
-    asked_again: bool,
+    empty_retries: u8,
+    /// The agent's plan (update_plan): the user's checklist, the supervisor's
+    /// measure of progress.
+    #[serde(default)]
+    plan: Vec<plan::Item>,
+    /// When the supervisor last checked (supervise.rs).
+    #[serde(default)]
+    review: ReviewClock,
     /// What the user asked, or the schedule's prompt: a scheduled run's
     /// report shows it as its instructions.
     #[serde(default)]
     request: String,
+}
+
+/// When the supervisor last checked on a task, and what it said.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct ReviewClock {
+    /// The step, working seconds and conversation length at the last check.
+    at_step: u32,
+    at_secs: f64,
+    at_message: usize,
+    /// Checks in a row that gave no verdict.
+    failures: u8,
+    /// The last check's verdict and advice, when it wasn't "progressing".
+    previous: Option<String>,
+    /// A stuck card's reason and advice, for when the user answers it.
+    stuck: Option<(String, String)>,
+}
+
+impl ReviewClock {
+    fn checked(&mut self, step: u32, secs: f64, messages: usize) {
+        self.at_step = step;
+        self.at_secs = secs;
+        self.at_message = messages;
+        self.failures = 0;
+    }
+}
+
+/// A model turn's output limit: more room for each retry of an empty reply,
+/// which was most likely cut off while the model was thinking.
+fn turn_max_tokens(empty_retries: u8) -> u32 {
+    TURN_MAX_TOKENS << empty_retries.min(EMPTY_RETRIES)
 }
 
 /// The scheduled run the background worker is on.
@@ -1151,6 +1198,7 @@ impl Agent {
             };
             self.recall(&task_id, &query, scheduled.as_ref().map(|s| s.id))
         });
+        let messages_len = messages.len();
         let state = RunState {
             task: task_id,
             model: settings.model,
@@ -1173,7 +1221,13 @@ impl Agent {
             nudged: false,
             memory_block,
             reported: None,
-            asked_again: false,
+            empty_retries: 0,
+            plan: Vec::new(),
+            review: ReviewClock {
+                // From the request on: the history before it isn't this task's work.
+                at_message: messages_len - 1,
+                ..ReviewClock::default()
+            },
             schedule_id: scheduled.as_ref().map(|s| s.id),
             scheduled: scheduled.map(|s| s.name),
             request: text,
@@ -1346,6 +1400,8 @@ impl Agent {
     }
 
     async fn run_loop(&self, state: &mut RunState, mut answer: Option<Answer>) -> Result<Outcome> {
+        // Working time: what the task had, plus this stretch (drive adds it on).
+        let loop_started = Instant::now();
         let now = self.user_clock().now();
         // The date and time as of now: a parked task may resume much later.
         let memories = if self.cfg.memory_v2 {
@@ -1376,6 +1432,41 @@ impl Agent {
             self.cfg.memory_v2,
         );
         state.messages[0] = json!({"role": "system", "content": prompt});
+        let schemas = tools::schemas(
+            self.cfg.shell_tool,
+            !self.skills.is_empty(),
+            self.cfg.memory_v2,
+            self.cfg.memory_v2 && state.scheduled.is_some(),
+        );
+        // The user answered a stuck card (review): keep going with the
+        // supervisor's advice, or stop with a summary of where it got to
+        // (without the browser: it's no longer needed).
+        if answer.as_ref().is_some_and(|a| a.card["kind"] == "stuck") {
+            let answer = answer.take().expect("checked");
+            let (reason, advice) = state.review.stuck.take().unwrap_or_default();
+            if !answer.approved {
+                return Ok(self
+                    .wrap_up(
+                        state,
+                        &schemas,
+                        &format!("The user stopped this task after a check found it stuck: {reason}"),
+                        format!("Stopped: {reason}"),
+                        "stuck",
+                    )
+                    .await);
+            }
+            let advice = if advice.is_empty() {
+                String::new()
+            } else {
+                format!(" The check's advice: {advice}")
+            };
+            state.messages.push(json!({"role": "user", "content": format!(
+                "(agentd) A check on your progress found you may be stuck ({reason}), and the user chose to \
+                 keep going.{advice}"
+            )}));
+            let (step, secs, messages) = (state.step, state.seconds, state.messages.len());
+            state.review.checked(step, secs, messages);
+        }
         let background = state.scheduled.is_some();
         let mut browser = Browser::new(self.cdp.clone(), state.allow_actions, self.policy.clone());
         if background {
@@ -1387,12 +1478,6 @@ impl Agent {
                 .attach(self.store.setting("tab_target")?.as_deref())
                 .await?;
         }
-        let schemas = tools::schemas(
-            self.cfg.shell_tool,
-            !self.skills.is_empty(),
-            self.cfg.memory_v2,
-            self.cfg.memory_v2 && state.scheduled.is_some(),
-        );
         let lane = if background {
             &self.background_cancel
         } else {
@@ -1515,6 +1600,25 @@ impl Agent {
                     self.action_needed(&browser, &task_id, &reason).await;
                     break 'task Outcome::Finished(format!("I need you: {reason}"), "needs_user");
                 }
+                if name == "update_plan" {
+                    state.queue.remove(0);
+                    let content = match plan::parse(&args) {
+                        Ok(items) => {
+                            state.plan = items;
+                            // The web app's checklist: a scheduled run's isn't watched.
+                            if !background {
+                                self.emit("plan", json!({"task": task_id, "items": state.plan}));
+                            }
+                            let (done, total) = plan::progress(&state.plan);
+                            format!("ok: plan saved ({done} of {total} done)")
+                        }
+                        Err(why) => format!("error: {why}"),
+                    };
+                    state
+                        .messages
+                        .push(json!({"role": "tool", "tool_call_id": call["id"], "content": content}));
+                    continue;
+                }
                 let result = if args.is_object() {
                     let call = self.call_tool(
                         &mut browser,
@@ -1593,8 +1697,18 @@ impl Agent {
             if *cancel.borrow() {
                 break 'task Outcome::Finished("Stopped.".into(), "cancelled");
             }
-            if state.step >= self.cfg.max_steps {
-                break 'task self.wrap_up(state, &schemas).await;
+            // No cap on steps: every so often the supervisor checks on the task.
+            let active = state.seconds + loop_started.elapsed().as_secs_f64();
+            if self.review_due(state, active) {
+                let outcome = tokio::select! {
+                    outcome = self.review(state, &schemas, active) => outcome,
+                    _ = stop.wait_for(|stopped| *stopped) => {
+                        break 'task Outcome::Finished("Stopped.".into(), "cancelled");
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    break 'task outcome;
+                }
             }
 
             // The model's next turn.
@@ -1604,16 +1718,32 @@ impl Agent {
             if cut > 0 {
                 tracing::info!(task = %task_id, step, cut, "trimmed old tool output from the context");
             }
-            let request = json!({
+            let max_tokens = turn_max_tokens(state.empty_retries);
+            let mut request = json!({
                 "model": state.model, "messages": state.messages, "tools": schemas,
-                "tool_choice": "auto", "max_tokens": 8192,
+                "tool_choice": "auto", "max_tokens": max_tokens,
             });
             // A stop interrupts the model call rather than waiting for its answer.
             let reply = tokio::select! {
-                reply = self.llm.chat(&request) => reply?,
+                reply = self.llm.chat(&request) => reply,
                 _ = stop.wait_for(|stopped| *stopped) => {
                     break 'task Outcome::Finished("Stopped.".into(), "cancelled");
                 }
+            };
+            // More room than the model or the account allows: the usual limit, then.
+            let reply = match reply {
+                Err(err) if max_tokens > TURN_MAX_TOKENS => {
+                    tracing::warn!(task = %task_id, step, max_tokens, err = %format!("{err:#}"),
+                        "a larger reply was refused: trying the usual limit");
+                    request["max_tokens"] = json!(TURN_MAX_TOKENS);
+                    tokio::select! {
+                        reply = self.llm.chat(&request) => reply?,
+                        _ = stop.wait_for(|stopped| *stopped) => {
+                            break 'task Outcome::Finished("Stopped.".into(), "cancelled");
+                        }
+                    }
+                }
+                reply => reply?,
             };
             state.usage.add(reply.get("usage"));
             let message = reply["choices"][0]["message"].clone();
@@ -1621,18 +1751,35 @@ impl Agent {
             // models that want it (GLM, Kimi) and without for the rest.
             state.messages.push(llm::for_history(&message, &state.model));
             let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
-            if calls.is_empty() {
-                // No text either: the thinking used up the reply. Ask once
-                // for the answer, rather than ending with "(empty answer)".
-                if is_empty_reply(&message) && !state.asked_again {
-                    state.asked_again = true;
-                    let finish = reply["choices"][0]["finish_reason"].as_str().unwrap_or("");
-                    tracing::info!(task = %task_id, step, finish, "empty reply: asking for the answer");
+            if calls.is_empty() && is_empty_reply(&message) {
+                // No text and no call: the thinking used up the reply. Ask
+                // again, with more room each time; then end with a summary.
+                let finish = reply["choices"][0]["finish_reason"].as_str().unwrap_or("");
+                if state.empty_retries < EMPTY_RETRIES {
+                    state.empty_retries += 1;
+                    tracing::info!(task = %task_id, step, finish, retry = state.empty_retries,
+                        "empty reply: asking again");
                     state
                         .messages
                         .push(json!({"role": "user", "content": EMPTY_REPLY}));
                     continue;
                 }
+                tracing::warn!(task = %task_id, step, finish, "empty replies: ending with a summary");
+                break 'task self
+                    .wrap_up(
+                        state,
+                        &schemas,
+                        "Your last replies were cut off before you wrote anything.",
+                        "The model's replies kept getting cut off before it wrote anything, so I stopped. Ask me \
+                         again, or pick another model in Settings."
+                            .into(),
+                        // Not "error": a scheduled run would be tried again and cut off again.
+                        "stuck",
+                    )
+                    .await;
+            }
+            state.empty_retries = 0;
+            if calls.is_empty() {
                 // Models sometimes ask for a sign-in in their answer, which ends the task
                 // with no way for the user to reach the tab. Remind them once.
                 if !state.reminded && browser.looks_like_sign_in().await {
@@ -1652,11 +1799,7 @@ impl Agent {
                         .push(json!({"role": "user", "content": REMEMBER_NUDGE}));
                     continue;
                 }
-                let answer = message["content"]
-                    .as_str()
-                    .unwrap_or("(empty answer)")
-                    .trim()
-                    .to_string();
+                let answer = message["content"].as_str().unwrap_or_default().trim().to_string();
                 break 'task Outcome::Finished(answer, "done");
             }
             state.queue = calls;
@@ -1676,17 +1819,24 @@ impl Agent {
         Ok(outcome)
     }
 
-    /// Out of steps: one last turn without tools, so the user hears what was
-    /// done and what's left rather than just "stopped".
-    async fn wrap_up(&self, state: &mut RunState, schemas: &Value) -> Outcome {
-        let fallback = format!("I stopped after {} steps without finishing.", self.cfg.max_steps);
+    /// The task has to end before it's done (`why`, for the model): one last
+    /// turn without tools, so the user hears what was done and what's left
+    /// rather than just "stopped". `fallback` if that turn gives nothing.
+    async fn wrap_up(
+        &self,
+        state: &mut RunState,
+        schemas: &Value,
+        why: &str,
+        fallback: String,
+        status: &'static str,
+    ) -> Outcome {
         state
             .messages
-            .push(json!({"role": "user", "content": tools::WRAP_UP}));
+            .push(json!({"role": "user", "content": tools::wrap_up(why)}));
         guard::enforce_budget(&mut state.messages, guard::TOOL_OUTPUT_BUDGET);
         let request = json!({
             "model": state.model, "messages": state.messages, "tools": schemas,
-            "tool_choice": "none", "max_tokens": 2048,
+            "tool_choice": "none", "max_tokens": TURN_MAX_TOKENS,
         });
         let answer = match self.llm.chat(&request).await {
             Ok(reply) => {
@@ -1702,7 +1852,112 @@ impl Agent {
                 fallback
             }
         };
-        Outcome::Finished(answer, "max_steps")
+        Outcome::Finished(answer, status)
+    }
+
+    /// Whether the supervisor should check on the task now: enough working
+    /// time or model turns since its last check.
+    fn review_due(&self, state: &RunState, active: f64) -> bool {
+        let (steps, secs) = (self.cfg.review_every_steps, self.cfg.review_every_secs);
+        (steps > 0 && state.step.saturating_sub(state.review.at_step) >= steps)
+            || (secs > 0 && active - state.review.at_secs >= secs as f64)
+    }
+
+    /// The supervisor's check (supervise.rs). None: carry on, after a nudge
+    /// with its advice in the conversation. Some: a chat task parks on a stuck
+    /// card for the user (never answered by Auto approve: it's about whether to
+    /// keep spending, not a permission), and a scheduled run ends with a summary.
+    async fn review(&self, state: &mut RunState, schemas: &Value, active: f64) -> Option<Outcome> {
+        let task_id = state.task.clone();
+        let minutes = (active / 60.0).round() as u64;
+        let digest = supervise::Digest {
+            request: &state.request,
+            plan: &state.plan,
+            steps: state.step,
+            minutes,
+            steps_since: state.step.saturating_sub(state.review.at_step),
+            since: state.messages.get(state.review.at_message..).unwrap_or_default(),
+            previous: state.review.previous.as_deref(),
+        }
+        .text();
+        let review = match self.llm.chat(&supervise::request(&state.model, &digest)).await {
+            Ok(reply) => {
+                state.usage.add(reply.get("usage"));
+                supervise::parse(&reply)
+            }
+            Err(err) => {
+                tracing::warn!(task = %task_id, err = %format!("{err:#}"), "the supervisor's check failed");
+                None
+            }
+        };
+        let review = match review {
+            Some(review) => review,
+            None => {
+                state.review.failures += 1;
+                self.emit("review", json!({"task": task_id, "verdict": "failed"}));
+                // Tried again before the next turn; twice in a row, it counts as stuck.
+                if state.review.failures < REVIEW_FAILURES {
+                    return None;
+                }
+                supervise::Review {
+                    verdict: Verdict::Stuck,
+                    reason: "The check on this task's progress failed twice in a row.".into(),
+                    advice: String::new(),
+                }
+            }
+        };
+        let reason = if review.reason.is_empty() {
+            "It doesn't seem to be getting anywhere.".to_string()
+        } else {
+            review.reason
+        };
+        tracing::info!(task = %task_id, step = state.step, minutes, verdict = review.verdict.as_str(), "supervisor's check");
+        self.emit(
+            "review",
+            json!({"task": task_id, "verdict": review.verdict.as_str(), "reason": reason}),
+        );
+        let (step, messages) = (state.step, state.messages.len());
+        state.review.checked(step, active, messages);
+        match review.verdict {
+            Verdict::Progressing => {
+                state.review.previous = None;
+                None
+            }
+            Verdict::Nudge => {
+                let advice = if review.advice.is_empty() {
+                    "Step back and try a different approach.".to_string()
+                } else {
+                    review.advice
+                };
+                state.review.previous = Some(format!("nudge: {advice}"));
+                state.messages.push(json!({"role": "user", "content": format!(
+                    "(agentd) A check on your progress: {reason} Try this: {advice}"
+                )}));
+                None
+            }
+            Verdict::Stuck if state.scheduled.is_some() => Some(
+                self.wrap_up(
+                    state,
+                    schemas,
+                    &format!("A check on your progress found you stuck: {reason}"),
+                    format!("Stopped: {reason}"),
+                    "stuck",
+                )
+                .await,
+            ),
+            Verdict::Stuck => {
+                state.review.previous = Some(format!("stuck: {reason}"));
+                state.review.stuck = Some((reason.clone(), review.advice));
+                let (done, total) = plan::progress(&state.plan);
+                let id = short_id();
+                let card = json!({
+                    "kind": "stuck", "id": id, "task": task_id, "reason": reason,
+                    "minutes": minutes, "steps": step,
+                    "plan": (total > 0).then(|| json!({"done": done, "total": total})),
+                });
+                Some(Outcome::Parked(Park { id, card }))
+            }
+        }
     }
 
     /// Runs a tool call. `resumed`: the user's answer, when the task parked on
@@ -3097,7 +3352,8 @@ pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
         egress_base_hosts: vec![".github.com".into(), "pypi.org".into()],
         policy_path: dir.join("no-policy.toml"),
         skills_dir: dir.join("no-skills"),
-        max_steps: 5,
+        review_every_secs: 1800,
+        review_every_steps: 5,
         shell_tool: true,
         desktop_name: "test-desktop".into(),
         memory_v2: true,
@@ -4241,6 +4497,8 @@ mod tests {
             "task": "t1", "model": "m", "allow_actions": true, "messages": [], "queue": [], "step": 3,
             "tainted": false, "reminded": false, "loops": guard::LoopDetector::default(),
             "usage": Usage::default(), "seconds": 1.0, "scheduled": "Morning inbox",
+            // Written by agentd before the supervisor: ignored now.
+            "asked_again": true,
         });
         let state: RunState = serde_json::from_value(old).unwrap();
         assert_eq!(
@@ -4249,11 +4507,12 @@ mod tests {
                 state.remembered,
                 state.nudged,
                 state.schedule_id,
-                state.asked_again
+                state.empty_retries
             ),
-            (false, false, false, None, false)
+            (false, false, false, None, 0)
         );
         assert_eq!(state.scheduled.as_deref(), Some("Morning inbox"));
+        assert!(state.plan.is_empty() && state.review.at_step == 0 && state.review.stuck.is_none());
     }
 
     #[test]
@@ -4648,6 +4907,347 @@ mod background_tests {
         let again = Agent::new(agent.cfg.clone()).unwrap();
         assert!(again.store.claim_run(now).unwrap().is_none());
         assert!(events(&again, "message").is_empty()); // quietly
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A stand-in model that answers each request with `reply(request)`, and
+    /// keeps every request. A message with no content and no calls comes back
+    /// cut off (finish "length"), as when the thinking used up the reply.
+    async fn scripted_model(
+        reply: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let reply = Arc::new(reply);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let (reply, log) = (reply.clone(), log.clone());
+                async move {
+                    let message = reply(&body);
+                    log.lock().unwrap().push(body);
+                    let finish = if message["tool_calls"].is_array() {
+                        "tool_calls"
+                    } else if message["content"].is_null() {
+                        "length"
+                    } else {
+                        "stop"
+                    };
+                    axum::Json(json!({
+                        "choices": [{"message": message, "finish_reason": finish}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, seen)
+    }
+
+    fn is_review(request: &Value) -> bool {
+        request["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("(agentd supervisor)"))
+    }
+
+    fn is_wrap_up(request: &Value) -> bool {
+        request["tool_choice"] == "none"
+    }
+
+    /// The task's own turns (not the supervisor's, nor memory's tidying up,
+    /// which may run after a task ends).
+    fn is_turn(request: &Value) -> bool {
+        request["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("You are an assistant"))
+    }
+
+    fn says(text: &str) -> Value {
+        json!({"role": "assistant", "content": text})
+    }
+
+    fn cut_off() -> Value {
+        json!({"role": "assistant", "content": null})
+    }
+
+    /// A call that works without a browser, and never fails.
+    fn lists_schedules() -> Value {
+        json!({"role": "assistant", "content": null, "tool_calls": [{
+            "id": format!("c{}", short_id()), "type": "function",
+            "function": {"name": "list_schedules", "arguments": "{}"},
+        }]})
+    }
+
+    fn last_message(request: &Value) -> String {
+        request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Runs the "Hourly check" schedule ("Check the build") once, to its end.
+    async fn run_scheduled(model: &str) -> (Arc<Agent>, std::path::PathBuf) {
+        let (agent, dir) = agent_on(model);
+        let schedule = a_schedule(&agent);
+        let queued = queue(&agent, &schedule, "sched1");
+        agent.clone().run_queued(queued, schedule).await;
+        (agent, dir)
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_stops_a_scheduled_run_that_is_stuck() {
+        let (model, seen) = scripted_model(|request| {
+            if is_review(request) {
+                says(r#"{"verdict": "stuck", "reason": "It lists the schedules over and over.", "advice": ""}"#)
+            } else if is_wrap_up(request) {
+                says("I listed the schedules but never got to the build.")
+            } else {
+                lists_schedules()
+            }
+        })
+        .await;
+        let (agent, dir) = run_scheduled(&model).await;
+        // A check every 5 steps here (test_agent): the first one finds it stuck.
+        let finished = &events(&agent, "run.finished")[0];
+        assert_eq!(
+            (finished["status"].as_str(), finished["steps"].as_u64()),
+            (Some("stuck"), Some(5))
+        );
+        let reviews = events(&agent, "review");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["verdict"], "stuck");
+        assert_eq!(reviews[0]["reason"], "It lists the schedules over and over.");
+        let messages = events(&agent, "message");
+        assert_eq!(
+            messages.last().unwrap()["text"],
+            "I listed the schedules but never got to the build."
+        );
+        // The supervisor read the request and every call since the start; the
+        // wrap-up told the model why it had to stop.
+        let seen = seen.lock().unwrap();
+        let digest = seen.iter().find(|r| is_review(r)).unwrap()["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(digest.starts_with("The user's request:\nCheck the build"));
+        assert_eq!(digest.matches("- list_schedules {}").count(), 5);
+        let wrap_up = seen.iter().find(|r| is_turn(r) && is_wrap_up(r)).unwrap();
+        assert!(last_message(wrap_up).starts_with("(agentd) A check on your progress found you stuck"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_runs_go_on_and_a_nudge_reaches_the_agent() {
+        let reviews = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = reviews.clone();
+        let (model, seen) = scripted_model(move |request| {
+            if is_review(request) {
+                return match counted.fetch_add(1, Ordering::SeqCst) {
+                    0 => says(r#"{"verdict": "progressing", "reason": "Making progress.", "advice": ""}"#),
+                    _ => says(
+                        r#"{"verdict": "nudge", "reason": "It keeps listing schedules.", "advice": "Check the build log instead."}"#,
+                    ),
+                };
+            }
+            if last_message(request).starts_with("(agentd) A check on your progress") {
+                says("The build is green.")
+            } else {
+                lists_schedules()
+            }
+        })
+        .await;
+        let (agent, dir) = run_scheduled(&model).await;
+        // Past where the old cap (5 steps here) would have ended it.
+        let finished = &events(&agent, "run.finished")[0];
+        assert_eq!(
+            (finished["status"].as_str(), finished["steps"].as_u64()),
+            (Some("done"), Some(11))
+        );
+        let verdicts: Vec<Value> = events(&agent, "review")
+            .iter()
+            .map(|r| r["verdict"].clone())
+            .collect();
+        assert_eq!(verdicts, [json!("progressing"), json!("nudge")]);
+        assert_eq!(
+            events(&agent, "message").last().unwrap()["text"],
+            "The build is green."
+        );
+        let seen = seen.lock().unwrap();
+        let nudged = seen.iter().rfind(|r| is_turn(r)).unwrap();
+        assert_eq!(
+            last_message(nudged),
+            "(agentd) A check on your progress: It keeps listing schedules. Try this: Check the build log instead."
+        );
+        // The second check knew only the calls since the first.
+        let second = seen.iter().filter(|r| is_review(r)).nth(1).unwrap()["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(second.matches("- list_schedules {}").count(), 5);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_check_that_keeps_failing_counts_as_stuck() {
+        let (model, _) = scripted_model(|request| {
+            if is_review(request) {
+                says("I'd say it's fine.") // no verdict
+            } else if is_wrap_up(request) {
+                says("Stopped early.")
+            } else {
+                lists_schedules()
+            }
+        })
+        .await;
+        let (agent, dir) = run_scheduled(&model).await;
+        let verdicts: Vec<Value> = events(&agent, "review")
+            .iter()
+            .map(|r| r["verdict"].clone())
+            .collect();
+        assert_eq!(verdicts, [json!("failed"), json!("failed"), json!("stuck")]);
+        let finished = &events(&agent, "run.finished")[0];
+        assert_eq!(
+            (finished["status"].as_str(), finished["steps"].as_u64()),
+            (Some("stuck"), Some(6))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_reply_is_asked_again_with_more_room() {
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = turns.clone();
+        let (model, seen) = scripted_model(move |request| match counted.fetch_add(1, Ordering::SeqCst) {
+            _ if !is_turn(request) => says("{}"),
+            // A call, then twice cut off, then an answer.
+            0 => lists_schedules(),
+            1 | 2 => cut_off(),
+            _ => says("All quiet."),
+        })
+        .await;
+        let (agent, dir) = run_scheduled(&model).await;
+        assert_eq!(events(&agent, "run.finished")[0]["status"], "done");
+        assert_eq!(events(&agent, "message").last().unwrap()["text"], "All quiet.");
+        let seen = seen.lock().unwrap();
+        let turns: Vec<&Value> = seen.iter().filter(|r| is_turn(r)).collect();
+        let limits: Vec<u64> = turns.iter().map(|r| r["max_tokens"].as_u64().unwrap()).collect();
+        assert_eq!(limits, [8192, 8192, 16384, 32768]);
+        assert!(last_message(turns[2]).starts_with("(agentd) Your last reply was cut off"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replies_that_stay_cut_off_end_with_a_summary() {
+        // Even the summary is cut off: the fallback says what happened.
+        let (model, seen) = scripted_model(|_| cut_off()).await;
+        let (agent, dir) = run_scheduled(&model).await;
+        assert_eq!(events(&agent, "run.finished")[0]["status"], "stuck");
+        let answer = events(&agent, "message").last().unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            answer.starts_with("The model's replies kept getting cut off"),
+            "{answer}"
+        );
+        let seen = seen.lock().unwrap();
+        let turns: Vec<&Value> = seen.iter().filter(|r| is_turn(r)).collect();
+        let limits: Vec<u64> = turns.iter().map(|r| r["max_tokens"].as_u64().unwrap()).collect();
+        assert_eq!(limits, [8192, 16384, 32768, 8192]);
+        assert!(is_wrap_up(turns[3]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_larger_reply_falls_back_to_the_usual_limit() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|axum::Json(body): axum::Json<Value>| async move {
+                match body["max_tokens"].as_u64() {
+                    // As Together does when the account can't cover it.
+                    Some(n) if n > 8192 => (axum::http::StatusCode::PAYMENT_REQUIRED, "credit").into_response(),
+                    _ if body["messages"].as_array().unwrap().len() > 3 => axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": "All quiet."}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                    }))
+                    .into_response(),
+                    _ => axum::Json(json!({
+                        "choices": [{"message": {"role": "assistant", "content": null}, "finish_reason": "length"}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                    }))
+                    .into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (agent, dir) = run_scheduled(&model).await;
+        assert_eq!(events(&agent, "run.finished")[0]["status"], "done");
+        assert_eq!(events(&agent, "message").last().unwrap()["text"], "All quiet.");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_on_a_stuck_card_ends_the_task_with_a_summary() {
+        let (model, seen) = scripted_model(|request| {
+            if is_wrap_up(request) {
+                says("Done: cloned the repo. Left: the build, which kept failing.")
+            } else {
+                says("unexpected")
+            }
+        })
+        .await;
+        let (agent, dir) = agent_on(&model);
+        agent
+            .store
+            .start_run(
+                "t1",
+                "Deploy the blog",
+                None,
+                "zai-org/GLM-5.3",
+                &agent.policy_version(),
+                None,
+            )
+            .unwrap();
+        let state = json!({
+            "task": "t1", "model": "zai-org/GLM-5.3", "allow_actions": true,
+            "messages": [{"role": "system", "content": ""}, {"role": "user", "content": "Deploy the blog"}],
+            "queue": [], "step": 70, "tainted": false, "reminded": false, "loops": guard::LoopDetector::default(),
+            "usage": Usage::default(), "seconds": 2000.0, "request": "Deploy the blog",
+            "review": {"at_step": 70, "at_secs": 2000.0, "at_message": 2, "failures": 0,
+                       "previous": "stuck: The build fails the same way each time.",
+                       "stuck": ["The build fails the same way each time.", "Read the error."]},
+        });
+        let card = json!({"kind": "stuck", "id": "s1", "task": "t1", "reason": "The build fails the same way each time.",
+                          "minutes": 33, "steps": 70, "plan": null});
+        agent
+            .store
+            .park("s1", "t1", &card, &state.to_string(), &agent.policy_version())
+            .unwrap();
+        assert!(
+            agent
+                .answer_approval("s1", false, None, Some("me".into()))
+                .is_ok()
+        );
+        until("the task ends", || !events(&agent, "task.finished").is_empty()).await;
+        assert_eq!(events(&agent, "task.finished")[0]["status"], "stuck");
+        assert_eq!(
+            events(&agent, "message").last().unwrap()["text"],
+            "Done: cloned the repo. Left: the build, which kept failing."
+        );
+        let seen = seen.lock().unwrap();
+        let turns: Vec<&Value> = seen.iter().filter(|r| is_turn(r)).collect();
+        assert_eq!(turns.len(), 1);
+        assert!(is_wrap_up(turns[0]));
+        assert_eq!(
+            last_message(turns[0]),
+            tools::wrap_up(
+                "The user stopped this task after a check found it stuck: The build fails the same way each time."
+            )
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

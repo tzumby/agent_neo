@@ -13,12 +13,14 @@ mod effects;
 mod guard;
 mod llm;
 mod memory;
+mod plan;
 mod policy;
 mod schedule;
 mod secrets;
 mod shell;
 mod skills;
 mod store;
+mod supervise;
 mod tools;
 
 use std::io::IsTerminal;

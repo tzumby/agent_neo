@@ -51,7 +51,6 @@ export const api = {
   settings: () => request("GET", "/api/v1/settings"),
   updateSettings: (settings) => request("PUT", "/api/v1/settings", settings),
   schedules: async () => (await request("GET", "/api/v1/schedules")).schedules,
-  addSchedule: (schedule) => request("POST", "/api/v1/schedules", schedule),
   deleteSchedule: (id) => request("DELETE", `/api/v1/schedules/${enc(id)}`, {}),
   pauseSchedule: (id, paused) => request("POST", `/api/v1/schedules/${enc(id)}/${paused ? "pause" : "resume"}`, {}),
   secrets: async () => (await request("GET", "/api/v1/secrets")).secrets,

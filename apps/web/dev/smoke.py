@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Clicks through the web app in headless Chrome against `make web-dev`
 (apps/web/dev/run.sh): sends a message and waits for the answer, answers a
-card, saves a key and opens each page. Prints a line per check; exits 1 if
+card, saves a key, follows a task's plan, stops a task the supervisor finds
+stuck and opens each page. Prints a line per check; exits 1 if
 one fails. Screenshots go to the folder given (default: the current one).
 
   uv run --with websockets apps/web/dev/smoke.py [screenshots-dir]
@@ -230,6 +231,43 @@ async def main(out):
             p.check(bool(made) and made[0]["prompt"] == "Check only the status page", "…and the edited instructions are what's scheduled")
             if made:
                 await p.js(f"fetch('/api/v1/schedules/{made[0]['id']}', {{method: 'DELETE'}})")
+
+            # A task with steps: its plan shows right away, ticks off live, and folds once it's done.
+            plans = "document.querySelectorAll('.row-plan').length"
+            before = await p.js(plans)
+            await say("Make a plan for porting the blog")
+            p.check(await p.until(f"{plans} > {before}", 15), "a task's plan appears in the chat")
+            last = "[...document.querySelectorAll('.row-plan')].pop()"
+            p.check(await p.until(f"!!{last}.querySelector('section.plan .plan-step.is-in-progress')", 10),
+                    "…with the step it's on marked as it works")
+            await p.shot(f"{out}/smoke-plan.png")
+            p.check(await p.until(f"{last}.querySelector('details.plan-finished summary')?.textContent === 'Plan · 3 of 3 done'", 15),
+                    "…and folds as 3 of 3 done when the task ends")
+            p.check(await p.js(f"{last}.querySelectorAll('.plan-step.is-done').length") == 3, "…every step ticked")
+
+            # Going in circles: the supervisor's card; Stop ends it with a summary.
+            await say("Keep checking the form page")
+            card = "[...document.querySelectorAll('.card-needs')].find(c => c.getAttribute('aria-label') === 'Looks stuck')"
+            p.check(await p.until(f"!!{card}", 40), "a task going in circles: the supervisor's card asks")
+            words = await p.js(f"{card}.textContent")
+            p.check("read the same page" in words, "…saying why it looks stuck")
+            p.check("steps" in words, "…and how far it got")
+            p.check(await p.js(f"![...{card}.querySelectorAll('button')].some(b => b.textContent === 'Edit')"), "…with nothing to edit")
+            await p.shot(f"{out}/smoke-stuck.png")
+            # Keep going: the task carries on, and the next check finds it stuck again.
+            stuck_cards = """fetch('/api/v1/events/page?limit=500&kinds=approval.requested').then(r => r.json())
+                .then(d => d.events.filter(e => e.data.kind === 'stuck').length)"""
+            asked = await p.js(stuck_cards)
+            await press(card, "Keep going")
+            p.check(await p.until(f"{stuck_cards}.then(n => n > {asked})", 40) and await p.until(f"!!{card}", 10),
+                    "Keep going: it carries on, and the next check asks again")
+            summaries = "[...document.querySelectorAll('.row-agent')].filter(r => r.textContent.includes('Done so far')).length"
+            had = await p.js(summaries)
+            await press(card, "Stop")
+            p.check(await p.until(f"{summaries} > {had}", 20), "Stop ends it with what's done and what's left")
+            finished = await p.js("""fetch('/api/v1/events/page?limit=5&kinds=task.finished').then(r => r.json())
+                .then(d => d.events.reduce((a, e) => (e.seq > a.seq ? e : a)).data.status)""")
+            p.check(finished == "stuck", "…and the task ends as stuck")
 
             # A card the desktop doesn't know (a sample one): it expires.
             await p.js("location.hash = '#/chat'")

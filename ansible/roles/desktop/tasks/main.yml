@@ -154,7 +154,7 @@
 
 # --- VNC password ------------------------------------------------------------
 # Off by default: the viewer is only reachable over SSM port forwarding and the
-# tailnet (viewer-proxy), which already limit access to you.
+# tailnet (tailnet-proxy), which already limit access to you.
 # TODO(M2): when on, generate per desktop at boot from desktop.env instead.
 # Generating it here would bake one password into the AMI for every desktop.
 

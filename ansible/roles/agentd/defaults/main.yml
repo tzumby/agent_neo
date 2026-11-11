@@ -61,16 +61,21 @@ agentd_nix_baseline_marker: uv
 agentd_skills_dir: "{{ playbook_dir }}/../../services/agentd/skills/"
 
 agentd_model: zai-org/GLM-5.3
-agentd_max_steps: 40
+# No cap on a task's steps: a supervisor (a separate model call) checks on a
+# running task after this many minutes of work or model turns, whichever comes
+# first, and nudges it, asks you on a card if it looks stuck, or stops a stuck
+# scheduled run (services/agentd/src/supervise.rs). 0 turns a trigger off.
+agentd_review_every_minutes: 30
+agentd_review_every_steps: 60
 agentd_shell_tool: "on"
-# Memory v2 (kinds, trust, retrieval, consolidation): "off" until it has been
-# tried on the dev desktop (docs/memory-v2.md §17).
+# Memory v2 (kinds, trust, retrieval, consolidation): "off" here;
+# group_vars/desktop.yml turns it on (docs/memory-v2.md §17).
 agentd_memory_v2: "off"
-agentd_desktop_name: "{{ (desktop_name | default('', true)) or (desktop_tailnet_name | default('cloud-desktop-dev')) }}"
+agentd_desktop_name: "{{ (desktop_name | default('', true)) or (desktop_tailnet_name | default('neo-agent')) }}"
 
 # Overrides the approval rules built into agentd (list of {pattern, reason};
 # regex patterns without single quotes). Empty: use the built-in rules.
 agentd_dangerous: []
 
-agentd_ssm_prefix: "/cloud-desktops/{{ desktop_env | default('dev') }}"
+agentd_ssm_prefix: "/cloud-desktops/{{ desktop_env | default('personal') }}"
 agentd_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"

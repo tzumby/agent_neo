@@ -7,7 +7,15 @@ last user message, with no real model and no key.
 - "schedule" or "report": schedules a one-time run in two minutes (a report)
 - "slow": takes 6 seconds (the working dots)
 - "status site": asks to reach status.example.com (request_access: a card)
+- "make a plan": writes a three-step plan with update_plan and ticks it off,
+  a second per step (the plan checklist)
+- "keep checking": reads the same page over and over (the supervisor finds it
+  stuck: run.sh has it check every 6 steps)
 - anything else: a Markdown answer with a table, a list and code
+
+It also answers agentd's supervisor (a system prompt starting "(agentd
+supervisor)"): stuck when the task it's shown says "keep checking", otherwise
+progressing; and the summary agentd asks for when a task is stopped.
 """
 
 import datetime
@@ -35,8 +43,25 @@ npm test -- --grep 'api/login'
 I'd raise the limiter's burst size for the test environment. Want me to draft the change?"""
 
 
-# Each ends in a card that asks about text, to try editing it.
+def plan(*statuses):
+    steps = ["Read the build setup", "Port the layouts", "Build and check the site"]
+    return ("update_plan", {"items": [{"step": step, "status": status} for step, status in zip(steps, statuses)]})
+
+
+# Paced a second a step, so the checklist can be watched filling in.
+SLOW_SCRIPTS = {"make a plan"}
+
+# Each ends in a card that asks about text, to try editing it (but the plan's
+# and the endless check's).
 SCRIPTS = {
+    "make a plan": [
+        plan("pending", "pending", "pending"),
+        plan("in_progress", "pending", "pending"),
+        plan("done", "in_progress", "pending"),
+        plan("done", "done", "in_progress"),
+        plan("done", "done", "done"),
+    ],
+    "keep checking": [("open_url", {"url": "http://form.test/form"})] + [("read_text", {})] * 39,
     "write a message": [
         ("open_url", {"url": "http://form.test/form"}),
         ("type_text", {"role": "textbox", "name": "Message Lawrence", "text": "Hello from the agent"}),
@@ -65,19 +90,45 @@ FORM = b"""<!doctype html><title>Message Lawrence</title><p id="echo">Nothing wr
 <td><button onclick="document.getElementById('echo').textContent = 'On the page: paid'">Confirm payment</button></td></tr></table>"""
 
 
-def reply(messages, tools=()):
+SUPERVISOR = "(agentd supervisor)"
+STUCK = {"verdict": "stuck", "reason": "It has read the same page 6 times without anything changing.",
+         "advice": "Stop re-reading the page."}
+PROGRESSING = {"verdict": "progressing", "reason": "Making progress.", "advice": ""}
+SUMMARY = """**Done so far:** opened the page and read it several times.
+
+**Left:** nothing on the page changed, so there was nothing more to find."""
+
+
+def reply(messages, tools=(), body=None):
+    body = body or {}
+    first = messages[0] if messages else {}
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
     text = last_user.get("content") if isinstance(last_user.get("content"), str) else json.dumps(last_user.get("content"))
+    # agentd's supervisor, checking on a task: a verdict as JSON.
+    if first.get("role") == "system" and str(first.get("content", "")).startswith(SUPERVISOR):
+        verdict = STUCK if "keep checking" in (text or "").lower() else PROGRESSING
+        return {"role": "assistant", "content": json.dumps(verdict)}
+    # A task stopped (or out of time): what's done and what's left, no tools.
+    if tools and body.get("tool_choice") == "none" and (text or "").startswith("(agentd)"):
+        return {"role": "assistant", "content": SUMMARY}
+    # The task's own request: agentd's notes to the model (a nudge, the user's
+    # "keep going" on a stuck card) don't change what it's doing.
+    def own(m):
+        return m.get("role") == "user" and not str(m.get("content", "")).startswith("(agentd)")
+    request = next((m for m in reversed(messages) if own(m)), last_user)
+    text = request.get("content") if isinstance(request.get("content"), str) else json.dumps(request.get("content"))
     text = (text or "").lower()
     after_tool = messages and messages[-1].get("role") == "tool"
     # Calls one after another, each once the last one has answered.
     done = 0
     for message in reversed(messages):
-        if message.get("role") == "user":
+        if own(message):
             break
         done += message.get("role") == "tool"
     for trigger, steps in SCRIPTS.items():
         if trigger in text and done < len(steps):
+            if trigger in SLOW_SCRIPTS:
+                time.sleep(1)
             return call(*steps[done])
     if after_tool:
         result = str(messages[-1].get("content", ""))[:300]
@@ -123,7 +174,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-        message = reply(body.get("messages", []), body.get("tools", []))
+        message = reply(body.get("messages", []), body.get("tools", []), body)
         answer = {
             "id": "fake", "object": "chat.completion", "model": body.get("model", "fake"),
             "choices": [{"index": 0, "message": message,

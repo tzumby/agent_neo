@@ -197,7 +197,7 @@ Terraform creates no parameters. You create these with `scripts/put-secret.py` (
 | Instance | Type | Where | Image | Notes |
 |---|---|---|---|---|
 | The desktop | t3a.medium (`desktop_instance_type`; `cpu_credits = unlimited`) | Private subnet 1 | Latest Canonical Ubuntu 26.04 (`ubuntu_version`) for `desktop_arch` (amd64 default, arm64 supported) | No key pair, no user data, IMDSv2 (hop limit 1), `disk_size_gb` (20) GiB gp3 encrypted with its key and deleted with the instance, its own instance profile, `Role=desktop` and `TailnetName`. AMI changes are ignored (Ansible updates in place); changing `desktop_arch` replaces the instance. Precondition: a NAT is enabled |
-| fck-nat | t4g.nano (`nat_instance_type`) | Public subnet 1 | fck-nat AL2023 arm64 | EIP on its ENI |
+| fck-nat | t4g.nano (the module's default; `personal` doesn't change it) | Public subnet 1 | fck-nat AL2023 arm64 | EIP on its ENI |
 
 ### 4.9 Data stores in AWS
 
@@ -293,7 +293,7 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
 
 ### 5.4 Role `agentd`: users, files and units
 
-**Order.** Users and directories, the guard firewall, the shell's egress proxy (Squid), then a handler flush (Squid runs with its allowlist before Nix downloads anything), Nix, and only then agentd's binary, a copy of its database, its settings, the model key, skills, rules and unit. Nothing before the flush may notify "Restart agentd": on a new desktop its unit doesn't exist yet, and the restart would fail the play.
+**Order.** Users and directories, the guard firewall, the shell's egress proxy (Squid), then a handler flush (Squid runs with its allowlist before Nix downloads anything), Nix, and only then agentd's binary, a copy of its database, its settings, the model key, skills, approval rules, sudoers and unit. Nothing before the flush may notify "Restart agentd": on a new desktop its unit doesn't exist yet, and the restart would fail the play.
 
 **Users.**
 
@@ -311,7 +311,7 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
 |---|---|---|
 | `/usr/local/bin/agentd` | root 0755 | The binary |
 | `/etc/agentd/` | root:agentd 0750 | Configuration directory |
-| `/etc/agentd/agentd.env` | root:agentd 0640 | `LISTEN`, `MODEL`, `CDP_URL`, `STATE_DIR`, `WORKDIR`, `RUN_AS=worker`, shell limits, `POLICY`, `MAX_STEPS`, `SHELL_TOOL`, `MEMORY_V2`, `DESKTOP_NAME`, `SHELL_PROXY=http://127.0.0.1:3128`, `EGRESS_USER_HOSTS`, `EGRESS_BASE_HOSTS` |
+| `/etc/agentd/agentd.env` | root:agentd 0640 | `LISTEN`, `MODEL`, `CDP_URL`, `STATE_DIR`, `WORKDIR`, `RUN_AS=worker`, shell limits, `POLICY`, `REVIEW_EVERY_SECS`, `REVIEW_EVERY_STEPS`, `SHELL_TOOL`, `MEMORY_V2`, `DESKTOP_NAME`, `SHELL_PROXY=http://127.0.0.1:3128`, `EGRESS_USER_HOSTS`, `EGRESS_BASE_HOSTS` |
 | `/etc/agentd/secrets.env` | root:agentd 0640 | `TOGETHER_API_KEY`, read from SSM `<prefix>/llm/together_api_key` on your machine at each deploy (`no_log`). agentd reads it; the shell user can't |
 | `/etc/agentd/policy.toml` | root:agentd 0640 | Only when `agentd_dangerous` overrides the built-in approval rules |
 | `/etc/agentd/skills/*.md` | root:agentd 0640 | Skills |
@@ -425,7 +425,8 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 | `EGRESS_BASE_HOSTS` | (empty) | The deployment's list, space-separated, as Squid has it: shown in Settings and checked before asking |
 | `POLICY` | `/etc/agentd/policy.toml` | Overrides the built-in approval patterns |
 | `SKILLS_DIR` | `/etc/agentd/skills` | Markdown how-tos |
-| `MAX_STEPS` | `40` | Model turns per task |
+| `REVIEW_EVERY_SECS` | `1800` | The supervisor checks on a running task after this much working time (§6.6). 0: off |
+| `REVIEW_EVERY_STEPS` | `60` | …or after this many model turns, whichever comes first. 0: off. There's no cap on steps |
 | `SHELL_TOOL` | `on` | Whether the agent has a shell at all |
 | `DESKTOP_NAME` | `cloud-desktop` | Shown in the web app. Ansible sets the tailnet name (`neo-agent`) |
 | `MEMORY_V2` | `off` | Memory v2 ([memory-v2.md](memory-v2.md)). Off: the v1 memory path, on the v2 schema (always migrated). The desktop's group_vars turn it on |
@@ -484,7 +485,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | `events` | `seq` (autoincrement), `ts`, `kind`, `data` (JSON) | The append-only event log the web app streams and replays (§6.5) |
 | `history` | `id`, `ts`, `role`, `content`, `agent` | What the model sees as the conversation: user messages and final answers only. The last 20 entries go into each new task |
 | `settings` | `key`, `value` | `model`, `allow_actions`, `auto_approve`, `tab_target`, `user_timezone`, `user_utc_offset`, and tidy-up's `memory_consolidation`, `memory_consolidation_model`, `memory_consolidation_daily_cap_usd`, `memory_last_consolidated_run` |
-| `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before); 0.15.10: `due` (unix seconds: a queued run isn't taken before then) and `attempt` (0, or 1 for the retry) | One row per task. `status` is `queued` (a scheduled run waiting for the background worker), `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `max_steps`, `stuck`, `interrupted` or `skipped` (a queued run that waited over an hour) |
+| `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before); 0.15.10: `due` (unix seconds: a queued run isn't taken before then) and `attempt` (0, or 1 for the retry) | One row per task. `status` is `queued` (a scheduled run waiting for the background worker), `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `stuck`, `interrupted`, `skipped`, or `max_steps` (runs from before the supervisor) (a queued run that waited over an hour) |
 | `pending` | `id`, `kind` (`approval` or `action`), `run`, `card` (JSON), `checkpoint` (the task's serialized `RunState`), `created` (unix seconds); v2: `policy_version` | What the user is being asked: parked approvals and Action needed cards |
 | `memory` | `id`, `agent`, `text`, `trusted`, `created`; v2: `kind` (rule, preference, fact, work_log), `status` (active, superseded, expired, deleted; `pending` only before 0.15.2), `trust` (user_stated, agent_inferred, imported), `importance`, `source_run`, `source_seq`, `source_schedule`, `valid_until`, `superseded_by`, `pending_reason`, `version`, `updated`, `last_recalled`, `recall_count` | Long-term memory (§6.13). `trusted` is kept in step with `trust` and `status` by triggers, for 0.14.0 and the v1 path |
 | `memory_fts` | FTS5 (`id`, `text`; porter stemming) | Full-text index over `memory`, kept in step by triggers |
@@ -572,9 +573,11 @@ Every change the web app shows is an event: appended to `events` and broadcast o
 | `task.started` | `task`, `model` | A chat task starts (the web app shows the chat as working until `task.finished` or `task.paused`) |
 | `run.started` | `task`, `model`, `schedule` ({id, name}) | A scheduled run starts, beside the chat (0.15.10). Not `task.started`, so the web app doesn't show the chat as working |
 | `step` | `task`, `step`, `tool`, `args` (first 300 characters) | Each tool call, except a resumed one |
+| `plan` | `task`, `items` ([{step, status: pending, in_progress or done}]) | A chat task's `update_plan`: the whole plan each time |
+| `review` | `task`, `verdict` (progressing, nudge, stuck or failed), `reason` | Each supervisor check (§6.6) |
 | `shell` | `task`, `command`, `as_root`, `direct` (outside the proxy, §6.21), `needs_approval`, `secrets` (key names) | A command is about to run or ask |
 | `shell.output` | `task`, `command`, `exit_code`, `timed_out`, `stopped`, `output` (last 4,000 characters), `seconds` | A command ended |
-| `approval.requested` | The card: `id`, `task`, `kind` (`shell`, `browser`, `schedule`, `secret` or `access`) and its fields. A `shell` card has `command`, `reason`, `secrets`, `summary` (the model's plain words, one line, at most 120 characters), `tainted` (asked after outside content) and, only for a direct command, `direct: true` (§6.21) | A task parks |
+| `approval.requested` | The card: `id`, `task`, `kind` (`shell`, `browser`, `schedule`, `secret`, `access` or `stuck`) and its fields. A `shell` card has `command`, `reason`, `secrets`, `summary` (the model's plain words, one line, at most 120 characters), `tainted` (asked after outside content) and, only for a direct command, `direct: true` (§6.21) | A task parks |
 | `task.paused` | `task`, `approval` | Right after the card |
 | `approval.resolved` | `task`, `id`, `approved`, `by`, `edited`, `text`, `expired`, `reason` (`policy_changed`) | Answered (`text`: what the person changed it to), or given up on |
 | `task.resumed` | `task` | A parked task carries on |
@@ -630,7 +633,12 @@ POST /approvals/{id} ──► answer_approval(): load the checkpoint, remove th
   - a shell command's systemd unit is stopped, which kills everything it started;
   - the web app gets `task.stopping` immediately.
 - **Restart recovery.** Chat tasks still marked `running` when agentd starts were cut off: each gets an "I was interrupted…" answer and the status `interrupted`. Scheduled runs are queued again once, quietly (§6.14). Parked tasks keep waiting.
-- **Step limit.** After `MAX_STEPS` (40) model turns, a wrap-up turn runs with no tools (`tool_choice: none`, 2,048 tokens). The model reports what it did, what's left and why. Status `max_steps`.
+- **No step limit: the supervisor** (`supervise.rs`). A task runs until it's done, you stop it, or a check finds it stuck. Before a model turn, once `REVIEW_EVERY_SECS` of working time (30 min; time parked on a card doesn't count) or `REVIEW_EVERY_STEPS` turns (60) have passed since the last check, a separate model call with a fresh context reviews the task. It sees your request, the agent's plan, the last check's verdict, and the calls since then (up to 40, arguments and results cut short; tool results are marked as data). It answers `{verdict, reason, advice}`:
+  - **progressing:** carry on;
+  - **nudge:** the advice goes to the agent as a user-role note, and the task carries on;
+  - **stuck:** a chat task parks on a **stuck** card (the reason, working minutes, steps, plan progress). Keep going resumes it with the advice; Stop ends it with a wrap-up. Auto approve never answers this card: it's about whether to keep spending, not a permission. A scheduled run, with nobody to ask, ends with a wrap-up. Status `stuck`.
+
+  A check that gives no usable verdict is tried again before the next turn; two in a row count as stuck, so a broken check can't leave a task running unchecked. Each check is a `review` event and adds to the task's usage. The loop detector (§6.12) still catches the same failing call repeated, at once. A **wrap-up** is one more turn with no tools (`tool_choice: none`, 8,192 tokens), told why the task has to end: the model reports what it did, what's left and why.
 
 ### 6.7 The model loop
 
@@ -642,14 +650,14 @@ Each model turn (`run_loop`):
    - trusted and unverified memories (up to 60; memory v2's notes instead, §6.13);
    - the saved keys' names and labels;
    - the skills listing.
-2. Run the queued tool calls in order (below). Then, if the step budget is spent, wrap up.
+2. Run the queued tool calls in order (below). Then, if a check is due, the supervisor reviews the task (§6.6).
 3. Trim the context. When tool results total more than 120,000 characters, the oldest are replaced by a note; the 2 newest stay whole. Every turn resends the whole context, so this also caps cost.
-4. Call the model: `{model, messages, tools, tool_choice: auto, max_tokens: 8192}`, POSTed to `LLM_URL` with the key as a bearer token (180 s timeout). A Stop cancels the call.
+4. Call the model: `{model, messages, tools, tool_choice: auto, max_tokens: 8192}`, POSTed to `LLM_URL` with the key as a bearer token (180 s timeout). A Stop cancels the call. After an empty reply, the retry gets 16,384 and then 32,768 tokens; if the provider refuses the larger limit (a 4xx, such as Together's 402 when the account can't cover it), the turn is sent again with 8,192.
 5. Add the reply to the conversation. For GLM and Kimi, `reasoning_content` is kept and sent back on later turns, since they reason worse without it; it's dropped for other models, which reject it.
-6. No tool calls means the answer is final. Exceptions, each at most once per task, each adding one reminder and running another turn:
-   - the reply has no text either: usually the model's thinking used up `max_tokens` (GLM, `finish_reason` "length"). The reminder asks for the answer itself, rather than ending with "(empty answer)";
-   - the open tab looks like a sign-in page: the reminder says to call `needs_user` instead;
-   - memory v2's reminder to `remember` (§6.13).
+6. No tool calls means the answer is final. Exceptions, each adding one reminder and running another turn:
+   - the reply has no text either: the model's thinking used up `max_tokens` (`finish_reason` "length"; on the dev desktop, every empty reply in three weeks). It's asked again, up to twice in a row and with more room each time (step 4), to make its next call or give its answer; after that the task ends with a wrap-up (status `stuck`, not `error`, so a scheduled run isn't tried again only to be cut off again). The count resets after any reply with text or calls. Nothing ends as "(empty answer)";
+   - the open tab looks like a sign-in page: the reminder says to call `needs_user` instead (once per task);
+   - memory v2's reminder to `remember` (§6.13, once per task).
 
 For each tool call:
 
@@ -855,6 +863,7 @@ These patterns are a speed bump against mistakes and injected instructions, not 
 | `schedule` | Name, prompt, when |
 | `secret` | Label, why, how (Markdown), link and its host, replace, tainted |
 | `access` | The hosts, why, tainted (§6.20) |
+| `stuck` | From the supervisor, not an action (§6.6): the reason, working `minutes`, `steps`, `plan` ({done, total} or null). Approve is Keep going, deny is Stop; nothing to edit, and Auto approve never answers it |
 
 Each answer records who gave it (`by`, from `X-Tailscale-User`).
 
@@ -1204,7 +1213,8 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
 - **Chat** (`chat.js`, `timeline.js`, `store.js`):
   - The chat is built from the event log. `timeline.js` reads only messages, images, `task.*`, cards and their answers, and `secret.saved`: the agent's steps, commands and their output, and memory and schedule events stay out. Replaying the later part of the log gives the chat of that part.
   - It opens at its end: the newest page (60 events of those kinds), then the stream after its `last_seq`. Older pages load as you scroll up, without moving what's on screen. On an error it shows offline, waits 2 s and reconnects after the last seq it applied.
-  - Three dots while a task runs; Send becomes Stop. Suggestions in an empty chat.
+  - Three dots while a task runs, with how long it has worked ("Working · 24 min", from `task.started`); Send becomes Stop. Suggestions in an empty chat.
+  - **The plan:** when the agent writes one (`update_plan`), a checklist after your message: "Plan" with "3 of 5", each step ✓ done, ◐ in progress or ○ to do, updated with each `plan` event. When the task ends it folds to "Plan · 4 of 5 done", above the answer.
   - Answers are Markdown (`markdown.js`): blocks and tables, single newlines break lines, raw HTML stays text, only web and mail links, images become links.
   - **Scheduled runs are reports,** not you speaking: the schedule's name and time, the instructions folded away, and the answer. A one-line run that found nothing is a quiet grey line, and such runs of one schedule fold into the latest.
   - **Cards,** only while they wait for you (answered or expired, a card leaves the chat):
@@ -1213,7 +1223,8 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
     - **Schedule this?**, with what to do each time;
     - **Key request:** why, the steps, "Open <host>", a password field, Not now and Save;
     - **Let your agent reach this site?**, with the hosts and why ("scheduled checks included");
-    - **Action needed:** the reason and a screenshot, with Skip, I'm done and Take over (the Desktop page).
+    - **Action needed:** the reason and a screenshot, with Skip, I'm done and Take over (the Desktop page);
+    - **Looks stuck,** from the supervisor: its reason, how long it has worked, steps and plan progress, with Stop and Keep going.
 
     On an editable card, Edit lets you change the text before approving (§6.11). A 409 says the desktop is busy; a 404 expires the card ("That request has expired.").
   - **Keys in the chat:** `keys.js` spots well-known key formats in a message about to be sent (GitHub, GitLab, Anthropic, Together, Stripe, OpenAI, Slack, Hugging Face, Google, AWS) and offers to save it under Keys and tokens instead.
@@ -1366,7 +1377,7 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
 | The agent reads the model key | It's in agentd's secrets file, which `worker` and the browser can't read, and it never goes into a prompt. A root command can read it, so one you approve (or any, under Auto approve) could |
 | The model sees or leaks a saved key | Keys are never in the model's context: they're injected per command through systemd credentials, and every result, event and history entry is redacted |
 | Someone else on your tailnet | Every device your tailnet's rules let through gets in, unless `make tailscale-allow` names logins. Other sites' pages can't act on the desktop through your browser (`door`'s cross-origin checks) |
-| Runaway model cost | `MAX_STEPS` 40 per task, the context budget, loop detection, tidy-up's daily cap ($0.50). Tasks have no daily budget: Together bills your account |
+| Runaway model cost | The supervisor's checks (every 30 min of work or 60 turns: a stuck chat task waits on a card, a stuck scheduled run stops), the context budget, loop detection, tidy-up's daily cap ($0.50). Tasks have no daily budget: Together bills your account |
 | A lost laptop or phone | Remove the device in Tailscale's admin console. Keys can't be read back from the web app |
 | Destructive commands by mistake | Dangerous patterns ask; root asks; Stop kills the unit; limits on memory, processes, CPU and time |
 | Losing your data | The disk's own KMS key keeps it private, not safe: state is on the root volume, with no snapshots or backups in Terraform. `make agentd-deploy` keeps the last 3 copies of the database on the same disk |
@@ -1449,7 +1460,7 @@ Found while writing this document. None of them is a known exploit; most are tra
 
 **Security and robustness.**
 - The model key is on the desktop (§2, rule 6). Root can read it, so an approved root command, or any command under Auto approve, could too; Together bills whatever it's used for. Rotating it is `make model-key` and `make agentd-deploy`.
-- Model calls have no spending limit: tasks have no daily budget, only tidy-up has its cap. `MAX_STEPS`, the context budget and loop detection limit each task.
+- Model calls have no spending limit: tasks have no daily budget, only tidy-up has its cap. No cap on a task's steps: the supervisor's checks, the context budget and loop detection limit each task, and a fast loop can run up to 60 turns before the first check.
 - `PUT /api/v1/settings` stores any `model` without checking `KNOWN_MODELS`; the web app offers only the known ones. A task on another model runs (Together decides), with no price, so its cost is null; a card it parks expires when answered, since today's rules refuse that model.
 - Squid has no `Safe_ports` rule, so plain-HTTP requests to allowed hosts aren't port-limited.
 - A schedule that runs without asking (every one a person sets up, §6.14) doesn't ask before data-out after outside content: its commands can send data to any host on the allowlist or that you allowed, with whatever account a command brings.
@@ -1461,14 +1472,7 @@ Found while writing this document. None of them is a known exploit; most are tra
 - Desktop egress at the security-group level is open (all protocols); only `worker` is restricted, and that's done on the host.
 - The web app has no memory screen and no "Run without asking" switch: both are reachable only through the API. Nothing notifies you when the web app isn't open (§6.17).
 
-**Drift in comments and docs.**
-- `modules/network` still mentions an ALB and a control plane (its subnet comments, and the validation message "the ALB needs two"), and `desktop_fleet`'s header a "Packer milestone". There's no ALB, control plane or Packer here.
-- The desktop role's comments on `novnc_bind` and the VNC password mention `viewer-proxy`, tailnet-proxy's old name.
-- The agentd role's comment on `agentd_memory_v2` says it stays off "until it has been tried on the dev desktop"; `group_vars/desktop.yml` turns it on.
-- Role defaults fall back to `cloud-desktop-dev` (`agentd_desktop_name`) and `dev` (`agentd_ssm_prefix`), while `tailnet_proxy`'s fall back to `neo-agent` and `personal`. The inventory sets both from tags, so the fallbacks don't apply.
-- `scripts/put-secret.py`'s usage example names `/cloud-desktops/dev/…`.
-- The web app's `api.js` still has `addSchedule`, which nothing calls.
-- `docs/memory-v2.md` is the plan as written: it still describes notifications, an attention budget and the apps' Memory screen, and its references to this document's §13.6 now mean §10.6.
+**Docs.** `docs/memory-v2.md` is the plan as written; its note at the top says what doesn't apply in this edition (notifications, the attention budget, the apps' Memory screen).
 
 ## 12. Glossary
 

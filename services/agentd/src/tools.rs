@@ -9,10 +9,14 @@ pub const SKIP_TEXT: &str =
 pub const SIGN_IN_REMINDER: &str = "(agentd) The open tab looks like a sign-in page. If the user has to \
 sign in, enter a code or solve a CAPTCHA there, call needs_user now: a text reply ends the task and gives \
 them no way to reach the tab. If no sign-in is needed, give your answer again.";
-/// Sent by agentd when a task runs out of steps: one last turn, without tools.
-pub const WRAP_UP: &str = "(agentd) You've used all the steps for this task, so you can't use tools any \
-more. Reply to the user now: what you did, what's still undone and why, and what they could ask you next. \
-Keep it short.";
+/// Sent by agentd when a task has to end before it's done (`why`): one last
+/// turn, without tools.
+pub fn wrap_up(why: &str) -> String {
+    format!(
+        "(agentd) {why} You can't use tools any more. Reply to the user now: what you did, what's still \
+         undone and why, and what they could ask you next. Keep it short."
+    )
+}
 
 /// Memory v2's instructions (docs/memory-v2.md §15); the memory block follows.
 const MEMORY_V2_RULES: &str = "## Memory
@@ -117,6 +121,10 @@ morning\", \"in two hours\"), use schedule_task, never the shell (crontab, at an
 is a new task that sees only its prompt, not this conversation, so write the prompt as a complete request \
 with the details it needs. Times are the user's local time. Use list_schedules and cancel_schedule to manage \
 them.
+- Plans: for a task with three or more distinct steps, call update_plan first with your steps (short, in the \
+order you'll do them), then keep it current: mark a step in_progress when you start it and done as soon as it's \
+finished, and add or drop steps when the work changes. The user follows along with it. Skip it for quick \
+requests of one or two steps.
 {memory_rule}- When done, reply with the answer only, without a tool call. Be concise and never repeat passwords, \
     security phrases, one-time codes, booking codes or full account numbers.",
         and_shell = if shell { ", and a bash shell" } else { "" },
@@ -266,6 +274,25 @@ pub fn schemas(shell: bool, skills: bool, memory_v2: bool, scheduled: bool) -> V
             "Stop and ask the user to do something only they can do (login, 2FA, CAPTCHA). Open the page first.",
             json!({"reason": {"type": "string"}}),
             &["reason"],
+        ),
+        tool(
+            "update_plan",
+            "Write or update your plan for this task, the whole list each time. The user sees it as a \
+             checklist while you work.",
+            json!({"items": {
+                "type": "array",
+                "description": "every step, in order (at most 20)",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step": {"type": "string", "description": "a short step, like \"Port the layouts to Astro\""},
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "done"]},
+                    },
+                    "required": ["step", "status"],
+                    "additionalProperties": false,
+                },
+            }}),
+            &["items"],
         ),
     ];
     if memory_v2 {
@@ -435,5 +462,15 @@ mod tests {
         let v1 = names(&schemas(true, true, false, false));
         assert!(v1.contains(&"remember".to_string()) && !v1.contains(&"search_memory".to_string()));
         assert_eq!(v2.len(), v1.len() + 1);
+        assert!(v1.contains(&"update_plan".to_string()) && v2.contains(&"update_plan".to_string()));
+    }
+
+    #[test]
+    fn the_prompt_asks_for_a_plan_on_longer_tasks() {
+        assert!(system_prompt(true, "now", "", "", "", true).contains("call update_plan first"));
+        assert!(
+            wrap_up("A check found you stuck.")
+                .starts_with("(agentd) A check found you stuck. You can't use tools")
+        );
     }
 }

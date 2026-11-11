@@ -663,7 +663,7 @@ agentd 0.15.2, the user's decisions: "I should never ever have to approve memori
 | `ansible/roles/agentd/` | `MEMORY_V2` in `agentd.env`; DB copy before restart |
 | `apps/apple/DesktopKit/AgentAPI`, `ChatCore` | §14 |
 | `apps/apple/CloudDesktop/Settings`, `ChatView`, `DesktopHome` | §14 |
-| `docs/architecture.md` | §6.3, §6.4, §6.5, §6.8, §6.11, §6.13, §6.14, §6.17, §13.6 updated in each phase's PR |
+| `docs/architecture.md` | §6.3, §6.4, §6.5, §6.8, §6.11, §6.13, §6.14, §6.17, §10.6 updated in each phase's PR |
 | `docs/memory-v2.md` | This plan, exported as Markdown, with decisions kept current |
 
 No new crates are expected: FTS5 comes with rusqlite's bundled SQLite, SHA-256 is already a dependency through the attestation code, JSON through serde. If a crate is needed anyway, add it in the phase PR with one line of justification.

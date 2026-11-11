@@ -17,7 +17,7 @@ chrome_debug_port: 9222
 vnc_port: 5900
 novnc_port: 6080
 # Without a VNC password, keep noVNC on localhost: reached only through SSM
-# port forwarding and viewer-proxy (tailnet).
+# port forwarding and tailnet-proxy (tailnet).
 novnc_bind: 127.0.0.1
 vnc_password_enabled: false
 

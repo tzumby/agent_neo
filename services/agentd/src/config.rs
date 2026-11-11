@@ -43,7 +43,12 @@ pub struct Config {
     pub policy_path: PathBuf,
     /// Skills: Markdown how-tos the agent reads on demand (skills.rs).
     pub skills_dir: PathBuf,
-    pub max_steps: u32,
+    /// The supervisor checks on a running task after this much working time
+    /// (seconds) or this many model turns, whichever comes first (supervise.rs).
+    /// There's no cap on steps: a task runs until it's done, is stopped, or the
+    /// supervisor finds it stuck. 0 turns that trigger off.
+    pub review_every_secs: u64,
+    pub review_every_steps: u32,
     pub shell_tool: bool,
     pub desktop_name: String,
     /// Memory v2 (docs/memory-v2.md): kinds, trust, retrieval, consolidation.
@@ -113,7 +118,12 @@ impl Config {
                 .collect(),
             policy_path: get("POLICY", "/etc/agentd/policy.toml").into(),
             skills_dir: get("SKILLS_DIR", "/etc/agentd/skills").into(),
-            max_steps: get("MAX_STEPS", "40").parse().context("MAX_STEPS")?,
+            review_every_secs: get("REVIEW_EVERY_SECS", "1800")
+                .parse()
+                .context("REVIEW_EVERY_SECS")?,
+            review_every_steps: get("REVIEW_EVERY_STEPS", "60")
+                .parse()
+                .context("REVIEW_EVERY_STEPS")?,
             shell_tool: get("SHELL_TOOL", "on") == "on",
             desktop_name: get("DESKTOP_NAME", "cloud-desktop"),
             memory_v2: get("MEMORY_V2", "off") == "on",

@@ -1,18 +1,20 @@
-// The chat: only the conversation, scheduled runs as reports, and the cards
-// waiting for the person. Three dots while the agent works; nothing else of
-// what it does. Opens at its end; older pages load as the person scrolls up,
-// without moving what's on screen.
+// The chat: only the conversation, scheduled runs as reports, the cards
+// waiting for the person, and a task's plan as a checklist. Three dots while
+// the agent works, with how long it has been at it; nothing else of what it
+// does. Opens at its end; older pages load as the person scrolls up, without
+// moving what's on screen.
 
 import { findKey } from "./keys.js";
 import { parse, render, safeHref } from "./markdown.js";
 import { busyButton, h, icon, site, time, when } from "./dom.js";
-import { rowKey } from "./timeline.js";
+import { duration, rowKey, workingFor } from "./timeline.js";
 
 export function mountChat(store, view, { openDesktop, openKeys }) {
   const scroll = view.querySelector(".chat-scroll");
   const list = view.querySelector(".rows");
   const older = view.querySelector(".older");
   const working = view.querySelector(".working");
+  const workingTime = view.querySelector(".working-time");
   const empty = view.querySelector(".empty");
   const rows = new Map(); // row key → {sig, node}
   let revealed = false;
@@ -66,7 +68,7 @@ export function mountChat(store, view, { openDesktop, openKeys }) {
     }
 
     working.hidden = !store.busy;
-    working.setAttribute("aria-label", store.stopping ? "Stopping" : "Working");
+    updateWorking();
     empty.hidden = items.length > 0 || store.busy;
     older.hidden = !store.hasOlder;
 
@@ -97,6 +99,17 @@ export function mountChat(store, view, { openDesktop, openKeys }) {
     olderVisible = entries.some((e) => e.isIntersecting);
     checkOlder();
   }, { root: scroll, rootMargin: "200px 0px 0px 0px" }).observe(older);
+
+  /** "Working · 24 min" beside the dots (nothing under a minute). */
+  function updateWorking() {
+    const since = store.busy && !store.stopping ? workingFor(store.timeline.workingSince) : "";
+    workingTime.textContent = since ? `Working · ${since}` : "";
+    workingTime.hidden = !since;
+    working.setAttribute("aria-label", store.stopping ? "Stopping" : since ? `Working for ${since}` : "Working");
+  }
+  setInterval(() => {
+    if (store.busy) updateWorking();
+  }, 30_000);
 
   scroll.addEventListener("scroll", () => (pinned = nearBottom()), { passive: true });
   new ResizeObserver(() => {
@@ -136,6 +149,8 @@ function renderRow(item, ctx) {
       return h("li", { class: "row row-report" }, report(item));
     case "image":
       return h("li", { class: "row row-agent" }, picture(item.url, item.caption));
+    case "plan":
+      return h("li", { class: "row row-plan" }, plan(item));
     case "approval":
       return h("li", { class: "row row-card" }, approvalCard(item, ctx));
     case "action":
@@ -187,6 +202,29 @@ function report(item) {
     setTimeout(() => (copy.textContent = "Copy"), 1500);
   }));
   return h("div", { class: "report report-full" }, head, answer(item.answer.text), h("div", { class: "report-foot" }, copy), instructions);
+}
+
+// --- A task's plan -----------------------------------------------------------------
+
+const MARKS = { done: "✓", in_progress: "◐", pending: "○" };
+const SAID = { done: "Done", in_progress: "In progress", pending: "To do" };
+
+/** The agent's own steps, ticked off as it goes; folded once the task ends. */
+function plan(item) {
+  const done = item.steps.filter((s) => s.status === "done").length;
+  const count = `${done} of ${item.steps.length}`;
+  const steps = h("ol", { class: "plan-steps" }, item.steps.map((s) =>
+    h("li", { class: `plan-step is-${s.status.replace("_", "-")}` },
+      h("span", { class: "plan-mark", "aria-hidden": "true" }, MARKS[s.status]),
+      h("span", { class: "visually-hidden" }, `${SAID[s.status]}: `),
+      h("span", { class: "plan-text" }, s.step))));
+  if (item.finished) {
+    return h("details", { class: "plan plan-finished" },
+      h("summary", null, `Plan · ${count} done`), steps);
+  }
+  return h("section", { class: "plan", "aria-label": `Plan, ${count} done` },
+    h("div", { class: "plan-head" }, h("span", { class: "plan-title" }, "Plan"), h("span", { class: "plan-count" }, count)),
+    steps);
 }
 
 // --- Cards -----------------------------------------------------------------------
@@ -247,6 +285,7 @@ function approvalCard(card, ctx) {
   if (card.kind === "schedule") return scheduleCard(card, ctx);
   if (card.kind === "secret") return secretCard(card, ctx);
   if (card.kind === "access") return accessCard(card, ctx);
+  if (card.kind === "stuck") return stuckCard(card, ctx);
   const command = h("pre", null, h("code", null, card.command));
   const edit = textEdit(card, card.command, "The command", command, { code: true });
   return h("section", { class: "card card-needs", "aria-label": "Needs your OK" },
@@ -305,6 +344,28 @@ function scheduleCard(card, ctx) {
       prompt, edit.input),
     h("p", { class: "card-text muted" }, "The agent asked for this after reading outside content. Approve only if you asked for it."),
     answerButtons(card, ctx, edit));
+}
+
+// The supervisor thinks the task is going in circles: carry on, or stop it
+// (it then ends with what's done and what's left). Never answered for you.
+function stuckCard(card, ctx) {
+  const s = card.stuck;
+  const facts = [
+    s.minutes >= 1 ? `Working for ${duration(s.minutes)}` : null,
+    s.steps ? `${s.steps} ${s.steps === 1 ? "step" : "steps"}` : null,
+    s.plan ? `plan ${s.plan.done} of ${s.plan.total} done` : null,
+  ].filter(Boolean).join(" · ");
+  const stop = h("button", { class: "button", type: "button" }, "Stop");
+  const keep = h("button", { class: "button button-primary", type: "button" }, "Keep going");
+  stop.addEventListener("click", () => busyButton(stop, () => ctx.store.answer(card, false)));
+  keep.addEventListener("click", () => busyButton(keep, () => ctx.store.answer(card, true)));
+  return h("section", { class: "card card-needs", "aria-label": "Looks stuck" },
+    h("p", { class: "card-kicker" }, icon("clock"), "Checked on your task"),
+    h("h3", { class: "card-title" }, "Looks stuck"),
+    s.reason ? h("p", { class: "card-text" }, s.reason) : null,
+    facts ? h("p", { class: "card-text muted" }, facts) : null,
+    h("p", { class: "card-note" }, "Stop ends it with what's done and what's left. Keep going lets it carry on, with a hint."),
+    buttons(stop, keep));
 }
 
 // The agent's commands hit a site the desktop's proxy doesn't let through.

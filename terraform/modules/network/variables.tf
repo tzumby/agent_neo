@@ -14,7 +14,7 @@ variable "azs" {
 
   validation {
     condition     = length(var.azs) >= 2
-    error_message = "Use at least two AZs (the ALB needs two)."
+    error_message = "Use at least two AZs."
   }
 }
 

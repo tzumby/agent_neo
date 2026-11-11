@@ -8,8 +8,8 @@ remembers what you tell it, and runs scheduled tasks. Anything risky waits for
 your OK.
 
 This is a trimmed edition of the full project, for one person. It leaves out
-the model gateway, push notifications and the iPhone and Mac apps, Slack and
-Teams updates, the Cloudflare and Datadog monitoring with its setup guide, the
+the model gateway, the push relay and the iPhone and Mac apps (notifications
+come to your browsers by Web Push instead), Slack and Teams updates, the Cloudflare and Datadog monitoring with its setup guide, the
 Cloudflare Access front door, and the tooling for running desktops for other
 people.
 
@@ -124,6 +124,15 @@ on every `make` gives a second, separate deployment in the same account.
 - **Schedules**: "every weekday at 8, summarize my inbox" or "tomorrow at 9,
   check PR 12". Each run is an ordinary task with the saved instructions, and
   its answer lands in the chat. The Schedules page pauses and cancels them.
+- **Notifications**: under Settings → Notifications, turn them on for each
+  device you use. You get one when a card needs you (an approval, a key, a
+  stuck task), when Action needed comes up, when a chat task that ran over a
+  minute finishes, and when a scheduled run finds something. agentd sends
+  them by Web Push, encrypted to your browser, with no relay and no app-store
+  account. On iPhone or iPad, add the web app to your Home Screen first (Share
+  → Add to Home Screen), open it from there, then turn them on. iOS only
+  allows Web Push for Home Screen apps. `agentd_push_contact` sets the contact
+  address the push services see.
 - **Memory**: the agent remembers facts across conversations, and tidies up
   duplicates and things that are no longer true.
 - **Skills** (`services/agentd/skills`) are how-tos the agent reads when it

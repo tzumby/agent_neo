@@ -43,7 +43,7 @@ env -i PATH="$PATH" HOME="$work/home" LISTEN="unix:$sock" STATE_DIR="$work/state
   EGRESS_USER_HOSTS="$work/state/allowed-hosts.txt" EGRESS_BASE_HOSTS=".github.com pypi.org" \
   MODEL=zai-org/GLM-5.3 LLM_URL=http://127.0.0.1:8091/v1/chat/completions LLM_API_KEY=dev \
   MEMORY_V2=on DESKTOP_NAME=neo-agent RUST_LOG=agentd=info \
-  REVIEW_EVERY_STEPS=6 \
+  REVIEW_EVERY_STEPS=6 PUSH_DEV_ENDPOINTS=on \
   services/agentd/target/debug/agentd >"$work/agentd.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 50); do

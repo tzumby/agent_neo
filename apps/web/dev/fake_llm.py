@@ -94,6 +94,11 @@ SUPERVISOR = "(agentd supervisor)"
 STUCK = {"verdict": "stuck", "reason": "It has read the same page 6 times without anything changing.",
          "advice": "Stop re-reading the page."}
 PROGRESSING = {"verdict": "progressing", "reason": "Making progress.", "advice": ""}
+
+# Notifications agentd sent (Web Push, to an endpoint here: run.sh lets it with
+# PUSH_DEV_ENDPOINTS). The body is encrypted for the browser, so only its size
+# and the headers are kept. GET /pushes lists them.
+PUSHES = []
 SUMMARY = """**Done so far:** opened the page and read it several times.
 
 **Left:** nothing on the page changed, so there was nothing more to find."""
@@ -163,7 +168,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path == "/form":
+        if self.path == "/pushes":
+            self.send_json(PUSHES)
+        elif self.path == "/form":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(FORM)))
@@ -173,7 +180,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.path.startswith("/push/"):
+            PUSHES.append({
+                "name": self.path[len("/push/"):],
+                "content_encoding": self.headers.get("Content-Encoding", ""),
+                "ttl": self.headers.get("TTL", ""),
+                "urgency": self.headers.get("Urgency", ""),
+                "authorization": self.headers.get("Authorization", "")[:12],
+                "length": len(raw),
+            })
+            self.send_response(201)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = json.loads(raw)
         message = reply(body.get("messages", []), body.get("tools", []), body)
         answer = {
             "id": "fake", "object": "chat.completion", "model": body.get("model", "fake"),

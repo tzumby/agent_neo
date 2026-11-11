@@ -49,6 +49,11 @@ pub struct Config {
     /// supervisor finds it stuck. 0 turns that trigger off.
     pub review_every_secs: u64,
     pub review_every_steps: u32,
+    /// Notifications (notify.rs): the contact push services see in each
+    /// request's VAPID token (a mailto: or https: URL).
+    pub vapid_subject: String,
+    /// Local development only: subscriptions may point at http://127.0.0.1.
+    pub push_dev_endpoints: bool,
     pub shell_tool: bool,
     pub desktop_name: String,
     /// Memory v2 (docs/memory-v2.md): kinds, trust, retrieval, consolidation.
@@ -124,6 +129,8 @@ impl Config {
             review_every_steps: get("REVIEW_EVERY_STEPS", "60")
                 .parse()
                 .context("REVIEW_EVERY_STEPS")?,
+            vapid_subject: get("VAPID_SUBJECT", "mailto:neo-agent@example.com"),
+            push_dev_endpoints: get("PUSH_DEV_ENDPOINTS", "off") == "on",
             shell_tool: get("SHELL_TOOL", "on") == "on",
             desktop_name: get("DESKTOP_NAME", "cloud-desktop"),
             memory_v2: get("MEMORY_V2", "off") == "on",

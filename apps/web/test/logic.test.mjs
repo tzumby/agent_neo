@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import { findKey, isValidName, normalizedName } from "../public/assets/js/keys.js";
 import { inline, parse, safeHref } from "../public/assets/js/markdown.js";
+import { deviceLabel, fromBase64Url, iosOutsideHomeScreen, isIOS, ownSubscription, pushState, pushSupported } from "../public/assets/js/push.js";
 import { Timeline, duration, rowKey, workingFor } from "../public/assets/js/timeline.js";
 
 let seq = 0;
@@ -230,4 +231,54 @@ test("how long the task has worked", () => {
   assert.equal(t.workingSince, start, "counts from when it started");
   t.apply({ seq: 4, ts: "2026-11-03T08:10:00Z", kind: "task.finished", data: { task: "t1" } });
   assert.equal(t.workingSince, null);
+});
+
+test("push: the desktop's key becomes bytes for the browser", () => {
+  // 65 bytes, uncompressed P-256 (0x04 first), base64url without padding.
+  const bytes = new Uint8Array(65).map((_, i) => (i === 0 ? 4 : i * 3));
+  const b64url = Buffer.from(bytes).toString("base64url");
+  assert.ok(!b64url.includes("=") && /^[A-Za-z0-9_-]+$/.test(b64url));
+  assert.deepEqual([...fromBase64Url(b64url)], [...bytes]);
+  assert.deepEqual([...fromBase64Url("_-8")], [0xff, 0xef]);
+});
+
+test("push: a device's label from its browser", () => {
+  const cases = [
+    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36", 0, "Mac · Chrome"],
+    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15", 0, "Mac · Safari"],
+    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15", 5, "iPad · Safari"],
+    ["Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1", 5, "iPhone · Safari"],
+    ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0", 0, "Windows · Edge"],
+    ["Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0", 0, "Linux · Firefox"],
+    ["Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36", 5, "Android · Chrome"],
+    ["", 0, "This device"],
+  ];
+  for (const [ua, touch, label] of cases) assert.equal(deviceLabel(ua, touch), label, ua);
+  assert.ok(isIOS("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", 5) && !isIOS("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", 0));
+});
+
+test("push: what the browser can do, and what Settings shows", () => {
+  const iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1";
+  const win = (nav, extra = {}, standaloneQuery = false) => ({
+    navigator: nav, matchMedia: () => ({ matches: standaloneQuery }), ...extra,
+  });
+  assert.ok(pushSupported(win({ serviceWorker: {} }, { PushManager: {}, Notification: {} })));
+  assert.ok(!pushSupported(win({ serviceWorker: {} }, { Notification: {} })));
+  assert.ok(!pushSupported(undefined));
+  // Safari on iPhone, in a tab: only a Home Screen app gets notifications.
+  assert.ok(iosOutsideHomeScreen(win({ userAgent: iphone, maxTouchPoints: 5 })));
+  assert.ok(!iosOutsideHomeScreen(win({ userAgent: iphone, maxTouchPoints: 5, standalone: true })));
+  assert.ok(!iosOutsideHomeScreen(win({ userAgent: iphone, maxTouchPoints: 5 }, {}, true)));
+  assert.ok(!iosOutsideHomeScreen(win({ userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)", maxTouchPoints: 0 })));
+
+  assert.equal(pushState({ ios: true, supported: false }), "ios-home-screen");
+  assert.equal(pushState({ supported: false }), "unsupported");
+  assert.equal(pushState({ supported: true, permission: "denied", subscribed: true }), "denied");
+  assert.equal(pushState({ supported: true, permission: "granted", subscribed: true }), "on");
+  assert.equal(pushState({ supported: true, permission: "default", subscribed: false }), "off");
+
+  const subs = [{ id: "a1", endpoint: "https://fcm.googleapis.com/fcm/send/x" }, { id: "b2", endpoint: "https://web.push.apple.com/y" }];
+  assert.equal(ownSubscription(subs, "https://web.push.apple.com/y").id, "b2");
+  assert.equal(ownSubscription(subs, "https://elsewhere/z"), null);
+  assert.equal(ownSubscription(subs, undefined), null);
 });

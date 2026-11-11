@@ -14,8 +14,8 @@
 //!   `EFFECT_MAX_ATTEMPTS` failures the row stays, given up, and `/status`
 //!   reports it; enqueuing the same key again starts it over.
 //!
-//! Kinds: `purge` (daily) and `consolidate` (consolidate.rs). `push` rows
-//! from before notifications were removed are dropped.
+//! Kinds: `purge` (daily), `consolidate` (consolidate.rs) and `web_push`
+//! (notify.rs). `push` rows, from the old push relay, are dropped.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -122,7 +122,8 @@ async fn handle(agent: &Agent, effect: &Effect) -> Outcome {
     match effect.kind.as_str() {
         "purge" => purge(&agent.store),
         "consolidate" => crate::consolidate::run(agent).await,
-        // A notification queued by an agentd that still had push: nowhere to send it.
+        "web_push" => crate::notify::deliver(agent, effect).await,
+        // A notification queued by an agentd that still had the push relay: nowhere to send it.
         "push" => Outcome::Done,
         // From a newer agentd (after a rollback): keep it for that version.
         other => Outcome::Failed(format!("unknown effect kind {other}")),

@@ -3,6 +3,7 @@
 
 import { busyButton, fill, h, icon, when } from "./dom.js";
 import { isValidName, normalizedName } from "./keys.js";
+import { deviceLabel, fromBase64Url, iosOutsideHomeScreen, ownSubscription, pushState, pushSupported } from "./push.js";
 
 // --- Desktop ---------------------------------------------------------------------
 
@@ -271,6 +272,7 @@ export function mountSettings(store, view, session) {
         h("label", { class: "toggle" }, autoApprove,
           h("span", null, h("span", { class: "strong" }, "Auto approve"),
             h("span", { class: "muted block" }, "Nothing waits for your OK, in chats or scheduled runs. Commands as root, direct connections, browser changes, new sites and schedules all go ahead, even if a page or log has fooled the agent. Keys still come from you, and what the agent is never allowed to do stays refused.")))),
+      pushSection(store),
       sitesSection(store),
       h("section", { class: "settings-group" },
         h("h2", { class: "page-h2" }, "Appearance"),
@@ -288,6 +290,168 @@ export function mountSettings(store, view, session) {
   }
 
   return { enter: load };
+}
+
+// --- Notifications (Web Push) -----------------------------------------------------
+
+const SW_SCOPE = "/assets/";
+
+/** This browser's service worker registration, once it's active (subscribe needs that). */
+async function activeRegistration() {
+  const registration = (await navigator.serviceWorker.getRegistration(SW_SCOPE))
+    || (await navigator.serviceWorker.register("/assets/sw.js", { scope: SW_SCOPE }));
+  if (registration.active) return registration;
+  const worker = registration.installing || registration.waiting;
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("the service worker didn't start")), 10000);
+    worker?.addEventListener("statechange", () => {
+      if (worker.state === "activated") {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+  });
+  return registration;
+}
+
+/** This browser's push subscription, if it has one. */
+async function currentSubscription() {
+  try {
+    const registration = await navigator.serviceWorker.getRegistration(SW_SCOPE);
+    return (await registration?.pushManager.getSubscription()) || null;
+  } catch {
+    return null;
+  }
+}
+
+function pushSection(store) {
+  const section = h("section", { class: "settings-group", "aria-label": "Notifications" });
+  const heading = () => h("h2", { class: "page-h2" }, "Notifications");
+  const what = () => h("p", { class: "muted" },
+    "On the devices you turn them on for: approvals and other cards that need you, a task that looks stuck, Action needed, a long task finishing, and scheduled runs that found something.");
+  const problem = h("p", { class: "error", hidden: true });
+  const fail = (text) => {
+    problem.hidden = false;
+    problem.textContent = text;
+  };
+
+  async function render() {
+    problem.hidden = true;
+    let info;
+    try {
+      info = await store.api.push();
+    } catch (error) {
+      fill(section, heading(), h("p", { class: "error" }, `Couldn't load notifications: ${error.message}`));
+      return;
+    }
+    const subscriptions = info.subscriptions || [];
+    const supported = pushSupported(window);
+    const mine = supported ? await currentSubscription() : null;
+    const own = ownSubscription(subscriptions, mine?.endpoint);
+    const state = pushState({
+      supported,
+      ios: iosOutsideHomeScreen(window),
+      permission: supported ? Notification.permission : "default",
+      subscribed: Boolean(own),
+    });
+    const others = subscriptions.filter((s) => s !== own);
+    fill(section, heading(), what(), thisDevice(state, own, info, mine), problem, othersList(others));
+  }
+
+  function thisDevice(state, own, info, mine) {
+    if (state === "ios-home-screen") {
+      return h("p", null, "On iPhone or iPad: tap Share → Add to Home Screen, open Neo Agent from there, then turn notifications on here.");
+    }
+    if (state === "unsupported") return h("p", null, "This browser can't get notifications from the web app.");
+    if (state === "denied") {
+      return h("p", null, "Notifications are blocked for this site. Allow them in your browser's site settings (and for the browser in your system's notification settings), then reload this page.");
+    }
+    if (state === "on") {
+      const test = h("button", { class: "button", type: "button" }, "Send a test");
+      const off = h("button", { class: "button button-quiet", type: "button" }, "Turn off");
+      test.addEventListener("click", () => busyButton(test, async () => {
+        try {
+          await store.api.testPush(own.id);
+          store.notice("Sent. It should arrive in a few seconds.");
+        } catch (error) {
+          fail(`Couldn't send a test: ${error.message}`);
+        }
+      }));
+      off.addEventListener("click", () => busyButton(off, async () => {
+        try {
+          await mine?.unsubscribe().catch(() => {});
+          await store.api.deletePush(own.id);
+          store.notice("Notifications are off for this device.");
+        } catch (error) {
+          fail(`Couldn't turn them off: ${error.message}`);
+          return;
+        }
+        await render();
+      }));
+      return h("div", { class: "card-actions card-actions-start" },
+        h("p", { class: "card-text" }, `On for this device (${own.label || deviceLabel(navigator.userAgent, navigator.maxTouchPoints)}).`),
+        test, off);
+    }
+    const on = h("button", { class: "button button-primary", type: "button" }, "Turn on notifications on this device");
+    on.addEventListener("click", () => busyButton(on, async () => {
+      try {
+        // First, while the tap still counts as one: iOS asks only then.
+        const permission = await Notification.requestPermission();
+        if (permission !== "granted") {
+          await render();
+          return;
+        }
+        const registration = await activeRegistration();
+        // One from before (another key, or the desktop no longer has it): start over.
+        const stale = await registration.pushManager.getSubscription();
+        if (stale) await stale.unsubscribe().catch(() => {});
+        const subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: fromBase64Url(info.public_key),
+        });
+        await store.api.subscribePush({
+          ...subscription.toJSON(),
+          label: deviceLabel(navigator.userAgent, navigator.maxTouchPoints),
+        });
+        store.notice("Notifications are on for this device.");
+      } catch (error) {
+        fail(`Couldn't turn them on: ${error.message}`);
+        return;
+      }
+      await render();
+    }));
+    return h("div", { class: "card-actions card-actions-start" }, on);
+  }
+
+  function othersList(others) {
+    if (!others.length) return null;
+    return h("div", { class: "push-others" },
+      h("p", { class: "strong" }, "Other devices"),
+      h("ul", { class: "list" }, others.map((s) => {
+        const remove = h("button", { class: "button button-quiet", type: "button" }, "Remove");
+        remove.addEventListener("click", () => busyButton(remove, async () => {
+          if (!confirm(`Stop notifying ${s.label || "that device"}?`)) return;
+          try {
+            await store.api.deletePush(s.id);
+          } catch (error) {
+            fail(`Couldn't remove it: ${error.message}`);
+            return;
+          }
+          await render();
+        }));
+        const added = s.created ? `Added ${when(new Date(s.created * 1000))}` : "";
+        const sent = s.last_sent ? `last notified ${when(new Date(s.last_sent * 1000))}` : "not notified yet";
+        return h("li", { class: "list-row" },
+          h("div", { class: "list-main" },
+            h("p", null, s.label || "A device"),
+            h("p", { class: "muted" }, [added, sent].filter(Boolean).join(", "))),
+          h("div", { class: "list-actions" }, remove));
+      })));
+  }
+
+  fill(section, heading(), h("p", { class: "muted" }, "Loading…"));
+  render();
+  return section;
 }
 
 /** "*.github.com" for the proxy's ".github.com": a domain and everything under it. */

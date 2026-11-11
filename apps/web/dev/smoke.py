@@ -269,6 +269,50 @@ async def main(out):
                 .then(d => d.events.reduce((a, e) => (e.seq > a.seq ? e : a)).data.status)""")
             p.check(finished == "stuck", "…and the task ends as stuck")
 
+            # Notifications (Web Push): a device's subscription, made in the page
+            # with WebCrypto (headless Chrome has no push service), pointing at the
+            # model's stand-in; agentd sends it a test, then a card's.
+            name = f"smoke-{int(time.time() * 1000)}"
+            def pushes():
+                every = json.load(urllib.request.urlopen("http://127.0.0.1:8091/pushes"))
+                return [x for x in every if x["name"] == name]
+            async def pushed(count, seconds=10):
+                for _ in range(int(seconds / 0.2)):
+                    if len(pushes()) >= count:
+                        return True
+                    await asyncio.sleep(0.2)
+                return False
+            sub_id = await p.js(rf"""(async () => {{
+                const pair = await crypto.subtle.generateKey({{ name: "ECDH", namedCurve: "P-256" }}, true, ["deriveBits"]);
+                const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+                const auth = crypto.getRandomValues(new Uint8Array(16));
+                const b64 = (b) => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+                const r = await fetch("/api/v1/push/subscriptions", {{ method: "POST", headers: {{ "Content-Type": "application/json" }},
+                    body: JSON.stringify({{ endpoint: "http://127.0.0.1:8091/push/{name}", keys: {{ p256dh: b64(raw), auth: b64(auth) }}, label: "Smoke test" }}) }});
+                return r.ok ? (await r.json()).id : "";
+            }})()""")
+            p.check(bool(sub_id), "a device subscribes to notifications")
+            listed = await p.js("fetch('/api/v1/push').then(r => r.json())")
+            p.check(any(s["id"] == sub_id and s["label"] == "Smoke test" for s in listed.get("subscriptions", []))
+                    and len(listed.get("public_key", "")) == 87, "…and the desktop lists it, with its key")
+            await p.js(f"fetch('/api/v1/push/test', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{id: '{sub_id}'}})}})")
+            p.check(await pushed(1), "a test notification goes out")
+            first = (pushes() or [{}])[0]
+            p.check(first.get("content_encoding") == "aes128gcm" and first.get("authorization", "").startswith("vapid t=")
+                    and first.get("length", 0) > 100, "…encrypted, with the desktop's VAPID signature")
+            await say("Run the risky command")
+            card = "[...document.querySelectorAll('.card-needs')].find(c => c.textContent.includes('rm -rf ./old-build'))"
+            p.check(await p.until(f"!!{card}", 15) and await pushed(2), "a card that needs you sends a notification")
+            await press(card, "Deny")
+            gone = await p.js(f"fetch('/api/v1/push/subscriptions/{sub_id}', {{method: 'DELETE'}}).then(r => r.ok)")
+            after = await p.js("fetch('/api/v1/push').then(r => r.json())")
+            p.check(gone and not any(s["id"] == sub_id for s in after.get("subscriptions", [])), "…and a device can be removed")
+            await p.js("location.hash = '#/settings'")
+            p.check(await p.until("[...document.querySelectorAll('#view-settings h2')].some(h => h.textContent === 'Notifications')", 10),
+                    "Settings has Notifications")
+            await p.until("![...document.querySelectorAll('#view-settings section[aria-label=Notifications] p')].some(x => x.textContent === 'Loading…')", 5)
+            await p.shot(f"{out}/smoke-notifications.png")
+
             # A card the desktop doesn't know (a sample one): it expires.
             await p.js("location.hash = '#/chat'")
             await p.until("!document.querySelector('#view-chat').hidden")

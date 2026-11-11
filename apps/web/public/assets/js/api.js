@@ -57,6 +57,11 @@ export const api = {
   saveSecret: (name, value, label, approval) =>
     request("PUT", `/api/v1/secrets/${enc(name)}`, { value, label, ...(approval ? { approval } : {}) }),
   deleteSecret: (name) => request("DELETE", `/api/v1/secrets/${enc(name)}`, {}),
+  // Notifications (Web Push): the desktop's key, and the devices it notifies.
+  push: () => request("GET", "/api/v1/push"),
+  subscribePush: (subscription) => request("POST", "/api/v1/push/subscriptions", subscription),
+  deletePush: (id) => request("DELETE", `/api/v1/push/subscriptions/${enc(id)}`, {}),
+  testPush: (id) => request("POST", "/api/v1/push/test", id ? { id } : {}),
   access: () => request("GET", "/api/v1/access"),
   allowSite: (host) => request("POST", "/api/v1/access", { host }),
   removeSite: (host) => request("DELETE", `/api/v1/access/${enc(host)}`, {}),

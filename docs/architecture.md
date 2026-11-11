@@ -427,6 +427,8 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 | `SKILLS_DIR` | `/etc/agentd/skills` | Markdown how-tos |
 | `REVIEW_EVERY_SECS` | `1800` | The supervisor checks on a running task after this much working time (§6.6). 0: off |
 | `REVIEW_EVERY_STEPS` | `60` | …or after this many model turns, whichever comes first. 0: off. There's no cap on steps |
+| `VAPID_SUBJECT` | `mailto:neo-agent@example.com` | The contact in each notification's VAPID token (§6.17); Ansible's `agentd_push_contact` |
+| `PUSH_DEV_ENDPOINTS` | `off` | `on`: subscriptions may point at `http://127.0.0.1` (local development only) |
 | `SHELL_TOOL` | `on` | Whether the agent has a shell at all |
 | `DESKTOP_NAME` | `cloud-desktop` | Shown in the web app. Ansible sets the tailnet name (`neo-agent`) |
 | `MEMORY_V2` | `off` | Memory v2 ([memory-v2.md](memory-v2.md)). Off: the v1 memory path, on the v2 schema (always migrated). The desktop's group_vars turn it on |
@@ -484,13 +486,14 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 |---|---|---|
 | `events` | `seq` (autoincrement), `ts`, `kind`, `data` (JSON) | The append-only event log the web app streams and replays (§6.5) |
 | `history` | `id`, `ts`, `role`, `content`, `agent` | What the model sees as the conversation: user messages and final answers only. The last 20 entries go into each new task |
-| `settings` | `key`, `value` | `model`, `allow_actions`, `auto_approve`, `tab_target`, `user_timezone`, `user_utc_offset`, and tidy-up's `memory_consolidation`, `memory_consolidation_model`, `memory_consolidation_daily_cap_usd`, `memory_last_consolidated_run` |
+| `settings` | `key`, `value` | `model`, `allow_actions`, `auto_approve`, `tab_target`, `vapid_pkcs8` (the notifications key, §6.17), `user_timezone`, `user_utc_offset`, and tidy-up's `memory_consolidation`, `memory_consolidation_model`, `memory_consolidation_daily_cap_usd`, `memory_last_consolidated_run` |
 | `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before); 0.15.10: `due` (unix seconds: a queued run isn't taken before then) and `attempt` (0, or 1 for the retry) | One row per task. `status` is `queued` (a scheduled run waiting for the background worker), `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `stuck`, `interrupted`, `skipped`, or `max_steps` (runs from before the supervisor) (a queued run that waited over an hour) |
 | `pending` | `id`, `kind` (`approval` or `action`), `run`, `card` (JSON), `checkpoint` (the task's serialized `RunState`), `created` (unix seconds); v2: `policy_version` | What the user is being asked: parked approvals and Action needed cards |
 | `memory` | `id`, `agent`, `text`, `trusted`, `created`; v2: `kind` (rule, preference, fact, work_log), `status` (active, superseded, expired, deleted; `pending` only before 0.15.2), `trust` (user_stated, agent_inferred, imported), `importance`, `source_run`, `source_seq`, `source_schedule`, `valid_until`, `superseded_by`, `pending_reason`, `version`, `updated`, `last_recalled`, `recall_count` | Long-term memory (§6.13). `trusted` is kept in step with `trust` and `status` by triggers, for 0.14.0 and the v1 path |
 | `memory_fts` | FTS5 (`id`, `text`; porter stemming) | Full-text index over `memory`, kept in step by triggers |
 | `memory_events` | `seq`, `memory_id`, `actor`, `action`, `by_user`, `run`, `before`, `after`, `created` | History of every memory change; `before` and `after` are cleared when a memory is purged |
 | `effects` | `kind`, `key` (primary key together), `payload`, `due`, `attempts`, `last_error`, `created` | Side effects waiting to be done (§6.19) |
+| `push_subscriptions` | `id` (the endpoint's SHA-256, 12 hex), `endpoint`, `p256dh`, `auth`, `label`, `created`, `last_sent` | Browsers with notifications on (§6.17) |
 | `egress_hosts` | `host` (primary key), `added` (unix seconds), `by_user`, `task` (the run whose card asked; null from Settings), `why` | The sites you allowed the shell to reach (§6.20); written to Squid's file at every change and at startup |
 | `schedules` | `id`, `agent`, `name`, `prompt`, `cron`, `timezone`, `next_run`, `last_run`, `paused`, `created`; v2: `policy_version`, `created_from`; v4: `auto_approve` (1 for every schedule a person sets up, 0 for one asked for after outside content; the column's default stays 0, §6.14) | Scheduled tasks (§6.14) |
 | `secrets` | `name`, `agent`, `label`, `created`, `updated`, `last_used` | Saved keys' names and labels, never their values (§6.15) |
@@ -542,6 +545,10 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/access` | `{enabled, base, allowed: [{host, added, by, task, why}]}`: whether you can add sites on this desktop (`EGRESS_USER_HOSTS` set), the deployment's list as Squid has it, and yours (§6.20) |
 | POST | `/api/v1/access` | `{host}`: a person allows a site from Settings. 400 for a host that isn't an exact public name; 409 if it's allowed already, if there are 100, or if the deployment sets the list |
 | DELETE | `/api/v1/access/{host}` | The shell can no longer reach it; 404 if it wasn't on the list |
+| GET | `/api/v1/push` | `{public_key, subscriptions: [{id, endpoint, label, created, last_sent}]}`: the VAPID key browsers subscribe with, and the browsers with notifications on (§6.17) |
+| POST | `/api/v1/push/subscriptions` | `{endpoint, keys: {p256dh, auth}, label}` (`PushSubscription.toJSON()`): adds or updates by endpoint, `{id}`. 400 for an endpoint that isn't a known push service's, bad keys, or a 21st browser |
+| DELETE | `/api/v1/push/subscriptions/{id}` | Notifications off in that browser; 404 if unknown |
+| POST | `/api/v1/push/test` | `{id?}`: a test notification to that browser, or all; `{queued}` |
 
 The web app has no memory screen, so the memory endpoints are reached only through the API.
 
@@ -1107,9 +1114,21 @@ The model therefore never sees a value, even if a command prints one or you past
 | `pentest-cloud` | Reviewing your own cloud account and Terraform for misconfigurations, plus blast-radius checks from the desktop (what code running here could reach) |
 | `pentest-detection-check` | Checking that your monitoring catches attacks: agreed benign probes at your stack, then whether the edge (WAF/CDN) and the app's logs saw and blocked them |
 
-### 6.17 Notifications
+### 6.17 Notifications (Web Push: `notify.rs`, `webpush.rs`)
 
-There are none. Nothing reaches a phone or a lock screen: what needs you shows in the web app while it's open (its stage line, the "Needs you" badge on Chat, and the cards; §7.2). A `push` effect left by an older agentd is dropped as done (§6.19). A scheduled run's `report_outcome` only decides whether its report is a quiet row.
+agentd sends notifications itself, by Web Push (RFC 8030), to the browsers where you turned them on in the web app (Settings → Notifications, §7.2). There's no relay and no app-store account. The push service in between (Apple's for Safari, Google's FCM for Chrome and Edge on a Mac, Mozilla's, Microsoft's WNS) carries ciphertext only: the payload is encrypted to the browser (RFC 8291, `aes128gcm`, one 4096-byte record). Each request is signed with this desktop's VAPID key (RFC 8292, ES256): made on first use and kept in `settings` (`vapid_pkcs8`), so `agentd-reset` makes a new one. Its token names the push service's origin, expires in 12 h, and carries `VAPID_SUBJECT` as the contact. Browsers subscribe with its public half.
+
+- **What notifies you:**
+  - a card that waits on you, from `ask` (urgency high, TTL 24 h): "Needs your OK" with the command's summary, "Write this?" / "Write and send this?" / "Click this?" / "Press …?", "Schedule this?", "Needs a key", "Let it reach a site?", "Looks stuck";
+  - Action needed, with its reason;
+  - a chat task that worked over a minute and ends `done` ("Done", with the answer's first line of prose) or `error` ("Hit a problem");
+  - a scheduled run with something to report: its name, and `report_outcome`'s summary or the answer's first line. Not a quiet run (`nothing`), a cancelled one, or a failed first try that's being retried.
+
+  Not: a quick chat answer, a task you stopped, or Stop on a stuck card.
+- **Payload:** `{title (≤ 80 characters), body (≤ 180), tag, url: "/#/chat"}`, saved keys replaced with `[secret NAME]` first. The tag is the task's id, so a newer notification about a task replaces the older one on the device.
+- **Delivery:** a `web_push` effect per browser and tag (§6.19), so an unsent notification is replaced by a newer one for the same task and device, and a slow service for one device never re-sends to another. 2xx: done, with `last_sent` recorded. 404 or 410: the browser unsubscribed, so its row is deleted. 429 or 5xx: tried again (after `Retry-After` if given). Any other answer is logged and dropped. Not delivered within an hour, or after 5 failures, a notification is dropped rather than left to show as a problem.
+- **Subscriptions** (`push_subscriptions`): at most 20 browsers. An endpoint must be https on a known push service's host (`fcm.googleapis.com`, `*.push.apple.com`, `*.push.services.mozilla.com`, `*.notify.windows.com`, no port), so a subscription can't aim agentd's requests elsewhere; `PUSH_DEV_ENDPOINTS=on` (local development only) also takes `http://127.0.0.1`. Keys are checked: a 65-byte uncompressed P-256 `p256dh` and a 16-byte `auth`. They stay on the desktop: the API lists browsers by label, never their keys.
+- **Tests:** RFC 8291's worked example, byte for byte, with its intermediate values; the VAPID signature verified; the whole path to a stand-in push service, decrypted with the browser's key; saved keys cut out; a 410 forgetting the browser. On 2026-11-11 a test notification also went through Mozilla's real push service to a scripted browser and decrypted correctly.
 
 ### 6.18 The user's clock
 
@@ -1135,7 +1154,8 @@ Side effects are stored first and done afterwards. Each is a row in `effects`, w
 - **Kinds today:**
   - `purge`, daily: hard-deletes memories deleted more than 30 days ago, with their search entries and the text in their history;
   - `consolidate` (key `main`): memory consolidation (§6.13). It's re-enqueued by each finished task, waits while a task runs, and fails over to retries if the model's answer is invalid twice;
-  - `push`: left by an older agentd that sent notifications. Nothing sends them here, so it's done at once.
+  - `web_push` (key `<browser id>:<tag>`): a notification to one browser (§6.17);
+  - `push`: left by an older agentd that sent notifications through the push relay. That relay isn't here, so it's done at once.
 
   Any other kind (from a newer agentd, after a rollback) fails and is kept for that version.
 
@@ -1234,6 +1254,7 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
 - **Keys and tokens:** the saved keys (never their values), add (with suggestions such as GitHub token and Together AI API key), replace and delete. Names are checked as agentd checks them.
 - **Settings:**
   - Agent: Model (`known_models`), Browser actions, Auto approve (asks for confirmation first);
+  - Notifications: turn them on for this device (permission, then `pushManager.subscribe` with the desktop's VAPID key, from the click, as iOS requires), Send a test, Turn off, and the other devices with Remove. On iPhone and iPad it says to add the app to the Home Screen first: iOS only allows Web Push for Home Screen web apps. `sw.js` (at `/assets/`, its scope) shows each push as a notification (always: browsers penalize silent pushes) and opens or focuses the app on a click; `manifest.json` and the icons make it installable;
   - Sites your agent can reach (§6.20);
   - Appearance: the theme, kept in this browser only;
   - Desktop: its name and agent version;

@@ -13,6 +13,7 @@ mod effects;
 mod guard;
 mod llm;
 mod memory;
+mod notify;
 mod plan;
 mod policy;
 mod schedule;
@@ -22,6 +23,7 @@ mod skills;
 mod store;
 mod supervise;
 mod tools;
+mod webpush;
 
 use std::io::IsTerminal;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

@@ -67,6 +67,11 @@ agentd_model: zai-org/GLM-5.3
 # scheduled run (services/agentd/src/supervise.rs). 0 turns a trigger off.
 agentd_review_every_minutes: 30
 agentd_review_every_steps: 60
+# Notifications (Web Push, from agentd to the browsers where you turned them on
+# in the web app): the contact every push carries in its signed token, for the
+# push services (Apple, Google, Mozilla, Microsoft) to reach whoever sends
+# them. A mailto: or https: URL; yours if you like.
+agentd_push_contact: "mailto:neo-agent@example.com"
 agentd_shell_tool: "on"
 # Memory v2 (kinds, trust, retrieval, consolidation): "off" here;
 # group_vars/desktop.yml turns it on (docs/memory-v2.md §17).

@@ -1325,6 +1325,7 @@ impl Agent {
     /// Shows a parked task's approval card.
     fn ask(&self, task_id: &str, park: Park) {
         tracing::info!(task = %task_id, approval = %park.id, "waiting for approval");
+        self.notify_card(task_id, &park.card);
         self.emit("approval.requested", park.card);
         self.emit("task.paused", json!({"task": task_id, "approval": park.id}));
     }
@@ -1389,6 +1390,15 @@ impl Agent {
         if let Err(err) = self.store.finish_run(task_id, status, state.step, cost, answer) {
             tracing::error!(%err, "couldn't store the run's end");
         }
+        self.notify_finished(
+            task_id,
+            status,
+            state.seconds,
+            answer,
+            state.scheduled.as_deref(),
+            state.reported.as_ref().map(|r| r.summary.as_str()),
+            quiet,
+        );
         // Memory v2: fold the finished task into memory, later.
         crate::consolidate::trigger(self);
         let outcome = state.reported.as_ref().map(|r| r.outcome.as_str());
@@ -3199,6 +3209,7 @@ impl Agent {
             "action_needed",
             json!({"task": task_id, "id": id, "reason": reason, "page": page, "image": image}),
         );
+        self.notify_action_needed(task_id, reason);
     }
 
     /// The saved keys, by name, for the system prompt.
@@ -3354,6 +3365,8 @@ pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
         skills_dir: dir.join("no-skills"),
         review_every_secs: 1800,
         review_every_steps: 5,
+        vapid_subject: "mailto:test@example.com".into(),
+        push_dev_endpoints: true,
         shell_tool: true,
         desktop_name: "test-desktop".into(),
         memory_v2: true,

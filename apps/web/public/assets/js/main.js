@@ -103,6 +103,19 @@ store.onNotice((text) => {
   toastTimer = setTimeout(() => (toast.hidden = true), 6000);
 });
 
+// Notifications (Web Push): the service worker shows them. Tapping one brings
+// this window to the front, and it opens the page the notification is about.
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/assets/sw.js", { scope: "/assets/" }).catch(() => {});
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    const url = event.data?.type === "open" ? event.data.url : null;
+    if (typeof url !== "string") return;
+    const target = new URL(url, location.origin);
+    if (target.origin === location.origin) location.hash = target.hash || "#/chat";
+  });
+  navigator.serviceWorker.startMessages?.();
+}
+
 api.session().then((s) => {
   Object.assign(session, s);
   $("#who").textContent = s.email;

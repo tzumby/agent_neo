@@ -56,6 +56,10 @@ pub fn router(agent: Arc<Agent>) -> Router {
         )
         .route("/api/v1/schedules/{id}/pause", post(pause_schedule))
         .route("/api/v1/schedules/{id}/resume", post(resume_schedule))
+        .route("/api/v1/push", get(push_info))
+        .route("/api/v1/push/subscriptions", post(subscribe_push))
+        .route("/api/v1/push/subscriptions/{id}", delete(unsubscribe_push))
+        .route("/api/v1/push/test", post(test_push))
         .route("/api/v1/secrets", get(list_secrets))
         .route("/api/v1/secrets/{name}", put(save_secret).delete(delete_secret))
         .route("/api/v1/access", get(access_list).post(allow_host))
@@ -841,6 +845,71 @@ async fn remove_host(State(agent): App, Path(host): Path<String>, headers: Heade
 }
 
 /// The saved keys, by name and label. Values never leave the desktop.
+/// Notifications (notify.rs): the key browsers subscribe with, and the
+/// browsers where they're on.
+async fn push_info(State(agent): App) -> Response {
+    match agent.push_info() {
+        Ok(info) => Json(info).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct SubscriptionKeys {
+    p256dh: String,
+    auth: String,
+}
+
+/// A browser's `PushSubscription.toJSON()`, and what to call it.
+#[derive(Deserialize)]
+struct NewSubscription {
+    endpoint: String,
+    keys: SubscriptionKeys,
+    #[serde(default)]
+    label: String,
+}
+
+async fn subscribe_push(State(agent): App, Json(body): Json<NewSubscription>) -> Response {
+    match agent.subscribe_push(&body.endpoint, &body.keys.p256dh, &body.keys.auth, &body.label) {
+        Ok(id) => Json(json!({"id": id})).into_response(),
+        Err(crate::notify::PushError::Invalid(problem)) => error(StatusCode::BAD_REQUEST, &problem),
+        Err(crate::notify::PushError::Failed(err)) => {
+            error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}"))
+        }
+    }
+}
+
+async fn unsubscribe_push(State(agent): App, Path(id): Path<String>) -> Response {
+    match agent.unsubscribe_push(&id) {
+        Ok(true) => Json(json!({"ok": true})).into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "no such browser"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct PushTest {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// A test notification, to one browser or all of them.
+async fn test_push(State(agent): App, body: Option<Json<PushTest>>) -> Response {
+    let id = body.and_then(|Json(b)| b.id);
+    let notice = crate::notify::Notice {
+        title: "Notifications work".into(),
+        body: "You'll hear from your agent here when it needs you or finishes something.".into(),
+        tag: "test".into(),
+        urgency: "normal",
+        ttl: 600,
+    };
+    match agent.notify(&notice, id.as_deref()) {
+        Ok(0) if id.is_some() => error(StatusCode::NOT_FOUND, "no such browser"),
+        Ok(queued) => Json(json!({"queued": queued})).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
 async fn list_secrets(State(agent): App) -> Json<Value> {
     Json(json!({"secrets": agent.secret_infos()}))
 }

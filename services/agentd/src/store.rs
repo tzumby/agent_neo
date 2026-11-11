@@ -120,6 +120,24 @@ fn queued_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedRun> {
     })
 }
 
+/// A browser where notifications are on (webpush.rs): its push endpoint and
+/// keys. The web app lists them by label.
+#[derive(Clone, Debug, Serialize)]
+pub struct PushSubscription {
+    /// The first 12 hex digits of the endpoint's SHA-256.
+    pub id: String,
+    pub endpoint: String,
+    #[serde(skip)]
+    pub p256dh: String,
+    #[serde(skip)]
+    pub auth: String,
+    /// "Mac · Chrome": what the web app called it.
+    pub label: String,
+    /// Unix seconds.
+    pub created: i64,
+    pub last_sent: Option<i64>,
+}
+
 /// A saved key, as the apps list it: never its value.
 #[derive(Clone, Debug, Serialize)]
 pub struct SecretInfo {
@@ -284,7 +302,16 @@ impl Store {
                  ts TEXT,
                  task TEXT,
                  created INTEGER NOT NULL);
-             CREATE INDEX IF NOT EXISTS posts_by_destination ON posts (destination, created);"
+             CREATE INDEX IF NOT EXISTS posts_by_destination ON posts (destination, created);
+             -- Browsers to send notifications to (webpush.rs).
+             CREATE TABLE IF NOT EXISTS push_subscriptions (
+                 id TEXT PRIMARY KEY,
+                 endpoint TEXT NOT NULL UNIQUE,
+                 p256dh TEXT NOT NULL,
+                 auth TEXT NOT NULL,
+                 label TEXT NOT NULL DEFAULT '',
+                 created INTEGER NOT NULL,
+                 last_sent INTEGER);"
         ))?;
         migrate(&conn)?;
         Ok(Self {
@@ -1025,6 +1052,74 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Adds a browser's subscription, or updates the one with its endpoint
+    /// (new keys after the browser renewed it). Returns its id.
+    pub fn save_push_subscription(
+        &self,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+        label: &str,
+        now: i64,
+    ) -> Result<String> {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, endpoint.as_bytes());
+        let id: String = digest.as_ref()[..6].iter().map(|b| format!("{b:02x}")).collect();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO push_subscriptions (id, endpoint, p256dh, auth, label, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, label = excluded.label",
+            params![id, endpoint, p256dh, auth, label, now],
+        )?;
+        Ok(id)
+    }
+
+    pub fn push_subscriptions(&self) -> Result<Vec<PushSubscription>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, endpoint, p256dh, auth, label, created, last_sent FROM push_subscriptions ORDER BY created",
+        )?;
+        let rows = stmt.query_map([], push_subscription_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn push_subscription(&self, id: &str) -> Result<Option<PushSubscription>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT id, endpoint, p256dh, auth, label, created, last_sent FROM push_subscriptions WHERE id = ?1",
+                params![id],
+                push_subscription_row,
+            )
+            .optional()?)
+    }
+
+    /// Whether there was one to delete.
+    pub fn delete_push_subscription(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM push_subscriptions WHERE id = ?1", params![id])? > 0)
+    }
+
+    pub fn push_sent(&self, id: &str, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE push_subscriptions SET last_sent = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+}
+
+fn push_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PushSubscription> {
+    Ok(PushSubscription {
+        id: row.get(0)?,
+        endpoint: row.get(1)?,
+        p256dh: row.get(2)?,
+        auth: row.get(3)?,
+        label: row.get(4)?,
+        created: row.get(5)?,
+        last_sent: row.get(6)?,
+    })
 }
 
 fn schedule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {

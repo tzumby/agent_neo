@@ -40,7 +40,16 @@
       Signed-By: /etc/apt/keyrings/google-chrome.asc
     mode: "0644"
     force: false
-  register: desktop_chrome_repo
+
+# A new repo's packages aren't in apt's lists until they're updated, and the
+# common role updated them minutes ago, which the install below counts as
+# fresh. So if apt doesn't know Chrome yet (a first install, or a run that
+# stopped after adding the repo), update the lists now.
+- name: Check whether apt knows Chrome yet
+  ansible.builtin.command: apt-cache show google-chrome-stable
+  register: desktop_chrome_known
+  changed_when: false
+  failed_when: false
 
 # Latest on every run, and daily in between (below).
 - name: Install Google Chrome stable
@@ -48,7 +57,7 @@
     name: google-chrome-stable
     state: latest
     update_cache: true
-    cache_valid_time: 3600
+    cache_valid_time: "{{ 3600 if desktop_chrome_known.rc == 0 else 0 }}"
 
 # Chrome reads the pages the agent opens, attackers' included, so its fixes
 # matter most. Unattended upgrades install them daily with Ubuntu's security

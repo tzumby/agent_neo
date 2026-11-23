@@ -179,6 +179,10 @@ In the [admin console](https://login.tailscale.com/admin):
 3. **Settings → Keys → Generate auth key**, tagged `tag:neo-agent`, and
    pre-approved if you use device approval. tailnet-proxy only uses it the
    first time it joins; after that, the node keeps its own identity.
+4. **Your devices**: install Tailscale on each laptop and phone you'll use
+   the agent from ([tailscale.com/download](https://tailscale.com/download)),
+   and sign in with the same account. Only devices on your tailnet can open
+   the web app.
 
 With the default access rules, every device of yours on the tailnet can reach
 the desktop. If you share your tailnet with others, use `make tailscale-allow`
@@ -205,9 +209,21 @@ on many machines points at some other account. Export it in every new shell.
 when `AWS_PROFILE` isn't set.
 
 Wait a minute or two after `make apply` for the desktop to register with SSM
-before `make deploy`. Then open `https://neo-agent.<your tailnet>.ts.net` on
-any device on your tailnet. To find your tailnet's name, look under DNS in the
-admin console.
+before `make deploy`.
+
+`make deploy` ends by printing the web app's address, for example:
+
+```
+ok: [i-0123456789abcdef0] => {
+    "msg": "The web app: https://neo-agent.tail1234.ts.net (open it on a device on your tailnet)"
+}
+```
+
+Open it in a browser on any of your devices that has Tailscale running (step
+4 of [Tailscale, once](#tailscale-once)). The first load can be slow while
+Tailscale issues the site's certificate. You don't need to know your
+tailnet's name: `make url` prints the address again whenever you need it. On
+a phone, add the page to your Home Screen to use it like an app.
 
 Settings you might change are in `terraform/personal/variables.tf`. Copy
 `terraform.tfvars.example` to `terraform.tfvars` to set them. These are the
@@ -266,6 +282,7 @@ on every `make` gives a second, separate deployment in the same account.
 From your machine, over SSM:
 
 ```sh
+make url            # the web app's address on your tailnet
 make viewer         # the desktop in your browser: http://localhost:6080/vnc.html
 make shell          # a shell on the desktop
 make screenshot     # → screenshots/<instance-id>.png
@@ -361,6 +378,10 @@ and remove the device in Tailscale's admin console.
   can't read them from the environment. On macOS it also runs Ansible with
   `no_proxy='*'`. Without that, forked workers segfault in the system proxy
   lookup.
+- Each playbook run starts with two warnings: "The 'tags' host variable is
+  deprecated" and "Found variable using reserved name 'tags'". They're
+  harmless. The EC2 inventory plugin (amazon.aws 11.x) sets `tags` alongside
+  `ec2_tags`, which is what this project uses, until it drops `tags`.
 - The VNC password is off and noVNC listens on 127.0.0.1 only. You reach the
   desktop through tailnet-proxy (your tailnet) or SSM port forwarding.
 - The desktop is x86_64 by default, because many Linux desktop apps ship only

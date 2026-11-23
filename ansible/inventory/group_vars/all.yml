@@ -2,6 +2,11 @@
 ansible_connection: amazon.aws.aws_ssm
 ansible_aws_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"
 ansible_aws_ssm_s3_addressing_style: virtual
+# The longest a single task may run over SSM (amazon.aws's default is 60
+# seconds). A fresh desktop's package installs (the X stack and XFCE, Chrome,
+# Nix) take minutes; when the limit is hit, the session closes and can leave
+# dpkg half done (the common role finishes it on the next run).
+ansible_aws_ssm_timeout: 1200
 # Ubuntu 26.04's default sudo-rs relays the SSM session's tty input into the
 # command, swallowing the plugin's end-of-command marker so every become task
 # hangs until timeout. Classic sudo is still installed as sudo.ws.

@@ -22,7 +22,7 @@ SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 .DEFAULT_GOAL := help
 .PHONY: help preflight bootstrap init plan apply destroy fmt lint galaxy inventory deploy desktop screenshot \
   model-key tailscale-key tailscale-allow agentd-test agentd-build agentd-deploy agentd-evals agentd-reset agentd-logs \
-  tailnet-test tailnet-build tailnet-deploy web-test web-dev web-smoke stop start cdp viewer shell
+  tailnet-test tailnet-build tailnet-deploy url web-test web-dev web-smoke stop start cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
@@ -129,6 +129,9 @@ tailnet-build: ## Build tailnet-proxy (tsnet) for the desktop (linux, DESKTOP_AR
 
 tailnet-deploy: tailnet-build inventory ## Put the desktop on your tailnet: the web app, agent API, noVNC, VNC (deploy agentd first; needs make tailscale-key)
 	$(ANSIBLE_PLAYBOOK) playbooks/tailnet-proxy.yml $(ANSIBLE_ARGS)
+
+url: inventory ## Show the web app's address on your tailnet (https://<name>.<tailnet>.ts.net)
+	$(ANSIBLE_PLAYBOOK) playbooks/tailnet-proxy.yml --tags url $(ANSIBLE_ARGS)
 
 web-test: ## Unit tests for the web app's chat rules, Markdown and key detector (node)
 	node --test apps/web/test/*.test.mjs

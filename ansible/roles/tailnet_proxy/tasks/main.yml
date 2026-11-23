@@ -58,3 +58,56 @@
     enabled: true
     state: started
     daemon_reload: true
+
+# Restart now rather than at the end of the play, so the address below is
+# the running one's.
+- name: Apply pending restarts
+  ansible.builtin.meta: flush_handlers
+
+# The web app's full address, so nobody has to look up their tailnet's name
+# (also `make url`). tailnet-proxy logs it once it's on the tailnet
+# ("serving https://<name>.<tailnet>.ts.net ..."). Only its current run's log
+# counts, in case the name changed. Exit 2: on the tailnet, but without a
+# certificate domain, because HTTPS Certificates or MagicDNS is off.
+- name: Wait for the desktop to join your tailnet
+  ansible.builtin.shell: |
+    for _ in $(seq 60); do
+      run=$(systemctl show -p InvocationID --value tailnet-proxy)
+      line=$(journalctl -o cat --no-pager "_SYSTEMD_INVOCATION_ID=$run" | grep 'serving https://' | tail -n 1)
+      if [ -n "$line" ]; then
+        url=$(printf '%s\n' "$line" | sed -n 's|.*serving \(https://[^ ,]*\).*|\1|p')
+        [ "$url" = "https://" ] && exit 2
+        echo "$url"
+        exit 0
+      fi
+      sleep 2
+    done
+    exit 1
+  register: tailnet_proxy_url
+  changed_when: false
+  failed_when: false
+  tags: url
+
+- name: Stop if it has no HTTPS address
+  ansible.builtin.fail:
+    msg: >-
+      The desktop joined your tailnet but has no HTTPS address. In the
+      Tailscale admin console, under DNS, turn on MagicDNS and HTTPS
+      Certificates, then run make tailnet-deploy.
+  when: tailnet_proxy_url.rc == 2
+  tags: url
+
+- name: Stop if it didn't join
+  ansible.builtin.fail:
+    msg: >-
+      The desktop didn't join your tailnet within two minutes. See its log
+      with make shell, then sudo journalctl -u tailnet-proxy -n 30. The usual
+      cause is the auth key: generate a new one tagged tag:neo-agent, run
+      make tailscale-key, then make tailnet-deploy.
+  when: tailnet_proxy_url.rc not in [0, 2]
+  tags: url
+
+- name: Show the web app's address
+  ansible.builtin.debug:
+    msg: "The web app: {{ tailnet_proxy_url.stdout }} (open it on a device on your tailnet)"
+  tags: url

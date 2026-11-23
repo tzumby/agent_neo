@@ -5,6 +5,27 @@
   # 2 means "done, with recoverable errors"
   failed_when: common_cloud_init.rc not in [0, 2]
 
+# A run cut off mid-install (a reboot, a killed session) leaves dpkg
+# "interrupted": files in /var/lib/dpkg/updates, and every apt task fails
+# until it's finished. An install that's still running writes there too, and
+# holds the lock, for example apt from an earlier run whose SSM session timed
+# out: wait for it (up to 15 minutes) and then finish whatever's left.
+- name: Check for an interrupted package install
+  ansible.builtin.find:
+    paths: /var/lib/dpkg/updates
+  register: common_dpkg_updates
+
+- name: Finish the interrupted package install
+  ansible.builtin.command: dpkg --force-confdef --force-confold --configure -a
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  register: common_dpkg_configure
+  until: "'lock' not in common_dpkg_configure.stderr"
+  retries: 90
+  delay: 10
+  when: common_dpkg_updates.matched > 0
+  changed_when: true
+
 - name: Install base packages
   ansible.builtin.apt:
     name: "{{ common_packages }}"

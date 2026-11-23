@@ -171,9 +171,11 @@ and you can close the account when you're done.
 In the [admin console](https://login.tailscale.com/admin):
 
 1. **DNS**: turn on MagicDNS and HTTPS Certificates.
-2. **Access controls**: add a tag for the desktop. Under `tagOwners`, add
-   `"tag:neo-agent": ["autogroup:admin"]`. A tagged device doesn't expire
-   with your login.
+2. **Access controls → Definitions → Tags → Create tag**, for the desktop.
+   Set Tag name to `neo-agent` (without `tag:`) and Tag owner to
+   `autogroup:admin`, then Save tag. In the JSON editor, that's
+   `"tag:neo-agent": ["autogroup:admin"]` under `tagOwners`. A tagged device
+   doesn't expire with your login.
 3. **Settings → Keys → Generate auth key**, tagged `tag:neo-agent`, and
    pre-approved if you use device approval. tailnet-proxy only uses it the
    first time it joins; after that, the node keeps its own identity.

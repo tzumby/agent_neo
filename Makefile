@@ -20,7 +20,7 @@ INSTANCE   = $(shell $(TF) output -raw desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
-.PHONY: help bootstrap init plan apply destroy fmt lint galaxy inventory deploy desktop screenshot \
+.PHONY: help preflight bootstrap init plan apply destroy fmt lint galaxy inventory deploy desktop screenshot \
   model-key tailscale-key tailscale-allow agentd-test agentd-build agentd-deploy agentd-evals agentd-reset agentd-logs \
   tailnet-test tailnet-build tailnet-deploy web-test web-dev web-smoke stop start cdp viewer shell
 
@@ -28,6 +28,10 @@ help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
 
 # --- Terraform ---------------------------------------------------------------
+
+# AWS_PROFILE_ORIGIN tells it whether AWS_PROFILE is yours or the default above.
+preflight: ## Check this account and region can take a deployment: permissions, SCPs, quota (read-only)
+	AWS_PROFILE_ORIGIN=$(origin AWS_PROFILE) scripts/preflight.py $(ENV)
 
 bootstrap: ## Create the S3 state bucket (one time; its own state stays local, in terraform/bootstrap)
 	$(TF_BOOTSTRAP) init

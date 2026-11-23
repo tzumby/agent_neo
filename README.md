@@ -39,8 +39,9 @@ On the desktop:
 ## What you need
 
 - An AWS account, and a profile for it in AWS CLI v2 that can create VPCs,
-  EC2, IAM roles, KMS keys, S3 buckets and SSM parameters. You also need the
-  [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+  EC2, IAM roles, KMS keys, S3 buckets and SSM parameters. Starting from
+  nothing? See [A new AWS account, once](#a-new-aws-account-once). You also
+  need the [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
   (`brew install --cask session-manager-plugin`).
 - Terraform ≥ 1.10 (`brew install hashicorp/tap/terraform`).
 - Ansible ≥ 2.17, with boto3 in its Python.
@@ -50,6 +51,120 @@ On the desktop:
 - Go ≥ 1.27, for tailnet-proxy.
 - A [Together AI](https://api.together.ai) API key.
 - A Tailscale account (the free personal plan is enough).
+
+### A new AWS account, once
+
+Give the agent an AWS account of its own, with nothing else in it. Whatever
+goes wrong there, whether it's your mistake, the agent's or this project's,
+can't touch your other AWS resources. The bill shows only this deployment,
+and you can close the account when you're done.
+
+1. **Sign up** at [aws.amazon.com](https://aws.amazon.com) (Create an AWS
+   account). Use an email address that no other AWS account uses; a
+   `you+neo@example.com` alias works with most mail providers. Choose the
+   **Paid** plan. The Free plan launches only a short list of small instance
+   types, and neither the desktop (t3a.medium) nor the NAT (t4g.nano) is on
+   it. Step 4 upgrades the account anyway: enabling IAM Identity Center
+   creates an AWS Organization.
+
+   Already have an AWS Organization with IAM Identity Center? Then create the
+   account from the management account instead (AWS Organizations → Add an
+   AWS account). Assign yourself AdministratorAccess on it (the last part of
+   step 4) and carry on from step 5. Set the budget (step 3) in the
+   management account, filtered to the new account. The same goes for an
+   account someone else gives you inside their organization, such as an
+   employer's sandbox. In both cases the organization's service control
+   policies (SCPs) apply to the account. They can block whole regions or
+   services, even for an administrator, and step 6 shows what they block.
+
+2. **Lock up the root user.** While signed in as root, add MFA (a passkey or
+   an authenticator app) from the account menu (top right): Security
+   credentials → Assign MFA device. Never create access keys for root. After
+   step 4, you need root only for billing and account settings.
+
+3. **Set a budget**, so you hear about a desktop you forgot to stop before
+   the card statement arrives. Go to Billing and Cost Management → Budgets →
+   Create budget → Monthly cost budget. Pick an amount a bit above the running
+   cost (about $40/month, see [Cost](#cost)), say $60, and add your email.
+   Then, from the account menu: Account → IAM user and role access to Billing
+   information → Edit → Activate IAM Access, so the admin user from step 4
+   can see costs too.
+
+4. **Create an admin user in IAM Identity Center.** This way the CLI uses
+   short-lived credentials that expire on their own, not long-lived access
+   keys in `~/.aws/credentials`. First, pick the region you'll deploy to (top
+   right of the console), since Identity Center lives in a single region.
+   - IAM Identity Center → Enable. In a standalone account, this creates an
+     AWS Organization with the account as its management account, which is
+     expected.
+   - Users → Add user, with your email. Accept the invitation email, then set
+     a password and MFA.
+   - Permission sets → Create permission set → Predefined permission set →
+     AdministratorAccess. PowerUserAccess isn't enough, because Terraform
+     creates an IAM role for the desktop.
+   - AWS accounts → tick the account → Assign users or groups → your user →
+     AdministratorAccess.
+   - On the Dashboard, copy the AWS access portal URL
+     (`https://d-xxxxxxxxxx.awsapps.com/start`).
+
+5. **Add a CLI profile** on your machine. Your answers to the prompts look
+   like this:
+
+   ```
+   $ aws configure sso
+   SSO session name (Recommended): neo
+   SSO start URL [None]: https://d-xxxxxxxxxx.awsapps.com/start
+   SSO region [None]: ca-central-1          # where you enabled Identity Center
+   SSO registration scopes [sso:account:access]:
+     (a browser opens: sign in, allow, then pick the account and AdministratorAccess)
+   Default client Region [None]: ca-central-1
+   CLI default output format [None]: json
+   Profile name [AdministratorAccess-123456789012]: neo-sandbox
+   ```
+
+   Check that the profile reaches the new account:
+
+   ```sh
+   aws sts get-caller-identity --profile neo-sandbox
+   ```
+
+   A sign-in lasts 8 hours by default. After that, run
+   `aws sso login --profile neo-sandbox` again. Terraform, Ansible and the
+   scripts all use this profile through `AWS_PROFILE`.
+
+6. **Check the account with `make preflight`**, from this repository:
+
+   ```sh
+   export AWS_PROFILE=neo-sandbox AWS_REGION=ca-central-1
+   make preflight
+   ```
+
+   It only reads, and creates nothing. It shows which account and identity
+   you're using, then checks three things:
+   - that you're allowed to make the calls the deployment makes in that
+     region, under your IAM policies and your organization's SCPs;
+   - that the desktop's instance type is offered in two availability zones
+     there;
+   - that EC2's vCPU quota covers the desktop and the NAT (4 vCPUs).
+
+   Fix whatever it reports before `make bootstrap`:
+   - **Blocked by an SCP.** When the SCPs block the region, it lists the
+     regions they allow. Change `AWS_REGION` to one of them and run
+     `make preflight` again. Anything else an SCP blocks needs the
+     organization's administrator.
+   - **Not allowed by your IAM policies.** Give your user or role
+     AdministratorAccess (step 4).
+   - **vCPU quota under 4.** New accounts can start with low EC2 limits. Go
+     to Service Quotas → Amazon EC2 → Running On-Demand Standard (A, C, D, H,
+     I, M, R, T, Z) instances → Request increase at account level, and ask
+     for 8. Some SCPs also block reading the quota. If yours do, go ahead
+     anyway: `make apply` fails with `VcpuLimitExceeded` if the quota is too
+     low.
+
+   The first instance launch in a new account, or in a region the account
+   hasn't used before, can fail with `PendingVerification` while AWS checks
+   the account. This usually clears within minutes but can take a few hours.
+   Once it does, run `make plan` and `make apply` again.
 
 ### Tailscale, once
 
@@ -71,6 +186,7 @@ the desktop. If you share your tailnet with others, use `make tailscale-allow`
 
 ```sh
 export AWS_PROFILE=<your profile> AWS_REGION=<region>   # e.g. us-east-1; default ca-central-1
+make preflight       # the account, permissions, SCPs and quota (read-only)
 make galaxy          # once: Ansible's AWS collections
 make bootstrap       # once: the S3 bucket for Terraform's state
 make init
@@ -80,6 +196,11 @@ make model-key       # paste your Together AI key (hidden input; stored in SSM)
 make tailscale-key   # paste the auth key from above
 make deploy          # the desktop, agentd, then tailnet-proxy (first run: 15-20 minutes)
 ```
+
+If `AWS_PROFILE` isn't set, the Makefile uses your `default` profile, which
+on many machines points at some other account. Export it in every new shell.
+`make preflight` shows which account you're about to deploy to, and warns you
+when `AWS_PROFILE` isn't set.
 
 Wait a minute or two after `make apply` for the desktop to register with SSM
 before `make deploy`. Then open `https://neo-agent.<your tailnet>.ts.net` on

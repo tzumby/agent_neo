@@ -72,7 +72,7 @@ impl Together {
     pub fn new(cfg: &Config) -> Result<Self> {
         let http = reqwest::Client::builder()
             // Cloudflare in front of the API rejects some default User-Agents (error 1010).
-            .user_agent("cloud-desktops-agentd/0.1")
+            .user_agent("neo-agent-agentd/0.1")
             .timeout(Duration::from_secs(180))
             .build()?;
         Ok(Self {

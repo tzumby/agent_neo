@@ -132,7 +132,7 @@
     owner: "{{ agentd_shell_user }}"
     group: "{{ agentd_shell_user }}"
     mode: "0644"
-    marker: "# {mark} cloud-desktops: Nix and npm"
+    marker: "# {mark} neo-agent: Nix and npm"
     block: |
       if [ -e "$HOME/.nix-profile/etc/profile.d/nix.sh" ]; then . "$HOME/.nix-profile/etc/profile.d/nix.sh"; fi
       export PATH="$HOME/.npm-global/bin:$PATH"

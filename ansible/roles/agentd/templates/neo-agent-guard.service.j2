@@ -7,9 +7,9 @@ Before=network-pre.target agentd.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/nft -f /etc/cloud-desktops/guard.nft
-ExecReload=/usr/sbin/nft -f /etc/cloud-desktops/guard.nft
-ExecStop=/usr/sbin/nft delete table inet cloud_desktop_guard
+ExecStart=/usr/sbin/nft -f /etc/neo-agent/guard.nft
+ExecReload=/usr/sbin/nft -f /etc/neo-agent/guard.nft
+ExecStop=/usr/sbin/nft delete table inet neo_agent_guard
 
 [Install]
 WantedBy=multi-user.target

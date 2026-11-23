@@ -131,7 +131,7 @@ pub fn touches_egress_policy(command: &str) -> bool {
     use std::sync::LazyLock;
     static EGRESS: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
-            r"(?i)\bsquid\b|/etc/squid|cloud[-_]desktop[-_]guard|guard\.nft|/etc/cloud-desktops\b",
+            r"(?i)\bsquid\b|/etc/squid|neo[-_]agent[-_]guard|guard\.nft|/etc/neo-agent\b",
         )
         .expect("valid regex")
     });
@@ -367,11 +367,11 @@ mod tests {
             "sudo sed -i 's/^acl allowed dstdomain/& .slack.com/' /etc/squid/squid.conf && sudo squid -k reconfigure",
             "echo 'acl x dstdomain slack.com' | sudo tee -a /etc/squid/conf.d/slack.conf",
             "sudo systemctl restart squid",
-            "sudo nft -f /etc/cloud-desktops/guard.nft",
-            "sudo systemctl stop cloud-desktop-guard",
+            "sudo nft -f /etc/neo-agent/guard.nft",
+            "sudo systemctl stop neo-agent-guard",
             // Holding the firewall open past the one command the user approved.
-            "sudo nft add element inet cloud_desktop_guard direct_egress '{ 1002 timeout 1d }'",
-            "sudo nft flush set inet cloud_desktop_guard direct_egress",
+            "sudo nft add element inet neo_agent_guard direct_egress '{ 1002 timeout 1d }'",
+            "sudo nft flush set inet neo_agent_guard direct_egress",
         ] {
             assert!(touches_egress_policy(egress), "{egress}");
         }

@@ -57,9 +57,9 @@ In the [admin console](https://login.tailscale.com/admin):
 
 1. **DNS**: turn on MagicDNS and HTTPS Certificates.
 2. **Access controls**: add a tag for the desktop. Under `tagOwners`, add
-   `"tag:cloud-desktop": ["autogroup:admin"]`. A tagged device doesn't expire
+   `"tag:neo-agent": ["autogroup:admin"]`. A tagged device doesn't expire
    with your login.
-3. **Settings → Keys → Generate auth key**, tagged `tag:cloud-desktop`, and
+3. **Settings → Keys → Generate auth key**, tagged `tag:neo-agent`, and
    pre-approved if you use device approval. tailnet-proxy only uses it the
    first time it joins; after that, the node keeps its own identity.
 
@@ -222,7 +222,7 @@ make destroy
 ```
 
 The state bucket stays (`prevent_destroy`); delete it in the S3 console if you
-want it gone. Then delete the SSM parameters under `/cloud-desktops/personal/`
+want it gone. Then delete the SSM parameters under `/neo-agent/personal/`
 and remove the device in Tailscale's admin console.
 
 ## Notes

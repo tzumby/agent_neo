@@ -116,7 +116,7 @@ Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0). One account and o
 
 ### 4.1 State
 
-- **`terraform/bootstrap`** creates the bucket `cloud-desktops-<env>-tfstate-<account>-<region>`:
+- **`terraform/bootstrap`** creates the bucket `neo-agent-<env>-tfstate-<account>-<region>`:
   - `prevent_destroy`;
   - versioning, with noncurrent versions expiring after 90 days;
   - SSE-S3 (AES256);
@@ -128,12 +128,12 @@ Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0). One account and o
 
 ### 4.2 Conventions
 
-- **Default tags** on everything: `Project=cloud-desktops`, `Env=<env>`, `ManagedBy=terraform`. Resources add:
+- **Default tags** on everything: `Project=neo-agent`, `Env=<env>`, `ManagedBy=terraform`. Resources add:
   - `Name`;
   - `Tier=public|private` on subnets;
   - `Role=desktop|nat` on instances;
   - `TailnetName` on the desktop: its device name on your tailnet (`tailnet_hostname`, default `neo-agent`).
-- **Names:** `local.name = cloud-desktops-<env>` (`cloud-desktops-personal` by default). The SSM prefix is `/cloud-desktops/<env>`. `env` is 2–20 lowercase letters, digits and dashes, starting with a letter (a variable validation).
+- **Names:** `local.name = neo-agent-<env>` (`neo-agent-personal` by default). The SSM prefix is `/neo-agent/<env>`. `env` is 2–20 lowercase letters, digits and dashes, starting with a letter (a variable validation).
 
 ### 4.3 Network (`modules/network`)
 
@@ -164,10 +164,10 @@ Terraform ≥ 1.10 and `hashicorp/aws ~> 6.0` (locked 6.71.0). One account and o
 
 ### 4.5 IAM
 
-**The desktop's role** `cloud-desktops-<env>-desktop` (`modules/desktop_identity`), with an instance profile of the same name:
+**The desktop's role** `neo-agent-<env>-desktop` (`modules/desktop_identity`), with an instance profile of the same name:
 - Trust: `ec2.amazonaws.com`, with no conditions.
 - Policy: `AmazonSSMManagedInstanceCore`, for Ansible and Session Manager.
-- Inline **`deny-project-secrets`**: Deny `ssm:GetParameter`, `GetParameters`, `GetParametersByPath`, `GetParameterHistory` on `parameter/cloud-desktops/*` (every env's, not only this one's). `AmazonSSMManagedInstanceCore` allows reading any parameter, and the default `aws/ssm` key decrypts for anyone in the account. So without this deny, anything on the desktop that reaches the metadata service could read your model key and Tailscale auth key. The desktop never needs them: Ansible reads them on your machine instead.
+- Inline **`deny-project-secrets`**: Deny `ssm:GetParameter`, `GetParameters`, `GetParametersByPath`, `GetParameterHistory` on `parameter/neo-agent/*` (every env's, not only this one's). `AmazonSSMManagedInstanceCore` allows reading any parameter, and the default `aws/ssm` key decrypts for anyone in the account. So without this deny, anything on the desktop that reaches the metadata service could read your model key and Tailscale auth key. The desktop never needs them: Ansible reads them on your machine instead.
 - No access to the transfer bucket: Ansible's SSM connection hands the desktop presigned URLs.
 
 There are no other roles, and no permission boundaries.
@@ -176,7 +176,7 @@ There are no other roles, and no permission boundaries.
 
 | What | Key |
 |---|---|
-| The desktop's root volume | **Its own KMS key** (`aws_kms_key.desktop`): rotation on, 30-day deletion window, alias `alias/cloud-desktops-<env>/desktop`. Default key policy (the account's IAM decides). Deleting it crypto-shreds the disk and its snapshots |
+| The desktop's root volume | **Its own KMS key** (`aws_kms_key.desktop`): rotation on, 30-day deletion window, alias `alias/neo-agent-<env>/desktop`. Default key policy (the account's IAM decides). Deleting it crypto-shreds the disk and its snapshots |
 | The NAT's volume | `encrypted = true`, AWS-managed EBS key |
 | S3 buckets | SSE-S3, TLS-only bucket policies |
 | SSM SecureStrings | AWS-managed `aws/ssm` key |
@@ -188,9 +188,9 @@ Terraform creates no parameters. You create these with `scripts/put-secret.py` (
 
 | Parameter | Written by | Read by |
 |---|---|---|
-| `/cloud-desktops/<env>/llm/together_api_key` | `make model-key` | Ansible on your machine → `/etc/agentd/secrets.env`; `make agentd-evals` when `TOGETHER_API_KEY` isn't set |
-| `/cloud-desktops/<env>/tailscale/auth_key` | `make tailscale-key` | Ansible → `/etc/tailnet-proxy.env` |
-| `/cloud-desktops/<env>/tailscale/allowed_logins` | `make tailscale-allow` (optional) | Ansible → tailnet-proxy's `-allow`. Missing or empty: no login allowlist |
+| `/neo-agent/<env>/llm/together_api_key` | `make model-key` | Ansible on your machine → `/etc/agentd/secrets.env`; `make agentd-evals` when `TOGETHER_API_KEY` isn't set |
+| `/neo-agent/<env>/tailscale/auth_key` | `make tailscale-key` | Ansible → `/etc/tailnet-proxy.env` |
+| `/neo-agent/<env>/tailscale/allowed_logins` | `make tailscale-allow` (optional) | Ansible → tailnet-proxy's `-allow`. Missing or empty: no login allowlist |
 
 ### 4.8 Compute
 
@@ -203,8 +203,8 @@ Terraform creates no parameters. You create these with `scripts/put-secret.py` (
 
 | Store | Holds | Retention |
 |---|---|---|
-| S3 `cloud-desktops-<env>-tfstate-<account>-<region>` | Terraform's state (no secrets) | Noncurrent versions expire after 90 days |
-| S3 `cloud-desktops-<env>-ssm-<account>-<region>` | Ansible's SSM file transfers | Objects expire after 1 day |
+| S3 `neo-agent-<env>-tfstate-<account>-<region>` | Terraform's state (no secrets) | Noncurrent versions expire after 90 days |
+| S3 `neo-agent-<env>-ssm-<account>-<region>` | Ansible's SSM file transfers | Objects expire after 1 day |
 | SSM Parameter Store | The parameters above | Until you delete them |
 
 **Never in AWS-side stores:** chat history, prompts, memory, saved keys, screenshots. They live only on the desktop's disk.
@@ -221,10 +221,10 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
 
 - **Inventory:** `ansible/inventory/aws_ec2.yml.tmpl`. `make inventory`, which every playbook target and `lint` run first, writes the gitignored `aws_ec2.yml` from it with `AWS_REGION` and `ENV` filled in, since the plugin can't read them from the environment.
   - The `amazon.aws.aws_ec2` plugin, in that region.
-  - Filters: `tag:Project = cloud-desktops`, `tag:Env = <env>` and running instances.
+  - Filters: `tag:Project = neo-agent`, `tag:Env = <env>` and running instances.
   - Hostnames are instance ids.
   - Groups come from the `Role` tag (`desktop`, `nat`). Every playbook targets only `desktop`.
-  - Per-host variables from tags: `desktop_env` (`Env`), which picks the SSM prefix `/cloud-desktops/<env>` for agentd and tailnet-proxy, and `desktop_tailnet_name` (`TailnetName`, default `neo-agent`), tailnet-proxy's hostname and agentd's `DESKTOP_NAME`.
+  - Per-host variables from tags: `desktop_env` (`Env`), which picks the SSM prefix `/neo-agent/<env>` for agentd and tailnet-proxy, and `desktop_tailnet_name` (`TailnetName`, default `neo-agent`), tailnet-proxy's hostname and agentd's `DESKTOP_NAME`.
 - **Connection** (`group_vars/all.yml`):
   - `ansible_connection: amazon.aws.aws_ssm`, with file transfer through the SSM transfer bucket. The Makefile passes `ansible_aws_ssm_bucket_name` from the Terraform output; the region comes from `AWS_REGION`.
   - `ansible_become_exe: sudo.ws`: Ubuntu 26.04's default `sudo-rs` swallows the SSM plugin's end-of-command marker, so every privileged task would hang.
@@ -246,17 +246,17 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
 
 - **Packages:** `acl`, `ca-certificates`, `curl`, `gnupg`, `needrestart`, `unattended-upgrades`, `zram-tools`.
 - **Removed:** `openssh-server`, `ec2-instance-connect`.
-- **Automatic updates** (`tasks/updates.yml`), set by the role rather than left to the image: the package lists and unattended upgrades daily (`apt-daily.timer`, `apt-daily-upgrade.timer`), from Ubuntu's security pockets (`-security`, and ESM's when there), plus Chrome from Google's repo (the desktop role's `52cloud-desktops-chrome`: origin `Google LLC`, label `Google`, codename `stable`). Unused kernels and dependencies are removed, and the package cache is cleaned weekly (`AutocleanInterval`). `Automatic-Reboot` is off: reboots are the maintenance window's.
+- **Automatic updates** (`tasks/updates.yml`), set by the role rather than left to the image: the package lists and unattended upgrades daily (`apt-daily.timer`, `apt-daily-upgrade.timer`), from Ubuntu's security pockets (`-security`, and ESM's when there), plus Chrome from Google's repo (the desktop role's `52neo-agent-chrome`: origin `Google LLC`, label `Google`, codename `stable`). Unused kernels and dependencies are removed, and the package cache is cleaned weekly (`AutocleanInterval`). `Automatic-Reboot` is off: reboots are the maintenance window's.
 - **needrestart** is set to list only (`$nrconf{restart} = 'l'`), so unattended upgrades don't restart Xvfb, XFCE or Chrome in the middle of a task.
-- **The maintenance window** (`tasks/maintenance.yml`, `/usr/local/sbin/cloud-desktop-maintenance`, a timer every 15 minutes). Between 04:00 and 06:00 in your time zone (agentd's `user_timezone` setting, which the web app sends with each message; `common_maintenance_timezone`, UTC, until then), if `/run/reboot-required` exists, needrestart sees a newer kernel, or it lists services running old code (Chrome after an update above all), the desktop reboots, which brings Xvfb, XFCE, Chrome and agentd back in order. Not while agentd is busy (the chat's task or a scheduled run), not while a VNC or noVNC connection is open (someone viewing), and not within 30 minutes of a boot. It logs why it rebooted or waited, nothing else. `common_maintenance: false` turns it off.
+- **The maintenance window** (`tasks/maintenance.yml`, `/usr/local/sbin/neo-agent-maintenance`, a timer every 15 minutes). Between 04:00 and 06:00 in your time zone (agentd's `user_timezone` setting, which the web app sends with each message; `common_maintenance_timezone`, UTC, until then), if `/run/reboot-required` exists, needrestart sees a newer kernel, or it lists services running old code (Chrome after an update above all), the desktop reboots, which brings Xvfb, XFCE, Chrome and agentd back in order. Not while agentd is busy (the chat's task or a scheduled run), not while a VNC or noVNC connection is open (someone viewing), and not within 30 minutes of a boot. It logs why it rebooted or waited, nothing else. `common_maintenance: false` turns it off.
 - **Logs kept to a size** (`tasks/logs.yml`): the journal at most 1 GB (`SystemMaxUse`), 2 GB always left free, files of 64 MB, one month (`MaxRetentionSec`). logrotate's own rules cover `/var/log`'s files; Squid's are the agentd role's (§5.6).
 - **Hardening** (`tasks/hardening.yml`), adapted from DevSec's `os_hardening` role ([dev-sec.io](https://dev-sec.io), Apache-2.0) rather than applied as is:
-  - kernel and network settings (`/etc/sysctl.d/90-cloud-desktops-hardening.conf`): ptrace only for root (`kernel.yama.ptrace_scope = 2`), no kexec, no SysRq, no core dumps of setuid programs, protected hard links, symlinks, FIFOs and regular files, kernel pointers hidden, BPF JIT hardened, no IP forwarding, strict reverse-path filtering, no source routing or redirects (in or out), martians logged, SYN cookies. Not DevSec's IPv6 router-advertisement settings: AWS networking uses them;
+  - kernel and network settings (`/etc/sysctl.d/90-neo-agent-hardening.conf`): ptrace only for root (`kernel.yama.ptrace_scope = 2`), no kexec, no SysRq, no core dumps of setuid programs, protected hard links, symlinks, FIFOs and regular files, kernel pointers hidden, BPF JIT hardened, no IP forwarding, strict reverse-path filtering, no source routing or redirects (in or out), martians logged, SYN cookies. Not DevSec's IPv6 router-advertisement settings: AWS networking uses them;
   - unused filesystem and protocol modules can't load (`cramfs`, `freevxfs`, `jffs2`, `hfs`, `hfsplus`, `udf`, `dccp`, `rds`, `sctp`, `tipc`). Not `squashfs` (the SSM agent is a snap: blocking it would cut off access) or `vfat` (the EFI boot partition), which DevSec's list has;
   - SUID taken off programs nobody here needs (`chfn`, `chsh`, `newgrp`, `gpasswd`, `mount`, `umount`, both `su`s, `ntfs-3g`, `fusermount3`, `ssh-keysign`), recorded with `dpkg-statoverride` so package updates don't put it back. `sudo` (agentd's), Chrome's sandbox helper (its fallback when user namespaces aren't allowed) and D-Bus's launch helper keep it;
   - no core dumps (`* hard core 0`), apport off (crash reports hold whatever the program had in memory), `/dev/shm` mounted `nosuid,nodev,noexec`;
   - no login shell for `nova` (an account novnc's package makes);
-  - **auditd**, rotating (5 files of 6 MB; DevSec's `keep_logs` never deletes). Rules (`/etc/audit/rules.d/cloud-desktops.rules`): changes to accounts and sudoers, to agentd's configuration, the egress policy (`/etc/cloud-desktops`, `/etc/squid`) and systemd units, kernel modules loaded or removed, and each run of `sudo` and `systemd-run`: who ran which program, and when. Never the arguments: `EXECVE` and `PROCTITLE` records are excluded, since the agent's commands can hold your data;
+  - **auditd**, rotating (5 files of 6 MB; DevSec's `keep_logs` never deletes). Rules (`/etc/audit/rules.d/neo-agent.rules`): changes to accounts and sudoers, to agentd's configuration, the egress policy (`/etc/neo-agent`, `/etc/squid`) and systemd units, kernel modules loaded or removed, and each run of `sudo` and `systemd-run`: who ran which program, and when. Never the arguments: `EXECVE` and `PROCTITLE` records are excluded, since the agent's commands can hold your data;
   - not DevSec's password ageing, PAM, `login.defs` or `securetty` rules: every account's password is locked, and there's no SSH.
 - **zram swap:** 2 GB, zstd, priority 100.
 - **cloud-init:** waits for it to finish first (exit code 0 or 2 accepted).
@@ -271,7 +271,7 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
   - Removed: `light-locker`, `xfce4-screensaver` and `xfce4-power-manager`, so the screen never blanks or locks.
 - **Chrome:**
   - Google Chrome stable for the host's architecture, from Google's signed apt repository (deb822 source with `Signed-By`). Ansible writes the source once; after that the Chrome package owns it. Each run installs the latest, and unattended upgrades keep it current in between (§5.2); the maintenance window restarts into it. (Ubuntu has no Chromium package of its own: `chromium-browser` installs Canonical's snap, which was a release behind Google's on 2026-11-04 and would move the profile, policies and debugging port into snap confinement.)
-  - Managed policy `/etc/opt/chrome/policies/managed/cloud-desktops.json` (`desktop_chrome_policy`; Chrome reloads it without a restart; `make desktop TAGS=chrome_policy` updates only it):
+  - Managed policy `/etc/opt/chrome/policies/managed/neo-agent.json` (`desktop_chrome_policy`; Chrome reloads it without a restart; `make desktop TAGS=chrome_policy` updates only it):
     - `PasswordManagerEnabled: false`, so the browser never stores your passwords (§2, rule 4).
     - `URLBlocklist` of desktop-app link schemes (`slack:*`, Zoom's, Teams', `discord:*`, `figma:*`, `notion:*`, `vscode:*` and others, 28 in all). Web apps try to open their desktop apps, as Slack's web client does with `slack://`. Chrome then asks "Open xdg-open?" in its own UI, which the agent can't see or answer over DevTools, so tasks hung there (2026-11-02). Blocked, the launch fails quietly and the web app stays in the browser.
     - `ExternalProtocolDialogShowAlwaysOpenCheckbox: false`: any other scheme's prompt has no "Always allow…", so it can't be made permanent from Take over.
@@ -318,18 +318,18 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
 | `/etc/sudoers.d/agentd` | root 0440 (validated by `visudo`) | `agentd ALL=(root) NOPASSWD: ALL`. agentd uses it only for `systemd-run`, `systemctl stop`, `squid -k reconfigure` and the guard firewall's `direct_egress` set (`nft`), and enforces approvals for root commands itself |
 | `/var/lib/agentd/` | agentd 0700 | SQLite, images, saved keys (§6.3) |
 | `/run/agentd/agentd.sock` | agentd:agentd 0660 in a 0750 directory | The API. Reachable by agentd and tailnet-proxy only |
-| `/etc/cloud-desktops/guard.nft` | root 0644 | Firewall rules (§5.5) |
+| `/etc/neo-agent/guard.nft` | root 0644 | Firewall rules (§5.5) |
 | `/etc/squid/agentd/allowed-hosts.txt` | agentd:proxy 0640, in a 2750 directory | The sites you allowed (§6.20). agentd writes it, Squid reads it, `worker` can't |
 
 **Units.**
 - `agentd.service` (§6.1).
-- `cloud-desktop-guard.service`: a oneshot before `network-pre.target` and agentd, `nft -f /etc/cloud-desktops/guard.nft`.
+- `neo-agent-guard.service`: a oneshot before `network-pre.target` and agentd, `nft -f /etc/neo-agent/guard.nft`.
 - `squid.service`.
 - `agentd-nix-gc.timer` (§5.7).
 
-### 5.5 The guard firewall (`cloud-desktop-guard`)
+### 5.5 The guard firewall (`neo-agent-guard`)
 
-A single nftables table, `inet cloud_desktop_guard`, with one `output` chain (policy accept) and one set, `direct_egress`. The file deletes and re-creates the table, so a reload is atomic. The rules, in order:
+A single nftables table, `inet neo_agent_guard`, with one `output` chain (policy accept) and one set, `direct_egress`. The file deletes and re-creates the table, so a reload is atomic. The rules, in order:
 
 1. **Instance metadata** (`169.254.169.254` and `fd00:ec2::254`): rejected for every uid except root (the SSM agent). agentd, Chrome, the shell user, tailnet-proxy, websockify and Squid can't get the instance role's credentials. agentd has no use for them: it reads the model key from its secrets file.
 2. **The desktop's controls:** `worker` → `127.0.0.0/8` and `::1` ports 9222 (DevTools), 5900 (VNC) and 6080 (noVNC) are rejected. The shell can't drive the logged-in browser around the approvals.
@@ -430,7 +430,7 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 | `VAPID_SUBJECT` | `mailto:neo-agent@example.com` | The contact in each notification's VAPID token (§6.17); Ansible's `agentd_push_contact` |
 | `PUSH_DEV_ENDPOINTS` | `off` | `on`: subscriptions may point at `http://127.0.0.1` (local development only) |
 | `SHELL_TOOL` | `on` | Whether the agent has a shell at all |
-| `DESKTOP_NAME` | `cloud-desktop` | Shown in the web app. Ansible sets the tailnet name (`neo-agent`) |
+| `DESKTOP_NAME` | `neo-agent` | Shown in the web app. Ansible sets the tailnet name (`neo-agent`) |
 | `MEMORY_V2` | `off` | Memory v2 ([memory-v2.md](memory-v2.md)). Off: the v1 memory path, on the v2 schema (always migrated). The desktop's group_vars turn it on |
 
 - **Startup order:**
@@ -803,7 +803,7 @@ The hardening follows moltis' container settings (MIT).
 
 **Refused outright, not even asked** (`guard.rs`; the model is told why, and nothing is shown):
 - a bare `sleep` or `date`, a piped install script, scheduling through the shell;
-- anything touching the egress controls: Squid (`/etc/squid`, `squid -k`, the service; your list in `/etc/squid/agentd` too) or the guard firewall (`cloud-desktop-guard`, its table `cloud_desktop_guard`, `guard.nft`, `/etc/cloud-desktops`). These stop injected instructions from sending data anywhere, so they're the deployment's (Ansible's `agentd_shell_allowed_domains`/`agentd_shell_extra_domains`) and yours (§6.20: a card the agent can only ask for, or Settings), never the agent's commands'.
+- anything touching the egress controls: Squid (`/etc/squid`, `squid -k`, the service; your list in `/etc/squid/agentd` too) or the guard firewall (`neo-agent-guard`, its table `neo_agent_guard`, `guard.nft`, `/etc/neo-agent`). These stop injected instructions from sending data anywhere, so they're the deployment's (Ansible's `agentd_shell_allowed_domains`/`agentd_shell_extra_domains`) and yours (§6.20: a card the agent can only ask for, or Settings), never the agent's commands'.
 
 **A command that needs approval must come with a plain summary** (`guard::is_plain_summary`): present, not the command itself, no shell symbols or flags, and not starting with a program's name. Otherwise it isn't shown or logged, and the model is asked to call again with one (`SUMMARY_REFUSAL`). The card leads with it; the command is a click away.
 
@@ -1199,7 +1199,7 @@ Some tools ignore `HTTPS_PROXY` and connect on their own, often to an address no
 ### 7.1 tailnet-proxy: the desktop on your tailnet
 
 - **What it is:** `services/tailnet-proxy` (Go 1.27, `tailscale.com` v1.104 **tsnet**) is a userspace Tailscale node inside one process. The VM itself isn't on the tailnet, so neither the VM nor the agent's commands can reach your other devices or change Tailscale's settings.
-- **Identity:** the node is `neo-agent.<tailnet>.ts.net` (Terraform's `tailnet_hostname`, through the `TailnetName` tag), tagged `tag:cloud-desktop` through its pre-approved auth key, so it doesn't expire with your login. Its state is in `/var/lib/tailnet-proxy`; the auth key is only needed the first time it joins.
+- **Identity:** the node is `neo-agent.<tailnet>.ts.net` (Terraform's `tailnet_hostname`, through the `TailnetName` tag), tagged `tag:neo-agent` through its pre-approved auth key, so it doesn't expire with your login. Its state is in `/var/lib/tailnet-proxy`; the auth key is only needed the first time it joins.
 - **Network:** it connects outbound only, so no security-group change is needed.
 
 | Listener | Serves |
@@ -1222,7 +1222,7 @@ Some tools ignore `HTTPS_PROXY` and connect on their own, often to an address no
 - **Tests:** `make tailnet-test`: who gets in (`admits`), and package `door` with a Tailscale-style caller.
 - **Tailnet setup**, one time, in the Tailscale admin console:
   - MagicDNS and HTTPS certificates on;
-  - the tag `tag:cloud-desktop` (owner `autogroup:admin`);
+  - the tag `tag:neo-agent` (owner `autogroup:admin`);
   - a pre-approved auth key with that tag, stored with `make tailscale-key`.
 
 ### 7.2 The web app (`apps/web`)
@@ -1429,7 +1429,7 @@ There's one desktop: targets reach it by Terraform's `desktop_instance_id` outpu
 
 ### 10.2 Order for a new deployment
 
-1. Tailscale, once (§7.1): MagicDNS and HTTPS certificates, the tag `tag:cloud-desktop`, and a pre-approved auth key with that tag.
+1. Tailscale, once (§7.1): MagicDNS and HTTPS certificates, the tag `tag:neo-agent`, and a pre-approved auth key with that tag.
 2. `make galaxy`, then `make bootstrap`, `init`, `plan` and `apply`. Optional settings go in `terraform/personal/terraform.tfvars` (from `terraform.tfvars.example`).
 3. Secrets: `make model-key`, `make tailscale-key`, and optionally `make tailscale-allow`.
 4. Wait a minute or two for the desktop to register with SSM, then `make deploy` (the first run takes 15–20 minutes).
@@ -1517,4 +1517,4 @@ Found while writing this document. None of them is a known exploit; most are tra
 | **fck-nat** | A NAT instance AMI (a cheap alternative to NAT gateways) |
 | **ZDR** | Zero data retention, a Together AI account setting |
 | **Skill** | A Markdown how-to the agent reads with `read_skill` |
-| **tag:cloud-desktop** | The Tailscale tag the desktop's node carries, so it doesn't expire with your login |
+| **tag:neo-agent** | The Tailscale tag the desktop's node carries, so it doesn't expire with your login |

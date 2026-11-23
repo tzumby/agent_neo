@@ -9,7 +9,7 @@
 
 - name: Cap the journal
   ansible.builtin.copy:
-    dest: /etc/systemd/journald.conf.d/50-cloud-desktops.conf
+    dest: /etc/systemd/journald.conf.d/50-neo-agent.conf
     content: |
       # Managed by Ansible (common role: tasks/logs.yml).
       [Journal]

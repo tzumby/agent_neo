@@ -55,7 +55,7 @@
 # updates; the maintenance window (common role) restarts into them.
 - name: Update Chrome automatically
   ansible.builtin.copy:
-    dest: /etc/apt/apt.conf.d/52cloud-desktops-chrome
+    dest: /etc/apt/apt.conf.d/52neo-agent-chrome
     content: |
       // Managed by Ansible (desktop role). Google's repo: Origin "Google LLC",
       // Label "Google", suite and codename "stable".
@@ -85,7 +85,7 @@
 # without a restart.
 - name: Install the Chrome policy
   ansible.builtin.copy:
-    dest: /etc/opt/chrome/policies/managed/cloud-desktops.json
+    dest: /etc/opt/chrome/policies/managed/neo-agent.json
     content: "{{ desktop_chrome_policy | to_nice_json }}\n"
     mode: "0644"
   tags: [chrome_policy]

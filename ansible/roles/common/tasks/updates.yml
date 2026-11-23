@@ -17,7 +17,7 @@
 
 - name: Install security updates, and clean up after them
   ansible.builtin.copy:
-    dest: /etc/apt/apt.conf.d/52cloud-desktops-upgrades
+    dest: /etc/apt/apt.conf.d/52neo-agent-upgrades
     content: |
       // Managed by Ansible (common role: tasks/updates.yml).
       // Ubuntu's security pockets (also listed by the package's own

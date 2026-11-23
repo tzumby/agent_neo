@@ -29,7 +29,7 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 CDP_URL = os.environ.get("CDP_URL", "http://localhost:9222")
-STATE_FILE = Path.home() / ".cache" / "cloud-desktops" / "current-tab"
+STATE_FILE = Path.home() / ".cache" / "neo-agent" / "current-tab"
 
 
 def parse_args():

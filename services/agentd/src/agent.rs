@@ -392,7 +392,7 @@ fn nft_element(verb: &str, set: &str, element: &str) -> Result<()> {
             verb,
             "element",
             "inet",
-            "cloud_desktop_guard",
+            "neo_agent_guard",
             set,
             &format!("{{ {element} }}"),
         ])
@@ -2887,7 +2887,7 @@ impl Agent {
                     "flush",
                     "set",
                     "inet",
-                    "cloud_desktop_guard",
+                    "neo_agent_guard",
                     "direct_egress",
                 ])
                 .stdin(std::process::Stdio::null())

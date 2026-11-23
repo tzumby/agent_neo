@@ -132,7 +132,7 @@ impl Config {
             vapid_subject: get("VAPID_SUBJECT", "mailto:neo-agent@example.com"),
             push_dev_endpoints: get("PUSH_DEV_ENDPOINTS", "off") == "on",
             shell_tool: get("SHELL_TOOL", "on") == "on",
-            desktop_name: get("DESKTOP_NAME", "cloud-desktop"),
+            desktop_name: get("DESKTOP_NAME", "neo-agent"),
             memory_v2: get("MEMORY_V2", "off") == "on",
         })
     }

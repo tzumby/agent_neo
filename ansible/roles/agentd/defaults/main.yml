@@ -82,5 +82,5 @@ agentd_desktop_name: "{{ (desktop_name | default('', true)) or (desktop_tailnet_
 # regex patterns without single quotes). Empty: use the built-in rules.
 agentd_dangerous: []
 
-agentd_ssm_prefix: "/cloud-desktops/{{ desktop_env | default('personal') }}"
+agentd_ssm_prefix: "/neo-agent/{{ desktop_env | default('personal') }}"
 agentd_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"

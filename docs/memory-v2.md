@@ -1,10 +1,10 @@
 # agentd Memory v2 and Borrowed Patterns — Development Plan
 
-> **In this personal edition** there's no model gateway, push relay or iPhone app, and the web app has no Memory screen yet. Model calls go straight to Together AI, and with no notifications the attention budget (§11) is gone too. The memory design itself (kinds, trust, retrieval, consolidation, the effects queue) is what agentd runs.
+> **Where this stands.** agentd calls Together AI directly (or Bedrock, for the evals). Notifications go from agentd to your browsers by Web Push (`notify.rs`, a `web_push` effect per browser), and §11's attention rules decide which events send one. The web app has no Memory screen: the memory API is the list and tidying up (§13), and you fix or forget a memory by asking the agent. The memory design itself (kinds, trust, retrieval, consolidation, the effects queue) is what agentd runs.
 
 *2026-11-01 · Razvan Draghici. Filed from the Claude doc [agentd Memory v2 and Borrowed Patterns](https://claude.ai/artifact/RSHkSqTRP897X5V3YxFQs2); this copy is kept current with decisions as the phases land.*
 
-> **Changed 2026-11-02 (agentd 0.15.2), the user's decisions: nothing waits for the user's approval, and tidying up is smaller.** The user never approves memories; the Memory screen is only for fixing or forgetting something. Tidying up writes no facts and skips scheduled runs, which see their own last reports instead. Where the sections below describe pending memories, proposals, "Review first" (`observe`) or a review stage, [§19 "No approvals, smaller tidying up"](#no-approvals-smaller-tidying-up-2026-11-02) replaces them.
+> **Changed 2026-11-02 (agentd 0.15.2), the user's decisions: nothing waits for the user's approval, and tidying up is smaller.** The user never approves memories. Tidying up writes no facts and skips scheduled runs, which see their own last reports instead. Where the sections below describe pending memories, proposals, "Review first" (`observe`) or a review stage, [§19 "No approvals, smaller tidying up"](#no-approvals-smaller-tidying-up-2026-11-02) replaces them.
 
 
 ## 0. Purpose and how to work from this plan
@@ -17,7 +17,7 @@ Rules for Claude Code while implementing:
 - Work phase by phase (§18), one PR per phase. `make agentd-test` (fmt, clippy `-D warnings`, tests) is green at every commit.
 - Every schema change is additive (`ADD COLUMN`, `CREATE TABLE`). Never drop, rename or re-type anything 0.14.0 reads.
 - The harness enforces rules, not the prompt. Every MUST below is a code check in agentd with a unit test; prompt text is guidance only.
-- No new network paths. Model calls go through the model gateway as today. No memory content ever reaches an AWS-side store, the push relay, or the journal.
+- No new network paths. Model calls go to the model provider as today. No memory content ever reaches an AWS-side store, a notification, or the journal.
 - No embeddings, no vector extension, no new crates beyond §20.
 - Where this plan conflicts with the code you find, keep the code's behaviour, finish the phase, and list the conflict in the PR description. Do not invent a third option silently.
 - Update `docs/architecture.md` (§6.3, §6.4, §6.5, §6.8, §6.13, §6.14, §6.17) in the same PR as the code it describes.
@@ -31,7 +31,7 @@ flowchart LR
   L --> F["finish()"]
   F -->|enqueue| E[(effects)]
   E --> C["consolidate (GLM-5.3-Flash)\nwork log · merge · supersede · expire"]
-  E --> P[push relay]
+  E --> P[Web Push]
   C --> M
   M --> R
 ```
@@ -44,10 +44,10 @@ The agent keeps rules, preferences, facts and a dated work log across tasks and 
 2. **Taint decides trust.** A memory written after outside content is `agent_inferred`; rules and preferences written then are kept as inferred facts, hints that are never instructions (until 0.15.2 they were `pending` until the user approved).
 3. **Dated and sourced.** Every injected item shows its date and where it came from, and the prompt says memories may be stale and the live source wins.
 4. **One binary, one database.** Everything lives in `agentd.db` on the encrypted root volume. FTS5 from the bundled SQLite does search. No queue process, no vector store, no embedding model.
-5. **Observe before auto.** Anything the agent writes on its own (consolidation now, proactive Bots later) starts in a mode that records what it would have done, and is switched to auto after the user has reviewed the record. Borrowed from dsh-superagent's accept modes. *Dropped for memory on 2026-11-02:* the review was 31 proposals the user approved one by one, mostly task results; consolidation now writes only what needs no review (§19).
-6. **Stored first, done afterwards.** Side effects (consolidation, push) are rows in an `effects` table written in the same transaction as the state change, then executed with retries. Borrowed from dsh-superagent's Effects.
-7. **Attention budget.** The phone is notified when the person must act or can use a result, and at no other time. Borrowed from dsh-superagent's philosophy.
-8. **Operator-blind stays intact.** Journal lines carry counts and ids; the gateway sees prompts as today; nothing new is logged or stored off the desktop.
+5. **Observe before auto.** Anything the agent writes on its own (consolidation) starts in a mode that records what it would have done, and is switched to auto after the user has reviewed the record. Borrowed from dsh-superagent's accept modes. *Dropped for memory on 2026-11-02:* the review was 31 proposals the user approved one by one, mostly task results; consolidation now writes only what needs no review (§19).
+6. **Stored first, done afterwards.** Side effects (consolidation, notifications) are rows in an `effects` table written in the same transaction as the state change, then executed with retries. Borrowed from dsh-superagent's Effects.
+7. **Attention budget.** You're notified when you must act or can use a result, and at no other time. Borrowed from dsh-superagent's philosophy.
+8. **Nothing leaves the desktop.** Journal lines carry counts and ids; the model provider sees prompts as today; nothing new is logged or stored off the desktop.
 
 
 ## 2. What exists today (baseline)
@@ -65,31 +65,29 @@ Memory v1 ships in agentd 0.14.0. This plan is a v2 of it, and the baseline for 
 | Settings → Memory: confirm or forget | Memory screen v2: kinds, pending/proposed, edit, source link, export/import, consolidation mode |
 | System prompt forbids remembering passwords, codes, keys, account numbers, and anything a page told it to remember | Keep the text; add a code-level secret filter so the rule holds without the model's cooperation |
 | Scheduled runs start without chat history | Scheduled runs get the memory block plus their own last work-log entries |
-| Push on every finished task except `needs_user` and `cancelled`; failures logged, not retried | Push through the effects queue with retries; scheduled runs that report `nothing` do not push |
+| A notification on every finished task except `needs_user` and `cancelled`; failures logged, not retried | Notifications through the effects queue with retries; scheduled runs that report `nothing` do not notify |
 | `pending` and `schedules` carry no record of the rules in force when created | Both record `policy_version`; parked cards are revalidated before resume |
 | `/status` exposes `busy` and `waiting_on` | Adds `stage`, `policy_version`, `memory {active, pending}`, `effects {pending, failing}` |
 
 
 ## 3. Scope, non-goals and rejected concepts
 
-**In scope:** memory kinds, trust and status; FTS5 retrieval with a budgeted block; three agent tools; pending approval for rules and preferences; a secret filter; consolidation on GLM-5.3-Flash with observe/auto modes; a durable effects queue used by consolidation and push; policy versions on parked cards and schedules; attention-budget notification rules and a `report_outcome` tool for scheduled runs; a stage field; API, app, prompt, tests, docs.
+**In scope:** memory kinds, trust and status; FTS5 retrieval with a budgeted block; three agent tools; pending approval for rules and preferences; a secret filter; consolidation on GLM-5.3-Flash with observe/auto modes; a durable effects queue used by consolidation and notifications; policy versions on parked cards and schedules; attention-budget notification rules and a `report_outcome` tool for scheduled runs; a stage field; API, prompt, tests, docs.
 
-**Out of scope for 0.15:** memory shared across Bots (`agent` stays `main`; `'*'` is reserved), embeddings, importing from other assistants beyond the JSON format defined here, generic or encrypted notification text, attested desktops.
+**Out of scope for 0.15:** embeddings, importing from other assistants beyond the JSON format defined here, generic or encrypted notification text.
 
 | Rejected | Reason |
 |---|---|
-| Postgres + pgvector, a job queue (pg-boss, Celery…) | agentd is one static binary with bundled SQLite on the user's VM; a central store breaks operator-blind and the one-VM tenancy boundary (§4.9) |
-| Embeddings in v1 | Needs a new gateway route and image, or a local ONNX model in a musl static build on 2 vCPUs. FTS5 + recency + importance is enough at hundreds to low thousands of items; revisit if recall evals show FTS misses |
-| `team` scope, group-chat filters, team-admin audit log | No teams, no groups, no admin role, and an operator must not read memory content. Cross-user isolation is the VM |
+| Postgres + pgvector, a job queue (pg-boss, Celery…) | agentd is one static binary with bundled SQLite on the user's VM; a separate store would take memory off the desktop |
+| Embeddings in v1 | Needs a hosted embedding model, or a local ONNX model in a musl static build on 2 vCPUs. FTS5 + recency + importance is enough at hundreds to low thousands of items; revisit if recall evals show FTS misses |
 | A Vault that fills logins | Contradicts ground rule 4: third-party passwords are never stored. API keys already have `request_secret` |
 | A classifier in the secret filter | Regex over known key formats plus the existing redaction is enough; a classifier has nowhere to run |
 | Five memory tools, `expected_version` in a model-facing tool | Mid-size open models mishandle version numbers and extra tools; three tools, versions on the API only |
 | Per-turn retrieval | Breaks prefix caching and has no good query mid-task; retrieve once per task, `search_memory` for more |
 | Recency-wins contradiction handling | A tainted inferred memory must not silently override a user-stated one |
-| 100% / 0 gates on model-dependent metrics in CI | Flaky and costs gateway spend per run; deterministic harness tests are gated, model evals are tracked |
+| 100% / 0 gates on model-dependent metrics in CI | Flaky and costs model spend per run; deterministic harness tests are gated, model evals are tracked |
 | 5% → 25% → 100% rollout, backup retention policy | One desktop, no backups of `agentd.db`; an env flag and a pre-deploy DB copy do the job |
-| DeepSeek Harness as the runtime | Node plugin tree at alpha, `danger-full-access` presets, no attestation path; the opposite of agentd's constraints |
-| Follow-up ownership / hand-back between workers | Applies when several Bots share one chat; deferred to `agents-and-bots.md` |
+| DeepSeek Harness as the runtime | Node plugin tree at alpha, `danger-full-access` presets; the opposite of agentd's constraints |
 
 
 ## 4. Data model (migration `user_version` 1 → 2)
@@ -144,7 +142,7 @@ CREATE INDEX IF NOT EXISTS memory_events_memory ON memory_events(memory_id, seq)
 
 -- durable side effects (§9)
 CREATE TABLE IF NOT EXISTS effects (
-  kind       TEXT NOT NULL,   -- consolidate | push | purge
+  kind       TEXT NOT NULL,   -- consolidate | web_push | purge
   key        TEXT NOT NULL,   -- idempotency key within kind
   payload    TEXT NOT NULL,   -- JSON
   due        INTEGER NOT NULL,

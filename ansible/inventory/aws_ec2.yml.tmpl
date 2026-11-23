@@ -9,7 +9,7 @@ plugin: amazon.aws.aws_ec2
 regions:
   - "@REGION@"
 filters:
-  tag:Project: cloud-desktops
+  tag:Project: neo-agent
   tag:Env: "@ENV@"
   instance-state-name: running
 hostnames:
@@ -20,6 +20,6 @@ keyed_groups:
 compose:
   ansible_aws_ssm_instance_id: instance_id
   # Its environment (Terraform's Env tag), which picks its SSM paths
-  # (/cloud-desktops/<env>/...), and its device name on your tailnet.
+  # (/neo-agent/<env>/...), and its device name on your tailnet.
   desktop_env: ec2_tags.Env
   desktop_tailnet_name: ec2_tags.TailnetName | default('neo-agent')

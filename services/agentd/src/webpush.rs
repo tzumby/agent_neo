@@ -274,7 +274,7 @@ pub async fn send(
 pub fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
-        .user_agent("cloud-desktops-agentd/0.1")
+        .user_agent("neo-agent-agentd/0.1")
         .build()
         .context("push client")
 }

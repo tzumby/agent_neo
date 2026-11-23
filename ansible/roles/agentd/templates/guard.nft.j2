@@ -1,11 +1,11 @@
 #!/usr/sbin/nft -f
 # {{ ansible_managed }}
-# Who may reach what on this desktop (loaded by cloud-desktop-guard.service).
+# Who may reach what on this desktop (loaded by neo-agent-guard.service).
 # Declare, delete and re-create the table so reloading is atomic.
-table inet cloud_desktop_guard
-delete table inet cloud_desktop_guard
+table inet neo_agent_guard
+delete table inet neo_agent_guard
 
-table inet cloud_desktop_guard {
+table inet neo_agent_guard {
   # The shell user while a command the user approved to connect on its own runs
   # (agentd adds and removes it; services/agentd/src/agent.rs, open_direct).
   # Entries expire by themselves, so this closes even if agentd stops.

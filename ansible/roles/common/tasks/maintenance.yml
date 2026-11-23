@@ -1,12 +1,12 @@
-# The maintenance window (files/cloud-desktop-maintenance): once installed
+# The maintenance window (files/neo-agent-maintenance): once installed
 # updates need a reboot or a restart, the desktop reboots between
 # common_maintenance_hours in its user's time zone, while the agent is idle
 # and nobody is viewing the screen. Off with common_maintenance: false.
 
 - name: Install the maintenance script
   ansible.builtin.copy:
-    dest: /usr/local/sbin/cloud-desktop-maintenance
-    src: cloud-desktop-maintenance
+    dest: /usr/local/sbin/neo-agent-maintenance
+    src: neo-agent-maintenance
     mode: "0755"
 
 - name: Install the maintenance units
@@ -15,7 +15,7 @@
     content: "{{ item.content }}"
     mode: "0644"
   loop:
-    - name: cloud-desktop-maintenance.service
+    - name: neo-agent-maintenance.service
       content: |
         # Managed by Ansible (common role: tasks/maintenance.yml).
         [Unit]
@@ -26,8 +26,8 @@
         Type=oneshot
         Environment=MAINTENANCE_HOURS={{ common_maintenance_hours | join(',') }}
         Environment=MAINTENANCE_TIMEZONE={{ common_maintenance_timezone }}
-        ExecStart=/usr/local/sbin/cloud-desktop-maintenance
-    - name: cloud-desktop-maintenance.timer
+        ExecStart=/usr/local/sbin/neo-agent-maintenance
+    - name: neo-agent-maintenance.timer
       content: |
         # Managed by Ansible (common role: tasks/maintenance.yml).
         [Unit]
@@ -44,7 +44,7 @@
 
 - name: Run the maintenance timer
   ansible.builtin.systemd_service:
-    name: cloud-desktop-maintenance.timer
+    name: neo-agent-maintenance.timer
     enabled: "{{ common_maintenance }}"
     state: "{{ 'started' if common_maintenance else 'stopped' }}"
     daemon_reload: true

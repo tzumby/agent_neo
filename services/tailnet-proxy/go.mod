@@ -1,4 +1,4 @@
-module cloud-desktops/tailnet-proxy
+module neo-agent/tailnet-proxy
 
 go 1.27.3
 

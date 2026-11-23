@@ -12,7 +12,7 @@ description: Setting up and running opencode, a coding agent CLI, with a Togethe
    - url `https://api.together.ai/settings/projects/~current/api-keys`
    - how:
      1. Open the link and sign in to Together AI.
-     2. Tap **Create key**, name it (e.g. "Cloud desktop") and copy it.
+     2. Tap **Create key**, name it (e.g. "Neo Agent") and copy it.
         Together shows it only once.
      3. Come back here and paste it.
 3. Configure it without the key, in `~/.config/opencode/opencode.json`:

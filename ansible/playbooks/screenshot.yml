@@ -4,7 +4,7 @@
   become: true
   gather_facts: false
   vars:
-    screenshot_remote_path: /tmp/cloud-desktops-screenshot.png
+    screenshot_remote_path: /tmp/neo-agent-screenshot.png
   tasks:
     - name: Capture the display
       ansible.builtin.command: scrot --overwrite {{ screenshot_remote_path }}

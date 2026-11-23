@@ -1,7 +1,7 @@
 AWS_PROFILE ?= default
 AWS_REGION  ?= ca-central-1
 # This deployment's name: in resource names, tags, SSM paths
-# (/cloud-desktops/<env>/...) and the state bucket. A second deployment in the
+# (/neo-agent/<env>/...) and the state bucket. A second deployment in the
 # same account needs its own (ENV=other).
 ENV         ?= personal
 # The desktop's architecture (Terraform: desktop_arch): amd64 or arm64.
@@ -14,7 +14,7 @@ export TF_VAR_env    := $(ENV)
 
 TF_BOOTSTRAP := terraform -chdir=$(CURDIR)/terraform/bootstrap
 TF           := terraform -chdir=$(CURDIR)/terraform/personal
-SSM_PREFIX   := /cloud-desktops/$(ENV)
+SSM_PREFIX   := /neo-agent/$(ENV)
 
 INSTANCE   = $(shell $(TF) output -raw desktop_instance_id 2>/dev/null)
 SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
@@ -59,7 +59,7 @@ lint: inventory ## Check formatting, validate Terraform, syntax-check playbooks
 model-key: ## Store your Together AI API key in SSM
 	scripts/put-secret.py $(SSM_PREFIX)/llm/together_api_key
 
-tailscale-key: ## Store a Tailscale auth key (tagged tag:cloud-desktop) in SSM
+tailscale-key: ## Store a Tailscale auth key (tagged tag:neo-agent) in SSM
 	scripts/put-secret.py $(SSM_PREFIX)/tailscale/auth_key
 
 tailscale-allow: ## Optional: only these Tailscale logins get in (comma-separated), then make tailnet-deploy

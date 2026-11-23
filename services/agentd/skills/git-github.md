@@ -26,7 +26,7 @@ password, and never ask for the token in the chat.
    - url: GitHub's new fine-grained token page, filled in. `contents=read`
      is enough to clone; `contents=write` lets you push; add
      `pull_requests=write` to open pull requests:
-     `https://github.com/settings/personal-access-tokens/new?name=Cloud+desktop&description=For+the+agent+on+my+cloud+desktop&expires_in=90&contents=write&pull_requests=write`
+     `https://github.com/settings/personal-access-tokens/new?name=Neo+Agent&description=For+the+agent+on+my+cloud+desktop&expires_in=90&contents=write&pull_requests=write`
      For a repository owned by an organization, add `&target_name=<org>`.
    - how, adapted to the job:
      1. Open the link and sign in to GitHub. The name, expiry and

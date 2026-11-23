@@ -9,7 +9,7 @@ tailnet_proxy_vnc: 127.0.0.1:5900
 
 tailnet_proxy_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"
 # auth_key (`make tailscale-key`) and, optionally, allowed_logins.
-tailnet_proxy_params: "/cloud-desktops/{{ desktop_env | default('personal') }}/tailscale"
+tailnet_proxy_params: "/neo-agent/{{ desktop_env | default('personal') }}/tailscale"
 
 # Tailscale login names let in (comma-separated), from SSM so they stay out
 # of git (`make tailscale-allow`). Empty or missing: anyone your tailnet's

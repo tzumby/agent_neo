@@ -4,6 +4,6 @@ variable "role_name" {
 }
 
 variable "ssm_parameter_prefix" {
-  description = "SSM path holding the project's secrets (e.g. /cloud-desktops); the desktop is denied reading it."
+  description = "SSM path holding the project's secrets (e.g. /neo-agent); the desktop is denied reading it."
   type        = string
 }

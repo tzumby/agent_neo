@@ -34,7 +34,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 
-	"cloud-desktops/tailnet-proxy/door"
+	"neo-agent/tailnet-proxy/door"
 )
 
 type gate struct {
@@ -77,7 +77,7 @@ func (g gate) identity(ctx context.Context, remoteAddr string) (login, node stri
 var errNotAllowed = errors.New("not on the allowlist")
 
 func main() {
-	hostname := flag.String("hostname", "cloud-desktop", "device name on the tailnet")
+	hostname := flag.String("hostname", "neo-agent", "device name on the tailnet")
 	stateDir := flag.String("state-dir", "/var/lib/tailnet-proxy", "where the node keeps its identity")
 	novnc := flag.String("novnc", "http://127.0.0.1:6080", "noVNC/websockify to proxy to")
 	agentd := flag.String("agentd", "/run/agentd/agentd.sock", "agentd's Unix socket")

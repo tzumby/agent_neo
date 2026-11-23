@@ -23,7 +23,7 @@
 # upgrades and interrupt whatever the agent is doing. List only.
 - name: Stop needrestart from restarting services automatically
   ansible.builtin.copy:
-    dest: /etc/needrestart/conf.d/90-cloud-desktops.conf
+    dest: /etc/needrestart/conf.d/90-neo-agent.conf
     content: |
       $nrconf{restart} = 'l';
     mode: "0644"

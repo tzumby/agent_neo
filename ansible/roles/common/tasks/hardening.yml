@@ -13,7 +13,7 @@
 
 - name: Kernel and network settings
   ansible.builtin.copy:
-    dest: /etc/sysctl.d/90-cloud-desktops-hardening.conf
+    dest: /etc/sysctl.d/90-neo-agent-hardening.conf
     content: |
       # Managed by Ansible (common role: tasks/hardening.yml), from DevSec's
       # os_hardening defaults.
@@ -25,7 +25,7 @@
 
 - name: Keep unused filesystem and protocol modules from loading
   ansible.builtin.copy:
-    dest: /etc/modprobe.d/cloud-desktops-hardening.conf
+    dest: /etc/modprobe.d/neo-agent-hardening.conf
     content: |
       # Managed by Ansible (common role: tasks/hardening.yml).
       {% for module in common_disabled_modules %}
@@ -55,7 +55,7 @@
 
 - name: No core dumps
   ansible.builtin.copy:
-    dest: /etc/security/limits.d/90-cloud-desktops.conf
+    dest: /etc/security/limits.d/90-neo-agent.conf
     content: |
       # Managed by Ansible (common role: tasks/hardening.yml).
       * hard core 0
@@ -124,7 +124,7 @@
 - name: Audit rules
   ansible.builtin.template:
     src: audit.rules.j2
-    dest: /etc/audit/rules.d/cloud-desktops.rules
+    dest: /etc/audit/rules.d/neo-agent.rules
     mode: "0640"
   notify: Load audit rules
   # A dry run hasn't installed auditd.

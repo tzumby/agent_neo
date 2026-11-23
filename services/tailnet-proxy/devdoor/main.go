@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"cloud-desktops/tailnet-proxy/door"
+	"neo-agent/tailnet-proxy/door"
 )
 
 func main() {

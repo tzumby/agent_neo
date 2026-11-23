@@ -7,7 +7,7 @@ variable "region" {
 variable "project" {
   description = "Project name, used in resource names, tags and SSM paths (/<project>/<env>/...)."
   type        = string
-  default     = "cloud-desktops"
+  default     = "neo-agent"
 }
 
 variable "env" {

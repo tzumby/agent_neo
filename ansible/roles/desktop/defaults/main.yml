@@ -9,8 +9,8 @@ desktop_width: 1280
 desktop_height: 800
 desktop_depth: 24
 
-desktop_config_dir: /etc/cloud-desktops
-desktop_libexec_dir: /usr/local/lib/cloud-desktops
+desktop_config_dir: /etc/neo-agent
+desktop_libexec_dir: /usr/local/lib/neo-agent
 
 chrome_start_url: ""
 chrome_debug_port: 9222

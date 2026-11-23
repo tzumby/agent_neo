@@ -5,7 +5,7 @@
 # ///
 """Store a secret in SSM Parameter Store as a SecureString without echoing it.
 
-  scripts/put-secret.py /cloud-desktops/personal/llm/together_api_key
+  scripts/put-secret.py /neo-agent/personal/llm/together_api_key
 
 Uses the AWS profile and region from the environment (the Makefile sets both).
 The value stays inside this process: it is not passed to a subprocess, written

@@ -8,8 +8,8 @@ import UserNotifications
     import AppKit
 #endif
 
-/// Registers this device for APNs and opens the card mentioned in a notification.
-/// The app delegates (iOS/, macOS/) hand it the token.
+/// Registers this device for APNs and opens the conversation and card
+/// mentioned in a notification. The app delegates (iOS/, macOS/) hand it the token.
 @MainActor
 @Observable
 final class PushCenter: NSObject {
@@ -19,6 +19,10 @@ final class PushCenter: NSObject {
     private(set) var deviceToken: String?
     /// The chat row a notification points to.
     var pendingCardID: String?
+    /// The conversation a notification opens (the home shows it, then its
+    /// chat looks for `pendingCardID`). The chat's banner about another
+    /// conversation opens it the same way.
+    var pendingSession: String?
     @ObservationIgnored private var registrations: [URL: Task<String, Error>] = [:]
     /// Signing out: no new registrations, and Settings stays open to finish it.
     @ObservationIgnored private(set) var loggingOut = false
@@ -111,6 +115,7 @@ final class PushCenter: NSObject {
 
     func finishLogout() {
         pendingCardID = nil
+        pendingSession = nil
         loggingOut = false
     }
 
@@ -146,6 +151,8 @@ extension PushCenter: UNUserNotificationCenterDelegate {
         let data = response.notification.request.content.userInfo
         let approval = data["approval"] as? String
         let action = data["action"] as? String
+        // agentd 0.16.0 names the conversation; an older one has only main.
+        let session = (data["session"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "main"
         nonisolated(unsafe) let done = completionHandler
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
@@ -154,6 +161,7 @@ extension PushCenter: UNUserNotificationCenterDelegate {
                 } else if let action, !action.isEmpty {
                     self.pendingCardID = "action-\(action)"
                 }
+                self.pendingSession = session
                 #if os(macOS)
                     self.showChat?()
                 #endif

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::agent::Agent;
 use crate::effects::Outcome;
-use crate::store::Effect;
+use crate::store::{Effect, MAIN};
 use crate::webpush::{self, Delivery, Vapid};
 
 /// Browsers that can have notifications on at once.
@@ -50,6 +50,8 @@ pub struct Notice {
     pub ttl: u32,
     /// The app can open the corresponding task or card: `{task, approval?, action?}`.
     pub data: Value,
+    /// The conversation it opens (none for a test or a budget alert).
+    pub session: Option<String>,
 }
 
 impl Notice {
@@ -63,7 +65,17 @@ impl Notice {
             urgency,
             ttl,
             data,
+            session: None,
         }
+    }
+}
+
+/// Where a Web Push notification opens the web app: its conversation, or
+/// the chat (`main`) for one about none.
+fn link(session: Option<&str>) -> String {
+    match session {
+        Some(session) => format!("/#/chat/{session}"),
+        None => "/#/chat".into(),
     }
 }
 
@@ -280,12 +292,18 @@ impl Agent {
             }
             let payload = json!({
                 "sub": sub.id, "title": title, "body": body,
-                "tag": notice.tag, "url": "/#/chat", "urgency": notice.urgency, "ttl": notice.ttl, "created": now,
+                "tag": notice.tag, "url": link(notice.session.as_deref()), "urgency": notice.urgency,
+                "ttl": notice.ttl, "created": now,
             });
             self.enqueue("web_push", &format!("{}:{}", sub.id, notice.tag), &payload, now)?;
             queued += 1;
         }
         if self.apns.is_some() {
+            // The app opens the notice's conversation.
+            let mut data = notice.data.clone();
+            if let (Some(session), Some(fields)) = (&notice.session, data.as_object_mut()) {
+                fields.insert("session".into(), json!(session));
+            }
             for device in self.store.device_tokens()? {
                 if only.is_some_and(|id| id != device.id) {
                     continue;
@@ -293,7 +311,7 @@ impl Agent {
                 let payload = json!({
                     "device": device.id, "title": title, "body": body, "tag": notice.tag,
                     "urgency": notice.urgency, "ttl": notice.ttl, "created": now,
-                    "data": notice.data,
+                    "data": data,
                 });
                 self.enqueue("apns", &format!("{}:{}", device.id, notice.tag), &payload, now)?;
                 queued += 1;
@@ -302,7 +320,17 @@ impl Agent {
         Ok(queued)
     }
 
-    fn notify_quietly(&self, notice: Notice) {
+    /// Sends a task's notice: about its conversation, titled with the
+    /// conversation's title first when it isn't `main`.
+    fn notify_quietly(&self, mut notice: Notice) {
+        let task = notice.data["task"].as_str().unwrap_or(&notice.tag).to_string();
+        notice.session = self.session_of(&task);
+        if let Some(session) = notice.session.as_deref().filter(|s| *s != MAIN)
+            && let Some(row) = self.store.session(session).ok().flatten()
+            && !row.title.is_empty()
+        {
+            notice.title = clip(&format!("{}: {}", row.title, notice.title), TITLE_CHARS);
+        }
         if let Err(err) = self.notify(&notice, None) {
             tracing::warn!(%err, "couldn't queue a notification");
         }
@@ -319,6 +347,7 @@ impl Agent {
                 urgency: "high",
                 ttl: 86_400,
                 data: json!({"task": task, "approval": id}),
+                session: None,
             });
         }
     }
@@ -331,6 +360,7 @@ impl Agent {
             urgency: "high",
             ttl: 86_400,
             data: json!({"task": task, "action": id}),
+            session: None,
         });
     }
 

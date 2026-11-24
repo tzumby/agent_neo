@@ -1,8 +1,9 @@
-//! SQLite state: the event log the apps stream, the chat history the model
-//! sees, runs (tasks) and what they wait on, the agent's memory, schedules,
-//! the saved keys' names and labels (their values are files: secrets.rs), and
-//! settings.
+//! SQLite state: the event log the apps stream, each conversation's history
+//! the model sees, runs (tasks) and what they wait on, queued messages, the
+//! agent's memory, schedules, the saved keys' names and labels (their values
+//! are files: secrets.rs), and settings.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -11,22 +12,110 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::Value;
 
+/// The first conversation, with everything from before conversations.
+pub const MAIN: &str = "main";
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Event {
     pub seq: i64,
     pub ts: String,
     pub kind: String,
     pub data: Value,
+    /// The conversation it's about (`data.session`); None for a global one.
+    #[serde(skip)]
+    pub session: Option<String>,
 }
+
+const EVENT_COLUMNS: &str = "seq, ts, kind, data, session";
 
 fn event_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
     let data: String = row.get(3)?;
+    let session: Option<String> = row.get(4)?;
+    let mut data: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+    // Events logged before conversations were tagged by the migration only:
+    // the apps read it from the event itself.
+    if let (Some(session), Some(fields)) = (&session, data.as_object_mut()) {
+        fields
+            .entry("session")
+            .or_insert_with(|| Value::from(session.as_str()));
+    }
     Ok(Event {
         seq: row.get(0)?,
         ts: row.get(1)?,
         kind: row.get(2)?,
-        data: serde_json::from_str(&data).unwrap_or(Value::Null),
+        data,
+        session,
     })
+}
+
+/// A conversation (`sessions` row).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionRow {
+    pub id: String,
+    pub title: String,
+    /// Unix seconds.
+    pub created: i64,
+    /// Its last message, queued message, title change or creation.
+    pub updated: i64,
+    pub archived: bool,
+    /// When it was deleted; its row stays for its runs' titles.
+    pub deleted: Option<i64>,
+    /// Its browser window's tab (not `main`'s, which is the `tab_target` setting).
+    pub tab_target: Option<String>,
+}
+
+const SESSION_COLUMNS: &str = "id, title, created, updated, archived, deleted, tab_target";
+
+fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        created: row.get(2)?,
+        updated: row.get(3)?,
+        archived: row.get(4)?,
+        deleted: row.get(5)?,
+        tab_target: row.get(6)?,
+    })
+}
+
+/// A message accepted but not started yet (`chat_queue`), with its raw text.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct QueuedMessage {
+    pub id: String,
+    #[serde(skip)]
+    pub session: String,
+    pub text: String,
+    pub by: Option<String>,
+    /// Unix seconds.
+    pub created: i64,
+}
+
+fn queued_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage> {
+    Ok(QueuedMessage {
+        id: row.get(0)?,
+        session: row.get(1)?,
+        text: row.get(2)?,
+        by: row.get(3)?,
+        created: row.get(4)?,
+    })
+}
+
+/// One run for the usage figures (usage.rs).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageRow {
+    /// Unix seconds: a run counts on the day it started.
+    pub started: i64,
+    pub cost: f64,
+    /// chat, scheduled or tidy_up.
+    pub kind: String,
+    pub schedule: Option<i64>,
+    pub session: Option<String>,
+    pub model: String,
+    pub input: i64,
+    pub output: i64,
+    pub cached: i64,
+    /// It ran (not a queued, skipped or never-started one).
+    pub counted: bool,
 }
 
 /// A page of the event log, oldest first (`Store::events_page`).
@@ -83,9 +172,11 @@ pub struct Schedule {
     /// Its runs go ahead with what would otherwise ask, except root commands
     /// and browser changes (agent.rs).
     pub auto_approve: bool,
+    /// The conversation it belongs to: its runs report there.
+    pub session: String,
 }
 
-const SCHEDULE_COLUMNS: &str = "id, name, prompt, cron, timezone, next_run, last_run, paused, created, policy_version, created_from, auto_approve";
+const SCHEDULE_COLUMNS: &str = "id, name, prompt, cron, timezone, next_run, last_run, paused, created, policy_version, created_from, auto_approve, session";
 
 /// A site the user allowed the shell to reach (access.rs).
 #[derive(Clone, Debug, Serialize)]
@@ -366,8 +457,9 @@ impl Store {
 
     // --- Runs ---------------------------------------------------------------------
 
-    /// A task starts, under the rules in `policy_version` (policy.rs);
-    /// `schedule` is set for a scheduled run.
+    /// A task starts in `main`, under the rules in `policy_version`
+    /// (policy.rs); `schedule` is set for a scheduled run.
+    #[cfg(test)]
     pub fn start_run(
         &self,
         id: &str,
@@ -377,13 +469,109 @@ impl Store {
         policy_version: &str,
         schedule: Option<i64>,
     ) -> Result<()> {
+        self.start_run_in(MAIN, id, request, by, model, policy_version, schedule)
+    }
+
+    /// `start_run` in a conversation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_run_in(
+        &self,
+        session: &str,
+        id: &str,
+        request: &str,
+        by: Option<&str>,
+        model: &str,
+        policy_version: &str,
+        schedule: Option<i64>,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO runs (id, status, request, by_user, model, policy_version, schedule, acted)
-             VALUES (?1, 'running', ?2, ?3, ?4, ?5, ?6, 0)",
-            params![id, request, by, model, policy_version, schedule],
+            "INSERT INTO runs (id, status, request, by_user, model, policy_version, schedule, acted, session)
+             VALUES (?1, 'running', ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            params![id, request, by, model, policy_version, schedule, session],
         )?;
         Ok(())
+    }
+
+    /// The conversation a run belongs to (none for a tidy-up).
+    pub fn run_session(&self, id: &str) -> Result<Option<String>> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row("SELECT session FROM runs WHERE id = ?1", params![id], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .flatten())
+        })
+    }
+
+    /// What a run has cost so far, written after each model call so a
+    /// running task counts in the usage figures and the budget.
+    pub fn record_usage(
+        &self,
+        id: &str,
+        cost: Option<f64>,
+        usage: &crate::llm::Usage,
+        steps: u32,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE runs SET cost = ?2, input_tokens = ?3, output_tokens = ?4, cached_tokens = ?5,
+               steps = MAX(steps, ?6) WHERE id = ?1",
+            params![
+                id,
+                cost,
+                usage.input as i64,
+                usage.output as i64,
+                usage.cached as i64,
+                steps
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// What every run started at or after `from` (`iso`) cost.
+    pub fn cost_since(&self, from: &str) -> Result<f64> {
+        self.read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COALESCE(SUM(cost), 0) FROM runs WHERE started >= ?1",
+                params![from],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    /// What every run ever cost.
+    pub fn cost_all_time(&self) -> Result<f64> {
+        self.read(|conn| Ok(conn.query_row("SELECT COALESCE(SUM(cost), 0) FROM runs", [], |row| row.get(0))?))
+    }
+
+    /// The runs started at or after `from` (`iso`), for the usage figures.
+    pub fn usage_since(&self, from: &str) -> Result<Vec<UsageRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT CAST(strftime('%s', started) AS INTEGER), COALESCE(cost, 0),
+               CASE WHEN kind = 'consolidation' THEN 'tidy_up' WHEN schedule IS NULL THEN 'chat' ELSE 'scheduled' END,
+               schedule, CASE WHEN kind = 'task' THEN COALESCE(session, 'main') END, model,
+               COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), COALESCE(cached_tokens, 0),
+               status NOT IN ('queued', 'skipped') AND (steps > 0 OR COALESCE(cost, 0) > 0 OR kind = 'consolidation')
+             FROM runs WHERE started >= ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![from], |row| {
+            Ok(UsageRow {
+                started: row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                cost: row.get(1)?,
+                kind: row.get(2)?,
+                schedule: row.get(3)?,
+                session: row.get(4)?,
+                model: row.get(5)?,
+                input: row.get(6)?,
+                output: row.get(7)?,
+                cached: row.get(8)?,
+                counted: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The task changed something: ran a command, wrote in the browser, or
@@ -466,9 +654,11 @@ impl Store {
         attempt: i64,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
+        // It belongs to its schedule's conversation, where its report goes.
         Ok(conn.execute(
-            "INSERT INTO runs (id, status, request, by_user, model, policy_version, schedule, acted, due, attempt)
-             SELECT ?1, 'queued', ?2, 'schedule', ?3, ?4, ?5, 0, ?6, ?7
+            "INSERT INTO runs (id, status, request, by_user, model, policy_version, schedule, acted, due, attempt, session)
+             SELECT ?1, 'queued', ?2, 'schedule', ?3, ?4, ?5, 0, ?6, ?7,
+               COALESCE((SELECT session FROM schedules WHERE id = ?5), 'main')
              WHERE NOT EXISTS (SELECT 1 FROM runs WHERE schedule = ?5 AND status IN ('queued', 'running'))",
             params![id, request, model, policy_version, schedule, due, attempt],
         )? > 0)
@@ -732,6 +922,227 @@ impl Store {
         Ok(conn.execute("DELETE FROM schedules WHERE id = ?1", params![id])? > 0)
     }
 
+    /// The conversation a schedule reports to (the one that set it up).
+    pub fn set_schedule_session(&self, id: i64, session: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE schedules SET session = ?2 WHERE id = ?1",
+            params![id, session],
+        )?;
+        Ok(())
+    }
+
+    // --- Conversations (sessions) ---------------------------------------------------
+
+    pub fn create_session(&self, id: &str, title: &str, now: i64) -> Result<SessionRow> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            &format!(
+                "INSERT INTO sessions (id, title, created, updated) VALUES (?1, ?2, ?3, ?3)
+                 RETURNING {SESSION_COLUMNS}"
+            ),
+            params![id, title, now],
+            session_row,
+        )?)
+    }
+
+    /// A conversation, deleted ones included.
+    pub fn session(&self, id: &str) -> Result<Option<SessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+                params![id],
+                session_row,
+            )
+            .optional()?)
+    }
+
+    /// The archived conversations or the others (never deleted ones), most
+    /// recently updated first.
+    pub fn sessions(&self, archived: bool) -> Result<Vec<SessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE deleted IS NULL AND archived = ?1
+             ORDER BY updated DESC, created DESC, rowid DESC"
+        ))?;
+        let rows = stmt.query_map(params![archived], session_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every conversation's title, deleted ones included (the usage figures).
+    pub fn session_titles(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, title FROM sessions")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_session_title(&self, id: &str, title: &str, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET title = ?2, updated = MAX(updated, ?3) WHERE id = ?1",
+            params![id, title, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_session_archived(&self, id: &str, archived: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET archived = ?2 WHERE id = ?1",
+            params![id, archived],
+        )?;
+        Ok(())
+    }
+
+    /// The tab of a conversation's browser window (None: it has none).
+    pub fn set_session_tab(&self, id: &str, target: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET tab_target = ?2 WHERE id = ?1",
+            params![id, target],
+        )?;
+        Ok(())
+    }
+
+    /// The tabs of every conversation's own window (not `main`'s).
+    pub fn session_tabs(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, tab_target FROM sessions WHERE tab_target IS NOT NULL AND deleted IS NULL AND id <> 'main'",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Deletes a conversation: its history, queued messages and open Action
+    /// needed cards go, its row stays (marked deleted) so its runs keep their
+    /// title, and its schedules report to `main` from now on.
+    pub fn delete_session(&self, id: &str, now: i64) -> Result<()> {
+        self.transact(|tx| {
+            tx.execute(
+                "UPDATE sessions SET deleted = ?2, tab_target = NULL WHERE id = ?1",
+                params![id, now],
+            )?;
+            tx.execute(
+                "DELETE FROM pending WHERE kind = 'action' AND run IN (SELECT id FROM runs WHERE session = ?1)",
+                params![id],
+            )?;
+            tx.execute("DELETE FROM history WHERE session = ?1", params![id])?;
+            tx.execute("DELETE FROM chat_queue WHERE session = ?1", params![id])?;
+            tx.execute(
+                "UPDATE schedules SET session = 'main' WHERE session = ?1",
+                params![id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// A conversation's newest history entry: (role, text, unix seconds).
+    pub fn last_message(&self, session: &str) -> Result<Option<(String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT role, content, COALESCE(CAST(strftime('%s', ts) AS INTEGER), 0) FROM history
+                 WHERE session = ?1 ORDER BY id DESC LIMIT 1",
+                params![session],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    // --- Queued messages ------------------------------------------------------------
+
+    /// Queues a message; its position in its conversation's queue (1 = next).
+    pub fn queue_message(
+        &self,
+        id: &str,
+        session: &str,
+        text: &str,
+        by: Option<&str>,
+        now: i64,
+    ) -> Result<i64> {
+        self.transact(|tx| {
+            tx.execute(
+                "INSERT INTO chat_queue (id, session, text, by_user, created) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, session, text, by, now],
+            )?;
+            tx.execute(
+                "UPDATE sessions SET updated = MAX(updated, ?2) WHERE id = ?1",
+                params![session, now],
+            )?;
+            Ok(tx.query_row(
+                "SELECT COUNT(*) FROM chat_queue WHERE session = ?1",
+                params![session],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    /// A conversation's queued messages, oldest first.
+    pub fn queued_in(&self, session: &str) -> Result<Vec<QueuedMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, text, by_user, created FROM chat_queue WHERE session = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![session], queued_message_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Each conversation's oldest queued message, oldest first: what starts
+    /// next (archived and deleted conversations wait).
+    pub fn queue_heads(&self) -> Result<Vec<QueuedMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT q.id, q.session, q.text, q.by_user, q.created FROM chat_queue q
+             JOIN sessions s ON s.id = q.session
+             WHERE s.archived = 0 AND s.deleted IS NULL
+               AND q.rowid = (SELECT MIN(rowid) FROM chat_queue WHERE session = q.session)
+             ORDER BY q.rowid",
+        )?;
+        let rows = stmt.query_map([], queued_message_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many messages are queued, in all conversations.
+    pub fn queued_messages(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM chat_queue q JOIN sessions s ON s.id = q.session WHERE s.deleted IS NULL",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Takes a queued message to start it; false if it's gone already.
+    pub fn take_queued(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM chat_queue WHERE id = ?1", params![id])? > 0)
+    }
+
+    /// Removes one queued message; false if it's gone (started or removed).
+    pub fn remove_queued(&self, session: &str, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM chat_queue WHERE id = ?1 AND session = ?2",
+            params![id, session],
+        )? > 0)
+    }
+
+    /// Drops a conversation's queue; the ids dropped, oldest first.
+    pub fn drop_queue(&self, session: &str) -> Result<Vec<String>> {
+        self.transact(|tx| {
+            let ids = {
+                let mut stmt = tx.prepare("SELECT id FROM chat_queue WHERE session = ?1 ORDER BY rowid")?;
+                stmt.query_map(params![session], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?
+            };
+            tx.execute("DELETE FROM chat_queue WHERE session = ?1", params![session])?;
+            Ok(ids)
+        })
+    }
+
     fn schedules_where(&self, condition: &str, args: impl rusqlite::Params) -> Result<Vec<Schedule>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
@@ -923,25 +1334,89 @@ impl Store {
         Ok(())
     }
 
-    /// Every parked approval: (id, card kind), newest first.
-    pub fn parked_cards(&self) -> Result<Vec<(String, String)>> {
+    /// Every parked approval: (id, card kind, conversation), newest first.
+    pub fn parked_cards(&self) -> Result<Vec<(String, String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, COALESCE(json_extract(card, '$.kind'), 'shell') FROM pending
-             WHERE kind = 'approval' ORDER BY created DESC",
+            "SELECT p.id, COALESCE(json_extract(p.card, '$.kind'), 'shell'), COALESCE(r.session, 'main')
+             FROM pending p LEFT JOIN runs r ON r.id = p.run
+             WHERE p.kind = 'approval' ORDER BY p.created DESC, p.rowid DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The conversations with a task parked on a card: waiting.
+    pub fn waiting_sessions(&self) -> Result<HashSet<String>> {
+        Ok(self
+            .parked_cards()?
+            .into_iter()
+            .map(|(_, _, session)| session)
+            .collect())
+    }
+
+    /// Whether a conversation waits on a card.
+    pub fn waiting_in(&self, session: &str) -> Result<bool> {
+        Ok(self.parked_in(session)?.is_some())
+    }
+
+    /// The latest card a conversation's parked task waits on.
+    pub fn parked_in(&self, session: &str) -> Result<Option<Pending>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT p.id, p.run, p.card, p.checkpoint, p.created, p.policy_version
+                 FROM pending p LEFT JOIN runs r ON r.id = p.run
+                 WHERE p.kind = 'approval' AND COALESCE(r.session, 'main') = ?1
+                 ORDER BY p.created DESC, p.rowid DESC LIMIT 1",
+                params![session],
+                pending_row,
+            )
+            .optional()?)
+    }
+
+    /// The label a waiting key request asked with, for that key.
+    pub fn asked_secret_label(&self, name: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT json_extract(card, '$.label') FROM pending
+                 WHERE kind = 'approval' AND json_extract(card, '$.kind') = 'secret'
+                   AND json_extract(card, '$.name') = ?1
+                 ORDER BY created DESC LIMIT 1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Open Action needed cards that are their conversation's latest task's:
+    /// (run, conversation), newest first.
+    pub fn open_actions(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT r.id, COALESCE(r.session, 'main') FROM runs r
+             WHERE r.kind = 'task' AND r.status = 'needs_user'
+               AND EXISTS (SELECT 1 FROM pending p WHERE p.kind = 'action' AND p.run = r.id)
+               AND NOT EXISTS (SELECT 1 FROM runs n WHERE n.kind = 'task' AND n.rowid > r.rowid
+                 AND COALESCE(n.session, 'main') = COALESCE(r.session, 'main')
+                 AND n.status NOT IN ('queued', 'skipped'))
+             ORDER BY r.rowid DESC",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The latest task (not a consolidation): (id, status).
-    pub fn latest_task(&self) -> Result<Option<(String, String)>> {
+    /// The latest task (not a consolidation): (id, status, conversation).
+    pub fn latest_task(&self) -> Result<Option<(String, String, String)>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
             .query_row(
-                "SELECT id, status FROM runs WHERE kind = 'task' ORDER BY rowid DESC LIMIT 1",
+                "SELECT id, status, COALESCE(session, 'main') FROM runs
+                 WHERE kind = 'task' AND status NOT IN ('queued', 'skipped') ORDER BY rowid DESC LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?)
     }
@@ -971,10 +1446,14 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn has_action(&self, id: &str) -> Result<bool> {
-        Ok(self
-            .pending_where("kind = 'action' AND id = ?1", Some(id))?
-            .is_some())
+        Ok(self.action(id)?.is_some())
+    }
+
+    /// The Action needed card with this ID.
+    pub fn action(&self, id: &str) -> Result<Option<Pending>> {
+        self.pending_where("kind = 'action' AND id = ?1", Some(id))
     }
 
     /// Forgets an approval or action; false if it wasn't there (already answered).
@@ -992,26 +1471,19 @@ impl Store {
                      ORDER BY created DESC LIMIT 1"
                 ),
                 rusqlite::params_from_iter(id),
-                |row| {
-                    let card: String = row.get(2)?;
-                    Ok(Pending {
-                        id: row.get(0)?,
-                        run: row.get(1)?,
-                        card: serde_json::from_str(&card).unwrap_or(Value::Null),
-                        checkpoint: row.get(3)?,
-                        created: row.get(4)?,
-                        policy_version: row.get(5)?,
-                    })
-                },
+                pending_row,
             )
             .optional()?)
     }
 
+    /// Logs an event; its conversation (`data.session`) goes in its own
+    /// column too, so a conversation's events can be read on their own.
     pub fn append_event(&self, kind: &str, data: &Value) -> Result<Event> {
+        let session = data["session"].as_str().map(String::from);
         let conn = self.conn.lock().unwrap();
         let (seq, ts) = conn.query_row(
-            "INSERT INTO events (kind, data) VALUES (?1, ?2) RETURNING seq, ts",
-            params![kind, data.to_string()],
+            "INSERT INTO events (kind, data, session) VALUES (?1, ?2, ?3) RETURNING seq, ts",
+            params![kind, data.to_string(), session],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(Event {
@@ -1019,13 +1491,15 @@ impl Store {
             ts,
             kind: kind.to_string(),
             data: data.clone(),
+            session,
         })
     }
 
     pub fn events_after(&self, after: i64, limit: i64) -> Result<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT seq, ts, kind, data FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2"
+        ))?;
         let rows = stmt.query_map(params![after, limit], event_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -1034,17 +1508,36 @@ impl Store {
     /// `kinds` only (all when empty), oldest first: the apps load the chat a
     /// page at a time, newest page first. The log's newest seq is read under
     /// the same lock, so the live stream can resume right after it.
+    #[cfg(test)]
     pub fn events_page(&self, before: Option<i64>, limit: i64, kinds: &[String]) -> Result<EventPage> {
+        self.events_page_in(before, limit, kinds, None)
+    }
+
+    /// `events_page`, of one conversation's events and the global ones when
+    /// `session` is given.
+    pub fn events_page_in(
+        &self,
+        before: Option<i64>,
+        limit: i64,
+        kinds: &[String],
+        session: Option<&str>,
+    ) -> Result<EventPage> {
         let conn = self.conn.lock().unwrap();
-        let filter = if kinds.is_empty() {
+        let mut filter = if kinds.is_empty() {
             String::new()
         } else {
             format!(" AND kind IN ({})", vec!["?"; kinds.len()].join(", "))
         };
+        if session.is_some() {
+            filter.push_str(" AND (session = ? OR session IS NULL)");
+        }
         let sql =
-            format!("SELECT seq, ts, kind, data FROM events WHERE seq < ?{filter} ORDER BY seq DESC LIMIT ?");
+            format!("SELECT {EVENT_COLUMNS} FROM events WHERE seq < ?{filter} ORDER BY seq DESC LIMIT ?");
         let mut values: Vec<rusqlite::types::Value> = vec![before.unwrap_or(i64::MAX).into()];
         values.extend(kinds.iter().map(|kind| kind.clone().into()));
+        if let Some(session) = session {
+            values.push(session.to_string().into());
+        }
         values.push((limit + 1).into()); // one more says whether older ones remain
         let mut stmt = conn.prepare(&sql)?;
         let mut events: Vec<Event> = stmt
@@ -1066,23 +1559,41 @@ impl Store {
         Ok(conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |row| row.get(0))?)
     }
 
+    /// Adds to `main`'s history.
+    #[cfg(test)]
     pub fn add_history(&self, role: &str, text: &str) -> Result<()> {
+        self.add_history_in(MAIN, role, text)
+    }
+
+    /// Adds to a conversation's history, which counts as its latest change.
+    pub fn add_history_in(&self, session: &str, role: &str, text: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO history (role, content) VALUES (?1, ?2)",
-            params![role, text],
+            "INSERT INTO history (role, content, session) VALUES (?1, ?2, ?3)",
+            params![role, text, session],
+        )?;
+        conn.execute(
+            "UPDATE sessions SET updated = MAX(updated, ?2) WHERE id = ?1",
+            params![session, unix_now()],
         )?;
         Ok(())
     }
 
-    /// The latest `limit` entries, oldest first.
+    /// `main`'s latest `limit` entries, oldest first.
+    #[cfg(test)]
     pub fn history(&self, limit: i64) -> Result<Vec<HistoryEntry>> {
+        self.history_in(MAIN, limit)
+    }
+
+    /// A conversation's latest `limit` entries, oldest first.
+    pub fn history_in(&self, session: &str, limit: i64) -> Result<Vec<HistoryEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT ts, role, content FROM (SELECT id, ts, role, content FROM history ORDER BY id DESC LIMIT ?1)
+            "SELECT ts, role, content FROM (SELECT id, ts, role, content FROM history WHERE session = ?2
+               ORDER BY id DESC LIMIT ?1)
              ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![limit], |row| {
+        let rows = stmt.query_map(params![limit, session], |row| {
             Ok(HistoryEntry {
                 ts: row.get(0)?,
                 role: row.get(1)?,
@@ -1107,6 +1618,12 @@ impl Store {
             "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
         Ok(())
     }
 
@@ -1235,6 +1752,18 @@ impl Store {
     }
 }
 
+fn pending_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pending> {
+    let card: String = row.get(2)?;
+    Ok(Pending {
+        id: row.get(0)?,
+        run: row.get(1)?,
+        card: serde_json::from_str(&card).unwrap_or(Value::Null),
+        checkpoint: row.get(3)?,
+        created: row.get(4)?,
+        policy_version: row.get(5)?,
+    })
+}
+
 fn device_token_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceToken> {
     Ok(DeviceToken {
         id: row.get(0)?,
@@ -1273,6 +1802,7 @@ fn schedule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedule> {
         policy_version: row.get(9)?,
         created_from: row.get(10)?,
         auto_approve: row.get(11)?,
+        session: row.get(12)?,
     })
 }
 
@@ -1354,33 +1884,41 @@ fn reconcile_legacy_memory_provenance(conn: &Connection) -> Result<()> {
 /// Every change is additive, so an older agentd still reads and writes a
 /// newer database (it ignores versions above its own).
 fn migrate(conn: &Connection) -> Result<()> {
+    migrate_to(conn, LATEST_VERSION)
+}
+
+/// The schema version this agentd migrates to.
+const LATEST_VERSION: i64 = 9;
+
+/// Migrates up to `target` (tests build older databases with it).
+fn migrate_to(conn: &Connection, target: i64) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version < 1 {
+    if version < 1 && target >= 1 {
         // Whose thread a history entry belongs to: "main" until there are bots.
         if conn.prepare("SELECT agent FROM history LIMIT 0").is_err() {
             conn.execute_batch("ALTER TABLE history ADD COLUMN agent TEXT NOT NULL DEFAULT 'main'")?;
         }
         conn.execute_batch("PRAGMA user_version = 1")?;
     }
-    if version < 2 {
+    if version < 2 && target >= 2 {
         // One transaction: a failed step leaves the database at version 1.
         conn.execute_batch(&format!("BEGIN; {MIGRATION_2} COMMIT;"))?;
     }
-    if version < 3 {
+    if version < 3 && target >= 3 {
         // Whether a task changed something (a command, a write in the browser,
         // a schedule): only those get a work-log entry. Null for older tasks.
         conn.execute_batch(
             "BEGIN; ALTER TABLE runs ADD COLUMN acted INTEGER; PRAGMA user_version = 3; COMMIT;",
         )?;
     }
-    if version < 4 {
+    if version < 4 && target >= 4 {
         // "Run without asking", per schedule: off unless a person turns it on.
         conn.execute_batch(
             "BEGIN; ALTER TABLE schedules ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0; \
              PRAGMA user_version = 4; COMMIT;",
         )?;
     }
-    if version < 5 {
+    if version < 5 && target >= 5 {
         // The scheduled runs' queue (schedule.rs): when a queued run is due,
         // and which try it is.
         conn.execute_batch(
@@ -1390,7 +1928,7 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 5; COMMIT;",
         )?;
     }
-    if version < 6 {
+    if version < 6 && target >= 6 {
         // Sites the user allowed the shell to reach (access.rs).
         conn.execute_batch(
             "BEGIN; CREATE TABLE IF NOT EXISTS egress_hosts (
@@ -1402,7 +1940,7 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 6; COMMIT;",
         )?;
     }
-    if version < 7 {
+    if version < 7 && target >= 7 {
         // The iPhone and Mac apps to notify by APNs (apns.rs).
         conn.execute_batch(
             "BEGIN; CREATE TABLE IF NOT EXISTS device_tokens (
@@ -1416,7 +1954,7 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 7; COMMIT;",
         )?;
     }
-    if version < 8 {
+    if version < 8 && target >= 8 {
         conn.execute_batch(
             "BEGIN;
              ALTER TABLE runs ADD COLUMN memory_consolidated INTEGER NOT NULL DEFAULT 0;
@@ -1437,8 +1975,72 @@ fn migrate(conn: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 9 && target >= 9 {
+        // Conversations, queued messages and usage per run (0.16.0). One
+        // transaction: a failed step leaves the database at version 8.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_9)?;
+        // `main` holds everything from before, titled from its first message.
+        let first: Option<String> = tx
+            .query_row(
+                "SELECT content FROM history WHERE role = 'user' ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let title = first
+            .as_deref()
+            .map(crate::sessions::title_from)
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "First conversation".into());
+        let (created, updated): (Option<i64>, Option<i64>) = tx.query_row(
+            "SELECT CAST(strftime('%s', MIN(ts)) AS INTEGER), CAST(strftime('%s', MAX(ts)) AS INTEGER) FROM history",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let now = unix_now();
+        tx.execute(
+            "INSERT OR IGNORE INTO sessions (id, title, created, updated) VALUES ('main', ?1, ?2, ?3)",
+            params![title, created.unwrap_or(now), updated.or(created).unwrap_or(now)],
+        )?;
+        tx.execute_batch("PRAGMA user_version = 9")?;
+        tx.commit()?;
+    }
     Ok(())
 }
+
+/// Conversations (`sessions`; `history`, `runs`, `schedules` and `events`
+/// gain a `session`), queued messages (`chat_queue`), and each run's tokens.
+/// Additive: an older agentd writes rows these columns default for.
+///
+/// The event log's conversation events are tagged `main`: the chat's kinds,
+/// and anything about a task, but never the global `access.*` ones.
+const MIGRATION_9: &str = "
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY, agent TEXT NOT NULL DEFAULT 'main',
+      title TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL, updated INTEGER NOT NULL,
+      archived INTEGER NOT NULL DEFAULT 0, deleted INTEGER, tab_target TEXT);
+    ALTER TABLE history ADD COLUMN session TEXT NOT NULL DEFAULT 'main';
+    CREATE INDEX IF NOT EXISTS history_by_session ON history (session, id);
+    ALTER TABLE runs ADD COLUMN session TEXT;
+    ALTER TABLE runs ADD COLUMN input_tokens INTEGER;
+    ALTER TABLE runs ADD COLUMN output_tokens INTEGER;
+    ALTER TABLE runs ADD COLUMN cached_tokens INTEGER;
+    UPDATE runs SET session = 'main' WHERE kind = 'task';
+    CREATE INDEX IF NOT EXISTS runs_by_started ON runs (started);
+    ALTER TABLE schedules ADD COLUMN session TEXT NOT NULL DEFAULT 'main';
+    ALTER TABLE events ADD COLUMN session TEXT;
+    UPDATE events SET session = 'main'
+      WHERE kind NOT LIKE 'access.%' AND (
+        kind IN ('message', 'step', 'plan', 'review', 'shell', 'shell.output', 'action_needed',
+                 'action.resolved', 'image')
+        OR kind LIKE 'task.%' OR kind LIKE 'run.%' OR kind LIKE 'approval.%'
+        OR (json_valid(data) AND json_extract(data, '$.task') IS NOT NULL));
+    CREATE INDEX IF NOT EXISTS events_by_session ON events (session, seq);
+    CREATE TABLE IF NOT EXISTS chat_queue (
+      id TEXT PRIMARY KEY, session TEXT NOT NULL, text TEXT NOT NULL,
+      by_user TEXT, created INTEGER NOT NULL);
+";
 
 /// Memory v2 (kinds, trust, status, history, full-text search), the effects
 /// queue, and policy versions on parked work (docs/memory-v2.md §4).
@@ -1770,7 +2372,12 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(version, 8);
+            assert_eq!(version, 9);
+            // Everything from before is in the first conversation.
+            let main: String = conn
+                .query_row("SELECT id FROM sessions", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(main, "main");
             // The apps' device-token table remains available.
             assert!(
                 conn.prepare("SELECT token, topic FROM device_tokens LIMIT 0")
@@ -2110,6 +2717,114 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(history, [("forget".into(), None), ("purge".into(), None)]);
+    }
+
+    /// agentd 0.15's database (schema version 8) with a chat, a parked card,
+    /// a scheduled run and the event log's kinds, opened by this version.
+    #[test]
+    fn migrates_a_v8_database_and_an_older_agentd_still_writes_to_it() {
+        let dir = std::env::temp_dir().join(format!("agentd-v8-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agentd.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("../testdata/agentd-v1.sql"))
+                .unwrap();
+            migrate_to(&conn, 8).unwrap();
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(version, 8);
+            conn.execute_batch(
+                r#"INSERT INTO runs (id, status, request, model, schedule, acted, cost)
+                     VALUES ('sched1', 'done', 'Check the build', 'm', 1, 0, 0.01);
+                   INSERT INTO runs (id, kind, status, request, model, cost)
+                     VALUES ('tidy1', 'consolidation', 'done', 'consolidate 2 tasks', 'm', 0.001);
+                   INSERT INTO events (kind, data) VALUES
+                     ('message', '{"role":"assistant","text":"A note."}'),
+                     ('step', '{"task":"a1b2c3d4e5f6","step":1,"tool":"read_text"}'),
+                     ('task.stopping', '{}'),
+                     ('approval.requested', '{"id":"c3d4e5f6a1b2","kind":"shell","task":"b2c3d4e5f6a1"}'),
+                     ('run.finished', '{"task":"sched1","status":"done"}'),
+                     ('memory.saved', '{"id":4,"task":"a1b2c3d4e5f6"}'),
+                     ('memory.forgotten', '{"id":4,"by":"me@example.com"}'),
+                     ('access.allowed', '{"hosts":["a.example.com"],"task":"b2c3d4e5f6a1"}'),
+                     ('settings', '{"model":"m"}'),
+                     ('secret.saved', '{"name":"GITHUB_TOKEN"}'),
+                     ('schedule.updated', '{"id":1,"next_run":5}'),
+                     ('not.json', 'oops');"#,
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        // `main` holds everything from before, titled from its first message.
+        let main = store.session(MAIN).unwrap().unwrap();
+        assert_eq!(main.title, "Remember that I like summaries short");
+        assert_eq!(main.created, 1_793_554_671); // 2026-11-01T17:37:51Z, its first entry
+        assert!(!main.archived && main.deleted.is_none());
+        assert_eq!(store.history_in(MAIN, 10).unwrap().len(), 2);
+        assert_eq!(
+            store.run_session("a1b2c3d4e5f6").unwrap().as_deref(),
+            Some("main")
+        );
+        assert_eq!(store.run_session("sched1").unwrap().as_deref(), Some("main"));
+        assert_eq!(store.run_session("tidy1").unwrap(), None);
+        assert_eq!(store.schedule(1).unwrap().unwrap().session, "main");
+        assert_eq!(store.parked_in(MAIN).unwrap().unwrap().id, "c3d4e5f6a1b2");
+        assert!(store.queued_in(MAIN).unwrap().is_empty());
+        // The event log: the chat's kinds and anything about a task are
+        // main's; the global ones stay without.
+        let tagged: Vec<(String, Option<String>)> = store
+            .events_after(0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.kind, e.session))
+            .collect();
+        let main_ = Some("main".to_string());
+        assert_eq!(
+            tagged,
+            [
+                ("memory.saved".into(), None), // the fixture's, from the app
+                ("message".into(), main_.clone()),
+                ("step".into(), main_.clone()),
+                ("task.stopping".into(), main_.clone()),
+                ("approval.requested".into(), main_.clone()),
+                ("run.finished".into(), main_.clone()),
+                ("memory.saved".into(), main_.clone()),
+                ("memory.forgotten".into(), None),
+                ("access.allowed".into(), None),
+                ("settings".into(), None),
+                ("secret.saved".into(), None),
+                ("schedule.updated".into(), None),
+                ("not.json".into(), None),
+            ]
+        );
+        // The apps read it from the event itself.
+        assert_eq!(store.events_after(1, 1).unwrap()[0].data["session"], "main");
+        // An older agentd's statements still work on the newer database.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO history (role, content) VALUES ('user', 'from 0.15');
+                 INSERT INTO runs (id, status, request, by_user, model, policy_version, schedule, acted)
+                   VALUES ('old1', 'running', 'from 0.15', NULL, 'm', 'v', NULL, 0);
+                 INSERT INTO events (kind, data) VALUES ('message', '{\"text\":\"from 0.15\"}');
+                 INSERT INTO schedules (name, prompt, cron, timezone, next_run) VALUES ('Old', 'x', NULL, 'UTC', 1);",
+            )
+            .unwrap();
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(version, 9);
+        }
+        assert_eq!(
+            store.history_in(MAIN, 10).unwrap().last().unwrap().text,
+            "from 0.15"
+        );
+        assert!(store.schedules().unwrap().iter().all(|s| s.session == "main"));
+        // An older agentd's chat task counts as main's.
+        assert_eq!(store.latest_task().unwrap().unwrap().2, "main");
+        drop(store);
+        // Opening again doesn't migrate again.
+        let again = Store::open(&path).unwrap();
+        assert_eq!(again.sessions(false).unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

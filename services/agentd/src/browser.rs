@@ -2,7 +2,7 @@
 //! Elements are found through the accessibility tree; `ref`s in snapshots
 //! are Chrome's backend DOM node IDs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -234,15 +234,35 @@ pub struct Element {
     pub label: String,
 }
 
+/// Where a task's browser works. It connects the first time a tool needs it,
+/// so a task that never browses doesn't need Chrome.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Mode {
+    /// `main`'s: the remembered tab, else the first one that isn't in
+    /// another conversation's window.
+    #[default]
+    Shared,
+    /// Another conversation's: a window of its own, opened the first time
+    /// and kept for its next tasks. It sees only that window's tabs.
+    Window,
+    /// A scheduled run's: a window for this run only, closed at its end
+    /// unless it's kept for the user.
+    Temporary,
+}
+
 pub struct Browser {
     cdp: Cdp,
     page: Option<Page>,
     /// What's happening on the current tab, followed from its events for as
     /// long as agentd is connected to it (across tool calls).
     watch: Mutex<Option<PageWatch>>,
-    /// A scheduled run's: it works only in a window it opens itself.
-    own_window: bool,
-    /// The window it opened, closed when the browser is dropped unless kept.
+    mode: Mode,
+    /// The tab to go back to: `main`'s remembered tab, or a conversation's
+    /// window from its earlier tasks.
+    remembered: Option<String>,
+    /// `main`: a tab of each other conversation's window, which it leaves alone.
+    foreign: Vec<String>,
+    /// A scheduled run's window, closed when the browser is dropped unless kept.
     opened: Option<String>,
 }
 
@@ -260,52 +280,179 @@ impl Drop for Browser {
 }
 
 impl Browser {
+    /// `main`'s browser, with no tab remembered.
     pub fn new(cdp: Cdp) -> Self {
         Self {
             cdp,
             page: None,
             watch: Mutex::new(None),
-            own_window: false,
+            mode: Mode::Shared,
+            remembered: None,
+            foreign: Vec::new(),
             opened: None,
         }
     }
 
-    /// From now on it works only in a window of its own (a scheduled run's),
-    /// opened by `open_own_window`; the user's tabs are left alone.
-    pub fn use_own_window(&mut self) {
-        self.own_window = true;
+    /// `main`'s: the tab it used last, never another conversation's window.
+    pub fn shared(&mut self, remembered: Option<String>, foreign: Vec<String>) {
+        self.mode = Mode::Shared;
+        self.remembered = remembered;
+        self.foreign = foreign;
     }
 
-    pub fn own_window_only(&self) -> bool {
-        self.own_window
+    /// Another conversation's: its own window, the one from its earlier
+    /// tasks while it's still open.
+    pub fn own_window(&mut self, remembered: Option<String>) {
+        self.mode = Mode::Window;
+        self.remembered = remembered;
     }
 
-    /// Opens its own window, the first time.
-    pub async fn open_own_window(&mut self) -> Result<()> {
+    /// A scheduled run's: a window for this run only; the user's tabs are
+    /// left alone.
+    pub fn temporary_window(&mut self) {
+        self.mode = Mode::Temporary;
+    }
+
+    /// A scheduled run's browser, which works in one tab of its own.
+    pub fn is_temporary(&self) -> bool {
+        self.mode == Mode::Temporary
+    }
+
+    /// Connects the first time it's needed: to `main`'s tab, the
+    /// conversation's window (opened if it's gone), or a new window.
+    pub async fn ensure(&mut self) -> Result<()> {
         if self.page.is_some() {
             return Ok(());
         }
-        let target = self.cdp.new_window().await?;
-        self.opened = Some(target.id.clone());
-        self.connect(&target).await
+        match self.mode {
+            Mode::Shared => {
+                let pages = self.cdp.pages().await?;
+                let remembered = pages.iter().find(|t| Some(&t.id) == self.remembered.as_ref());
+                let target = match remembered.or_else(|| pages.iter().find(|t| !self.foreign.contains(&t.id)))
+                {
+                    Some(t) => t.clone(),
+                    None => self.cdp.new_page().await?,
+                };
+                self.connect(&target).await
+            }
+            Mode::Window => {
+                if let Some(id) = &self.remembered
+                    && let Some(target) = self.cdp.pages().await?.into_iter().find(|t| &t.id == id)
+                {
+                    return self.connect(&target).await;
+                }
+                let target = self.cdp.new_window().await?;
+                self.connect(&target).await
+            }
+            Mode::Temporary => {
+                let target = self.cdp.new_window().await?;
+                self.opened = Some(target.id.clone());
+                self.connect(&target).await
+            }
+        }
     }
 
-    /// Leaves its window open after all (for the user to take over); its id.
+    /// For Action needed: connects to the tab it would use, but never opens
+    /// a window just to show it.
+    pub async fn ensure_existing(&mut self) {
+        if self.page.is_some() {
+            return;
+        }
+        let worth = match self.mode {
+            Mode::Shared => true,
+            Mode::Window => self.remembered_is_open().await,
+            Mode::Temporary => false,
+        };
+        if worth {
+            let _ = self.ensure().await;
+        }
+    }
+
+    async fn remembered_is_open(&self) -> bool {
+        let Some(id) = &self.remembered else { return false };
+        self.cdp
+            .pages()
+            .await
+            .is_ok_and(|pages| pages.iter().any(|t| &t.id == id))
+    }
+
+    /// A conversation's window comes to the front, for the user to take over.
+    pub async fn bring_to_front(&self) {
+        if self.mode == Mode::Window
+            && let Some(id) = self.current_target()
+            && let Err(err) = self.cdp.activate(&id).await
+        {
+            tracing::warn!(%err, "couldn't bring a conversation's window to the front");
+        }
+    }
+
+    /// Leaves a scheduled run's window open after all (for the user to take
+    /// over); its id.
     pub fn keep_own_window(&mut self) -> Option<String> {
         self.opened.take()
     }
 
-    /// The current tab: the one remembered from earlier, else the first tab.
-    pub async fn attach(&mut self, remembered: Option<&str>) -> Result<()> {
+    /// The tabs this task may list and switch to: its window's for a
+    /// conversation; for `main`, those outside other conversations' windows.
+    async fn tabs(&self) -> Result<Vec<crate::cdp::Target>> {
         let pages = self.cdp.pages().await?;
-        let target = match pages.iter().find(|t| Some(t.id.as_str()) == remembered) {
-            Some(t) => t.clone(),
-            None => match pages.first() {
-                Some(t) => t.clone(),
-                None => self.cdp.new_page().await?,
-            },
+        let current = self.current_target();
+        match self.mode {
+            Mode::Shared if self.foreign.is_empty() => Ok(pages),
+            Mode::Shared => {
+                let ids: Vec<String> = pages.iter().map(|t| t.id.clone()).collect();
+                Ok(match self.cdp.windows(&ids).await {
+                    Ok(windows) => {
+                        let theirs: HashSet<i64> = self
+                            .foreign
+                            .iter()
+                            .filter_map(|t| windows.get(t))
+                            .copied()
+                            .collect();
+                        pages
+                            .into_iter()
+                            .filter(|t| windows.get(&t.id).is_none_or(|w| !theirs.contains(w)))
+                            .collect()
+                    }
+                    Err(_) => pages
+                        .into_iter()
+                        .filter(|t| !self.foreign.contains(&t.id))
+                        .collect(),
+                })
+            }
+            Mode::Window | Mode::Temporary => {
+                let ids: Vec<String> = pages.iter().map(|t| t.id.clone()).collect();
+                let mine = match (self.cdp.windows(&ids).await, &current) {
+                    (Ok(windows), Some(current)) => windows.get(current).copied().map(|w| (windows, w)),
+                    _ => None,
+                };
+                Ok(match mine {
+                    Some((windows, window)) => pages
+                        .into_iter()
+                        .filter(|t| windows.get(&t.id) == Some(&window))
+                        .collect(),
+                    None => pages
+                        .into_iter()
+                        .filter(|t| Some(&t.id) == current.as_ref())
+                        .collect(),
+                })
+            }
+        }
+    }
+
+    /// Whether `id` landed in another conversation's window (`main` only).
+    async fn in_foreign_window(&self, id: &str) -> bool {
+        if self.foreign.is_empty() {
+            return false;
+        }
+        let mut ids = self.foreign.clone();
+        ids.push(id.to_string());
+        let Ok(windows) = self.cdp.windows(&ids).await else {
+            return false;
         };
-        self.connect(&target).await
+        windows
+            .get(id)
+            .is_some_and(|window| self.foreign.iter().any(|t| windows.get(t) == Some(window)))
     }
 
     async fn connect(&mut self, target: &crate::cdp::Target) -> Result<()> {
@@ -470,7 +617,7 @@ impl Browser {
 
     pub async fn list_tabs(&self) -> Result<String> {
         let current = self.current_target();
-        let pages = self.cdp.pages().await?;
+        let pages = self.tabs().await?;
         Ok(pages
             .iter()
             .enumerate()
@@ -483,7 +630,7 @@ impl Browser {
     }
 
     pub async fn switch_tab(&mut self, index: usize) -> Result<String> {
-        let pages = self.cdp.pages().await?;
+        let pages = self.tabs().await?;
         let target = pages
             .get(index)
             .ok_or_else(|| anyhow!("there is no tab {index}"))?
@@ -493,10 +640,17 @@ impl Browser {
     }
 
     pub async fn open_url(&mut self, url: &str, new_tab: bool) -> Result<String> {
-        // In its own window, a scheduled run loads everything in its one tab.
-        if new_tab && !self.own_window {
+        // In a window of its own, a conversation or a scheduled run loads
+        // everything in its one tab: Chrome puts a new tab in whichever
+        // window was last at the front.
+        if new_tab && self.mode == Mode::Shared {
             let target = self.cdp.new_page().await?;
-            self.switch_to(&target).await?;
+            if self.in_foreign_window(&target.id).await {
+                // Another conversation's window was at the front: not there.
+                let _ = self.cdp.close(&target.id).await;
+            } else {
+                self.switch_to(&target).await?;
+            }
         }
         if let Some(watch) = self.watch.get_mut().as_mut() {
             watch.catch_up();

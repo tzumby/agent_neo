@@ -36,18 +36,34 @@ async function request(method, path, body) {
 
 const enc = encodeURIComponent;
 
+/** A message, with where the person is (for "tomorrow at 8"). */
+function withTime(text) {
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return { text, timezone, utc_offset: -new Date().getTimezoneOffset() * 60 };
+}
+
 export const api = {
   status: () => request("GET", "/api/v1/status"),
   session: () => request("GET", "/session"),
-  page: (before, limit, kinds) =>
-    request("GET", `/api/v1/events/page?limit=${limit}&kinds=${enc(kinds.join(","))}${before ? `&before=${before}` : ""}`),
-  send(text) {
-    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    return request("POST", "/api/v1/messages", { text, timezone, utc_offset: -new Date().getTimezoneOffset() * 60 });
-  },
+  // One conversation's events (and the global ones) with `session`; without
+  // it, everything (a desktop from before conversations has only that).
+  page: (before, limit, kinds, session) =>
+    request("GET", `/api/v1/events/page?limit=${limit}&kinds=${enc(kinds.join(","))}${before ? `&before=${before}` : ""}${session ? `&session=${enc(session)}` : ""}`),
+  // The old endpoints: main's, on any desktop.
+  send: (text) => request("POST", "/api/v1/messages", withTime(text)),
+  stop: () => request("POST", "/api/v1/stop", {}),
   answer: (id, approved, text) => request("POST", `/api/v1/approvals/${enc(id)}`, { approved, text }),
   resolve: (id, done) => request("POST", `/api/v1/actions/${enc(id)}`, { choice: done ? "done" : "skip" }),
-  stop: () => request("POST", "/api/v1/stop", {}),
+  // Conversations (agentd 0.16): 404 on an older desktop.
+  sessions: (archived) => request("GET", `/api/v1/sessions${archived ? "?archived=1" : ""}`),
+  getSession: (id) => request("GET", `/api/v1/sessions/${enc(id)}`),
+  createSession: () => request("POST", "/api/v1/sessions", {}),
+  updateSession: (id, change) => request("PATCH", `/api/v1/sessions/${enc(id)}`, change),
+  deleteSession: (id) => request("DELETE", `/api/v1/sessions/${enc(id)}`, {}),
+  sendTo: (session, text) => request("POST", `/api/v1/sessions/${enc(session)}/messages`, withTime(text)),
+  unqueue: (session, id) => request("DELETE", `/api/v1/sessions/${enc(session)}/queue/${enc(id)}`, {}),
+  stopSession: (session) => request("POST", `/api/v1/sessions/${enc(session)}/stop`, {}),
+  usage: (days = 30) => request("GET", `/api/v1/usage?days=${days}`),
   settings: () => request("GET", "/api/v1/settings"),
   updateSettings: (settings) => request("PUT", "/api/v1/settings", settings),
   setAutoApprove: (enabled, version) => version === undefined && !enabled

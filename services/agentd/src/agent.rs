@@ -1,15 +1,16 @@
-//! The agent: runs the chat's tasks one at a time, emits events for the apps,
-//! and asks the user for approvals and "action needed". Scheduled runs go
-//! beside the chat, one at a time, from a queue (schedule.rs), so the chat is
-//! never kept waiting for one: they work in a browser window of their own, and
-//! their report reaches the chat when they end.
+//! The agent: runs each conversation's tasks one at a time, in a lane of its
+//! own (up to `MAX_PARALLEL_TASKS` conversations at once; more messages wait
+//! in a queue, sessions.rs), emits events for the apps, and asks the user for
+//! approvals and "action needed". Scheduled runs go beside the conversations,
+//! one at a time, from a queue (schedule.rs), so a chat is never kept waiting
+//! for one: they work in a browser window of their own, and their report
+//! reaches their conversation when they end.
 //!
-//! A task that needs an approval parks: its state is saved, the desktop is free
+//! A task that needs an approval parks: its state is saved, its lane is free
 //! again, and the user's answer resumes it from there (after a restart too).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +33,7 @@ use crate::schedule;
 use crate::secrets::{self, Secrets};
 use crate::shell::{KeyFile, Route, Shell, split_sudo};
 use crate::skills::Skills;
-use crate::store::{Event, Pending, QueuedRun, Schedule, SecretInfo, Store};
+use crate::store::{Event, MAIN, Pending, QueuedRun, Schedule, SecretInfo, Store};
 use crate::supervise::{self, Verdict};
 use crate::tools;
 
@@ -224,11 +225,31 @@ pub struct Settings {
     pub memory_consolidation: String,
     pub memory_consolidation_model: String,
     pub memory_consolidation_daily_cap_usd: f64,
+    /// What the model may cost a month, in USD (usage.rs); None: no budget.
+    pub monthly_budget_usd: Option<f64>,
 }
 
 pub enum StartError {
     Busy,
     NotFound,
+}
+
+/// What became of a message: a task started, or it waits in its
+/// conversation's queue (`position` 1 is next).
+#[derive(Debug, PartialEq)]
+pub enum Posted {
+    Started(String),
+    Queued { id: String, position: i64 },
+}
+
+impl Posted {
+    /// The API's answer: `{task}` or `{queued: {id, position}}`.
+    pub fn json(&self) -> Value {
+        match self {
+            Self::Started(task) => json!({"task": task}),
+            Self::Queued { id, position } => json!({"queued": {"id": id, "position": position}}),
+        }
+    }
 }
 
 /// Why a key from the app wasn't saved.
@@ -293,6 +314,13 @@ struct RunState {
     /// report shows it as its instructions.
     #[serde(default)]
     request: String,
+    /// The conversation it belongs to (`main` for tasks from before them).
+    #[serde(default = "main_session")]
+    session: String,
+}
+
+fn main_session() -> String {
+    MAIN.to_string()
 }
 
 /// When the supervisor last checked on a task, and what it said.
@@ -333,13 +361,40 @@ struct Background {
     attempt: i64,
 }
 
-/// The chat's history while a chat task is between its question and its
+/// A conversation's history while its task is between its question and its
 /// answer: scheduled runs' reports that end meanwhile wait, so the question
 /// and its answer stay together for the model.
 #[derive(Default)]
 struct Thread {
     open: bool,
     held: Vec<(&'static str, String)>,
+}
+
+/// A conversation's chat lane: the task running in it (not one parked on a
+/// card), the watch that stops it, and its history thread.
+pub(crate) struct Lane {
+    pub(crate) running: Option<String>,
+    pub(crate) cancel: watch::Sender<bool>,
+    thread: Thread,
+}
+
+impl Lane {
+    pub(crate) fn new() -> Self {
+        Self {
+            running: None,
+            cancel: watch::channel(false).0,
+            thread: Thread::default(),
+        }
+    }
+}
+
+/// Event kinds about the whole desktop, never one conversation: they carry
+/// no `session` even when they name a task.
+fn is_global(kind: &str) -> bool {
+    matches!(kind, "settings" | "auto_approve.changed" | "budget.alert")
+        || ["secret.", "access.", "session."]
+            .iter()
+            .any(|prefix| kind.starts_with(prefix))
 }
 
 /// Added to a command's output when the proxy refused a host.
@@ -477,24 +532,28 @@ pub struct Agent {
     pub store: Arc<Store>,
     pub bus: broadcast::Sender<Event>,
     llm: Together,
-    cdp: Cdp,
+    pub(crate) cdp: Cdp,
     policy: Arc<Policy>,
     shell: Shell,
     skills: Skills,
-    /// The chat's task is running (not counting one parked on an approval).
-    busy: AtomicBool,
-    /// Stops the chat's task.
-    cancel: watch::Sender<bool>,
-    /// The scheduled run in progress, beside the chat (schedule.rs).
+    /// Each conversation's chat lane: its running task (not one parked on an
+    /// approval), its Stop and its history thread (sessions.rs).
+    pub(crate) lanes: Mutex<HashMap<String, Lane>>,
+    /// The conversation each task in progress belongs to, for its events.
+    task_sessions: Mutex<HashMap<String, String>>,
+    /// The scheduled run in progress, beside the conversations (schedule.rs).
     background: Mutex<Option<Background>>,
     /// Stops the scheduled run in progress.
     background_cancel: watch::Sender<bool>,
     /// Wakes the background worker when a run is queued.
     pub runs_queued: Notify,
-    /// One shell command at a time, the chat's or a scheduled run's.
-    shell_turn: tokio::sync::Mutex<()>,
+    /// Shell commands: ordinary ones side by side (each its own unit and
+    /// pipes), a direct one alone, since it opens the guard firewall to the
+    /// shell user (§6.21).
+    shell_turn: tokio::sync::RwLock<()>,
     access_sync: Mutex<()>,
-    thread: Mutex<Thread>,
+    /// Budget alerts are checked and recorded one at a time (usage.rs).
+    pub(crate) budget_check: Mutex<()>,
     /// Wakes the scheduler when schedules are added or resumed.
     pub schedules_changed: Notify,
     /// Wakes the effects runner when an effect is enqueued (effects.rs).
@@ -509,7 +568,7 @@ pub struct Agent {
     pub apns: Option<crate::apns::Apns>,
 }
 
-fn short_id() -> String {
+pub(crate) fn short_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
 }
 
@@ -604,14 +663,14 @@ impl Agent {
             skills: Skills::load(&cfg.skills_dir),
             store: Arc::new(store),
             bus,
-            busy: AtomicBool::new(false),
-            cancel: watch::channel(false).0,
+            lanes: Mutex::default(),
+            task_sessions: Mutex::default(),
             background: Mutex::new(None),
             background_cancel: watch::channel(false).0,
             runs_queued: Notify::new(),
-            shell_turn: tokio::sync::Mutex::new(()),
+            shell_turn: tokio::sync::RwLock::new(()),
             access_sync: Mutex::new(()),
-            thread: Mutex::default(),
+            budget_check: Mutex::new(()),
             schedules_changed: Notify::new(),
             effects_changed: Notify::new(),
             step_seqs: Mutex::default(),
@@ -640,26 +699,34 @@ impl Agent {
                 && now - run.due <= schedule::MAX_LATE_SECS
                 && self.retry(run.schedule, now);
             if !may_replay {
-                let name = self
-                    .store
-                    .schedule(run.schedule)
-                    .ok()
-                    .flatten()
-                    .map_or_else(|| format!("#{}", run.schedule), |schedule| schedule.name);
-                self.say(&format!(
-                    "Scheduled task “{name}” was interrupted. Check for changes before running it again."
-                ));
+                let schedule = self.store.schedule(run.schedule).ok().flatten();
+                let name = schedule
+                    .as_ref()
+                    .map_or_else(|| format!("#{}", run.schedule), |s| s.name.clone());
+                let session = schedule.map_or_else(main_session, |s| s.session);
+                self.say_in(
+                    &session,
+                    &format!(
+                        "Scheduled task “{name}” was interrupted. Check for changes before running it again."
+                    ),
+                );
             }
             tracing::warn!(task = %run.id, schedule = run.schedule, retried, "scheduled run interrupted by a restart");
         }
+        // Each conversation's task that was running gets its answer in its
+        // own history; its queued messages start once the socket is bound.
         for task in self.store.runs_with_status("running").unwrap_or_default() {
             tracing::warn!(task = %task, "task interrupted by a restart");
-            let _ = self.store.add_history("assistant", INTERRUPTED);
+            let session = self.session_of(&task).unwrap_or_else(main_session);
+            let _ = self.store.add_history_in(&session, "assistant", INTERRUPTED);
             self.emit(
                 "message",
-                json!({"role": "assistant", "text": INTERRUPTED, "task": task}),
+                json!({"role": "assistant", "text": INTERRUPTED, "task": task, "session": session}),
             );
-            self.emit("task.finished", json!({"task": task, "status": "interrupted"}));
+            self.emit(
+                "task.finished",
+                json!({"task": task, "status": "interrupted", "session": session}),
+            );
             let _ = self.store.set_run_status(&task, "interrupted");
         }
         // Nothing waits for the user's approval since 0.15.2.
@@ -670,11 +737,23 @@ impl Agent {
         }
     }
 
-    /// Logs an event and sends it to the apps; returns its seq.
+    /// Logs an event and sends it to the apps; returns its seq. An event
+    /// about a task names its conversation (`session`), so the apps can
+    /// route it; global kinds never do.
     pub fn emit(&self, kind: &str, mut data: Value) -> Option<i64> {
         // Every event names its agent: "main" until there are bots.
         if let Some(object) = data.as_object_mut() {
             object.entry("agent").or_insert_with(|| json!("main"));
+            if is_global(kind) {
+                object.remove("session");
+            } else if !object.contains_key("session")
+                && let Some(session) = object
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .and_then(|task| self.session_of(task))
+            {
+                object.insert("session".into(), json!(session));
+            }
         }
         // No saved key's value reaches the log or the apps.
         self.secrets.redact_json(&mut data);
@@ -725,6 +804,7 @@ impl Agent {
             memory_consolidation: crate::consolidate::mode(&self.store).name().to_string(),
             memory_consolidation_model: crate::consolidate::model(&self.store, &self.cfg.consolidation_model),
             memory_consolidation_daily_cap_usd: crate::consolidate::daily_cap(&self.store),
+            monthly_budget_usd: crate::usage::monthly_budget(&self.store),
         }
     }
 
@@ -812,9 +892,49 @@ impl Agent {
         self.llm.chat(request).await
     }
 
-    /// The chat's task is running: what the apps show as working.
+    /// `main` is working: what an older app shows as the chat working.
     pub fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::SeqCst)
+        self.is_working_in(MAIN)
+    }
+
+    /// A task of this conversation is running (not parked on a card).
+    pub fn is_working_in(&self, session: &str) -> bool {
+        self.lanes
+            .lock()
+            .unwrap()
+            .get(session)
+            .is_some_and(|lane| lane.running.is_some())
+    }
+
+    /// The conversations working now: (conversation, task).
+    pub fn working(&self) -> Vec<(String, String)> {
+        let mut working: Vec<(String, String)> = self
+            .lanes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(session, lane)| Some((session.clone(), lane.running.clone()?)))
+            .collect();
+        working.sort();
+        working
+    }
+
+    /// The conversation a task belongs to: while it runs, from memory;
+    /// otherwise from its run's row.
+    pub(crate) fn session_of(&self, task: &str) -> Option<String> {
+        if let Some(session) = self.task_sessions.lock().unwrap().get(task) {
+            return Some(session.clone());
+        }
+        self.store.run_session(task).ok().flatten()
+    }
+
+    /// Frees a conversation's lane if `task` still holds it.
+    pub(crate) fn release(&self, session: &str, task: &str) {
+        if let Some(lane) = self.lanes.lock().unwrap().get_mut(session)
+            && lane.running.as_deref() == Some(task)
+        {
+            lane.running = None;
+        }
     }
 
     /// The scheduled run in progress beside the chat: (task, schedule).
@@ -826,9 +946,9 @@ impl Agent {
             .map(|b| (b.task.clone(), b.schedule))
     }
 
-    /// Anything is running: the chat's task or a scheduled run.
+    /// Anything is running: a conversation's task or a scheduled run.
     pub fn is_working(&self) -> bool {
-        self.is_busy() || self.background.lock().unwrap().is_some()
+        !self.working().is_empty() || self.background.lock().unwrap().is_some()
     }
 
     /// The rules in force (policy.rs): recorded on runs and parked cards, and
@@ -856,29 +976,28 @@ impl Agent {
         self.store.any_parked().ok().flatten().map(|p| p.id)
     }
 
-    pub fn start(self: &Arc<Self>, text: String, by: Option<String>) -> Result<String, StartError> {
-        if self.busy.swap(true, Ordering::SeqCst) {
-            return Err(StartError::Busy);
-        }
-        // A new request replaces tasks waiting for an approval. A memory
-        // command (run() recognises it the same way) isn't a new task for the
-        // model, so a card stays waiting.
-        let memory_command =
-            MemoryCommand::from_authenticated_chat(&text, &self.cfg.listen, by.as_deref()).is_some();
-        if !memory_command {
-            self.abandon_parked("I stopped waiting for your approval because you sent a new message.");
-        }
-        self.cancel.send_replace(false);
-        let task_id = short_id();
-        let agent = self.clone();
-        let id = task_id.clone();
-        tokio::spawn(async move { agent.run(id, text, by, None).await });
-        Ok(task_id)
+    /// Whether a message is a memory command the signed-in user typed
+    /// (run() recognises it the same way): it isn't a task for the model.
+    pub(crate) fn is_memory_command(&self, text: &str, by: Option<&str>) -> bool {
+        MemoryCommand::from_authenticated_chat(text, &self.cfg.listen, by).is_some()
     }
 
-    /// Runs a queued scheduled run to its end, beside the chat (the background
-    /// worker's, schedule.rs). It leaves the chat's task, and the cards waiting
-    /// there, alone.
+    /// Starts a task in a conversation whose lane the caller has reserved
+    /// for it (`task`; sessions.rs).
+    pub(crate) fn spawn_task(
+        self: &Arc<Self>,
+        task: String,
+        text: String,
+        by: Option<String>,
+        session: String,
+    ) {
+        let agent = self.clone();
+        tokio::spawn(async move { agent.run(task, text, by, None, session).await });
+    }
+
+    /// Runs a queued scheduled run to its end, beside the conversations (the
+    /// background worker's, schedule.rs). It leaves their tasks, and the
+    /// cards waiting there, alone.
     pub async fn run_queued(self: Arc<Self>, queued: QueuedRun, schedule: Schedule) {
         *self.background.lock().unwrap() = Some(Background {
             task: queued.id.clone(),
@@ -887,7 +1006,10 @@ impl Agent {
         });
         self.background_cancel.send_replace(false);
         let prompt = schedule.prompt.clone();
-        self.clone().run(queued.id, prompt, None, Some(schedule)).await;
+        let session = schedule.session.clone();
+        self.clone()
+            .run(queued.id, prompt, None, Some(schedule), session)
+            .await;
         *self.background.lock().unwrap() = None;
     }
 
@@ -945,38 +1067,27 @@ impl Agent {
         queued
     }
 
-    /// A note from the agent in the chat, outside any task.
-    pub fn say(&self, text: &str) {
-        let _ = self.store.add_history("assistant", text);
-        self.emit("message", json!({"role": "assistant", "text": text}));
+    /// A note from the agent in a conversation, outside any task.
+    pub fn say_in(&self, session: &str, text: &str) {
+        let _ = self.store.add_history_in(session, "assistant", text);
+        self.emit(
+            "message",
+            json!({"role": "assistant", "text": text, "session": session}),
+        );
     }
 
-    /// Gives up on every task waiting for an approval.
-    fn abandon_parked(&self, answer: &str) -> bool {
+    /// Gives up on every task of a conversation waiting for an approval.
+    pub(crate) fn abandon_parked(&self, session: &str, answer: &str) -> bool {
         let mut any = false;
         // Bounded: abandon() removes each one (unless answered meanwhile).
         for _ in 0..16 {
-            let Ok(Some(parked)) = self.store.any_parked() else {
+            let Ok(Some(parked)) = self.store.parked_in(session) else {
                 break;
             };
             self.abandon(parked, answer);
             any = true;
         }
         any
-    }
-
-    pub fn stop(&self) -> bool {
-        if self.busy.swap(true, Ordering::SeqCst) {
-            // Running: the model call, browser action or command in progress
-            // is interrupted. Say so at once; task.finished follows.
-            self.cancel.send_replace(true);
-            self.emit("task.stopping", json!({}));
-            return true;
-        }
-        // Waiting for an approval: stopping it means giving up on it.
-        let stopped = self.abandon_parked("Stopped.");
-        self.busy.store(false, Ordering::SeqCst);
-        stopped
     }
 
     /// Remembers the user's time zone (sent with each message) for later
@@ -999,7 +1110,10 @@ impl Agent {
         }
     }
 
-    /// The user's answer to the approval a task parked on: resumes the task.
+    /// The user's answer to the approval a task parked on: resumes the task
+    /// in its conversation's lane at once, even with `MAX_PARALLEL_TASKS`
+    /// working or the budget used up (they limit starting tasks, not
+    /// finishing them).
     pub fn answer_approval(
         self: &Arc<Self>,
         id: &str,
@@ -1057,13 +1171,26 @@ impl Agent {
             }
             None => None,
         };
-        if self.busy.swap(true, Ordering::SeqCst) {
-            return Err(StartError::Busy);
+        let session = self.session_of(&parked.run).unwrap_or_else(main_session);
+        {
+            let mut lanes = self.lanes.lock().unwrap();
+            let lane = lanes.entry(session.clone()).or_insert_with(Lane::new);
+            // Only another card of the same conversation, answered first.
+            if lane.running.is_some() {
+                return Err(StartError::Busy);
+            }
+            lane.running = Some(parked.run.clone());
+            lane.cancel.send_replace(false);
         }
-        let (Some(state), Ok(true)) = (state, self.store.remove_pending(id)) else {
-            self.busy.store(false, Ordering::SeqCst);
+        let (Some(mut state), Ok(true)) = (state, self.store.remove_pending(id)) else {
+            self.release(&session, &parked.run);
             return Err(StartError::NotFound);
         };
+        state.session = session.clone();
+        self.task_sessions
+            .lock()
+            .unwrap()
+            .insert(state.task.clone(), session.clone());
         // The event log records who decided (an audit trail).
         let mut resolved = json!({"task": parked.run, "id": id, "approved": approved, "by": by});
         if let Some(text) = &edited {
@@ -1072,10 +1199,11 @@ impl Agent {
         }
         self.emit("approval.resolved", resolved);
         let _ = self.store.set_run_status(&state.task, "running");
-        self.cancel.send_replace(false);
         self.emit("task.resumed", json!({"task": state.task}));
-        tracing::info!(task = %state.task, approved, by = ?by, "task resumed");
-        self.thread.lock().unwrap().open = true;
+        tracing::info!(task = %state.task, approved, by = ?by, %session, "task resumed");
+        if let Some(lane) = self.lanes.lock().unwrap().get_mut(&session) {
+            lane.thread.open = true;
+        }
         let agent = self.clone();
         let answer = Answer {
             approved,
@@ -1206,28 +1334,33 @@ impl Agent {
         }
     }
 
-    /// "I'm done" or "Skip" on an action-needed card: resume with a new task.
+    /// "I'm done" or "Skip" on an action-needed card: a message like any
+    /// other in the card's conversation, which starts the resume or queues it.
     pub fn resolve_action(
         self: &Arc<Self>,
         id: &str,
         done: bool,
         by: Option<String>,
-    ) -> Result<String, StartError> {
-        if !self.store.has_action(id).unwrap_or(false) {
+    ) -> Result<Posted, StartError> {
+        let Ok(Some(action)) = self.store.action(id) else {
             return Err(StartError::NotFound);
-        }
+        };
+        let session = self.session_of(&action.run).unwrap_or_else(main_session);
         let text = if done {
             tools::RESUME_TEXT
         } else {
             tools::SKIP_TEXT
         };
-        let task = self.start(text.to_string(), by.clone())?;
+        // An archived conversation's card still resumes there.
+        let posted = self
+            .post_to(&session, text.to_string(), by.clone(), true)
+            .map_err(|_| StartError::NotFound)?;
         let _ = self.store.remove_pending(id);
         self.emit(
             "action.resolved",
-            json!({"id": id, "choice": if done { "done" } else { "skip" }, "by": by}),
+            json!({"id": id, "choice": if done { "done" } else { "skip" }, "by": by, "session": session}),
         );
-        Ok(task)
+        Ok(posted)
     }
 
     fn save_image(&self, jpeg: &[u8]) -> Result<String> {
@@ -1238,13 +1371,20 @@ impl Agent {
 
     // --- A task ------------------------------------------------------------------
 
+    /// A task of `session`: a chat message (its lane reserved for `task_id`)
+    /// or a scheduled run (beside the lanes).
     async fn run(
         self: Arc<Self>,
         task_id: String,
         text: String,
         by: Option<String>,
         scheduled: Option<Schedule>,
+        session: String,
     ) {
+        self.task_sessions
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), session.clone());
         let settings = self.settings();
         let memory_command = scheduled
             .is_none()
@@ -1254,10 +1394,11 @@ impl Agent {
         let text = memory_command
             .as_ref()
             .map_or_else(|| self.secrets.redact(&text).into_owned(), MemoryCommand::summary);
-        // A scheduled run stands on its own: its prompt, without the chat.
+        // A scheduled run stands on its own: its prompt, without the chat. A
+        // chat task sees its own conversation only.
         let history = match scheduled {
             Some(_) => Vec::new(),
-            None => self.store.history(HISTORY_LIMIT).unwrap_or_default(),
+            None => self.store.history_in(&session, HISTORY_LIMIT).unwrap_or_default(),
         };
         let (for_history, for_model) = match &scheduled {
             Some(schedule) => (
@@ -1285,7 +1426,7 @@ impl Agent {
         // report, when it ends (finish): never in the middle of the user's
         // conversation.
         if scheduled.is_none() {
-            self.open_thread(&for_history);
+            self.open_thread(&session, &for_history);
         }
         let by_label = by
             .clone()
@@ -1297,7 +1438,8 @@ impl Agent {
                 .begin_queued_run(&task_id, &settings.model, &self.policy_version())
                 .unwrap_or(false);
         if !queued
-            && let Err(err) = self.store.start_run(
+            && let Err(err) = self.store.start_run_in(
+                &session,
                 &task_id,
                 &text,
                 by_label.as_deref(),
@@ -1325,7 +1467,7 @@ impl Agent {
                 );
             }
         }
-        tracing::info!(task = %task_id, model = %settings.model, by = ?by_label, "task started");
+        tracing::info!(task = %task_id, model = %settings.model, by = ?by_label, %session, "task started");
 
         // The system prompt is written at each (re)start of the loop.
         let mut messages = vec![json!({"role": "system", "content": ""})];
@@ -1375,6 +1517,7 @@ impl Agent {
             schedule_id: scheduled.as_ref().map(|s| s.id),
             scheduled: scheduled.map(|s| s.name),
             request: text,
+            session,
         };
         if let Some(command) = memory_command {
             match self.apply_memory_command(&state.task, command, by.as_deref()) {
@@ -1384,16 +1527,17 @@ impl Agent {
                     self.finish(&state, "The memory command could not be completed.", "error");
                 }
             }
-            self.busy.store(false, Ordering::SeqCst);
+            self.release(&state.session, &state.task);
+            self.pump();
             return;
         }
         self.drive(state, None).await;
     }
 
-    /// Runs a task until it finishes or parks on an approval, then frees the
-    /// chat for the next request (a scheduled run frees the background worker
-    /// by returning).
-    async fn drive(&self, mut state: RunState, answer: Option<Answer>) {
+    /// Runs a task until it finishes or parks on an approval, then frees its
+    /// conversation's lane and starts what's queued (a scheduled run frees
+    /// the background worker by returning).
+    async fn drive(self: &Arc<Self>, mut state: RunState, answer: Option<Answer>) {
         let started = Instant::now();
         let result = self.run_loop(&mut state, answer).await;
         state.seconds += started.elapsed().as_secs_f64();
@@ -1401,10 +1545,13 @@ impl Agent {
         match result {
             Ok(Outcome::Parked(park)) if chat => match self.save_parked(&state, &park) {
                 Ok(()) => {
-                    // Free the chat before asking, so an answer can resume it at once.
-                    self.close_thread(None);
-                    self.busy.store(false, Ordering::SeqCst);
+                    // Free the lane before asking, so an answer can resume it
+                    // at once; its queue waits behind the card.
+                    self.close_thread(&state.session, None);
+                    self.release(&state.session, &state.task);
                     self.ask(&state.task, park);
+                    self.task_sessions.lock().unwrap().remove(&state.task);
+                    self.pump();
                     return;
                 }
                 Err(err) => self.finish(&state, &format!("Something went wrong: {err:#}"), "error"),
@@ -1419,48 +1566,53 @@ impl Agent {
             Err(err) => self.finish(&state, &format!("Something went wrong: {err:#}"), "error"),
         }
         if chat {
-            self.busy.store(false, Ordering::SeqCst);
+            self.release(&state.session, &state.task);
+            self.pump();
         }
     }
 
-    /// A chat task starts: its question goes into the history, and the reports
-    /// of scheduled runs that end meanwhile wait for its answer.
-    fn open_thread(&self, question: &str) {
-        let mut thread = self.thread.lock().unwrap();
-        if let Err(err) = self.store.add_history("user", question) {
+    /// A conversation's task starts: its question goes into its history, and
+    /// the reports of scheduled runs that end meanwhile wait for its answer.
+    fn open_thread(&self, session: &str, question: &str) {
+        let mut lanes = self.lanes.lock().unwrap();
+        let lane = lanes.entry(session.to_string()).or_insert_with(Lane::new);
+        if let Err(err) = self.store.add_history_in(session, "user", question) {
             tracing::error!(%err, "couldn't store the message");
         }
-        thread.open = true;
+        lane.thread.open = true;
     }
 
-    /// The chat task's answer (none when it parks), then the reports that
-    /// came in meanwhile.
-    fn close_thread(&self, answer: Option<&str>) {
-        let mut thread = self.thread.lock().unwrap();
+    /// The task's answer (none when it parks), then the reports that came in
+    /// meanwhile.
+    fn close_thread(&self, session: &str, answer: Option<&str>) {
+        let mut lanes = self.lanes.lock().unwrap();
+        let lane = lanes.entry(session.to_string()).or_insert_with(Lane::new);
         if let Some(answer) = answer
-            && let Err(err) = self.store.add_history("assistant", answer)
+            && let Err(err) = self.store.add_history_in(session, "assistant", answer)
         {
             tracing::error!(%err, "couldn't store the answer");
         }
-        thread.open = false;
-        for (role, text) in std::mem::take(&mut thread.held) {
-            if let Err(err) = self.store.add_history(role, &text) {
+        lane.thread.open = false;
+        for (role, text) in std::mem::take(&mut lane.thread.held) {
+            if let Err(err) = self.store.add_history_in(session, role, &text) {
                 tracing::error!(%err, "couldn't store a scheduled run's report");
             }
         }
     }
 
-    /// A scheduled run's report, for the model's later turns: now, or after
-    /// the chat task's answer if one is in progress.
-    fn add_report_history(&self, instructions: String, report: &str) {
-        let mut thread = self.thread.lock().unwrap();
-        if thread.open {
-            thread.held.push(("user", instructions));
-            thread.held.push(("assistant", report.to_string()));
+    /// A scheduled run's report, for the model's later turns in its
+    /// conversation: now, or after that conversation's answer if a task of
+    /// it is in progress.
+    fn add_report_history(&self, session: &str, instructions: String, report: &str) {
+        let mut lanes = self.lanes.lock().unwrap();
+        let lane = lanes.entry(session.to_string()).or_insert_with(Lane::new);
+        if lane.thread.open {
+            lane.thread.held.push(("user", instructions));
+            lane.thread.held.push(("assistant", report.to_string()));
             return;
         }
         for (role, text) in [("user", instructions.as_str()), ("assistant", report)] {
-            if let Err(err) = self.store.add_history(role, text) {
+            if let Err(err) = self.store.add_history_in(session, role, text) {
                 tracing::error!(%err, "couldn't store a scheduled run's report");
             }
         }
@@ -1495,6 +1647,7 @@ impl Agent {
     fn finish(&self, state: &RunState, answer: &str, status: &str) {
         let task_id = &state.task;
         self.step_seqs.lock().unwrap().remove(task_id);
+        self.record_usage(state);
         let cost = state.usage.cost(&state.model);
         let seconds = state.seconds.round();
         // A scheduled run that failed (the model or the network, most likely)
@@ -1513,13 +1666,18 @@ impl Agent {
                     json!({"task": task_id, "status": status, "steps": state.step, "seconds": seconds,
                            "model": state.model, "cost": cost, "retry": true}),
                 );
+                self.task_sessions.lock().unwrap().remove(task_id);
                 return;
             }
         }
         match &state.scheduled {
-            None => self.close_thread(Some(answer)),
+            None => self.close_thread(&state.session, Some(answer)),
             Some(name) => {
-                self.add_report_history(format!("[Scheduled task “{name}”] {}", state.request), answer);
+                self.add_report_history(
+                    &state.session,
+                    format!("[Scheduled task “{name}”] {}", state.request),
+                    answer,
+                );
                 // The report, whole: its instructions, then its answer below.
                 self.emit(
                     "message",
@@ -1574,6 +1732,21 @@ impl Agent {
             // Counted, so the scheduled-run prompt can be tuned.
             tracing::info!(task = %task_id, "report_outcome_missing");
         }
+        self.task_sessions.lock().unwrap().remove(task_id);
+    }
+
+    /// What a task has cost so far, on its run's row after each model call
+    /// (supervisor checks and wrap-ups too), so running tasks count; then
+    /// the budget's alerts (usage.rs).
+    fn record_usage(&self, state: &RunState) {
+        let cost = state.usage.cost(&state.model);
+        if let Err(err) = self
+            .store
+            .record_usage(&state.task, cost, &state.usage, state.step)
+        {
+            tracing::error!(%err, task = %state.task, "couldn't record the run's usage");
+        }
+        self.check_budget();
     }
 
     async fn run_loop(&self, state: &mut RunState, mut answer: Option<Answer>) -> Result<Outcome> {
@@ -1633,25 +1806,34 @@ impl Agent {
             state.review.checked(step, secs, messages);
         }
         let background = state.scheduled.is_some();
+        // Connected when a tool first needs it, so a task that doesn't
+        // browse doesn't need Chrome.
         let mut browser = Browser::new(self.cdp.clone());
         if background {
-            // A window of its own, opened when it first needs the browser:
-            // never the tab the chat works in.
-            browser.use_own_window();
+            // A window of its own: never a tab a conversation works in.
+            browser.temporary_window();
+        } else if state.session == MAIN {
+            browser.shared(self.store.setting("tab_target")?, self.foreign_tabs());
         } else {
-            browser
-                .attach(self.store.setting("tab_target")?.as_deref())
-                .await?;
+            // Its own window, kept from its earlier tasks.
+            let remembered = self.store.session(&state.session)?.and_then(|s| s.tab_target);
+            browser.own_window(remembered);
         }
-        let lane = if background {
-            &self.background_cancel
+        // One receiver to check between calls, a second to interrupt model
+        // calls and browser actions.
+        let (mut cancel, mut stop) = if background {
+            (
+                self.background_cancel.subscribe(),
+                self.background_cancel.subscribe(),
+            )
         } else {
-            &self.cancel
+            let mut lanes = self.lanes.lock().unwrap();
+            let lane = lanes.entry(state.session.clone()).or_insert_with(Lane::new);
+            (lane.cancel.subscribe(), lane.cancel.subscribe())
         };
-        let mut cancel = lane.subscribe();
-        // A second receiver, to interrupt model calls and browser actions.
-        let mut stop = lane.subscribe();
         let task_id = state.task.clone();
+        // The tab last remembered for the conversation, saved again when it changes.
+        let mut tab = None;
 
         let outcome = 'task: loop {
             // The calls of the model's last reply; after a resume, from the parked one on.
@@ -1758,7 +1940,7 @@ impl Agent {
                         .as_str()
                         .unwrap_or("Please take over the desktop.")
                         .to_string();
-                    self.action_needed(&browser, &task_id, &reason).await;
+                    self.action_needed(&mut browser, &task_id, &reason).await;
                     break 'task Outcome::Finished(format!("I need you: {reason}"), "needs_user");
                 }
                 if name == "update_plan" {
@@ -1844,6 +2026,14 @@ impl Agent {
                 state
                     .messages
                     .push(json!({"role": "tool", "tool_call_id": call["id"], "content": content}));
+                // The conversation's tab, as soon as it has one: a card parked
+                // on it, or its next task, finds it again.
+                if !background && browser.current_target() != tab {
+                    tab = browser.current_target();
+                    if let Some(target) = &tab {
+                        self.set_tab_target(&state.session, target);
+                    }
+                }
                 match repeat {
                     guard::Repeat::Fine => {}
                     guard::Repeat::Nudge(text) => nudge = Some(text),
@@ -1916,6 +2106,7 @@ impl Agent {
                 reply => reply?,
             };
             state.usage.add(reply.get("usage"));
+            self.record_usage(state);
             let message = reply["choices"][0]["message"].clone();
             // Back into the conversation, with reasoning_content for the
             // models that want it (GLM, Kimi) and without for the rest.
@@ -1976,17 +2167,42 @@ impl Agent {
         };
         if background {
             // Its window stays open for the user only when it needs them
-            // (needs_user), and "I'm done" carries on there; otherwise it's
-            // closed when the browser is dropped.
+            // (needs_user), and "I'm done" carries on there, in its
+            // conversation; otherwise it's closed when the browser is dropped.
             if matches!(outcome, Outcome::Finished(_, "needs_user"))
                 && let Some(target) = browser.keep_own_window()
             {
-                let _ = self.store.set_setting("tab_target", &target);
+                self.set_tab_target(&state.session, &target);
             }
-        } else if let Some(target) = browser.current_target() {
-            let _ = self.store.set_setting("tab_target", &target);
+        } else if let Some(target) = browser.current_target()
+            && tab.as_ref() != Some(&target)
+        {
+            self.set_tab_target(&state.session, &target);
         }
         Ok(outcome)
+    }
+
+    /// Remembers a conversation's tab: `main`'s in settings, another's on
+    /// its row.
+    fn set_tab_target(&self, session: &str, target: &str) {
+        let saved = if session == MAIN {
+            self.store.set_setting("tab_target", target)
+        } else {
+            self.store.set_session_tab(session, Some(target))
+        };
+        if let Err(err) = saved {
+            tracing::warn!(%err, %session, "couldn't remember the conversation's tab");
+        }
+    }
+
+    /// A tab of each other conversation's window, which `main` leaves alone.
+    fn foreign_tabs(&self) -> Vec<String> {
+        self.store
+            .session_tabs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, tab)| tab)
+            .collect()
     }
 
     /// The task has to end before it's done (`why`, for the model): one last
@@ -2011,6 +2227,7 @@ impl Agent {
         let answer = match self.llm.chat(&request).await {
             Ok(reply) => {
                 state.usage.add(reply.get("usage"));
+                self.record_usage(state);
                 reply["choices"][0]["message"]["content"]
                     .as_str()
                     .map(str::trim)
@@ -2053,6 +2270,7 @@ impl Agent {
         let review = match self.llm.chat(&supervise::request(&state.model, &digest)).await {
             Ok(reply) => {
                 state.usage.add(reply.get("usage"));
+                self.record_usage(state);
                 supervise::parse(&reply)
             }
             Err(err) => {
@@ -2154,21 +2372,28 @@ impl Agent {
                 .or_else(|| args[key].as_str()?.trim().parse().ok())
         };
         let max_chars = number("max_chars").map_or(12_000, |n| n.clamp(500, 100_000) as usize);
-        // A scheduled run's browser: its own window, opened on first use.
-        if browser.own_window_only() {
-            match name {
-                "list_tabs" | "switch_tab" => {
-                    return Ok(
-                        "not done: a scheduled run works in a browser window of its own, not the \
-                               user's tabs; use open_url there"
-                            .into(),
-                    );
-                }
-                "open_url" | "read_text" | "snapshot" | "wait_for" | "show_screenshot" => {
-                    browser.open_own_window().await?;
-                }
-                _ => {}
-            }
+        // A scheduled run works in one tab of a window of its own.
+        if browser.is_temporary() && matches!(name, "list_tabs" | "switch_tab") {
+            return Ok(
+                "not done: a scheduled run works in a browser window of its own, not the \
+                       user's tabs; use open_url there"
+                    .into(),
+            );
+        }
+        // The browser connects (or opens the conversation's window) the
+        // first time a tool reads or loads a page. Inputs connect after
+        // their own checks, which need no Chrome.
+        if matches!(
+            name,
+            "list_tabs"
+                | "switch_tab"
+                | "open_url"
+                | "read_text"
+                | "snapshot"
+                | "wait_for"
+                | "show_screenshot"
+        ) {
+            browser.ensure().await?;
         }
         match name {
             "list_tabs" => browser.list_tabs().await,
@@ -2201,6 +2426,7 @@ impl Agent {
                         "not done: browser inputs require approval and a scheduled run can't ask.".into(),
                     );
                 }
+                browser.ensure().await?;
 
                 let value = match name {
                     "type_text" => {
@@ -2679,6 +2905,10 @@ impl Agent {
         if !tainted {
             self.store.set_schedule_auto_approve(saved.id, true)?;
         }
+        // It belongs to the conversation that set it up: its runs report there.
+        if let Some(session) = self.session_of(task_id) {
+            self.store.set_schedule_session(saved.id, &session)?;
+        }
         let saved = self.store.schedule(saved.id)?.unwrap_or(saved);
         self.schedules_changed.notify_one();
         let mut event = schedule::json(&saved);
@@ -3132,12 +3362,17 @@ impl Agent {
                 path: self.secrets.path(name),
             })
             .collect();
-        // One command at a time across the chat and the scheduled runs
-        // (shell_turn); waiting for it can be stopped.
-        let _turn = tokio::select! {
-            turn = self.shell_turn.lock() => turn,
+        // Ordinary commands of different conversations and scheduled runs
+        // run side by side: each has its own unit and pipes. A direct one
+        // opens the guard firewall to the shell user, so it runs alone
+        // (shell_turn). Waiting for a turn can be stopped.
+        let (mut alone, mut shared) = (None, None);
+        tokio::select! {
+            turn = self.shell_turn.write(), if direct_internet => alone = Some(turn),
+            turn = self.shell_turn.read(), if !direct_internet => shared = Some(turn),
             _ = cancel.wait_for(|stopped| *stopped) => return Ok("not run: stopped".into()),
-        };
+        }
+        let _turn = (alone, shared);
         let route = if direct_internet {
             Route::Direct
         } else {
@@ -3273,8 +3508,12 @@ impl Agent {
         }
     }
 
-    async fn action_needed(&self, browser: &Browser, task_id: &str, reason: &str) {
+    async fn action_needed(&self, browser: &mut Browser, task_id: &str, reason: &str) {
         let id = short_id();
+        // The tab the user takes over in; a conversation's window comes to
+        // the front for it.
+        browser.ensure_existing().await;
+        browser.bring_to_front().await;
         let image = match browser.screenshot_jpeg().await {
             Ok(jpeg) => self.save_image(&jpeg).ok().map(|i| format!("/api/v1/images/{i}")),
             Err(_) => None,
@@ -3343,13 +3582,7 @@ impl Agent {
             .into_iter()
             .find(|i| i.name == name)
             .map(|i| i.label);
-        let asked = self
-            .store
-            .any_parked()
-            .ok()
-            .flatten()
-            .filter(|p| p.card["kind"] == "secret" && p.card["name"] == name)
-            .and_then(|p| p.card["label"].as_str().map(String::from));
+        let asked = self.store.asked_secret_label(name).ok().flatten();
         let label: String = label
             .map(str::trim)
             .filter(|l| !l.is_empty())
@@ -3447,6 +3680,7 @@ pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
         shell_tool: true,
         desktop_name: "test-desktop".into(),
         memory_v2: true,
+        max_parallel_tasks: 3,
     };
     (Arc::new(Agent::new(cfg).unwrap()), dir)
 }
@@ -3702,6 +3936,83 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Runs a command as a conversation's task would, approved with
+    /// `answer` when it asks.
+    async fn shell(agent: &Agent, task: &str, command: &str, direct: bool, answer: Option<Answer>) -> String {
+        let (_stop, mut cancel) = watch::channel(false);
+        agent
+            .run_shell(
+                task,
+                command,
+                Some("Wait a moment"),
+                &[],
+                10,
+                direct,
+                false,
+                false,
+                false,
+                answer,
+                &mut cancel,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ordinary_commands_run_side_by_side_and_a_direct_one_alone() {
+        let (agent, dir) = test_agent();
+        let command = "sleep 0.6; echo done";
+        // Two conversations' ordinary commands at once take as long as one.
+        let started = Instant::now();
+        let (a, b) = tokio::join!(
+            shell(&agent, "t1", command, false, None),
+            shell(&agent, "t2", command, false, None)
+        );
+        assert!(
+            a.starts_with("exit code 0") && b.starts_with("exit code 0"),
+            "{a} {b}"
+        );
+        assert!(started.elapsed().as_secs_f64() < 1.1, "{:?}", started.elapsed());
+        // A direct command runs alone: an ordinary one waits for it, or it
+        // for the ordinary one.
+        let (_stop, mut cancel) = watch::channel(false);
+        let park = agent
+            .run_shell(
+                "t3",
+                command,
+                Some("Wait a moment"),
+                &[],
+                10,
+                true,
+                false,
+                false,
+                false,
+                None,
+                &mut cancel,
+            )
+            .await
+            .unwrap_err()
+            .downcast::<Park>()
+            .expect("a direct command asks");
+        let approved = Answer {
+            approved: true,
+            card: park.card,
+            by: None,
+            edited: None,
+        };
+        let started = Instant::now();
+        let (direct, ordinary) = tokio::join!(
+            shell(&agent, "t3", command, true, Some(approved)),
+            shell(&agent, "t4", command, false, None)
+        );
+        assert!(
+            direct.starts_with("exit code 0") && ordinary.starts_with("exit code 0"),
+            "{direct} {ordinary}"
+        );
+        assert!(started.elapsed().as_secs_f64() >= 1.15, "{:?}", started.elapsed());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4635,7 +4946,7 @@ mod tests {
 
     async fn until_idle(agent: &Agent) {
         for _ in 0..200 {
-            if !agent.busy.load(Ordering::SeqCst) {
+            if !agent.is_busy() {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -4649,11 +4960,12 @@ mod tests {
         let card =
             json!({"kind": "shell", "command": "rm -rf old", "reason": "recursive removal", "timeout": 120});
         let id = park(&agent, "t1", card, &agent.policy_version());
-        let started = agent.start(
+        let started = agent.post(
+            MAIN,
             "Remember fact: The office is in Lisbon".into(),
             Some("me@example.com".into()),
         );
-        assert!(started.is_ok());
+        assert!(matches!(started, Ok(Posted::Started(_))));
         until_idle(&agent).await;
         assert!(
             agent.store.parked(&id).unwrap().is_some(),
@@ -4673,11 +4985,12 @@ mod tests {
         );
 
         // An id too large to exist gets the usual answer, not the model.
-        let started = agent.start(
+        let started = agent.post(
+            MAIN,
             "forget #99999999999999999999999.".into(),
             Some("me@example.com".into()),
         );
-        assert!(started.is_ok());
+        assert!(matches!(started, Ok(Posted::Started(_))));
         until_idle(&agent).await;
         let answer = events(&agent, "message")
             .into_iter()
@@ -5062,6 +5375,7 @@ mod user_schedule_tests {
 
 #[cfg(test)]
 mod background_tests {
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use axum::Router;
@@ -5193,7 +5507,7 @@ mod background_tests {
         // The chat isn't busy, and a message starts a task at once. (It
         // fails without Chrome here; what matters is that it ran.)
         assert!(!agent.is_busy());
-        let Ok(chat) = agent.start("Hi".into(), None) else {
+        let Ok(Posted::Started(chat)) = agent.post(MAIN, "Hi".into(), None) else {
             panic!("the chat is busy")
         };
         until("the chat's task ends", || !agent.is_busy()).await;
@@ -5226,13 +5540,14 @@ mod background_tests {
     #[test]
     fn a_report_that_ends_mid_question_waits_for_the_answer() {
         let (agent, dir) = test_agent();
-        agent.open_thread("What's in my inbox?");
+        agent.open_thread(MAIN, "What's in my inbox?");
         agent.add_report_history(
+            MAIN,
             "[Scheduled task “Hourly check”] Check the build".into(),
             "All quiet.",
         );
         assert_eq!(agent.store.history(10).unwrap().len(), 1);
-        agent.close_thread(Some("Two new emails."));
+        agent.close_thread(MAIN, Some("Two new emails."));
         let texts: Vec<String> = agent
             .store
             .history(10)

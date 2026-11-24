@@ -63,6 +63,9 @@ pub struct Config {
     /// Memory v2 (docs/memory-v2.md): kinds, trust, retrieval, consolidation.
     /// Off: the v1 memory path, on the v2 schema (which is always migrated).
     pub memory_v2: bool,
+    /// How many conversations may work at the same moment (sessions.rs);
+    /// more messages wait in the queue. At least 1.
+    pub max_parallel_tasks: usize,
 }
 
 fn read_kv(path: &Path, into: &mut HashMap<String, String>) -> Result<()> {
@@ -138,6 +141,10 @@ impl Config {
             shell_tool: get("SHELL_TOOL", "on") == "on",
             desktop_name: get("DESKTOP_NAME", "neo-agent"),
             memory_v2: get("MEMORY_V2", "off") == "on",
+            max_parallel_tasks: get("MAX_PARALLEL_TASKS", "3")
+                .parse::<usize>()
+                .context("MAX_PARALLEL_TASKS")?
+                .max(1),
         })
     }
 }

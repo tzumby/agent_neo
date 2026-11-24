@@ -19,11 +19,13 @@ mod plan;
 mod policy;
 mod schedule;
 mod secrets;
+mod sessions;
 mod shell;
 mod skills;
 mod store;
 mod supervise;
 mod tools;
+mod usage;
 mod webpush;
 
 use std::io::IsTerminal;
@@ -66,6 +68,7 @@ async fn main() -> Result<()> {
         tracing::info!(socket = path, model = %cfg.model, "listening");
         // Only once this agentd owns the socket: never two schedulers or
         // effect runners.
+        // Messages queued before a restart start as slots allow.
         tokio::spawn(schedule::run(agent.clone()));
         tokio::spawn(schedule::work(agent.clone()));
         tokio::spawn(effects::run(agent));
@@ -75,6 +78,7 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("binding {}", cfg.listen))?;
         tracing::info!(address = %cfg.listen, model = %cfg.model, "listening");
+        // Messages queued before a restart start as slots allow.
         tokio::spawn(schedule::run(agent.clone()));
         tokio::spawn(schedule::work(agent.clone()));
         tokio::spawn(effects::run(agent));

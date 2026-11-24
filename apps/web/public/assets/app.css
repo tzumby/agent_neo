@@ -133,6 +133,14 @@ a { color: inherit; }
 .top-stage[data-tone="problem"] { color: var(--problem); }
 .icon-button { display: inline-grid; place-items: center; width: 2.4rem; height: 2.4rem; border: 0; border-radius: 0.6rem; background: transparent; cursor: pointer; }
 .icon-button:hover { background: var(--inset); }
+a.icon-button { color: inherit; }
+.top h1 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The chat's own buttons: all conversations, and a new one. */
+.top-actions { display: flex; align-items: center; gap: 0.1rem; margin-left: auto; flex: none; }
+.top-stage:not([hidden]) + .top-actions { margin-left: 0.2rem; }
+.top-stage { flex: none; }
+.icon-button { position: relative; }
+.dot { position: absolute; top: 0.45rem; right: 0.45rem; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--signal); box-shadow: 0 0 0 2px var(--bg); }
 
 .offline { background: var(--signal-wash); color: var(--signal-text); padding: 0.5rem 1rem; font-size: 0.88rem; text-align: center; }
 
@@ -295,12 +303,34 @@ kbd { font: 600 0.85em var(--mono); border: 1px solid var(--slate); border-radiu
 .model { border: 0; background: transparent; color: var(--slate); font-size: 0.85rem; padding: 0.2rem 0; max-width: 60%; cursor: pointer; }
 .send { margin-left: auto; display: inline-grid; place-items: center; width: 2.2rem; height: 2.2rem; border-radius: 50%; border: 0; background: var(--primary-bg); color: var(--primary-text); cursor: pointer; }
 .send .icon { stroke-width: 2.2; }
-.send.is-stop .icon { fill: currentColor; stroke-width: 1; width: 0.9em; height: 0.9em; }
 .send:disabled { opacity: 0.35; cursor: default; }
+/* Stop: beside Send while the agent works (Send queues then); dark when it's alone. */
+.stop { margin-left: auto; display: inline-grid; place-items: center; width: 2.2rem; height: 2.2rem; border-radius: 50%; border: 1px solid var(--rule); background: var(--surface); color: var(--ink); cursor: pointer; }
+.stop:hover { border-color: var(--slate); }
+.stop.is-alone { background: var(--primary-bg); color: var(--primary-text); border-color: var(--primary-bg); }
+.stop .icon { fill: currentColor; stroke-width: 1; width: 0.9em; height: 0.9em; }
+.stop:disabled { opacity: 0.45; cursor: default; }
+.stop:not([hidden]) + .send { margin-left: 0.45rem; }
 .fine { margin: 0.45rem 0 0; text-align: center; color: var(--slate); font-size: 0.78rem; }
 .key-note { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.8rem; margin: 0 0 0.5rem; padding: 0.6rem 0.8rem; border-radius: 0.7rem; background: var(--signal-wash); color: var(--ink); font-size: 0.88rem; }
 .key-note .icon { color: var(--signal-text); }
 .key-note span { flex: 1 1 18rem; }
+.budget-note, .archived-note { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 0.75rem; margin: 0 0 0.5rem; padding: 0.55rem 0.6rem 0.55rem 0.8rem; border-radius: 0.7rem; font-size: 0.88rem; }
+.budget-note { background: var(--signal-wash); }
+.budget-note .icon { color: var(--signal-text); }
+.archived-note { background: var(--surface); border: 1px solid var(--rule); }
+.budget-note span, .archived-note span { flex: 1 1 14rem; }
+.budget-note .button, .archived-note .button { min-height: 2rem; padding: 0.2rem 0.85rem; font-size: 0.86rem; }
+
+/* Messages queued behind the running task: grey, each with its place and a ✕. */
+.queue { list-style: none; margin: 1.4rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.9rem; }
+.queued { max-width: 85%; display: flex; flex-direction: column; align-items: flex-end; gap: 0.2rem; }
+.queued .bubble { max-width: 100%; background: var(--inset); color: var(--slate); box-shadow: inset 0 0 0 1px var(--rule); }
+.queued-meta { display: flex; align-items: center; gap: 0.3rem; margin: 0; color: var(--slate); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+.queued-meta .icon { width: 0.95rem; height: 0.95rem; }
+.queued-remove { display: inline-grid; place-items: center; width: 2rem; height: 2rem; margin: -0.3rem -0.5rem -0.3rem 0.1rem; border: 0; border-radius: 50%; background: transparent; color: var(--slate); cursor: pointer; }
+.queued-remove:hover { background: var(--inset); color: var(--ink); }
+.queued-remove .icon { width: 1rem; height: 1rem; }
 
 /* --- Desktop ----------------------------------------------------------------- */
 
@@ -343,6 +373,86 @@ kbd { font: 600 0.85em var(--mono); border: 1px solid var(--slate); border-radiu
 .facts dt { color: var(--slate); }
 .facts dd { margin: 0; overflow-wrap: anywhere; }
 
+/* Conversations: a row each, like a phone's messages. */
+.page-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.8rem 1.5rem; margin-bottom: 1.2rem; }
+.page-head .lede { margin: 0; flex: 1 1 18rem; }
+.chat-list { margin-bottom: 1.5rem; }
+.chat-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 0.2rem; border-bottom: 1px solid var(--rule); }
+.chat-link { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; margin: 0.3rem 0 0.3rem -0.6rem; padding: 0.55rem 0.6rem; border-radius: 0.7rem; text-decoration: none; }
+.chat-link:hover { background: var(--surface); }
+.chat-row.is-current .chat-link { background: var(--inset); }
+.chat-line { display: flex; align-items: center; gap: 0.75rem; min-width: 0; }
+.chat-title { flex: 1; min-width: 0; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-when { flex: none; color: var(--slate); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+.chat-last { flex: 1; min-width: 0; color: var(--slate); font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-badge { flex: none; font-size: 0.74rem; font-weight: 600; line-height: 1.5; border-radius: 999px; padding: 0 0.55rem; border: 1px solid var(--rule); color: var(--slate); white-space: nowrap; }
+.chat-badge.is-needs { border-color: transparent; background: var(--signal-wash); color: var(--signal-text); }
+.chat-badge.is-working { border: 0; padding: 0 0.1rem; display: inline-grid; place-items: center; }
+.chat-badge .spinner { width: 0.95rem; height: 0.95rem; opacity: 1; animation: spin 0.8s linear infinite; }
+.chat-more { color: var(--slate); }
+.chat-row.is-open .chat-more { background: var(--inset); color: var(--ink); }
+.icon-dots { stroke-width: 3.2; }
+.chat-tools { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 0.5rem; padding: 0.1rem 0 0.9rem; }
+.chat-tools p { margin: 0; font-size: 0.88rem; }
+.chat-rename { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 0.6rem; padding: 0.8rem 0; }
+.archived summary { cursor: pointer; color: var(--slate); font-weight: 600; width: fit-content; padding: 0.3rem 0; }
+.archived[open] summary { margin-bottom: 0.5rem; }
+.archived > p { margin: 0; }
+
+/* Usage: the totals, the budget, the days, and this month's breakdowns. */
+.back-link { display: inline-flex; align-items: center; gap: 0.15rem; margin: -0.4rem 0 0.9rem -0.35rem; padding: 0.2rem 0.35rem; color: var(--slate); font-weight: 600; font-size: 0.9rem; text-decoration: none; border-radius: 0.4rem; }
+.back-link:hover { color: var(--ink); }
+.page-body.is-refreshing { opacity: 0.55; transition: opacity 0.2s; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.6rem; margin: 0.4rem 0 1.8rem; }
+.stat { min-width: 0; background: var(--surface); border: 1px solid var(--rule); border-radius: 0.9rem; padding: 0.7rem 0.9rem 0.75rem; }
+.stat p { margin: 0; }
+.stat-label { color: var(--slate); font-size: 0.84rem; }
+.stat-value { font-size: 1.35rem; font-weight: 600; font-stretch: 108%; letter-spacing: -0.01em; line-height: 1.3; overflow-wrap: anywhere; }
+.usage-group { align-items: stretch; }
+.meter { width: 100%; max-width: 30rem; height: 0.5rem; border-radius: 999px; background: var(--inset); overflow: hidden; }
+.meter-fill { display: block; height: 100%; border-radius: inherit; background: var(--ink); }
+.meter.is-near .meter-fill { background: var(--signal); }
+.meter.is-over .meter-fill { background: var(--problem); }
+.budget-figures { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; width: 100%; max-width: 30rem; margin: 0; font-variant-numeric: tabular-nums; }
+.budget-said { margin: 0; }
+.budget-said.is-over { display: flex; gap: 0.45rem; color: var(--problem); font-weight: 600; }
+.budget-said .icon { margin-top: 0.2em; }
+.budget-form { display: flex; flex-direction: column; gap: 0.7rem; width: 100%; max-width: 30rem; }
+.money-field { position: relative; display: block; max-width: 12rem; }
+.money-sign { position: absolute; left: 0.75rem; top: 50%; transform: translateY(-50%); color: var(--slate); font-weight: 400; pointer-events: none; }
+.money-field .field { padding-left: 1.55rem; font-variant-numeric: tabular-nums; }
+
+.chart-readout { margin: 0; font-variant-numeric: tabular-nums; }
+.chart-readout strong { font-size: 1.15rem; font-weight: 650; }
+.chart { width: 100%; }
+.chart-plot { position: relative; height: 9.5rem; margin: 0.6rem 3rem 0 0; }
+.chart-grid { position: absolute; inset: 0; pointer-events: none; }
+.tick { position: absolute; left: 0; right: 0; border-top: 1px solid var(--rule); }
+.tick-top { top: 0; }
+.tick-mid { top: 50%; }
+.tick-zero { top: 100%; }
+.tick-label { position: absolute; left: calc(100% + 0.45rem); top: 0; transform: translateY(-50%); color: var(--slate); font-size: 0.74rem; line-height: 1; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bars { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 2px; touch-action: pan-y; border-radius: 4px; }
+.bars:focus-visible { outline-offset: 4px; }
+.bar { flex: 1 1 0; min-width: 0; height: 100%; display: flex; align-items: flex-end; justify-content: center; border-radius: 4px 4px 0 0; }
+.bar-mark { display: block; width: 100%; max-width: 24px; min-height: 2px; background: var(--ink); opacity: 0.8; border-radius: 4px 4px 0 0; }
+.bar.is-zero .bar-mark { height: 2px; background: var(--rule); opacity: 1; border-radius: 1px; }
+.bar.is-selected { background: var(--inset); }
+.bar.is-selected .bar-mark { opacity: 1; }
+.chart-x { display: flex; justify-content: space-between; margin: 0.45rem 3rem 0 0; color: var(--slate); font-size: 0.76rem; font-variant-numeric: tabular-nums; }
+
+.breakdowns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5rem 2.2rem; width: 100%; }
+.breakdown p { margin: 0; }
+.breakdown-title { margin: 0 0 0.55rem; font-size: 0.92rem; font-weight: 650; color: var(--slate); }
+.breakdown-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.7rem; }
+.breakdown-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.2rem 1rem; align-items: baseline; }
+.breakdown-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 550; }
+.breakdown-name a { color: inherit; text-decoration-color: var(--rule); text-underline-offset: 2px; }
+.breakdown-cost { font-weight: 600; font-variant-numeric: tabular-nums; }
+.share { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: var(--inset); overflow: hidden; }
+.share-fill { display: block; height: 100%; border-radius: inherit; background: var(--slate); }
+.breakdown-detail { grid-column: 1 / -1; color: var(--slate); font-size: 0.82rem; }
+
 .toast {
   position: fixed; left: 50%; bottom: 6.5rem; transform: translateX(-50%);
   max-width: min(32rem, calc(100vw - 2rem)); background: var(--primary-bg); color: var(--primary-text);
@@ -360,8 +470,23 @@ kbd { font: 600 0.85em var(--mono); border: 1px solid var(--slate); border-radiu
   .column { padding: 0 0.9rem; }
   .chat-scroll { padding-top: 1.2rem; }
   .bubble { max-width: 90%; }
+  .queued { max-width: 90%; }
   .list-row { flex-direction: column; }
   .card-actions .button { flex: 1 1 auto; }
+  .page-head .button { flex: 1 1 auto; }
+  .breakdowns { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 560px) {
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* A wide screen: the sidebar says how the desktop is, and the chat gets a
+   bar of its own for the conversation's name and buttons. */
+@media (min-width: 861px) {
+  body.has-conversations[data-view="chat"] .top { display: flex; padding: 0.5rem 1.25rem 0.5rem 1.5rem; }
+  #menu, .top-stage { display: none; }
+  .top .top-stage:not([hidden]) + .top-actions { margin-left: auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {

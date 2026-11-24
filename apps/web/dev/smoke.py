@@ -2,8 +2,11 @@
 """Clicks through the web app in headless Chrome against `make web-dev`
 (apps/web/dev/run.sh): sends a message and waits for the answer, answers a
 card, saves a key, follows a task's plan, stops a task the supervisor finds
-stuck and opens each page. Prints a line per check; exits 1 if
-one fails. Screenshots go to the folder given (default: the current one).
+stuck and opens each page; then queues messages behind a task, works in a
+second conversation beside main, renames, archives and deletes it, and sets
+a monthly budget (docs/conversations-and-usage.md). Prints a line per check;
+exits 1 if one fails. Screenshots go to the folder given (default: the
+current one).
 
   uv run --with websockets apps/web/dev/smoke.py [screenshots-dir]
 """
@@ -339,9 +342,161 @@ async def main(out):
             p.check(await p.js("document.documentElement.dataset.theme") == "dark", "Dark can be chosen in Settings")
             await p.js(f"({set_theme})('light')")
             p.check(await p.js("document.querySelector('.settings-group select') === null || true"), "settings render")
+            await conversations(p, out)
             return p.failed
     finally:
         chrome.terminate()
+
+
+async def conversations(p, out):
+    """Queued messages, conversations and usage (agentd 0.16); skipped on an older agentd."""
+    if await p.js("fetch('/api/v1/sessions').then(r => r.status)") == 404:
+        print("  skip  conversations, queued messages and usage: this agentd has none")
+        return
+
+    async def send(text):
+        await p.js(f"""(() => {{ const t = document.querySelector('.composer textarea');
+            t.value = {json.dumps(text)}; t.dispatchEvent(new Event('input')); }})()""")
+        await p.js("document.querySelector('.composer .send').click()")
+
+    async def session(sid):
+        return await p.js(f"fetch('/api/v1/sessions/{sid}').then(r => r.json())")
+
+    async def chat(hash_, title=None):
+        await p.js(f"location.hash = {json.dumps(hash_)}")
+        await p.until("!document.querySelector('#view-chat').hidden && document.querySelector('#view-chat').classList.contains('is-ready')")
+        if title:
+            await p.until(f"document.querySelector('#view-title').textContent === {json.dumps(title)}", 5)
+
+    def idle(sid):
+        return p.until(f"fetch('/api/v1/sessions/{sid}').then(r => r.json()).then(s => s.state === 'idle')", 30)
+
+    sent = "[...document.querySelectorAll('.row-user .bubble')].map(b => b.textContent)"
+    answers = "document.querySelectorAll('#view-chat .row-agent').length"
+    queued = "document.querySelectorAll('.queue li').length"
+    limit = "fetch('/api/v1/sessions').then(r => r.json()).then(d => d.running_limit)"
+    p.check(await p.js(limit) == 3, "conversations: up to 3 work at once")
+
+    # Queued messages: the composer stays on while the agent works.
+    await chat("#/chat")
+    await idle("main")
+    before = await p.js(answers)
+    await send("Take it slow, please")
+    p.check(await p.until("!document.querySelector('.composer .stop').hidden", 5), "while it works, Stop has a button of its own")
+    await send("A follow-up question")
+    p.check(await p.until(f"{queued} === 1", 5), "a message sent meanwhile waits its turn, as a Queued bubble")
+    await send("One more after that")
+    p.check(await p.until("document.querySelector('.queue li:last-child .queued-meta')?.textContent.includes('2 of 2')", 5),
+            "…two of them, each with its place")
+    await p.shot(f"{out}/smoke-queued.png")
+    await p.js("document.querySelector('.queue li:last-child .queued-remove').click()")
+    p.check(await p.until(f"{queued} === 1", 5), "its ✕ takes one back")
+    p.check(len((await session("main"))["queued"]) == 1, "…and the desktop has the other")
+    p.check(await p.until(f"{queued} === 0", 20) and await p.until(f"{sent}.includes('A follow-up question')", 5),
+            "when the task ends, the queued one starts and shows as sent")
+    p.check(await p.until(f"{answers} >= {before + 2}", 20), "…and gets its answer")
+    p.check(not await p.js(f"{sent}.includes('One more after that')"), "…and the one taken back never ran")
+
+    # Stop drops what's queued, and says so first.
+    await idle("main")
+    await send("Slow again")
+    await p.until("!document.querySelector('.composer .stop').hidden", 5)
+    await send("Dropped by Stop")
+    await p.until(f"{queued} === 1", 5)
+    p.check("queued" in await p.js("document.querySelector('.composer .stop').getAttribute('aria-label')"), "Stop says it drops the queued message too")
+    await p.js("window.confirm = () => true")
+    await p.js("document.querySelector('.composer .stop').click()")
+    p.check(await p.until(f"{queued} === 0", 5), "…and Stop drops it")
+    await idle("main")
+    p.check(not await p.js(f"{sent}.includes('Dropped by Stop')"), "…so it never runs")
+
+    # A second conversation: its own history, working beside main.
+    await p.js("document.querySelector('#new-chat').click()")
+    p.check(await p.until("location.hash.startsWith('#/chat/') && location.hash !== '#/chat/main'", 5), "New conversation opens one")
+    cid = await p.js("decodeURIComponent(location.hash.slice('#/chat/'.length))")
+    p.check(await p.until("document.querySelector('#view-title').textContent === 'New conversation' && !document.querySelector('.empty').hidden", 5),
+            "…empty, called New conversation")
+    await send("Compare the two test runs")
+    p.check(await p.until(f"{answers} >= 1", 15), "it answers in its own conversation")
+    p.check(await p.until("document.querySelector('#view-title').textContent === 'Compare the two test runs'", 5), "…and its first message is its title")
+    await chat("#/chat")
+    p.check(await p.until(f"{sent}.includes('A follow-up question')", 5) and not await p.js(f"{sent}.includes('Compare the two test runs')"),
+            "main keeps its own history")
+    await chat(f"#/chat/{cid}", "Compare the two test runs")
+    await send("Slow one, over here")
+    await p.until("!document.querySelector('.composer .stop').hidden", 5)
+    await chat("#/chat")
+    p.check(await p.until("document.querySelector('.composer .stop').hidden", 3), "main is free while the other works")
+    before = await p.js(answers)
+    await send("And a quick one in main")
+    p.check(await p.until(f"{answers} > {before}", 5), "…and answers at once, beside it")
+    p.check((await session(cid))["state"] == "working", "…while the other still works")
+
+    # The list: rename, archive, delete; main can't be deleted.
+    await p.js("location.hash = '#/chats'")
+    rows = "[...document.querySelectorAll('#view-chats .page-body > .chat-list > .chat-row')]"
+    p.check(await p.until(f"{rows}.length >= 2", 5), "the list shows both")
+    await idle(cid)
+    row = f"{rows}.find(r => r.textContent.includes('Compare the two test runs'))"
+    p.check(await p.until(f"!!{row}", 5), "…the new one with its title")
+    await p.shot(f"{out}/smoke-conversations.png")
+
+    async def tool(row, label):
+        if not await p.js(f"{row}.classList.contains('is-open')"):
+            await p.js(f"{row}.querySelector('.chat-more').click()")
+        await p.js(f"[...{row}.querySelectorAll('.chat-tools button')].find(b => b.textContent === {json.dumps(label)}).click()")
+
+    await tool(row, "Rename")
+    await p.js("document.querySelector('.chat-rename input').value = 'Test runs'")
+    await p.js("document.querySelector('.chat-rename button[type=submit]').click()")
+    row = f"{rows}.find(r => r.querySelector('.chat-title')?.textContent === 'Test runs')"
+    p.check(await p.until(f"!!{row}", 5), "Rename")
+    await tool(row, "Archive")
+    p.check(await p.until(f"!{row}", 5), "Archive takes it off the list")
+    await p.js("document.querySelector('#view-chats details.archived summary').click()")
+    archived = "[...document.querySelectorAll('#view-chats details.archived .chat-row')].find(r => r.textContent.includes('Test runs'))"
+    p.check(await p.until(f"!!{archived}", 5), "…to Archived")
+    main_row = f"{rows}.find(r => r.querySelector('a').getAttribute('href') === '#/chat')"
+    await p.js(f"{main_row}.querySelector('.chat-more').click()")
+    p.check(not await p.js(f"[...{main_row}.querySelectorAll('.chat-tools button')].some(b => b.textContent === 'Delete')"), "main can't be deleted")
+    await tool(archived, "Delete")
+    p.check(await p.until(f"!{archived}", 5), "Delete")
+    p.check(await p.js(f"fetch('/api/v1/sessions/{cid}').then(r => r.status)") == 404, "…and it's gone from the desktop")
+
+    # Opening the app again: the conversation this device used last.
+    await p.js("[...document.querySelectorAll('#view-chats .page-head button')].find(b => b.textContent.includes('New conversation')).click()")
+    await p.until("location.hash.startsWith('#/chat/') && location.hash !== '#/chat/main'", 5)
+    last = await p.js("location.hash")
+    await p.call("Page.navigate", url=APP)
+    p.check(await p.until(f"location.hash === {json.dumps(last)} && document.querySelector('#view-chat').classList.contains('is-ready')", 10),
+            "reopened, the app shows the conversation used last")
+
+    # Usage, from Settings, and a monthly budget that pauses new tasks.
+    await p.js("location.hash = '#/settings'")
+    link = "[...document.querySelectorAll('#view-settings a')].find(a => a.getAttribute('href') === '#/usage')"
+    p.check(await p.until(f"!!{link}", 10), "Settings links to Usage")
+    await p.js(f"{link}.click()")
+    p.check(await p.until("location.hash === '#/usage' && document.querySelectorAll('#view-usage .stat').length === 4", 10),
+            "Usage: today, this month, last month and all time")
+    p.check(await p.js("document.querySelectorAll('#view-usage .bar').length") == 30, "…a column for each of the last 30 days")
+    p.check(await p.js("!![...document.querySelectorAll('#view-usage .breakdown-name')].find(n => n.textContent === 'GLM-5.3')"), "…and this month by model")
+    p.check("estimates" in await p.js("document.querySelector('#view-usage .lede').textContent"), "…saying they're estimates")
+    await p.js("document.querySelector('.budget-form input').value = '0.01'")
+    await p.js("document.querySelector('.budget-form button[type=submit]').click()")
+    p.check(await p.until("!!document.querySelector('#view-usage .meter.is-over')", 10), "a budget used up shows as such")
+    await p.shot(f"{out}/smoke-usage.png")
+    await chat(last)
+    p.check(await p.until("!document.querySelector('.budget-note').hidden", 10), "…and the chat says new messages wait")
+    await send("Waiting for the budget")
+    p.check(await p.until(f"{queued} === 1", 5), "…and one sent waits its turn")
+    p.check((await session(last[len("#/chat/"):]))["state"] == "paused", "…as Paused")
+    await p.shot(f"{out}/smoke-paused.png")
+    await p.js("location.hash = '#/usage'")
+    await p.until("!!document.querySelector('.budget-form')", 10)
+    await p.js("[...document.querySelectorAll('.budget-form button')].find(b => b.textContent === 'Remove budget').click()")
+    p.check(await p.until("!document.querySelector('#view-usage .meter')", 10), "Remove budget")
+    await chat(last)
+    p.check(await p.until(f"{queued} === 0 && {sent}.includes('Waiting for the budget')", 15), "…and what waited starts")
 
 
 if __name__ == "__main__":

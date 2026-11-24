@@ -12,8 +12,9 @@ struct RootView: View {
             LoginView(loginURL: url)
         case .running, .reconnecting:
             // Stays up while Tailscale reconnects, so the chat and an open
-            // take-over view survive a trip to another app.
-            NavigationStack { DesktopHome() }
+            // take-over view survive a trip to another app. The home has its
+            // own navigation (a list and a chat, or a sidebar and a chat).
+            DesktopHome()
         case .failed(let message):
             ContentUnavailableView {
                 Label("Tailscale isn't connected", systemImage: "exclamationmark.triangle")

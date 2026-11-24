@@ -72,6 +72,21 @@ struct SettingsView: View {
                     Text(autoApproveDescription)
                 }
             }
+            if store.conversationsAvailable == true {
+                Section {
+                    NavigationLink {
+                        UsageView(store: store, client: client)
+                    } label: {
+                        LabeledContent("Usage") {
+                            if let spent = store.status?.budget?.spent {
+                                Text("\(Money.text(spent)) this month").monospacedDigit()
+                            }
+                        }
+                    }
+                } footer: {
+                    Text("What the model calls cost, and a monthly budget.")
+                }
+            }
             Section {
                 NavigationLink("Memory") { MemoryView(client: client) }
                 NavigationLink("Schedules") { SchedulesView(client: client) }

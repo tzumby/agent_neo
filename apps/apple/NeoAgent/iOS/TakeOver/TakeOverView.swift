@@ -30,10 +30,7 @@ struct TakeOverView: View {
 
     /// The action as it is now (it may have been resolved meanwhile).
     private var action: Action? {
-        for case .action(let action) in store.timeline.items where action.id == actionID {
-            return action
-        }
-        return nil
+        store.action(actionID)
     }
 
     var body: some View {

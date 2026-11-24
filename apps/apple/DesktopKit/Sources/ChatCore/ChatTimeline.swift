@@ -9,15 +9,23 @@ import Foundation
 /// (tool calls, commands, saves) stays out;
 /// `busy` only says that it's working. A pure value: apply events in order.
 /// Replaying the later part of the log gives the chat of that part, so the
-/// apps can load it a page at a time from the newest.
+/// apps can load it a page at a time from the newest. One timeline is one
+/// conversation's (the store routes events by their `session`).
 public struct ChatTimeline: Sendable, Equatable {
     /// The event kinds it reads: the apps ask agentd for these only.
     public static let kinds: Set<String> = [
         "message", "image", "task.started", "task.paused", "task.resumed", "task.stopping", "task.finished",
         "approval.requested", "approval.resolved", "action_needed", "action.resolved", "secret.saved", "plan",
+        "message.queued", "message.unqueued",
     ]
 
     public private(set) var items: [ChatItem] = []
+    /// Messages sent while it was busy, waiting their turn, in order. They
+    /// show below the chat until they start (then their message comes as usual).
+    public private(set) var queued: [QueuedMessage] = []
+    /// Queued messages that left the queue (started, removed or stopped), so
+    /// an older list of the queue doesn't bring them back.
+    private var unqueued: Set<String> = []
     /// A task is running (between task.started and task.finished, except while
     /// it's paused waiting for an approval).
     public private(set) var busy = false
@@ -92,6 +100,19 @@ public struct ChatTimeline: Sendable, Equatable {
             default: false
             }
         }?.id
+    }
+
+    /// The queued messages to show: the ones the events queued, then any that
+    /// agentd listed (GET /sessions, or the answer to a send) and no event
+    /// has queued or unqueued yet, e.g. queued before the oldest page loaded.
+    public func queue(merging listed: [QueuedMessage]) -> [QueuedMessage] {
+        let known = unqueued.union(queued.map(\.id))
+        let extra = listed.filter { !known.contains($0.id) }
+        guard !extra.isEmpty else { return queued }
+        // By when they were queued; the events' order among equals.
+        return (queued + extra).enumerated()
+            .sorted { ($0.element.created, $0.offset) < ($1.element.created, $1.offset) }
+            .map(\.element)
     }
 
     /// When the running chat task started, while it works.
@@ -252,6 +273,18 @@ public struct ChatTimeline: Sendable, Equatable {
             if let path = data["url"]?.string {
                 items.append(.image(Picture(id: event.seq, path: path, caption: data["caption"]?.string)))
             }
+        case "message.queued":
+            guard let id = data["id"]?.string, !unqueued.contains(id), !queued.contains(where: { $0.id == id })
+            else { break }
+            let created = data["created"]?.double.map(Date.init(timeIntervalSince1970:)) ?? Self.agentDate(event.ts)
+            queued.append(
+                QueuedMessage(
+                    id: id, text: data["text"]?.string ?? "", by: data["by"]?.string, created: created ?? .distantPast))
+        case "message.unqueued":
+            // Started (its message follows), removed, or dropped by Stop.
+            guard let id = data["id"]?.string else { break }
+            unqueued.insert(id)
+            queued.removeAll { $0.id == id }
         case "secret.saved":
             // Saved for a request that's still waiting: the desktop was busy.
             let name = data["name"]?.string ?? ""

@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Getting started with Agent Neo</title>
+  <meta name="description" content="Install Agent Neo in your own AWS account: set up the account and Tailscale, deploy with make, and open the web app on your tailnet.">
+  <meta name="theme-color" content="#edf0ee">
+  <link rel="canonical" href="https://agentneo.dev/getting-started.html">
+  <meta property="og:site_name" content="Agent Neo">
+  <meta property="og:title" content="Getting started with Agent Neo">
+  <meta property="og:description" content="Install Agent Neo in your own AWS account: set up the account and Tailscale, deploy with make, and open the web app on your tailnet.">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://agentneo.dev/getting-started.html">
+  <meta property="og:image" content="https://agentneo.dev/assets/icon-512.png">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="assets/favicon-32.png" type="image/png" sizes="32x32">
+  <link rel="icon" href="assets/logo-64.png" type="image/png" sizes="64x64">
+  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+  <link rel="preload" href="assets/fonts/archivo-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <script>
+    // Apply a saved theme before the page paints; without one, the page's own default stands.
+    try { var t = localStorage.getItem("neo-theme"); if (t === "dark" || t === "light") document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+  <link rel="stylesheet" href="assets/site.css">
+  <script src="assets/site.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="./" aria-label="Agent Neo home">
+        <img src="assets/logo-64.png" srcset="assets/logo-64.png 1x, assets/logo-128.png 2x" alt="" width="34" height="34">
+        Agent Neo
+      </a>
+      <nav class="nav" aria-label="Main">
+        <a class="nav-hide-sm" href="./#harness">Security</a>
+        <a class="nav-hide-sm" href="./#memory">Memory</a>
+        <a href="getting-started.html" aria-current="page">Getting started</a>
+        <a class="nav-gh" href="https://github.com/tzumby/agent_neo">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          <span class="nav-hide-sm">GitHub</span><span class="visually-hidden">GitHub</span>
+        </a>
+        <button class="theme-toggle" type="button" hidden>
+          <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+          <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main" class="wrap docs">
+    <details class="toc" open>
+      <summary>On this page</summary>
+      <nav aria-label="On this page">
+        <ol>
+          <li><a href="#before"><span class="n"></span>Before you start</a></li>
+          <li><a href="#aws"><span class="n">1</span>Set up AWS</a></li>
+          <li><a href="#tailscale"><span class="n">2</span>Set up Tailscale</a></li>
+          <li><a href="#deploy"><span class="n">3</span>Deploy</a></li>
+          <li><a href="#open"><span class="n">4</span>Open the web app</a></li>
+          <li><a href="#use"><span class="n">5</span>Start using it</a></li>
+        </ol>
+        <p class="toc-group">Reference</p>
+        <ol>
+          <li><a href="#apps"><span class="n"></span>iPhone and Mac apps</a></li>
+          <li><a href="#commands"><span class="n"></span>Everyday commands</a></li>
+          <li><a href="#settings"><span class="n"></span>Settings</a></li>
+          <li><a href="#updating"><span class="n"></span>Updating</a></li>
+          <li><a href="#backups"><span class="n"></span>Backups</a></li>
+          <li><a href="#cost"><span class="n"></span>Cost</a></li>
+          <li><a href="#teardown"><span class="n"></span>Teardown</a></li>
+          <li><a href="#troubleshooting"><span class="n"></span>Troubleshooting</a></li>
+        </ol>
+      </nav>
+    </details>
+
+    <article class="doc">
+      <header class="doc-head">
+        <h1>Getting started</h1>
+        <p class="lede">This guide takes you from an empty AWS account to chatting with your agent. Steps 1 and 2 happen once, in the AWS and Tailscale consoles. Step 3 is a short run of <code>make</code> commands; the first deploy takes 15–20 minutes.</p>
+        <ol class="route">
+          <li><a href="#aws">Set up AWS</a></li>
+          <li><a href="#tailscale">Set up Tailscale</a></li>
+          <li><a href="#deploy">Deploy</a></li>
+          <li><a href="#open">Open the web app</a></li>
+          <li><a href="#use">Start using it</a></li>
+        </ol>
+      </header>
+
+      <!-- Before you start -->
+      <section id="before" aria-labelledby="before-h">
+        <h2 id="before-h">Before you start</h2>
+
+        <h3>What gets deployed</h3>
+        <p>Everything lands in your AWS account, in one region:</p>
+        <ul class="plain">
+          <li>A VPC with private subnets. Outbound internet goes through a fck-nat instance (a t4g.nano), or AWS’s NAT gateway if you set <code>enable_nat_gateway</code>.</li>
+          <li><strong>One desktop</strong> (a t3a.medium by default) in a private subnet: no public IP, no inbound rules, its own IAM role (SSM only) and its own KMS key for its disk. You administer it with SSM Session Manager; there’s no SSH.</li>
+          <li>An S3 bucket for Terraform’s state, one for Ansible’s file transfers, and two SSM parameters you create yourself: your Together AI key and a Tailscale auth key.</li>
+        </ul>
+
+        <h3>Accounts</h3>
+        <ul class="plain">
+          <li>An AWS account. Step 1 walks you through a new one.</li>
+          <li>A <a href="https://api.together.ai">Together AI</a> API key.</li>
+          <li>A <a href="https://tailscale.com">Tailscale</a> account. The free personal plan is enough.</li>
+        </ul>
+
+        <h3>Tools on your machine</h3>
+        <ul class="tools">
+          <li><span class="t">AWS CLI v2</span><span class="d">With a profile that can create VPCs, EC2, IAM roles, KMS keys, S3 buckets and SSM parameters. Step 1 sets one up.</span></li>
+          <li><span class="t">Session Manager plugin</span><span class="d"><code>brew install --cask session-manager-plugin</code>, or see <a href="https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html">AWS’s install guide</a>.</span></li>
+          <li><span class="t">Terraform ≥ 1.10</span><span class="d"><code>brew install hashicorp/tap/terraform</code></span></li>
+          <li><span class="t">Ansible ≥ 2.17</span><span class="d">With boto3 installed in the Python that Ansible runs on. <code>ansible --version</code> shows which Python that is.</span></li>
+          <li><span class="t"><a href="https://docs.astral.sh/uv/">uv</a></span><span class="d">Runs the scripts that store your secrets in SSM.</span></li>
+          <li><span class="t">Rust</span><span class="d">Install rustup; it fetches the pinned toolchain (1.93.1) on the first build.</span></li>
+          <li><span class="t"><a href="https://ziglang.org">zig</a> and cargo-zigbuild</span><span class="d"><code>cargo install cargo-zigbuild</code>. Together they build agentd as a static Linux binary.</span></li>
+          <li><span class="t">Go ≥ 1.27</span><span class="d">Builds tailnet-proxy.</span></li>
+          <li><span class="t">Xcode 26 or later</span><span class="d">Only for the optional <a href="#apps">iPhone and Mac apps</a>.</span></li>
+        </ul>
+        <p>Check that they’re all on your path:</p>
+        <div class="code" data-copy>
+<pre><code>aws --version
+session-manager-plugin --version
+terraform -version
+ansible --version
+uv --version
+rustup --version
+zig version
+cargo zigbuild --version
+go version</code></pre>
+        </div>
+        <p>Then get the code:</p>
+        <div class="code" data-copy>
+<pre><code>git clone https://github.com/tzumby/agent_neo.git
+cd agent_neo</code></pre>
+        </div>
+      </section>
+
+      <!-- 1. AWS -->
+      <section id="aws" aria-labelledby="aws-h">
+        <h2 id="aws-h"><span class="n">1</span>Set up an AWS account</h2>
+        <p>Give the agent an AWS account of its own, with nothing else in it. Whatever goes wrong there, whether it’s your mistake, the agent’s or this project’s, can’t touch your other AWS resources. The bill shows only this deployment, and you can close the account when you’re done.</p>
+
+        <div class="callout">
+          <p class="callout-title">Already have an AWS Organization with IAM Identity Center?</p>
+          <p>Create the account from the management account instead (AWS Organizations → Add an AWS account), assign yourself AdministratorAccess on it (the end of step 4 below), and carry on from step 5. Set the budget (step 3) in the management account, filtered to the new account.</p>
+          <p>The same goes for an account someone gives you inside their organization, such as an employer’s sandbox. Either way, the organization’s service control policies (SCPs) apply. They can block whole regions or services, even for an administrator; step 6 shows what they block.</p>
+        </div>
+
+        <ol class="steps">
+          <li>
+            <h4>Sign up</h4>
+            <p>At <a href="https://aws.amazon.com">aws.amazon.com</a>, choose Create an AWS account. Use an email address no other AWS account uses; a <code>you+neo@example.com</code> alias works with most mail providers.</p>
+            <p>Choose the <strong>Paid</strong> plan. The Free plan launches only a short list of small instance types, and neither the desktop (t3a.medium) nor the NAT (t4g.nano) is on it. Step 4 upgrades the account anyway, because enabling IAM Identity Center creates an AWS Organization.</p>
+          </li>
+          <li>
+            <h4>Lock up the root user</h4>
+            <p>While signed in as root, add MFA (a passkey or an authenticator app) from the account menu at the top right: Security credentials → Assign MFA device. Never create access keys for root. After step 4 you need root only for billing and account settings.</p>
+          </li>
+          <li>
+            <h4>Set a budget</h4>
+            <p>So you hear about a desktop you forgot to stop before the card statement arrives. Go to Billing and Cost Management → Budgets → Create budget → Monthly cost budget. Pick an amount a bit above the <a href="#cost">running cost</a> (about $40 a month), say $60, and add your email.</p>
+            <p>Then, from the account menu: Account → IAM user and role access to Billing information → Edit → Activate IAM Access, so the admin user from step 4 can see costs too.</p>
+          </li>
+          <li>
+            <h4>Create an admin user in IAM Identity Center</h4>
+            <p>The CLI then uses short-lived credentials that expire on their own, not long-lived access keys in <code>~/.aws/credentials</code>. First pick the region you’ll deploy to (top right of the console), since Identity Center lives in a single region.</p>
+            <ul class="plain">
+              <li>IAM Identity Center → Enable. In a standalone account this creates an AWS Organization with the account as its management account. That’s expected.</li>
+              <li>Users → Add user, with your email. Accept the invitation email, then set a password and MFA.</li>
+              <li>Permission sets → Create permission set → Predefined permission set → AdministratorAccess. PowerUserAccess isn’t enough, because Terraform creates an IAM role for the desktop.</li>
+              <li>AWS accounts → tick the account → Assign users or groups → your user → AdministratorAccess.</li>
+              <li>On the Dashboard, copy the AWS access portal URL (<code>https://d-xxxxxxxxxx.awsapps.com/start</code>).</li>
+            </ul>
+          </li>
+          <li>
+            <h4>Add a CLI profile</h4>
+            <p>Run <code>aws configure sso</code>. Your answers look like this:</p>
+            <div class="code">
+<pre><code><span class="p">$ </span>aws configure sso
+<span class="o">SSO session name (Recommended):</span> neo
+<span class="o">SSO start URL [None]:</span> https://d-xxxxxxxxxx.awsapps.com/start
+<span class="o">SSO region [None]:</span> ca-central-1          <span class="c"># where you enabled Identity Center</span>
+<span class="o">SSO registration scopes [sso:account:access]:</span>
+  <span class="c">(a browser opens: sign in, allow, then pick the account and AdministratorAccess)</span>
+<span class="o">Default client Region [None]:</span> ca-central-1
+<span class="o">CLI default output format [None]:</span> json
+<span class="o">Profile name [AdministratorAccess-123456789012]:</span> neo-sandbox</code></pre>
+            </div>
+            <p>Check that the profile reaches the new account:</p>
+            <div class="code" data-copy>
+<pre><code>aws sts get-caller-identity --profile neo-sandbox</code></pre>
+            </div>
+            <p>A sign-in lasts 8 hours by default. After that, run <code>aws sso login --profile neo-sandbox</code> again. Terraform, Ansible and the scripts all use this profile through <code>AWS_PROFILE</code>.</p>
+          </li>
+          <li>
+            <h4>Check the account with <code>make preflight</code></h4>
+            <p>From the repository:</p>
+            <div class="code" data-copy>
+<pre><code>export AWS_PROFILE=neo-sandbox AWS_REGION=ca-central-1
+make preflight</code></pre>
+            </div>
+            <p>It only reads, and creates nothing. It shows which account and identity you’re using, then checks that you’re allowed to make the deployment’s calls in that region (under your IAM policies and your organization’s SCPs), that the desktop’s instance type is offered in two availability zones there, and that EC2’s vCPU quota covers the desktop and the NAT (4 vCPUs).</p>
+            <p>Fix whatever it reports before going on. <a href="#troubleshooting">Troubleshooting</a> covers each case.</p>
+          </li>
+        </ol>
+      </section>
+
+      <!-- 2. Tailscale -->
+      <section id="tailscale" aria-labelledby="tailscale-h">
+        <h2 id="tailscale-h"><span class="n">2</span>Set up Tailscale</h2>
+        <p>The desktop answers only on your tailnet. In the <a href="https://login.tailscale.com/admin">Tailscale admin console</a>:</p>
+        <ol class="steps">
+          <li>
+            <h4>Turn on MagicDNS and HTTPS</h4>
+            <p>Under DNS, turn on MagicDNS and HTTPS Certificates.</p>
+          </li>
+          <li>
+            <h4>Create a tag for the desktop</h4>
+            <p>Access controls → Definitions → Tags → Create tag. Set Tag name to <code>neo-agent</code> (without <code>tag:</code>) and Tag owner to <code>autogroup:admin</code>, then Save tag. In the JSON editor, that’s <code>"tag:neo-agent": ["autogroup:admin"]</code> under <code>tagOwners</code>. A tagged device doesn’t expire with your login.</p>
+          </li>
+          <li>
+            <h4>Generate an auth key</h4>
+            <p>Settings → Keys → Generate auth key, tagged <code>tag:neo-agent</code>, and pre-approved if you use device approval. Keep it handy for step 3. tailnet-proxy uses it only the first time it joins; after that, the node keeps its own identity.</p>
+          </li>
+          <li>
+            <h4>Put your devices on the tailnet</h4>
+            <p>Install Tailscale on each laptop and phone you’ll use the agent from (<a href="https://tailscale.com/download">tailscale.com/download</a>) and sign in with the same account. Only devices on your tailnet can open the web app. The iPhone and Mac apps join the tailnet by themselves, so a device that only uses an app doesn’t need the Tailscale app.</p>
+          </li>
+        </ol>
+        <div class="callout">
+          <p>With the default access rules, every device of yours on the tailnet can reach the desktop. If you share your tailnet with others, <a href="#limit-logins">limit it to named logins</a> after you deploy, or tighten your rules.</p>
+        </div>
+      </section>
+
+      <!-- 3. Deploy -->
+      <section id="deploy" aria-labelledby="deploy-h">
+        <h2 id="deploy-h"><span class="n">3</span>Deploy</h2>
+        <p>Run these from the repository, in order, one block at a time. Several of them stop to ask you something.</p>
+
+        <ol class="steps">
+          <li>
+            <h4>Point the Makefile at your account</h4>
+            <div class="code" data-copy>
+<pre><code>export AWS_PROFILE=neo-sandbox AWS_REGION=ca-central-1</code></pre>
+            </div>
+            <div class="callout must">
+              <p><strong>Export these in every new shell.</strong> If <code>AWS_PROFILE</code> isn’t set, the Makefile uses your <code>default</code> profile, which on many machines points at some other account. <code>make preflight</code> shows which account you’re about to deploy to and warns you when <code>AWS_PROFILE</code> isn’t set.</p>
+            </div>
+          </li>
+          <li>
+            <h4>Prepare Ansible and Terraform</h4>
+            <p>Once per deployment. Install Ansible’s AWS collections:</p>
+            <div class="code" data-copy>
+<pre><code>make galaxy</code></pre>
+            </div>
+            <p>Create the S3 bucket for Terraform’s state. Terraform shows what it will create and asks you to type <code>yes</code>:</p>
+            <div class="code" data-copy>
+<pre><code>make bootstrap</code></pre>
+            </div>
+            <p>Then point Terraform at that bucket:</p>
+            <div class="code" data-copy>
+<pre><code>make init</code></pre>
+            </div>
+          </li>
+          <li>
+            <h4>Create the infrastructure</h4>
+            <p>Plan first, and read what it will create:</p>
+            <div class="code" data-copy>
+<pre><code>make plan</code></pre>
+            </div>
+            <p>The plan is saved, and <code>make apply</code> applies exactly that plan, without asking again. It creates the VPC, the NAT and the desktop in a few minutes:</p>
+            <div class="code" data-copy>
+<pre><code>make apply</code></pre>
+            </div>
+            <p>Afterwards, give the desktop a minute or two to register with SSM before step 5.</p>
+            <p>The first instance launch in a new account, or in a region the account hasn’t used, can fail with <code>PendingVerification</code> while AWS checks the account. It usually clears within minutes but can take a few hours; then run <code>make plan</code> and <code>make apply</code> again.</p>
+          </li>
+          <li>
+            <h4>Store your two secrets</h4>
+            <p>Each command asks for a value with hidden input and stores it as a SecureString in SSM. Run them one at a time.</p>
+            <div class="code" data-copy>
+<pre><code>make model-key</code></pre>
+            </div>
+            <p>Paste your Together AI key. Then:</p>
+            <div class="code" data-copy>
+<pre><code>make tailscale-key</code></pre>
+            </div>
+            <p>Paste the auth key from <a href="#tailscale">step 2</a>.</p>
+          </li>
+          <li>
+            <h4>Set up the desktop</h4>
+            <div class="code" data-copy>
+<pre><code>make deploy</code></pre>
+            </div>
+            <p>This configures the desktop (OS hardening, the display stack, Chrome), then installs agentd, then puts the desktop on your tailnet with tailnet-proxy. The first run takes 15–20 minutes. It ends by printing the web app’s address:</p>
+            <div class="code">
+<pre><code><span class="o">ok: [i-0123456789abcdef0] =&gt; {
+    "msg": "The web app: https://neo-agent.tail1234.ts.net (open it on a device on your tailnet)"
+}</span></code></pre>
+            </div>
+            <p>Each playbook run starts with two warnings, “The 'tags' host variable is deprecated” and “Found variable using reserved name 'tags'”. They’re harmless.</p>
+          </li>
+        </ol>
+
+        <h3 id="limit-logins">Optional: let in only named logins</h3>
+        <p>To let only specific Tailscale logins reach the desktop, enter them comma-separated, then redeploy tailnet-proxy:</p>
+        <div class="code" data-copy>
+<pre><code>make tailscale-allow</code></pre>
+        </div>
+        <div class="code" data-copy>
+<pre><code>make tailnet-deploy</code></pre>
+        </div>
+      </section>
+
+      <!-- 4. Open -->
+      <section id="open" aria-labelledby="open-h">
+        <h2 id="open-h"><span class="n">4</span>Open the web app</h2>
+        <p>Open the address <code>make deploy</code> printed in a browser on any of your devices that has Tailscale running. You don’t need to remember it:</p>
+        <div class="code" data-copy>
+<pre><code>make url</code></pre>
+        </div>
+        <ul class="plain">
+          <li>The first load can be slow while Tailscale issues the site’s certificate.</li>
+          <li>On a phone, add the page to your Home Screen to use it like an app.</li>
+          <li><strong>Notifications:</strong> under Settings → Notifications, turn them on for each device you use. You’ll hear when a card needs you, when a site needs you to sign in, when a chat task that ran over a minute finishes, and when a scheduled run finds something. On iPhone or iPad, add the web app to your Home Screen first (Share → Add to Home Screen), open it from there, then turn them on; iOS only allows web notifications for Home Screen apps.</li>
+        </ul>
+      </section>
+
+      <!-- 5. Use -->
+      <section id="use" aria-labelledby="use-h">
+        <h2 id="use-h"><span class="n">5</span>Start using it</h2>
+        <p>Ask for something in the chat. The agent works in its own browser and shell; three dots mean it’s working, with how long it’s been at it, and Stop cancels the task.</p>
+        <ul class="tools">
+          <li><span class="t">Plans</span><span class="d">Anything with three or more steps gets a checklist that ticks off as the agent goes.</span></li>
+          <li><span class="t">Approval cards</span><span class="d">Show the exact command or browser input the agent wants. Every click, bit of typing and key press needs your OK, and typing and submitting are separate cards.</span></li>
+          <li><span class="t">Signing in to sites</span><span class="d">When a site needs you (a login, 2FA, a CAPTCHA), an Action needed card offers <strong>Take over</strong>. The desktop opens in the page, and the agent carries on when you’re done. Chrome stays signed in.</span></li>
+          <li><span class="t">Keys and tokens</span><span class="d">Give them through the secure card or the Keys and tokens screen, never in the chat. Review the exact command before granting a key, and prefer narrowly scoped tokens: the command runs in the agent’s workspace, so anything there it uses (a tool the agent installed, a repository’s git hooks, package scripts) runs with the key too.</span></li>
+          <li><span class="t">Schedules</span><span class="d">“Every weekday at 8, summarize my inbox” or “tomorrow at 9, check PR 12”. Each run’s answer lands in the chat; the Schedules screen pauses and cancels them.</span></li>
+          <li><span class="t">Memory</span><span class="d">Send <code>remember rule: …</code>, <code>remember preference: …</code> or <code>remember fact: …</code> for standing instructions, and <code>forget #ID</code> to remove one. The Apple apps add a Memory screen to confirm, edit, import and export.</span></li>
+          <li><span class="t">Long tasks</span><span class="d">There’s no step cap. A supervisor checks in every 30 minutes of work or 60 model turns; if a task looks stuck, you get a <strong>Looks stuck</strong> card with the reason, and choose Keep going or Stop.</span></li>
+          <li><span class="t">Local servers</span><span class="d">The agent’s commands reach the internet only through the proxy, and nothing on the desktop itself, not even a dev server the same command started. Run those checks on your own computer.</span></li>
+          <li><span class="t">Auto approve</span><span class="d">Off by default, in Settings. When on, ordinary shell commands and schedule setup run without a card. Browser input, saved keys, new sites, direct internet and data going out after reading outside content still ask.</span></li>
+        </ul>
+        <p>The agent also reads short how-tos (“skills”) when it needs them: installing software with Nix (never <code>curl | bash</code>), Python with uv, Node, git and GitHub, opencode with Together AI, and deploying to Fly. They live in <code>services/agentd/skills</code>.</p>
+      </section>
+
+      <!-- Reference: apps -->
+      <section id="apps" aria-labelledby="apps-h">
+        <h2 id="apps-h">The iPhone and Mac apps</h2>
+        <p>Optional native apps for iPhone (iOS 26 or later) and Mac (macOS 15.6 or later, Apple silicon), in <code>apps/apple</code>. They have the same chat as the web app, a native take-over view with the phone’s keyboard and gestures or the Mac’s keyboard and pointer, and a Memory screen. Each app has its own Tailscale node built in: you sign in with Tailscale inside the app, and it finds your desktop by its <code>tag:neo-agent</code> tag.</p>
+
+        <h3>What you need, on a Mac</h3>
+        <ul class="plain">
+          <li>Xcode 26 or later, from the App Store. Open it once to finish installing.</li>
+          <li>XcodeGen: <code>brew install xcodegen</code>.</li>
+          <li>Go, as for the deploy; it builds TailscaleKit.</li>
+          <li>Your Apple Account in Xcode: Xcode → Settings → Accounts → +. A free account works for building and running, but apps it signs stop opening after 7 days until you build again. With the Apple Developer Program ($99 a year) they last a year, and only a paid account can create the key that notifications need.</li>
+        </ul>
+
+        <h3>Build and install</h3>
+        <ol class="steps">
+          <li>
+            <h4>Build the Tailscale node the apps embed</h4>
+            <p>Once; it takes a few minutes.</p>
+            <div class="code" data-copy>
+<pre><code>make app-tailscalekit</code></pre>
+            </div>
+          </li>
+          <li>
+            <h4>Find your Apple team ID</h4>
+            <p>With no <code>APPLE_TEAM_ID</code> set, this lists the teams your Mac can sign for, each as a line like <code>export APPLE_TEAM_ID=A1B2C3D4E5</code>:</p>
+            <div class="code" data-copy>
+<pre><code>make app-project</code></pre>
+            </div>
+            <p>Run the line for the team you want. Like <code>AWS_PROFILE</code>, export it in every new shell.</p>
+          </li>
+          <li>
+            <h4>Build and install</h4>
+            <p>The Mac app installs to <code>/Applications</code> and opens:</p>
+            <div class="code" data-copy>
+<pre><code>make app-mac</code></pre>
+            </div>
+            <p>The iPhone app installs to an iPhone connected by cable (the first time, see below):</p>
+            <div class="code" data-copy>
+<pre><code>make app-device</code></pre>
+            </div>
+            <p>These builds have no notifications, which keeps them working on a free account. The bundle ID is <code>dev.neoagent.app.&lt;your team ID&gt;</code>; set <code>APP_BUNDLE_ID</code> to use another.</p>
+          </li>
+        </ol>
+
+        <h3>The iPhone, the first time</h3>
+        <ol class="steps">
+          <li><p>Connect it to the Mac with a cable, unlock it, and tap <strong>Trust</strong>.</p></li>
+          <li><p>Run <code>make app-device</code>. If it says Developer Mode is off, turn it on in Settings → Privacy &amp; Security → Developer Mode (the iPhone restarts), then run it again. The setting only appears once a Mac with Xcode has seen the phone.</p></li>
+          <li><p>With a free account, trust your certificate before the app will open: Settings → General → VPN &amp; Device Management → your Apple ID → Trust. Then open Agent Neo from the Home Screen.</p></li>
+        </ol>
+        <p><strong>Signing in:</strong> tap Log in with Tailscale and sign in with the account your desktop is on. The app joins your tailnet as <code>neo-agent-iphone</code> or <code>neo-agent-mac</code>; approve it in the admin console if you use device approval.</p>
+
+        <details class="more">
+          <summary>Notifications for the apps (Apple Developer Program)</summary>
+          <div>
+            <p>agentd sends notifications to Apple directly with your own APNs key: no push relay, nothing extra in AWS. A free account can’t create an APNs key or use the push entitlement.</p>
+            <ol class="steps">
+              <li>
+                <h4>Create an APNs key</h4>
+                <p>In your <a href="https://developer.apple.com/account">Apple developer account</a>: Certificates, Identifiers &amp; Profiles → Keys → +. Name it, tick Apple Push Notifications service (APNs), Continue, then Register. Download the <code>.p8</code> file (you can only download it once) and note its Key ID and your Team ID.</p>
+              </li>
+              <li>
+                <h4>Give the key to your desktop</h4>
+                <div class="code" data-copy>
+<pre><code>make apns-key   <span class="c"># asks for the .p8 path, the Key ID and the Team ID</span></code></pre>
+                </div>
+                <div class="code" data-copy>
+<pre><code>make agentd-deploy</code></pre>
+                </div>
+              </li>
+              <li>
+                <h4>Rebuild the apps with notifications on</h4>
+                <div class="code" data-copy>
+<pre><code>APP_PUSH=1 make app-mac
+APP_PUSH=1 make app-device</code></pre>
+                </div>
+                <p>Open a signed-in app and allow notifications when it asks; it registers itself with the desktop from then on.</p>
+              </li>
+            </ol>
+          </div>
+        </details>
+      </section>
+
+      <!-- Reference: commands -->
+      <section id="commands" aria-labelledby="commands-h">
+        <h2 id="commands-h">Everyday commands</h2>
+        <p>From your machine, over SSM:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+            <tbody>
+              <tr><td><code>make url</code></td><td>Prints the web app’s address on your tailnet</td></tr>
+              <tr><td><code>make viewer</code></td><td>The desktop in your browser at <code>http://localhost:6080/vnc.html</code></td></tr>
+              <tr><td><code>make shell</code></td><td>A shell on the desktop</td></tr>
+              <tr><td><code>make screenshot</code></td><td>Saves <code>screenshots/&lt;instance-id&gt;.png</code></td></tr>
+              <tr><td><code>make agentd-logs</code></td><td>agentd’s recent log</td></tr>
+              <tr><td><code>make cdp</code></td><td>Chrome’s DevTools on <code>localhost:9222</code>, for <code>scripts/browser.py</code></td></tr>
+              <tr><td><code>make stop</code> / <code>make start</code></td><td>Stops the desktop when you don’t need it; the disk stays</td></tr>
+              <tr><td><code>make agentd-reset</code></td><td>Wipes the chat, memories, schedules, keys and Chrome’s profile (asks first)</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Reference: settings -->
+      <section id="settings" aria-labelledby="settings-h">
+        <h2 id="settings-h">Settings</h2>
+        <p>Defaults live in <code>terraform/personal/variables.tf</code>. To change any, copy the example file, uncomment what you need, then run <code>make plan</code> and <code>make apply</code>.</p>
+        <div class="code" data-copy>
+<pre><code>cp terraform/personal/terraform.tfvars.example terraform/personal/terraform.tfvars</code></pre>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">Variable</th><th scope="col">Default</th><th scope="col">Notes</th></tr></thead>
+            <tbody>
+              <tr><td><code>desktop_instance_type</code></td><td><code>t3a.medium</code></td><td></td></tr>
+              <tr><td><code>disk_size_gb</code></td><td><code>20</code></td><td></td></tr>
+              <tr><td><code>desktop_arch</code></td><td><code>amd64</code></td><td><code>arm64</code> is about 13% cheaper; also export <code>DESKTOP_ARCH=arm64</code> for the builds. Many Linux desktop apps ship only for x86_64.</td></tr>
+              <tr><td><code>tailnet_hostname</code></td><td><code>neo-agent</code></td><td>The web app’s name on your tailnet</td></tr>
+              <tr><td><code>enable_nat_gateway</code></td><td><code>false</code></td><td>AWS’s NAT gateway instead of fck-nat: highly available, about $33 a month. Set <code>enable_nat_instance = false</code> at the same time.</td></tr>
+              <tr><td><code>enable_desktop_backups</code></td><td><code>false</code></td><td>See <a href="#backups">Backups</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The region comes from <code>AWS_REGION</code>. Adding <code>ENV=&lt;name&gt;</code> to every <code>make</code> command gives you a second, separate deployment in the same account.</p>
+      </section>
+
+      <!-- Reference: updating -->
+      <section id="updating" aria-labelledby="updating-h">
+        <h2 id="updating-h">Updating</h2>
+        <div class="code" data-copy>
+<pre><code>git pull
+make agentd-deploy    <span class="c"># agentd (copies its database first)</span>
+make tailnet-deploy   <span class="c"># tailnet-proxy and the web app</span>
+make desktop          <span class="c"># OS hardening, the display stack, Chrome</span></code></pre>
+        </div>
+        <p>If you use the apps, rebuild them too:</p>
+        <div class="code" data-copy>
+<pre><code>make app-mac app-device</code></pre>
+        </div>
+        <p>To rotate the model key, run <code>make model-key</code>, then <code>make agentd-deploy</code>.</p>
+      </section>
+
+      <!-- Reference: backups -->
+      <section id="backups" aria-labelledby="backups-h">
+        <h2 id="backups-h">Backups</h2>
+        <p>Set <code>enable_desktop_backups = true</code> in <code>terraform/personal/terraform.tfvars</code>, then run <code>make plan</code> and <code>make apply</code>. Amazon Data Lifecycle Manager then takes a daily snapshot around 03:00 UTC and keeps the latest seven. EBS storage charges apply.</p>
+        <p>Snapshots contain the desktop’s chat, memory, saved keys and Chrome profile. They use the desktop’s KMS key and stay in the deployment’s account and region, so keep that key available for recovery. Older snapshots can still contain data you’ve deleted from the desktop.</p>
+        <details class="more">
+          <summary>Restore drill</summary>
+          <div>
+            <ol class="steps">
+              <li><p>In EC2 → Snapshots, choose a completed snapshot with the <code>NeoAgentBackup</code> tag for your deployment. Confirm the source volume and timestamp, and note the snapshot and KMS key IDs.</p></li>
+              <li><p>Create a temporary encrypted volume from that snapshot in the availability zone of a trusted recovery instance, and attach it as a data volume. Leave the production desktop and its root device untouched.</p></li>
+              <li><p>On the recovery instance, use <code>lsblk -f</code> to find the restored Linux root partition. For ext4, mount it with <code>mount -o ro,noload</code>. Copy <code>/var/lib/agentd/agentd.db</code> and its <code>-wal</code> file, if there is one, to an encrypted scratch directory with restricted access. Run <code>sqlite3 agentd.db 'PRAGMA quick_check;'</code> on the copy and expect <code>ok</code>.</p></li>
+              <li><p>Unmount, detach and delete the temporary volume and the scratch data once you’ve verified the result. After replacing the desktop or turning backups off, inspect older snapshots by hand: Data Lifecycle Manager stops pruning them.</p></li>
+            </ol>
+          </div>
+        </details>
+      </section>
+
+      <!-- Reference: cost -->
+      <section id="cost" aria-labelledby="cost-h">
+        <h2 id="cost-h">Cost</h2>
+        <p>Roughly, on demand in ca-central-1:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">Item</th><th scope="col">Per month</th></tr></thead>
+            <tbody>
+              <tr><td>The desktop, a t3a.medium</td><td>~$31</td></tr>
+              <tr><td>Its 20 GB gp3 disk</td><td>~$2</td></tr>
+              <tr><td>The fck-nat t4g.nano and its public IPv4 address</td><td>~$7</td></tr>
+              <tr><td>The KMS key</td><td>$1</td></tr>
+              <tr><th scope="row">While it runs</th><th>~$40</th></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Plus what you spend on Together AI. <code>make stop</code> brings the desktop’s part down to its disk. Unlimited CPU credits (<code>cpu_credits</code>) can add to it under sustained load.</p>
+      </section>
+
+      <!-- Reference: teardown -->
+      <section id="teardown" aria-labelledby="teardown-h">
+        <h2 id="teardown-h">Teardown</h2>
+        <div class="code" data-copy>
+<pre><code>make destroy</code></pre>
+        </div>
+        <p>Then, by hand:</p>
+        <ul class="plain">
+          <li>The state bucket stays (<code>prevent_destroy</code>); delete it in the S3 console if you want it gone.</li>
+          <li>Delete the SSM parameters under <code>/neo-agent/personal/</code>.</li>
+          <li>Remove the desktop, and the apps’ devices <code>neo-agent-iphone</code> and <code>neo-agent-mac</code>, in Tailscale’s admin console.</li>
+        </ul>
+      </section>
+
+      <!-- Reference: troubleshooting -->
+      <section id="troubleshooting" aria-labelledby="troubleshooting-h">
+        <h2 id="troubleshooting-h">Troubleshooting</h2>
+        <ul class="fix">
+          <li>
+            <p class="sym"><code>make preflight</code> says the region is blocked by an SCP</p>
+            <p>It lists the regions the SCPs allow. Change <code>AWS_REGION</code> to one of them and run <code>make preflight</code> again. Anything else an SCP blocks needs the organization’s administrator.</p>
+          </li>
+          <li>
+            <p class="sym"><code>make preflight</code> says your IAM policies don’t allow a call</p>
+            <p>Give your user or role AdministratorAccess (<a href="#aws">step 1</a>, item 4).</p>
+          </li>
+          <li>
+            <p class="sym">The vCPU quota is under 4, or <code>make apply</code> fails with <code>VcpuLimitExceeded</code></p>
+            <p>New accounts can start with low EC2 limits. Go to Service Quotas → Amazon EC2 → Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances → Request increase at account level, and ask for 8. Some SCPs also block reading the quota; if yours do, go ahead and watch <code>make apply</code>.</p>
+          </li>
+          <li>
+            <p class="sym"><code>make apply</code> fails with <code>PendingVerification</code></p>
+            <p>AWS is still checking a new account or region. It usually clears within minutes but can take a few hours. Then run <code>make plan</code> and <code>make apply</code> again.</p>
+          </li>
+          <li>
+            <p class="sym">Commands are hitting the wrong AWS account</p>
+            <p><code>AWS_PROFILE</code> isn’t exported in this shell, so the Makefile fell back to <code>default</code>. Export it again; <code>make preflight</code> shows which account you’re on.</p>
+          </li>
+          <li>
+            <p class="sym">AWS commands fail after a few hours</p>
+            <p>Your SSO sign-in expired (8 hours by default). Run <code>aws sso login --profile neo-sandbox</code>.</p>
+          </li>
+          <li>
+            <p class="sym"><code>make deploy</code> can’t reach the desktop right after <code>make apply</code></p>
+            <p>The desktop takes a minute or two to register with SSM. Wait, then run <code>make deploy</code> again.</p>
+          </li>
+          <li>
+            <p class="sym">The web app is slow to load the first time</p>
+            <p>Tailscale is issuing the site’s certificate. Give it a moment; later loads are quick.</p>
+          </li>
+          <li>
+            <p class="sym">The app says “No desktop yet”</p>
+            <p>No device tagged <code>tag:neo-agent</code> is online. Check that the desktop is running (<code>make start</code>) and that <code>make url</code> prints its address.</p>
+          </li>
+          <li>
+            <p class="sym">The iPhone or Mac app stopped opening</p>
+            <p>Apps signed with a free Apple account last 7 days. Run <code>make app-device</code> or <code>make app-mac</code> again.</p>
+          </li>
+          <li>
+            <p class="sym"><code>APP_PUSH=1</code> builds fail to sign</p>
+            <p>A free Personal Team can’t use the Push Notifications capability. Notifications for the apps need the Apple Developer Program.</p>
+          </li>
+        </ul>
+
+        <div class="next">
+          <h2>How it stays safe</h2>
+          <p>Approvals, the sandboxed shell, the egress allowlist and memory trust are all enforced in code. Here’s how.</p>
+          <div class="actions">
+            <a class="btn btn-primary" href="./#harness">The harness</a>
+            <a class="btn btn-quiet" href="https://github.com/tzumby/agent_neo/blob/main/docs/architecture.md">Full architecture</a>
+          </div>
+        </div>
+      </section>
+    </article>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <div>
+        <a class="brand" href="./">
+          <img src="assets/logo-64.png" srcset="assets/logo-64.png 1x, assets/logo-128.png 2x" alt="" width="34" height="34">
+          Agent Neo
+        </a>
+        <p>Open source. It runs in your own AWS account and calls the model provider with your own key.</p>
+      </div>
+      <ul class="foot-links">
+        <li><a href="./">Overview</a></li>
+        <li><a href="https://github.com/tzumby/agent_neo/blob/main/docs/architecture.md">Architecture</a></li>
+        <li><a href="https://github.com/tzumby/agent_neo/blob/main/docs/memory-v2.md">Memory design</a></li>
+        <li><a href="https://github.com/tzumby/agent_neo">GitHub</a></li>
+      </ul>
+    </div>
+  </footer>
+</body>
+</html>

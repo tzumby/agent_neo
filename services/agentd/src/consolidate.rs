@@ -671,6 +671,11 @@ pub async fn run(agent: &Agent) -> Outcome {
         let seconds = DAY - memory::unix_now().rem_euclid(DAY);
         return Outcome::Later(Duration::from_secs(seconds as u64));
     }
+    // The month's budget is used up: it waits, like new tasks (usage.rs).
+    if agent.budget_paused() {
+        tracing::info!("memory consolidation postponed: the monthly budget is used up");
+        return Outcome::Later(Duration::from_secs(600));
+    }
     let user = match prompt(store, &runs) {
         Ok(text) => text,
         Err(err) => return Outcome::Failed(format!("{err:#}")),
@@ -728,10 +733,16 @@ pub async fn run(agent: &Agent) -> Outcome {
         }
     }
     let cost = usage.cost(&model).unwrap_or(0.0);
+    // Its tokens, beside the cost, for the usage figures.
+    let tokens = |store: &Store| {
+        let _ = store.record_usage(&run_id, Some(cost), &usage, 1);
+        agent.check_budget();
+    };
     let Some(output) = output else {
         let failed = Applied::default();
         let _ =
             store.transact(|tx| record_run(tx, &run_id, &model, "error", Some(cost), &failed, runs.len()));
+        tokens(store);
         return Outcome::Failed(format!("the model's answer wasn't valid twice: {problem}"));
     };
     match apply(
@@ -743,6 +754,7 @@ pub async fn run(agent: &Agent) -> Outcome {
         Some((&model, cost)),
     ) {
         Ok(applied) => {
+            tokens(store);
             tracing::info!(
                 tasks = runs.len(),
                 saved = applied.saved,

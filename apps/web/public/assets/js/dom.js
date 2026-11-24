@@ -51,6 +51,11 @@ const ICONS = {
   keyboard: "M4 7h16v10H4zM7 10h.01M10 10h.01M13 10h.01M16 10h.01M8 14h8",
   click: "M9 4v3M4 9h3M5.5 5.5l2 2M12 11l8 3-3.5 1.5L15 19z",
   back: "M15 6l-6 6 6 6",
+  chats: "M8 5h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-2v3l-3.5-3H8a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zM4 9v8.5L6.5 15",
+  compose: "M12 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6M17.5 3.5a2.1 2.1 0 0 1 3 3L13 14l-4 1 1-4z",
+  more: "M5.5 12h.01M12 12h.01M18.5 12h.01",
+  chart: "M4 20h16M7 16v-4M12 16V6M17 16v-7",
+  plus: "M12 5v14M5 12h14",
 };
 
 export function icon(name, className = "icon") {
@@ -74,6 +79,19 @@ export function when(date) {
   const today = new Date();
   const sameDay = d.toDateString() === today.toDateString();
   return sameDay ? timeFormat.format(d) : `${dayFormat.format(d)}, ${timeFormat.format(d)}`;
+}
+
+const shortDay = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+const weekday = new Intl.DateTimeFormat(undefined, { weekday: "short" });
+
+/** For a list: "9:00 AM" today, "Mon" this week, "Nov 2" before. */
+export function day(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return "";
+  const today = new Date();
+  if (d.toDateString() === today.toDateString()) return timeFormat.format(d);
+  const days = (new Date(today.toDateString()) - new Date(d.toDateString())) / 86_400_000;
+  return days > 0 && days < 7 ? weekday.format(d) : shortDay.format(d);
 }
 
 export function time(date) {

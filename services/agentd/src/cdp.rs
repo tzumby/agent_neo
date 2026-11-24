@@ -72,9 +72,9 @@ impl Cdp {
         Ok(target)
     }
 
-    /// A new window with one blank tab, not brought to the front: a scheduled
-    /// run's, so it never takes the tab the chat works in.
-    pub async fn new_window(&self) -> Result<Target> {
+    /// Commands on the browser's own session (not a tab's), where windows
+    /// are opened and found. One reply per call, in the order asked.
+    async fn browser_calls(&self, calls: &[(&str, Value)]) -> Result<Vec<Result<Value>>> {
         #[derive(Deserialize)]
         struct Version {
             #[serde(rename = "webSocketDebuggerUrl")]
@@ -89,34 +89,56 @@ impl Cdp {
             .error_for_status()?
             .json()
             .await?;
-        // The browser's own session: windows are opened there.
         let (mut ws, _) = tokio_tungstenite::connect_async(version.ws_url.as_str())
             .await
             .context("connecting to Chrome")?;
-        let request = json!({"id": 1, "method": "Target.createTarget",
-                             "params": {"url": "about:blank", "newWindow": true, "background": true}});
-        ws.send(Message::Text(request.to_string().into())).await?;
-        let reply = tokio::time::timeout(Duration::from_secs(10), async {
-            while let Some(message) = ws.next().await {
+        for (i, (method, params)) in calls.iter().enumerate() {
+            let request = json!({"id": i + 1, "method": method, "params": params});
+            ws.send(Message::Text(request.to_string().into())).await?;
+        }
+        let mut replies: Vec<Option<Result<Value>>> = calls.iter().map(|_| None).collect();
+        let answered = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut left = calls.len();
+            while left > 0 {
+                let Some(message) = ws.next().await else {
+                    bail!("Chrome closed the connection")
+                };
                 if let Message::Text(text) = message?
                     && let Ok(value) = serde_json::from_str::<Value>(text.as_str())
-                    && value["id"] == 1
+                    && let Some(slot) = value["id"]
+                        .as_u64()
+                        .and_then(|id| replies.get_mut((id as usize).wrapping_sub(1)))
+                    && slot.is_none()
                 {
-                    return Ok(value);
+                    *slot = Some(match value.get("error") {
+                        Some(err) => Err(anyhow!("{}", err["message"].as_str().unwrap_or("DevTools error"))),
+                        None => Ok(value["result"].clone()),
+                    });
+                    left -= 1;
                 }
             }
-            bail!("Chrome closed the connection")
+            Ok(())
         })
-        .await
-        .map_err(|_| anyhow!("Chrome didn't open a window in time"))??;
+        .await;
         let _ = ws.close(None).await;
-        if let Some(err) = reply.get("error") {
-            bail!(
-                "Chrome didn't open a window: {}",
-                err["message"].as_str().unwrap_or("error")
-            );
-        }
-        let id = reply["result"]["targetId"]
+        answered.map_err(|_| anyhow!("Chrome didn't answer in time"))??;
+        Ok(replies
+            .into_iter()
+            .map(|reply| reply.unwrap_or_else(|| Err(anyhow!("no reply"))))
+            .collect())
+    }
+
+    /// A new window with one blank tab, not brought to the front: a scheduled
+    /// run's or a conversation's, so it never takes the tab the chat works in.
+    pub async fn new_window(&self) -> Result<Target> {
+        let params = json!({"url": "about:blank", "newWindow": true, "background": true});
+        let reply = self
+            .browser_calls(&[("Target.createTarget", params)])
+            .await?
+            .pop()
+            .ok_or_else(|| anyhow!("no reply"))?
+            .map_err(|err| anyhow!("Chrome didn't open a window: {err}"))?;
+        let id = reply["targetId"]
             .as_str()
             .ok_or_else(|| anyhow!("Chrome didn't say which window it opened"))?
             .to_string();
@@ -125,6 +147,45 @@ impl Cdp {
             .into_iter()
             .find(|t| t.id == id)
             .ok_or_else(|| anyhow!("Chrome's new window isn't listed"))
+    }
+
+    /// The window each of these tabs is in, by tab id; tabs that are gone
+    /// are left out.
+    pub async fn windows(&self, ids: &[String]) -> Result<HashMap<String, i64>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let calls: Vec<(&str, Value)> = ids
+            .iter()
+            .map(|id| ("Browser.getWindowForTarget", json!({"targetId": id})))
+            .collect();
+        let replies = self.browser_calls(&calls).await?;
+        Ok(ids
+            .iter()
+            .zip(replies)
+            .filter_map(|(id, reply)| Some((id.clone(), reply.ok()?["windowId"].as_i64()?)))
+            .collect())
+    }
+
+    /// Closes the window `id` is in: every tab in it (a conversation's, when
+    /// it's archived or deleted).
+    pub async fn close_window_of(&self, id: &str) -> Result<()> {
+        let pages = self.pages().await?;
+        let ids: Vec<String> = pages.iter().map(|t| t.id.clone()).collect();
+        let tabs = match self.windows(&ids).await {
+            Ok(windows) => match windows.get(id) {
+                Some(window) => ids
+                    .into_iter()
+                    .filter(|tab| windows.get(tab) == Some(window))
+                    .collect(),
+                None => Vec::new(), // gone already
+            },
+            Err(_) => vec![id.to_string()],
+        };
+        for tab in tabs {
+            self.close(&tab).await?;
+        }
+        Ok(())
     }
 
     /// Closes a tab (the last one closes its window).

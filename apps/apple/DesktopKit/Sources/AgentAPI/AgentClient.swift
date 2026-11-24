@@ -194,9 +194,13 @@ public struct AgentStatus: Decodable, Sendable, Equatable {
     public let stageDetail: JSONValue?
     /// Memory v2 is on.
     public let memoryV2: Bool?
+    /// How many conversations work, wait and have queued messages (agentd 0.16.0).
+    public let sessions: SessionCounts?
+    /// The monthly budget and this month's spending (agentd 0.16.0).
+    public let budget: Budget?
 
     enum CodingKeys: String, CodingKey {
-        case desktop, busy, settings, version, stage
+        case desktop, busy, settings, version, stage, sessions, budget
         case lastSeq = "last_seq"
         case knownModels = "known_models"
         case shellTool = "shell_tool"
@@ -216,6 +220,12 @@ public struct EventPage: Decodable, Sendable, Equatable {
     enum CodingKeys: String, CodingKey {
         case events, more
         case lastSeq = "last_seq"
+    }
+
+    public init(events: [AgentEvent], more: Bool, lastSeq: Int) {
+        self.events = events
+        self.more = more
+        self.lastSeq = lastSeq
     }
 }
 
@@ -314,13 +324,18 @@ public struct AgentClient: Sendable {
     }
 
     /// Up to `limit` events of `kinds` before `before` (the newest when nil),
-    /// oldest first: the chat a page at a time. agentd before 0.15.1 answers 404.
-    public func eventPage(before: Int?, limit: Int, kinds: Set<String>) async throws -> EventPage {
+    /// oldest first: the chat a page at a time. With `session`, that
+    /// conversation's events and the global ones (agentd 0.16.0). agentd
+    /// before 0.15.1 answers 404.
+    public func eventPage(
+        before: Int?, limit: Int, kinds: Set<String>, session conversation: String? = nil
+    ) async throws -> EventPage {
         var query = [
             URLQueryItem(name: "limit", value: String(limit)),
             URLQueryItem(name: "kinds", value: kinds.sorted().joined(separator: ",")),
         ]
         if let before { query.append(URLQueryItem(name: "before", value: String(before))) }
+        if let conversation { query.append(URLQueryItem(name: "session", value: conversation)) }
         let url = baseURL.appending(path: "/api/v1/events/page").appending(queryItems: query)
         let (data, response) = try await session.data(from: url)
         try Self.check(response, data)
@@ -336,25 +351,13 @@ public struct AgentClient: Sendable {
 
     // MARK: Commands
 
-    /// Starts a task. Throws AgentError.http(409, …) while another one runs.
+    /// Sends a message to `main` with this device's time zone, so the agent
+    /// knows the user's date ("yesterday"). It starts a task, or (agentd
+    /// 0.16.0) queues behind the one running; an older agentd answers 409
+    /// while another task runs.
     @discardableResult
-    /// Sends a message with this device's time zone, so the agent knows the
-    /// user's date ("yesterday").
-    public func send(_ text: String, timeZone: TimeZone = .current) async throws -> String {
-        let message = NewMessage(text: text, timezone: timeZone.identifier, utcOffset: timeZone.secondsFromGMT())
-        let reply: [String: String] = try await post("/api/v1/messages", body: message)
-        return reply["task"] ?? ""
-    }
-
-    private struct NewMessage: Encodable {
-        let text: String
-        let timezone: String
-        let utcOffset: Int
-
-        enum CodingKeys: String, CodingKey {
-            case text, timezone
-            case utcOffset = "utc_offset"
-        }
+    public func send(_ text: String, timeZone: TimeZone = .current) async throws -> Sent {
+        try await post("/api/v1/messages", body: NewMessage(text, timeZone))
     }
 
     /// `text`: what the user changed the card's text to, on a card that takes an edit.
@@ -363,15 +366,16 @@ public struct AgentClient: Sendable {
             "/api/v1/approvals/\(id)", body: ApprovalAnswer(approved: approved, text: text))
     }
 
-    /// "I'm done" (true) or "Skip" (false) on an action-needed card; starts a new task.
+    /// "I'm done" (true) or "Skip" (false) on an action-needed card; starts a
+    /// new task, or queues it in the card's conversation.
     @discardableResult
-    public func resolve(action id: String, done: Bool) async throws -> String {
-        let reply: [String: String] = try await post("/api/v1/actions/\(id)", body: ["choice": done ? "done" : "skip"])
-        return reply["task"] ?? ""
+    public func resolve(action id: String, done: Bool) async throws -> Sent {
+        try await post("/api/v1/actions/\(id)", body: ["choice": done ? "done" : "skip"])
     }
 
+    /// Stops `main`'s task (agentd 0.16.0 also drops its queued messages).
     public func stop() async throws {
-        let _: [String: Bool] = try await post("/api/v1/stop", body: [String: String]())
+        try await perform("POST", "/api/v1/stop", body: [String: String]())
     }
 
     /// Registers this device for notifications: agentd stores the token and
@@ -572,13 +576,21 @@ public struct AgentClient: Sendable {
     }
 
     func send<T: Decodable, Body: Encodable>(_ method: String, _ path: String, body: Body) async throws -> T {
+        try JSONDecoder().decode(T.self, from: await perform(method, path, body: body))
+    }
+
+    /// A request whose answer may have no body (204).
+    @discardableResult
+    func perform(_ method: String, _ path: String, body: (any Encodable)? = nil) async throws -> Data {
         var request = URLRequest(url: baseURL.appending(path: path))
         request.httpMethod = method
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(body)
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONEncoder().encode(body)
+        }
         let (data, response) = try await session.data(for: request)
         try Self.check(response, data)
-        return try JSONDecoder().decode(T.self, from: data)
+        return data
     }
 
     static func check(_ response: URLResponse, _ data: Data) throws {

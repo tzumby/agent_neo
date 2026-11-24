@@ -244,9 +244,15 @@ worker launcher, API, and web app in order. Rebuild the native apps to use
 the current approval and settings screens.
 
 - **Chat**: ask for something. The agent works in its own browser and shell.
-  Three dots mean it's working, with how long it's been at it, and Stop cancels
-  the task. On anything with three or more steps the agent writes a **plan**,
-  which shows as a checklist that ticks off as it goes.
+  Three dots mean it's working, with how long it's been at it. You can keep
+  sending meanwhile: a message sent while the agent works, or waits on a
+  card, is queued and runs after the current task, in order (✕ removes it).
+  Stop cancels the task, or gives up on the card it waits on, and drops the
+  queued messages. On anything with three or more steps the agent writes a
+  **plan**, which shows as a checklist that ticks off as it goes.
+- **Conversations**: several chats, each with its own history, browser window
+  and cards; memory, keys, schedules and settings are shared. Up to three
+  work at the same moment (`MAX_PARALLEL_TASKS`); more wait their turn.
 - **Long tasks**: there's no cap on steps. Instead, a **supervisor** checks on a
   running task every 30 minutes of work or 60 model turns, whichever comes
   first (`agentd_review_every_minutes`, `agentd_review_every_steps`). The

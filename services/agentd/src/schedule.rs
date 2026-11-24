@@ -6,9 +6,11 @@
 //! approvals, no model and no way to tell the user.
 //!
 //! A due run joins a queue in the database (`runs` rows, `queued`), and a
-//! background worker takes them one at a time, beside the chat: the user can
-//! keep talking to the agent while a check runs. The queue outlives restarts;
-//! a run cut off by one, or that failed, is tried once more (agent.rs).
+//! background worker takes them one at a time, beside the conversations: the
+//! user can keep talking to the agent while a check runs. The queue outlives
+//! restarts; a run cut off by one, or that failed, is tried once more
+//! (agent.rs). A schedule belongs to the conversation that set it up, where
+//! its reports go. With the month's budget used up, runs are skipped.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +33,8 @@ pub const MIN_INTERVAL_SECS: i64 = 15 * 60;
 pub const MAX_LATE_SECS: i64 = 3600;
 /// One-time runs at most this far ahead.
 const MAX_AHEAD_SECS: i64 = 366 * 86_400;
+/// A scheduled run skipped because the month's budget is used up.
+pub const BUDGET_SKIPPED: &str = "Skipped: this month's budget is used up";
 
 /// What a scheduled run reported with `report_outcome` (docs/memory-v2.md §11).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -285,9 +289,12 @@ pub fn json(schedule: &Schedule) -> serde_json::Value {
     })
 }
 
-/// Queues schedules' runs when they're due, for as long as agentd runs.
+/// Queues schedules' runs when they're due, for as long as agentd runs. Its
+/// tick (at most a minute) also lets queued messages go when the month
+/// turns over and the budget is fresh.
 pub async fn run(agent: Arc<Agent>) {
     loop {
+        agent.pump();
         let now = Timestamp::now().as_second();
         match agent.store.due_schedules(now) {
             Ok(due) => enqueue_due(&agent, due, now),
@@ -305,39 +312,12 @@ pub async fn run(agent: Arc<Agent>) {
 }
 
 /// The background worker: runs the queued runs, one at a time and oldest
-/// first, beside the chat, for as long as agentd runs.
+/// first, beside the conversations, for as long as agentd runs.
 pub async fn work(agent: Arc<Agent>) {
     loop {
         let now = Timestamp::now().as_second();
-        match agent.store.claim_run(now) {
-            Ok(Some(queued)) => {
-                let schedule = agent.store.schedule(queued.schedule).ok().flatten();
-                match schedule {
-                    // Paused or cancelled since it was queued.
-                    Some(schedule) if schedule.paused => {
-                        let _ = agent.store.set_run_status(&queued.id, "cancelled");
-                    }
-                    None => {
-                        let _ = agent.store.set_run_status(&queued.id, "cancelled");
-                    }
-                    Some(schedule) if now - queued.due > MAX_LATE_SECS => {
-                        tracing::warn!(schedule = schedule.id, task = %queued.id, "skipping a queued run that's too late");
-                        let _ = agent.store.set_run_status(&queued.id, "skipped");
-                        agent.say(&format!(
-                            "I skipped the scheduled task “{}” that was due {}: it waited too long behind others.",
-                            schedule.name,
-                            local(queued.due, &schedule.timezone)
-                        ));
-                    }
-                    Some(schedule) => {
-                        tracing::info!(schedule = schedule.id, task = %queued.id, attempt = queued.attempt, late = now - queued.due, "scheduled run started");
-                        agent.clone().run_queued(queued, schedule).await;
-                    }
-                }
-                continue;
-            }
-            Ok(None) => {}
-            Err(err) => tracing::error!(%err, "couldn't read the queue"),
+        if work_once(&agent, now).await {
+            continue;
         }
         let next = agent.store.next_queued().ok().flatten();
         let wait = Duration::from_secs(next.map_or(60, |at| (at - now).clamp(1, 60)) as u64);
@@ -348,17 +328,71 @@ pub async fn work(agent: Arc<Agent>) {
     }
 }
 
+/// Takes the queued run due first, if any, and runs it to its end, or drops
+/// or skips it. False when nothing was due.
+async fn work_once(agent: &Arc<Agent>, now: i64) -> bool {
+    let queued = match agent.store.claim_run(now) {
+        Ok(Some(queued)) => queued,
+        Ok(None) => return false,
+        Err(err) => {
+            tracing::error!(%err, "couldn't read the queue");
+            return false;
+        }
+    };
+    let schedule = agent.store.schedule(queued.schedule).ok().flatten();
+    match schedule {
+        // Paused or cancelled since it was queued.
+        Some(schedule) if schedule.paused => {
+            let _ = agent.store.set_run_status(&queued.id, "cancelled");
+        }
+        None => {
+            let _ = agent.store.set_run_status(&queued.id, "cancelled");
+        }
+        Some(schedule) if now - queued.due > MAX_LATE_SECS => {
+            tracing::warn!(schedule = schedule.id, task = %queued.id, "skipping a queued run that's too late");
+            let _ = agent.store.set_run_status(&queued.id, "skipped");
+            agent.say_in(
+                &schedule.session,
+                &format!(
+                    "I skipped the scheduled task “{}” that was due {}: it waited too long behind others.",
+                    schedule.name,
+                    local(queued.due, &schedule.timezone)
+                ),
+            );
+        }
+        // The month's budget is used up: a quiet row in its conversation.
+        Some(schedule) if agent.budget_paused() => {
+            tracing::warn!(schedule = schedule.id, task = %queued.id, "skipping a scheduled run: the budget is used up");
+            let _ = agent.store.set_run_status(&queued.id, "skipped");
+            agent.emit(
+                "message",
+                json!({"role": "assistant", "text": BUDGET_SKIPPED, "task": queued.id, "quiet": true,
+                       "schedule": {"id": schedule.id, "name": schedule.name},
+                       "session": schedule.session}),
+            );
+        }
+        Some(schedule) => {
+            tracing::info!(schedule = schedule.id, task = %queued.id, attempt = queued.attempt, late = now - queued.due, "scheduled run started");
+            agent.clone().run_queued(queued, schedule).await;
+        }
+    }
+    true
+}
+
 /// Queues the runs that are due, oldest first, and moves each schedule on.
 fn enqueue_due(agent: &Arc<Agent>, due: Vec<Schedule>, now: i64) {
     for schedule in due {
         let late = now - schedule.next_run;
         if late > MAX_LATE_SECS {
             tracing::warn!(schedule = schedule.id, late, "skipping a run that's too late");
-            agent.say(&format!(
-                "I skipped the scheduled task “{}” that was due {}: the desktop was off or busy then.",
-                schedule.name,
-                local(schedule.next_run, &schedule.timezone)
-            ));
+            agent.say_in(
+                &schedule.session,
+                &format!(
+                    "I skipped the scheduled task “{}” that was due {}: the desktop was off or busy then.",
+                    schedule.name,
+                    local(schedule.next_run, &schedule.timezone)
+                ),
+            );
             advance(agent, &schedule, now, None);
             continue;
         }
@@ -371,7 +405,7 @@ fn enqueue_due(agent: &Arc<Agent>, due: Vec<Schedule>, now: i64) {
                     "message",
                     json!({"role": "assistant", "text": format!(
                         "Rules changed since “{}” was set up: it runs under today's rules.", schedule.name
-                    )}),
+                    ), "session": schedule.session}),
                 );
             }
             if let Err(err) = agent.store.set_schedule_policy(schedule.id, &current) {
@@ -501,6 +535,53 @@ mod tests {
                     .is_some_and(|t| t.starts_with("Rules changed"))
         });
         assert_eq!(notes.count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_is_skipped_quietly_in_its_conversation_when_the_budget_is_used_up() {
+        let (agent, dir) = crate::agent::test_agent();
+        let c1 = agent.create_session(None).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let made = agent
+            .add_user_schedule("Hourly check", "Check the build", "0 * * * *", None, None, true)
+            .unwrap();
+        let id = made["id"].as_i64().unwrap();
+        agent.store.set_schedule_session(id, &c1).unwrap();
+        let now = Timestamp::now().as_second();
+        assert!(
+            agent
+                .store
+                .enqueue_run("s1", id, "Check the build", "m", "v", now, 0)
+                .unwrap()
+        );
+        // Its run belongs to the schedule's conversation.
+        assert_eq!(
+            agent.store.run_session("s1").unwrap().as_deref(),
+            Some(c1.as_str())
+        );
+        agent.store.set_setting("monthly_budget_usd", "1").unwrap();
+        agent.store.start_run("spent", "x", None, "m", "v", None).unwrap();
+        agent
+            .store
+            .record_usage("spent", Some(2.0), &crate::llm::Usage::default(), 1)
+            .unwrap();
+        assert!(work_once(&agent, now).await);
+        assert!(!work_once(&agent, now).await, "nothing else is due");
+        let events = agent.store.events_after(0, 100).unwrap();
+        let skipped = events.iter().find(|e| e.kind == "message").unwrap();
+        assert_eq!(skipped.data["text"], BUDGET_SKIPPED);
+        assert_eq!(skipped.data["quiet"], true);
+        assert_eq!(skipped.data["session"], c1.as_str());
+        assert_eq!(skipped.data["schedule"]["name"], "Hourly check");
+        assert!(!events.iter().any(|e| e.kind == "run.started"));
+        let status: String = agent
+            .store
+            .read(|conn| Ok(conn.query_row("SELECT status FROM runs WHERE id = 's1'", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(status, "skipped");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

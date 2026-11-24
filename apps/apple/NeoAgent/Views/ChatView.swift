@@ -3,18 +3,26 @@ import ChatCore
 import DesktopViewer
 import SwiftUI
 
+/// One conversation's chat. The home around it keeps the store in sync
+/// (DesktopSync) and decides which conversation shows.
 struct ChatView: View {
     let store: ChatStore
+    let conversation: Conversation
     let client: AgentClient
     let desktopName: String
     let endpoint: DesktopEndpoint?
     let connectionKey: String
 
-    @State private var draft = ""
     @State private var showingSettings = false
     @State private var showingMemory = false
+    @State private var showingUsage = false
+    /// Stop was pressed with messages queued: it drops them, so it asks first.
+    @State private var confirmingStop = false
+    @State private var renaming: AgentSession?
+    @State private var deleting: AgentSession?
     #if os(iOS)
         @State private var takeOver: TakeOverRequest?
+        @Environment(\.dismiss) private var dismiss
     #else
         @Environment(\.openWindow) private var openWindow
         @Environment(DesktopSession.self) private var session
@@ -34,6 +42,7 @@ struct ChatView: View {
     @State private var savingKey: SecretEditor.Target?
     @FocusState private var composing: Bool
     @Environment(PushCenter.self) private var push
+    @Environment(\.openConversation) private var openConversation
 
     var body: some View {
         presentations(over: chat)
@@ -41,58 +50,31 @@ struct ChatView: View {
             .environment(\.chatStore, store)
             .environment(\.agentClient, client)
             .environment(\.takeOver, endpoint == nil ? nil : TakeOverAction { openDesktop(for: $0.id) })
-            .environment(\.openTask, OpenTask { task in openConversation(task) })
-            // Until the newest page is in, the splash covers everything (bars included).
-            // Only the splash fades: the chat under it is already at its end.
-            .overlay {
-                ZStack {
-                    if loading {
-                        SplashView(status: "Connecting to \(desktopName)…", detail: offlineDetail)
-                            .transition(.opacity)
-                    }
-                }
-                .animation(.easeOut(duration: 0.25), value: loading)
-            }
-            .toolbarVisibility(loading ? .hidden : .automatic, for: .appBar)
-            .task(id: connectionKey) { await store.run(client: client) }
-            .task(id: store.connection == .live) {
-                if store.connection == .live { await push.register() }
-            }
-            .task(id: "\(push.deviceToken ?? "")|\(connectionKey)") { await registerForPush() }
+            .environment(\.openTask, OpenTask { task in showTask(task) })
+            // Under the splash until the first chat is in (the Mac's toolbar isn't covered by it).
+            .toolbarVisibility(store.ready ? .automatic : .hidden, for: .appBar)
+            // Its newest page; again with a new Tailscale session's client.
+            .task(id: "\(conversation.id)|\(connectionKey)") { await store.open(conversation.id, client: client) }
             // A new Tailscale session restarts the search with its client.
-            .task(id: "\(push.pendingCardID ?? "")|\(connectionKey)") { await openNotificationCard() }
-    }
-
-    /// Hands this device's push token to the desktop, which registers it for
-    /// APNs notifications. Retries while the connection comes up. Nothing
-    /// happens on a desktop with no APNs key (it answers 400).
-    private func registerForPush() async {
-        guard push.deviceToken != nil else { return }
-        let topic = Bundle.main.bundleIdentifier ?? ""
-        for _ in 0..<10 {
-            if store.connection == .live {
-                do {
-                    try await push.registerDevice(on: client, topic: topic)
-                    return
-                } catch let error as AgentError where error.statusCode == 400 {
-                    return  // notifications to the apps aren't set up on this desktop
-                } catch {}
+            .task(id: "\(push.pendingCardID ?? "")|\(push.pendingSession ?? "")|\(store.selected)|\(connectionKey)") {
+                await openNotificationCard()
             }
-            try? await Task.sleep(for: .seconds(3))
-            if Task.isCancelled { return }
-        }
     }
 
-    /// A notification was tapped: show its card. After the app was suspended
-    /// the chat catches up first (`ChatStore.locate`), so a card that's still
-    /// on its way isn't reported gone.
+    /// A notification was tapped: show its card. The home opens its
+    /// conversation first. After the app was suspended the chat catches up
+    /// first (`ChatStore.locate`), so a card that's still on its way isn't
+    /// reported gone.
     private func openNotificationCard() async {
-        guard let id = push.pendingCardID, !push.loggingOut else { return }
-        let dismissingSheet = showingSettings || showingMemory
+        guard let id = push.pendingCardID, push.pendingSession == nil, conversation.id == store.selected,
+            !push.loggingOut
+        else { return }
+        let dismissingSheet = showingSettings || showingMemory || showingUsage
         showingSettings = false
         showingMemory = false
+        showingUsage = false
         if dismissingSheet { try? await Task.sleep(for: .milliseconds(450)) }
-        let found = await store.locate(id, client: client)
+        let found = await store.locate(id, in: conversation.id, client: client)
         guard !Task.isCancelled, push.pendingCardID == id else { return }
         switch found {
         case .waiting:
@@ -107,49 +89,86 @@ struct ChatView: View {
         push.pendingCardID = nil
     }
 
-    /// The conversation with its bars: the stage banner, the composer.
+    /// The conversation with its bars: the banners, the composer.
     private var chat: some View {
         messages
             .scrollDismissesKeyboard(.interactively)
             .overlay {
                 if empty {
                     EmptyChat(desktopName: desktopName)
+                } else if store.ready, !conversation.loaded {
+                    // Another conversation, opened: its newest page is on its way.
+                    ProgressView()
                 }
             }
             .bar(.top) {
-                if !loading, let banner = StageBanner.for(store.status) {
-                    StageBanner(banner: banner) { follow(banner.target) }
-                        .padding(.horizontal, 12)
-                        .padding(.top, 4)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                if store.ready {
+                    VStack(spacing: 8) {
+                        if store.status?.budget?.paused == true {
+                            BudgetBanner { showingUsage = true }
+                                .transition(.move(edge: .top).combined(with: .opacity))
+                        }
+                        if let banner = StageBanner.for(store.status, here: conversation.id, title: title(of:)) {
+                            StageBanner(banner: banner) { follow(banner) }
+                                .transition(.move(edge: .top).combined(with: .opacity))
+                        }
+                    }
+                    .frame(maxWidth: Theme.column)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
                 }
             }
             .animation(.snappy, value: store.status?.stage)
-            .bar(.bottom) {
-                VStack(spacing: 10) {
-                    if empty {
-                        Suggestions { send($0) }
-                    }
-                    Composer(
-                        text: $draft, busy: store.busy, stopping: store.stopping, canSend: store.connection == .live,
-                        focus: $composing,
-                        onSend: { send(draft) }, onStop: { Task { await store.stop(client: client) } })
-                }
-                .frame(maxWidth: Theme.column)
-                .padding(.horizontal, 12)
-                .padding(.bottom, 6)
-            }
+            .animation(.snappy, value: store.status?.budget?.paused)
+            .bar(.bottom) { bottomBar }
             .background(Color.black)
             .inlineTitle()
             .toolbar { toolbar }
             #if os(macOS)
-                // The model menu is the title, as on the iPhone.
-                .toolbar(removing: .title)
+                // With a sidebar, the conversation's title; alone, the model menu is the title, as on the iPhone.
+                .modifier(MacChatTitle(title: conversations ? title : nil))
             #endif
+            .confirmationDialog(
+                "Stop the task?", isPresented: $confirmingStop, titleVisibility: .visible
+            ) {
+                Button(conversation.queue.count == 1 ? "Stop and drop it" : "Stop and drop them", role: .destructive) {
+                    stopNow()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                let count = conversation.queue.count
+                Text(
+                    count == 1
+                        ? "Stopping also drops the message queued after it."
+                        : "Stopping also drops the \(count) messages queued after it.")
+            }
     }
 
-    /// Settings, Memory, the key dialog and editor, notices and (on the
-    /// iPhone) the take-over view, over the chat.
+    /// The composer, or (archived) the way back.
+    private var bottomBar: some View {
+        VStack(spacing: 10) {
+            if archived {
+                ArchivedBar {
+                    Task { await store.setArchived(false, conversation.id, client: client) }
+                }
+            } else {
+                if empty {
+                    Suggestions { send($0) }
+                }
+                Composer(
+                    text: Bindable(conversation).draft, busy: conversation.busy, stopping: conversation.stopping,
+                    canSend: store.connection == .live, queues: conversations, focus: $composing,
+                    onSend: { send(conversation.draft) }, onStop: stop)
+            }
+        }
+        .frame(maxWidth: Theme.column)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 6)
+    }
+
+    /// Settings, Memory, Usage, the key dialog and editor, and (on the
+    /// iPhone) the take-over view, over the chat. The store's notices show
+    /// from the home (DesktopSync).
     private func presentations(over content: some View) -> some View {
         content
             .sheet(isPresented: $showingSettings) {
@@ -162,6 +181,13 @@ struct ChatView: View {
                         .toolbar { Button("Done") { showingMemory = false } }
                 }
                 .macSheetSize(width: 560, height: 640)
+            }
+            .sheet(isPresented: $showingUsage) {
+                NavigationStack {
+                    UsageView(store: store, client: client)
+                        .toolbar { Button("Done") { showingUsage = false } }
+                }
+                .macSheetSize(width: 560, height: 700)
             }
             #if os(iOS)
                 .fullScreenCover(item: $takeOver) { request in
@@ -185,7 +211,7 @@ struct ChatView: View {
                 titleVisibility: .visible, presenting: foundKey
             ) { found in
                 Button("Save it on your desktop") { savingKey = .new(found) }
-                Button("Send it in the chat anyway", role: .destructive) { send(draft, checked: true) }
+                Button("Send it in the chat anyway", role: .destructive) { send(conversation.draft, checked: true) }
                 Button("Cancel", role: .cancel) {}
             } message: { _ in
                 Text("Messages go to the AI model and stay in the chat. A key saved on your desktop is given to commands by name, and the agent never sees it.")
@@ -195,48 +221,50 @@ struct ChatView: View {
                     SecretEditor(client: client, target: target) { name in
                         // The message keeps its meaning, without the key.
                         if case .new(let found?) = target {
-                            draft = draft.replacingOccurrences(of: found.value, with: "$\(name)")
+                            conversation.draft = conversation.draft.replacingOccurrences(of: found.value, with: "$\(name)")
                         }
                     }
                 }
                 .macSheetSize(height: 420)
             }
-            .alert(
-                "Agent Neo",
-                isPresented: Binding(get: { store.notice != nil }, set: { if !$0 { store.notice = nil } })
-            ) {
-                Button("OK") {}
-            } message: {
-                Text(store.notice ?? "")
-            }
+            .conversationEditing(store: store, client: client, renaming: $renaming, deleting: $deleting)
     }
 
-    /// The conversation, newest at the bottom; older pages load as the user
-    /// scrolls up to the oldest one loaded. A VStack, not a lazy one: only
-    /// the pages loaded are in it, and its exact height keeps the place when
-    /// a page goes in above (a lazy stack only estimates rows not yet shown).
+    /// The conversation, newest at the bottom, its queued messages under it;
+    /// older pages load as the user scrolls up to the oldest one loaded. A
+    /// VStack, not a lazy one: only the pages loaded are in it, and its exact
+    /// height keeps the place when a page goes in above (a lazy stack only
+    /// estimates rows not yet shown).
     private var messages: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                if store.hasOlder {
+                if conversation.hasOlder {
                     ProgressView()
                         .frame(maxWidth: .infinity)
                         .onScrollVisibilityChange(threshold: 0.01) { olderInView = $0 }
-                        .task(id: OlderPage(inView: olderInView, oldest: store.oldestLoaded)) {
-                            while olderInView, !Task.isCancelled, store.hasOlder,
-                                await !store.loadOlder(client: client)
+                        .task(id: OlderPage(inView: olderInView, oldest: conversation.oldestLoaded)) {
+                            while olderInView, !Task.isCancelled, conversation.hasOlder,
+                                await !store.loadOlder(conversation, client: client)
                             {
                                 try? await Task.sleep(for: .seconds(3))  // offline: try again while in view
                             }
                         }
                 }
-                ForEach(store.timeline.visibleItems) { item in
+                ForEach(conversation.timeline.visibleItems) { item in
                     ChatRow(item: item).equatable()
                 }
-                if store.busy {
-                    WorkingIndicator(since: store.stopping ? nil : store.timeline.workingSince)
+                if conversation.busy {
+                    WorkingIndicator(since: conversation.stopping ? nil : conversation.timeline.workingSince)
+                }
+                let queue = conversation.queue
+                ForEach(Array(queue.enumerated()), id: \.element.id) { index, message in
+                    QueuedBubble(message: message, position: queue.count > 1 ? index + 1 : nil) {
+                        Task { await store.remove(message, from: conversation.id, client: client) }
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottomTrailing)))
                 }
             }
+            .animation(.snappy(duration: 0.25), value: conversation.queue.map(\.id))
             .scrollTargetLayout()
             // A VStack is only as wide as its rows: without any (an empty
             // chat), the scroll view and the empty state over it shrank.
@@ -251,7 +279,7 @@ struct ChatView: View {
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { old, new in
             #if os(macOS)
-                let olderPage = store.oldestLoaded != oldestShown
+                let olderPage = conversation.oldestLoaded != oldestShown
             #endif
             keepPlace(old, new)
             #if os(macOS)
@@ -261,7 +289,7 @@ struct ChatView: View {
         #if os(macOS)
             // The Mac's scroll view starts at the top when the first page comes
             // after it appeared (empty): go to the end, under the splash.
-            .onChange(of: store.loaded) { _, loaded in
+            .onChange(of: conversation.loaded) { _, loaded in
                 if loaded { position.scrollTo(edge: .bottom) }
             }
         #endif
@@ -273,7 +301,7 @@ struct ChatView: View {
     /// height that went in, so what was on screen stays put. (Runs as the
     /// content's size changes, which comes before an onChange of the store.)
     private func keepPlace(_ old: ScrollGeometry, _ new: ScrollGeometry) {
-        let oldest = store.oldestLoaded
+        let oldest = conversation.oldestLoaded
         guard oldest != oldestShown else { return }
         defer { oldestShown = oldest }
         let added = new.contentSize.height - old.contentSize.height
@@ -304,14 +332,19 @@ struct ChatView: View {
     #endif
 
     /// Closes Settings and scrolls to a task's conversation (the message that
-    /// started it), loading older chat until it's there.
-    private func openConversation(_ task: String) {
+    /// started it), loading older chat until it's there. A task of another
+    /// conversation (one that's loaded) opens that one.
+    private func showTask(_ task: String) {
         showingSettings = false
         showingMemory = false
         Task {
             try? await Task.sleep(for: .milliseconds(450))  // the sheet closing
             var target = prompt(of: task)
-            while target == nil, await store.loadOlder(client: client) {
+            if target == nil, let other = store.conversation(startingTask: task), let openConversation {
+                openConversation.open(other)
+                return
+            }
+            while target == nil, await store.loadOlder(conversation, client: client) {
                 target = prompt(of: task)
             }
             if let target {
@@ -324,18 +357,24 @@ struct ChatView: View {
 
     /// The id of the row where a task started: its message, or its report.
     private func prompt(of task: String) -> String? {
-        store.timeline.itemID(startingTask: task)
+        conversation.timeline.itemID(startingTask: task)
     }
 
-    /// Where the stage banner leads.
-    private func follow(_ target: StageBanner.Target) {
-        switch target {
+    /// Where the stage banner leads. A banner about another conversation
+    /// opens it (and its card, the way a notification does).
+    private func follow(_ banner: StageBanner.Banner) {
+        if let elsewhere = banner.elsewhere {
+            if case .item(let id) = banner.target { push.pendingCardID = id }
+            push.pendingSession = elsewhere.id
+            return
+        }
+        switch banner.target {
         case .item(let id):
             withAnimation(.snappy) { position.scrollTo(id: id, anchor: .center) }
         case .task(let task):
-            openConversation(task)
+            showTask(task)
         case .lastAction:
-            let action = store.timeline.items.last { if case .action = $0 { true } else { false } }
+            let action = conversation.timeline.items.last { if case .action = $0 { true } else { false } }
             if let action { withAnimation(.snappy) { position.scrollTo(id: action.id, anchor: .center) } }
         case .memory:
             showingMemory = true
@@ -344,27 +383,79 @@ struct ChatView: View {
         }
     }
 
-    /// The newest page of the chat hasn't come yet.
-    private var loading: Bool { !store.loaded }
+    /// The desktop has conversations: the list is shown, and sending while
+    /// it works queues.
+    private var conversations: Bool { store.conversationsAvailable == true }
 
-    /// Nothing said yet on this desktop.
-    private var empty: Bool { store.loaded && store.timeline.items.isEmpty && store.connection == .live }
+    /// What agentd last said about this conversation.
+    private var listing: AgentSession? { store.session(conversation.id) }
 
-    private var offlineDetail: String? {
-        if case .offline(let reason) = store.connection { return "Still trying: \(reason)" }
-        return nil
+    /// The conversation's title.
+    private var title: String { listing?.displayTitle ?? "Conversation" }
+
+    private func title(of id: String) -> String? { store.session(id)?.displayTitle }
+
+    /// Archived: it can be read, and brought back to write in it.
+    private var archived: Bool { listing?.archived == true }
+
+    /// Nothing said yet in this conversation.
+    private var empty: Bool {
+        conversation.loaded && conversation.timeline.items.isEmpty && conversation.queue.isEmpty
+            && store.connection == .live
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .barLeading) {
-            Button("Settings", systemImage: "slider.horizontal.3") { showingSettings = true }
+        ToolbarItemGroup(placement: .barLeading) {
+            #if os(iOS)
+                // With conversations, Settings is on the list (the back button is here).
+                if !conversations { settingsButton }
+            #else
+                settingsButton
+            #endif
         }
         ToolbarItem(placement: .principal) {
-            ModelMenu(store: store, client: client, desktopName: desktopName)
+            #if os(iOS)
+                ModelMenu(
+                    store: store, client: client, desktopName: desktopName,
+                    conversationTitle: conversations ? title : nil, rename: renameAction, archive: archiveAction)
+            #else
+                ModelMenu(store: store, client: client, desktopName: desktopName)
+            #endif
         }
-        ToolbarItem(placement: .barTrailing) {
+        ToolbarItemGroup(placement: .barTrailing) {
             Button("Your desktop", systemImage: "display") { openDesktop(for: nil) }
                 .disabled(endpoint == nil)
+            #if os(iOS)
+                if conversations, let openConversation {
+                    Button("New conversation", systemImage: "square.and.pencil") { openConversation.new() }
+                }
+            #endif
+        }
+    }
+
+    /// The title menu renames or archives a listed conversation.
+    private var renameAction: (() -> Void)? {
+        guard conversations, !archived, let listing else { return nil }
+        return { renaming = listing }
+    }
+
+    private var archiveAction: (() -> Void)? {
+        guard conversations, !archived, listing != nil else { return nil }
+        return archive
+    }
+
+    private var settingsButton: some View {
+        Button("Settings", systemImage: "slider.horizontal.3") { showingSettings = true }
+    }
+
+    /// Archives it from its title menu, and goes back to the list.
+    private func archive() {
+        let id = conversation.id
+        Task {
+            await store.setArchived(true, id, client: client)
+            #if os(iOS)
+                if store.session(id)?.archived == true { dismiss() }
+            #endif
         }
     }
 
@@ -379,6 +470,16 @@ struct ChatView: View {
         #endif
     }
 
+    /// Stop drops the queued messages too: with some, it asks first.
+    private func stop() {
+        if conversation.queue.isEmpty { stopNow() } else { confirmingStop = true }
+    }
+
+    private func stopNow() {
+        let id = conversation.id
+        Task { await store.stop(id, client: client) }
+    }
+
     /// `checked`: the user chose to send a message with a key in it.
     private func send(_ text: String, checked: Bool = false) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -387,7 +488,7 @@ struct ChatView: View {
             foundKey = found
             return
         }
-        draft = ""
+        conversation.draft = ""
         sent += 1
         #if os(macOS)
             // At once: offsets seen mid-animation would read as scrolled up.
@@ -396,7 +497,8 @@ struct ChatView: View {
         #else
             withAnimation(.snappy) { position.scrollTo(edge: .bottom) }
         #endif
-        Task { await store.send(text, client: client) }
+        let id = conversation.id
+        Task { await store.send(text, to: id, client: client) }
     }
 }
 
@@ -407,86 +509,233 @@ private struct OlderPage: Equatable {
     let oldest: Int?
 }
 
+#if os(macOS)
+    /// The conversation's title in the window's toolbar, or none (the model
+    /// menu is the title).
+    private struct MacChatTitle: ViewModifier {
+        let title: String?
+
+        func body(content: Content) -> some View {
+            if let title {
+                content.navigationTitle(title)
+            } else {
+                content.toolbar(removing: .title)
+            }
+        }
+    }
+#endif
+
 // MARK: - Composer
 
 /// The floating input: a glass field that grows to six lines, with a white
-/// send button that turns into Stop while the agent works.
+/// send button that turns into Stop while the agent works. On a desktop with
+/// conversations, typing while it works brings Send back beside Stop:
+/// sending then queues the message.
 private struct Composer: View {
     @Binding var text: String
     let busy: Bool
     let stopping: Bool
     let canSend: Bool
+    /// Sending while it works queues the message (an older desktop refuses it).
+    let queues: Bool
     var focus: FocusState<Bool>.Binding
     let onSend: () -> Void
     let onStop: () -> Void
 
     private var empty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
+    /// Send shows when idle, and while it works once there's something to queue.
+    private var showsSend: Bool { !busy || (queues && !empty) }
+
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            TextField("Ask your desktop", text: $text, axis: .vertical)
+            TextField(busy && queues ? "Queue a message" : "Ask your desktop", text: $text, axis: .vertical)
                 .lineLimit(1...6)
                 .focused(focus)
                 #if os(macOS)
                     // Return sends, as in Messages (⌥Return starts a new line).
-                    .onSubmit { if !busy, canSend { onSend() } }
+                    .onSubmit { if showsSend, canSend { onSend() } }
                     .textFieldStyle(.plain)
                 #endif
                 .padding(.leading, 18)
                 .padding(.vertical, 14)
-            Group {
+            HStack(spacing: 6) {
                 if busy && stopping {
                     // Pressed: feedback at once, until the task has ended.
                     ProgressView()
                         .controlSize(.small)
-                        .tint(.black)
+                        .tint(showsSend ? .white : .black)
                         .frame(width: 38, height: 38)
-                        .background(.white, in: .circle)
+                        .background(showsSend ? Color.white.opacity(0.14) : .white, in: .circle)
                         .accessibilityLabel("Stopping")
+                        .transition(.scale.combined(with: .opacity))
                 } else if busy {
+                    // Beside Send, Stop steps back to the same circle in grey.
                     Button(action: onStop) {
                         Image(systemName: "stop.fill").font(.system(size: 14, weight: .bold))
                     }
+                    .buttonStyle(SendButtonStyle(prominent: !showsSend))
                     .accessibilityLabel("Stop")
-                } else {
+                    .transition(.scale.combined(with: .opacity))
+                }
+                if showsSend {
                     Button(action: onSend) {
                         Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold))
                     }
-                    .accessibilityLabel("Send")
+                    .buttonStyle(SendButtonStyle())
+                    .accessibilityLabel(busy ? "Queue" : "Send")
                     .disabled(empty || !canSend)
+                    .transition(.scale.combined(with: .opacity))
                 }
             }
-            .buttonStyle(SendButtonStyle())
             .padding(6)
             .animation(.snappy(duration: 0.2), value: busy)
             .animation(.snappy(duration: 0.2), value: stopping)
+            .animation(.snappy(duration: 0.2), value: showsSend)
         }
         .glass(.rect(cornerRadius: 26), interactive: true)
     }
 }
 
-/// A white circle with a black glyph, dimmed when disabled; shrinks on press.
+/// A white circle with a black glyph (or, not prominent, a grey one with a
+/// white glyph), dimmed when disabled; shrinks on press.
 private struct SendButtonStyle: ButtonStyle {
+    var prominent = true
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .foregroundStyle(.black)
+            .foregroundStyle(prominent ? .black : .white)
             .frame(width: 38, height: 38)
-            .background(.white.opacity(isEnabled ? 1 : 0.25), in: .circle)
+            .background(
+                prominent ? Color.white.opacity(isEnabled ? 1 : 0.25) : Color.white.opacity(0.14), in: .circle
+            )
+            .contentShape(.circle)
             .scaleEffect(configuration.isPressed ? 0.9 : 1)
             .animation(.snappy(duration: 0.15), value: configuration.isPressed)
+    }
+}
+
+// MARK: - Queued messages
+
+/// A message waiting its turn: grey and dashed, under the chat, with its
+/// place in line when there's more than one, and a ✕ to take it back.
+private struct QueuedBubble: View {
+    let message: QueuedMessage
+    /// 1 is next; nil when it's the only one.
+    let position: Int?
+    let remove: () -> Void
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 6) {
+            HStack(spacing: 4) {
+                Image(systemName: "clock")
+                Text(position.map { "Queued · \($0)" } ?? "Queued")
+            }
+            .font(.app(.caption).weight(.medium))
+            .foregroundStyle(.secondary)
+            .padding(.trailing, 6)
+            HStack(alignment: .top, spacing: 10) {
+                Text(message.text)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(8)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(action: remove) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .background(Color.white.opacity(0.1), in: .circle)
+                        .contentShape(.circle.inset(by: -8))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Remove from the queue")
+                .help("Remove from the queue")
+            }
+            .padding(.leading, 16)
+            .padding(.trailing, 10)
+            .padding(.vertical, 11)
+            .background(Theme.userBubble.opacity(0.4), in: .rect(cornerRadius: 22))
+            .overlay(
+                RoundedRectangle(cornerRadius: 22)
+                    .strokeBorder(Color.white.opacity(0.2), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.leading, 56)
+        .accessibilityElement(children: .combine)
+        .contextMenu {
+            Button("Copy", systemImage: "doc.on.doc") { Clipboard.copy(message.text) }
+            Button("Remove from the queue", systemImage: "xmark", role: .destructive, action: remove)
+        }
+    }
+}
+
+// MARK: - Banners and bars
+
+/// This month's budget is used up: new messages wait. Leads to Usage.
+private struct BudgetBanner: View {
+    let openUsage: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "gauge.with.dots.needle.100percent")
+                .font(.app(.title3))
+                .foregroundStyle(.yellow)
+            // Wraps at the width it gets. Not fixedSize: the Mac's split view
+            // measures the chat's minimum height at a sliver of width, where
+            // the text would stand a thousand points tall and push the
+            // composer out of the window.
+            Text("This month's budget is used up. New messages wait until you raise it.")
+                .font(.app(.subheadline).weight(.medium))
+                .lineLimit(1...4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Usage", action: openUsage)
+                .font(.app(.subheadline).weight(.semibold))
+                .glassButton()
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 8)
+        .padding(.vertical, 8)
+        .glass(.rect(cornerRadius: 22))
+        .accessibilityElement(children: .contain)
+    }
+}
+
+/// In place of the composer while the conversation is archived.
+private struct ArchivedBar: View {
+    let unarchive: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Label("Archived", systemImage: "archivebox")
+                .font(.app(.subheadline).weight(.medium))
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Unarchive", action: unarchive)
+                .font(.app(.subheadline).weight(.semibold))
+                .glassButton()
+        }
+        .padding(.leading, 18)
+        .padding(.trailing, 8)
+        .padding(.vertical, 8)
+        .glass(.capsule)
     }
 }
 
 // MARK: - Title: model and connection
 
 /// The centre of the bar, as in Grok: the model, with a menu to switch it,
-/// and a dot for the connection to the desktop.
+/// and a dot for the connection to the desktop. On the iPhone with
+/// conversations, the conversation's title above it, and the menu renames or
+/// archives it too.
 private struct ModelMenu: View {
     let store: ChatStore
     let client: AgentClient
     let desktopName: String
+    var conversationTitle: String? = nil
+    var rename: (() -> Void)? = nil
+    var archive: (() -> Void)? = nil
 
     var body: some View {
         #if os(macOS)
@@ -504,6 +753,32 @@ private struct ModelMenu: View {
             Menu {
                 items
             } label: {
+                label
+                    .padding(.horizontal, 4)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(conversationTitle.map { "\($0), model and connection" } ?? "Model and connection")
+        #endif
+    }
+
+    #if os(iOS)
+        @ViewBuilder private var label: some View {
+            if let conversationTitle {
+                VStack(spacing: 1) {
+                    Text(conversationTitle)
+                        .font(.app(.headline))
+                        .lineLimit(1)
+                    HStack(spacing: 4) {
+                        Circle().fill(dotColor).frame(width: 6, height: 6)
+                        Text(title).lineLimit(1)
+                        Image(systemName: "chevron.down").font(.app(.caption2).weight(.bold))
+                    }
+                    .font(.app(.caption))
+                    .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: 220)
+            } else {
                 HStack(spacing: 6) {
                     Circle().fill(dotColor).frame(width: 7, height: 7)
                     Text(title)
@@ -511,19 +786,21 @@ private struct ModelMenu: View {
                         .lineLimit(1)
                     Image(systemName: "chevron.down").font(.app(.caption2).weight(.bold)).foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 4)
-                .contentShape(.rect)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Model and connection")
-        #endif
-    }
+        }
+    #endif
 
     private var title: String {
         store.status.map { shortName($0.settings.model) } ?? desktopName
     }
 
     @ViewBuilder private var items: some View {
+        if rename != nil || archive != nil {
+            Section {
+                if let rename { Button("Rename…", systemImage: "pencil", action: rename) }
+                if let archive { Button("Archive", systemImage: "archivebox", action: archive) }
+            }
+        }
         if let status = store.status {
             Picker("Model", selection: modelBinding(status)) {
                 ForEach(status.knownModels, id: \.self) { Text(shortName($0)).tag($0) }
@@ -580,9 +857,8 @@ private struct ModelMenu: View {
 
 // MARK: - Working
 
-/// Three dots that pulse while the agent works: all the chat shows of it.
-/// Three dots while the agent works, and how long it has been at it
-/// ("Working · 24 min", from a minute on).
+/// Three dots that pulse while the agent works, and how long it has been at
+/// it ("Working · 24 min", from a minute on): all the chat shows of it.
 private struct WorkingIndicator: View {
     /// When the running task started (nil while stopping, or unknown).
     let since: Date?
@@ -671,6 +947,7 @@ private struct Suggestions: View {
 /// What the desktop needs from the user, from agentd's `stage`: a slim banner
 /// over the chat that leads to the card, the conversation or the memories.
 /// Nothing shows while it's idle, working or only has a schedule coming.
+/// About another conversation, it names that one and opens it.
 private struct StageBanner: View {
     enum Target: Equatable {
         case item(String)
@@ -685,6 +962,13 @@ private struct StageBanner: View {
         let icon: String
         let tint: Color
         let target: Target
+        /// The conversation it's about, when it isn't the one on screen.
+        var elsewhere: Elsewhere?
+    }
+
+    struct Elsewhere: Equatable {
+        let id: String
+        let title: String
     }
 
     let banner: Banner
@@ -694,7 +978,15 @@ private struct StageBanner: View {
         Button(action: tap) {
             HStack(spacing: 8) {
                 Image(systemName: banner.icon).foregroundStyle(banner.tint)
-                Text(banner.text).font(.app(.subheadline).weight(.medium)).lineLimit(1)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(banner.text).font(.app(.subheadline).weight(.medium)).lineLimit(1)
+                    if let elsewhere = banner.elsewhere {
+                        Text("In “\(elsewhere.title)”")
+                            .font(.app(.caption))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
                 Spacer(minLength: 4)
                 Image(systemName: "chevron.right").font(.app(.caption).weight(.bold)).foregroundStyle(.secondary)
             }
@@ -704,6 +996,15 @@ private struct StageBanner: View {
         }
         .buttonStyle(.plain)
         .glass(.capsule, interactive: true)
+    }
+
+    /// `here`: the conversation on screen; `title`: another one's title.
+    static func `for`(_ status: AgentStatus?, here: String, title: (String) -> String?) -> Banner? {
+        guard var banner = self.for(status) else { return nil }
+        if let session = status?.stageDetail?["session"]?.string, session != here {
+            banner.elsewhere = Elsewhere(id: session, title: title(session) ?? "another conversation")
+        }
+        return banner
     }
 
     static func `for`(_ status: AgentStatus?) -> Banner? {

@@ -1,8 +1,9 @@
-// The chat: only the conversation, scheduled runs as reports, the cards
-// waiting for the person, and a task's plan as a checklist. Three dots while
-// the agent works, with how long it has been at it; nothing else of what it
-// does. Opens at its end; older pages load as the person scrolls up, without
-// moving what's on screen.
+// The chat: one conversation, scheduled runs as reports, the cards waiting
+// for the person, and a task's plan as a checklist. Three dots while the agent
+// works, with how long it has been at it; nothing else of what it does; then
+// the messages queued behind it. Opens at its end; older pages load as the
+// person scrolls up, without moving what's on screen. Another conversation
+// starts over, at its end.
 
 import { findKey } from "./keys.js";
 import { parse, render, safeHref } from "./markdown.js";
@@ -12,12 +13,17 @@ import { duration, rowKey, workingFor } from "./timeline.js";
 export function mountChat(store, view, { openDesktop, openKeys }) {
   const scroll = view.querySelector(".chat-scroll");
   const list = view.querySelector(".rows");
+  const queue = view.querySelector(".queue");
   const older = view.querySelector(".older");
   const working = view.querySelector(".working");
   const workingTime = view.querySelector(".working-time");
   const empty = view.querySelector(".empty");
+  const splash = view.querySelector(".splash");
   const rows = new Map(); // row key → {sig, node}
+  let queueSig = "";
+  let shown = null; // the conversation on screen
   let revealed = false;
+  let splashTimer;
   // At the end of the chat: new rows, and rows that grow (a picture, the
   // fonts), keep it there. Scrolled up to read, it stays put.
   let pinned = true;
@@ -36,9 +42,25 @@ export function mountChat(store, view, { openDesktop, openKeys }) {
     renderRows();
   });
 
+  /** Another conversation: its rows from scratch, opening at its end once it's loaded. */
+  function switchTo(id) {
+    shown = id;
+    for (const entry of rows.values()) entry.node.remove();
+    rows.clear();
+    queue.replaceChildren();
+    queueSig = "";
+    revealed = false;
+    pinned = true;
+    clearTimeout(splashTimer);
+    splash.hidden = false;
+    view.classList.remove("is-ready");
+  }
+
   function renderRows() {
+    if (store.currentId !== shown) switchTo(store.currentId);
     if (!store.loaded || !fontsReady) return;
     const items = store.timeline.visible();
+    const queued = store.queue();
     const stick = !revealed || pinned;
     // The first row on screen keeps its place when rows go in above it.
     const top = scroll.getBoundingClientRect().top;
@@ -67,9 +89,11 @@ export function mountChat(store, view, { openDesktop, openKeys }) {
       }
     }
 
+    renderQueue(queued);
     working.hidden = !store.busy;
     updateWorking();
-    empty.hidden = items.length > 0 || store.busy;
+    // Suggestions only where they can be sent: not in an archived conversation.
+    empty.hidden = items.length > 0 || queued.length > 0 || store.busy || store.currentSession?.archived === true;
     older.hidden = !store.hasOlder;
 
     // An empty chat holds the suggestions: it reads from its top.
@@ -79,9 +103,18 @@ export function mountChat(store, view, { openDesktop, openKeys }) {
     if (!revealed) {
       revealed = true;
       view.classList.add("is-ready"); // only the splash fades; the chat is already at its end
-      setTimeout(() => (view.querySelector(".splash").hidden = true), 300);
+      splashTimer = setTimeout(() => (splash.hidden = true), 300);
       checkOlder();
     }
+  }
+
+  /** The queued messages, after the dots: each waits its turn, and its ✕ takes it back. */
+  function renderQueue(queued) {
+    const sig = JSON.stringify(queued);
+    if (sig === queueSig) return;
+    queueSig = sig;
+    queue.replaceChildren(...queued.map((item) => queuedRow(item, store)));
+    queue.hidden = !queued.length;
   }
 
   // Older pages: when the top of the chat comes into view.
@@ -112,9 +145,11 @@ export function mountChat(store, view, { openDesktop, openKeys }) {
   }, 30_000);
 
   scroll.addEventListener("scroll", () => (pinned = nearBottom()), { passive: true });
-  new ResizeObserver(() => {
-    if (pinned && revealed && list.children.length) scroll.scrollTop = scroll.scrollHeight;
-  }).observe(list);
+  const keepAtEnd = new ResizeObserver(() => {
+    if (pinned && revealed && (list.children.length || queue.children.length)) scroll.scrollTop = scroll.scrollHeight;
+  });
+  keepAtEnd.observe(list);
+  keepAtEnd.observe(queue);
 
   store.subscribe(renderRows);
   mountComposer(store, view, {
@@ -158,6 +193,17 @@ function renderRow(item, ctx) {
     default:
       return h("li", { class: "row" });
   }
+}
+
+/** A message waiting its turn: grey, with its place when there's more than one. */
+function queuedRow(item, store) {
+  const remove = h("button", { class: "queued-remove", type: "button", "aria-label": "Remove this queued message", title: "Remove" }, icon("close"));
+  remove.addEventListener("click", () => busyButton(remove, () => store.unqueue(item)));
+  const place = item.of > 1 ? `Queued · ${item.position} of ${item.of}` : "Queued";
+  return h("li", { class: "row row-user row-queued", dataset: { key: `queued-${item.id}` } },
+    h("div", { class: "queued" },
+      h("div", { class: "bubble" }, item.text),
+      h("p", { class: "queued-meta" }, icon("clock"), h("span", null, place), remove)));
 }
 
 function answer(text, className = "answer md") {
@@ -452,17 +498,30 @@ function actionCard(card, ctx) {
 
 // --- Composer ----------------------------------------------------------------------
 
+// It stays on while the agent works: a message sent then waits its turn (on a
+// desktop from before queued messages, which refuses it, Send waits instead).
+// Stop has a button of its own. Each conversation keeps its own draft.
 function mountComposer(store, view, { openKeys, onSent }) {
   const form = view.querySelector(".composer");
   const input = form.querySelector("textarea");
   const send = form.querySelector(".send");
+  const stop = form.querySelector(".stop");
   const model = form.querySelector(".model");
   const keyNote = form.querySelector(".key-note");
+  const budgetNote = form.querySelector(".budget-note");
+  const archivedNote = form.querySelector(".archived-note");
+  const box = form.querySelector(".box");
   let allowKey = null; // the key the person chose to send anyway
+  const drafts = new Map(); // conversation → what was typed there
+  let draftFor = store.currentId;
+
+  send.replaceChildren(icon("send"));
+  stop.replaceChildren(icon("stop"));
 
   function autosize() {
     input.style.height = "auto";
-    input.style.height = `${Math.min(input.scrollHeight, 220)}px`;
+    // Not on screen (another page is), it has no height to measure: left as one line.
+    if (input.scrollHeight) input.style.height = `${Math.min(input.scrollHeight, 220)}px`;
   }
 
   function showKeyNote() {
@@ -487,13 +546,38 @@ function mountComposer(store, view, { openKeys, onSent }) {
       save, anyway);
   }
 
+  /** Another conversation on screen: its draft back in the box. */
+  function swapDraft() {
+    if (store.currentId === draftFor) return;
+    drafts.set(draftFor, input.value);
+    draftFor = store.currentId;
+    input.value = drafts.get(draftFor) || "";
+    allowKey = null;
+    autosize();
+    showKeyNote();
+  }
+
   function update() {
+    swapDraft();
     const busy = store.busy;
     const offline = store.connection !== "live";
-    send.replaceChildren(icon(busy ? "stop" : "send"));
-    send.setAttribute("aria-label", busy ? (store.stopping ? "Stopping" : "Stop") : "Send");
-    send.classList.toggle("is-stop", busy);
-    send.disabled = offline || store.stopping || (!busy && !input.value.trim());
+    const older = store.sessionsSupported === false;
+    const queued = store.queue().length;
+    // Sent while it works, a message queues (an older desktop would refuse it).
+    send.hidden = busy && (older || !input.value.trim());
+    send.disabled = offline || !input.value.trim();
+    stop.hidden = !busy;
+    stop.classList.toggle("is-alone", send.hidden);
+    stop.disabled = offline || store.stopping;
+    const label = store.stopping ? "Stopping" : queued ? `Stop, and drop ${queuedWords(queued)}` : "Stop";
+    stop.setAttribute("aria-label", label);
+    stop.title = label;
+    input.placeholder = busy && !older ? "Queue a message for after this" : "Ask your agent";
+    // An archived conversation takes no messages until it's back in the list.
+    const archived = store.currentSession?.archived === true;
+    archivedNote.hidden = !archived;
+    box.hidden = archived;
+    budgetNote.hidden = store.status?.budget?.paused !== true || archived;
     const status = store.status;
     if (status && document.activeElement !== model) {
       const current = status.settings?.model || "";
@@ -508,20 +592,19 @@ function mountComposer(store, view, { openKeys, onSent }) {
   }
 
   async function submit() {
-    if (store.busy) {
-      await store.stop();
-      return;
-    }
     const text = input.value.trim();
-    if (!text || store.connection !== "live") return;
+    if (!text || store.connection !== "live" || send.hidden) return;
     const found = findKey(text);
     if (found && found.value !== allowKey) {
       showKeyNote();
       return;
     }
     send.disabled = true;
+    const to = store.currentId;
     if (await store.send(text)) {
-      input.value = "";
+      // Switched away meanwhile: that conversation's draft was this message.
+      if (store.currentId === to) input.value = "";
+      else drafts.set(to, "");
       allowKey = null;
       autosize();
       onSent();
@@ -529,6 +612,11 @@ function mountComposer(store, view, { openKeys, onSent }) {
     update();
   }
 
+  stop.addEventListener("click", async () => {
+    const queued = store.queue().length;
+    if (queued && !confirm(`Stop the task? It also drops ${queuedWords(queued)}.`)) return;
+    await store.stop();
+  });
   input.addEventListener("input", () => {
     autosize();
     showKeyNote();
@@ -544,6 +632,9 @@ function mountComposer(store, view, { openKeys, onSent }) {
     event.preventDefault();
     submit();
   });
+  const unarchive = archivedNote.querySelector("button");
+  unarchive.addEventListener("click", () =>
+    busyButton(unarchive, () => store.updateSession(store.currentId, { archived: false })));
   model.addEventListener("change", async () => {
     if (!store.status?.settings) return;
     try {
@@ -555,4 +646,8 @@ function mountComposer(store, view, { openKeys, onSent }) {
   });
   store.subscribe(update);
   update();
+}
+
+function queuedWords(count) {
+  return count === 1 ? "the queued message" : `the ${count} queued messages`;
 }

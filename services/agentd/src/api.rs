@@ -22,7 +22,8 @@ use crate::clock::UserClock;
 use crate::llm::KNOWN_MODELS;
 use crate::memory;
 use crate::schedule;
-use crate::store::Event;
+use crate::sessions::{PostError, SessionError};
+use crate::store::{Event, MAIN};
 
 type App = State<Arc<Agent>>;
 
@@ -35,6 +36,18 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/approvals/{id}", post(answer_approval))
         .route("/api/v1/actions/{id}", post(resolve_action))
         .route("/api/v1/stop", post(stop))
+        .route("/api/v1/sessions", get(list_sessions).post(create_session))
+        .route(
+            "/api/v1/sessions/{id}",
+            get(get_session).patch(update_session).delete(delete_session),
+        )
+        .route(
+            "/api/v1/sessions/{id}/messages",
+            get(session_messages).post(post_session_message),
+        )
+        .route("/api/v1/sessions/{id}/queue/{qid}", delete(unqueue))
+        .route("/api/v1/sessions/{id}/stop", post(stop_session))
+        .route("/api/v1/usage", get(usage))
         .route("/api/v1/images/{id}", get(image))
         .route("/api/v1/settings", get(settings).put(put_settings))
         .route("/api/v1/settings/auto-approve", put(set_auto_approve))
@@ -79,50 +92,64 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error": message}))).into_response()
 }
 
-/// What `stage` is worked out from.
+/// What `stage` is worked out from, across every conversation.
 #[derive(Default)]
 pub struct StageFacts {
-    /// Parked approvals: (id, card kind).
-    pub cards: Vec<(String, String)>,
-    /// The latest task: (id, status).
-    pub latest: Option<(String, String)>,
-    pub busy: bool,
+    /// Parked approvals: (id, card kind, conversation).
+    pub cards: Vec<(String, String, String)>,
+    /// Open Action needed cards, each its conversation's latest task's:
+    /// (run, conversation).
+    pub actions: Vec<(String, String)>,
+    /// The latest task: (id, status, conversation).
+    pub latest: Option<(String, String, String)>,
+    /// The conversations working: (conversation, task).
+    pub working: Vec<(String, String)>,
     pub failing_effects: usize,
     /// The next schedule due within a day: (id, name, next_run).
     pub next_schedule: Option<(i64, String, i64)>,
 }
 
 /// One word for what the desktop needs, from the first matching row
-/// (docs/memory-v2.md §12), and the ids behind it so the app can deep-link.
+/// (docs/memory-v2.md §12), and the ids behind it (with the conversation)
+/// so the app can deep-link.
 pub fn stage_of(facts: &StageFacts) -> (&'static str, Value) {
     let card = |kinds: &[&str]| {
         facts
             .cards
             .iter()
-            .find(|(_, kind)| kinds.contains(&kind.as_str()))
+            .find(|(_, kind, _)| kinds.contains(&kind.as_str()))
     };
     let latest_is = |statuses: &[&str]| {
         facts
             .latest
             .as_ref()
-            .filter(|(_, status)| statuses.contains(&status.as_str()))
+            .filter(|(_, status, _)| statuses.contains(&status.as_str()))
     };
     // Every card that waits for an OK: a command, the browser, a schedule, a
     // site to allow, or a task that looks stuck.
-    if let Some((id, kind)) = card(&["shell", "browser", "schedule", "access", "stuck"]) {
-        return ("needs_you/approval", json!({"card": id, "kind": kind}));
+    if let Some((id, kind, session)) = card(&["shell", "browser", "schedule", "access", "stuck"]) {
+        return (
+            "needs_you/approval",
+            json!({"card": id, "kind": kind, "session": session}),
+        );
     }
-    if let Some((id, _)) = card(&["secret"]) {
-        return ("needs_you/secret", json!({"card": id}));
+    if let Some((id, _, session)) = card(&["secret"]) {
+        return ("needs_you/secret", json!({"card": id, "session": session}));
     }
-    if let Some((run, _)) = latest_is(&["needs_user"]) {
-        return ("needs_you/action", json!({"run": run}));
+    if let Some((run, session)) = facts.actions.first() {
+        return ("needs_you/action", json!({"run": run, "session": session}));
     }
-    if facts.busy {
-        return ("working", json!({"run": facts.latest.as_ref().map(|(id, _)| id)}));
+    if let Some((run, _, session)) = latest_is(&["needs_user"]) {
+        return ("needs_you/action", json!({"run": run, "session": session}));
     }
-    if let Some((run, status)) = latest_is(&["error", "interrupted", "stuck", "max_steps"]) {
-        return ("problem", json!({"run": run, "status": status}));
+    if let Some((session, run)) = facts.working.first() {
+        return ("working", json!({"run": run, "session": session}));
+    }
+    if let Some((run, status, session)) = latest_is(&["error", "interrupted", "stuck", "max_steps"]) {
+        return (
+            "problem",
+            json!({"run": run, "status": status, "session": session}),
+        );
     }
     if facts.failing_effects > 0 {
         return ("problem", json!({"failing_effects": facts.failing_effects}));
@@ -148,8 +175,9 @@ fn stage(agent: &Agent, failing_effects: usize) -> (&'static str, Value) {
         .map(|s| (s.id, s.name, s.next_run));
     stage_of(&StageFacts {
         cards: agent.store.parked_cards().unwrap_or_default(),
+        actions: agent.store.open_actions().unwrap_or_default(),
         latest: agent.store.latest_task().ok().flatten(),
-        busy: agent.is_busy(),
+        working: agent.working(),
         failing_effects,
         next_schedule,
     })
@@ -165,8 +193,12 @@ async fn status(State(agent): App) -> Json<Value> {
         .collect();
     Json(json!({
         "desktop": agent.cfg.desktop_name,
-        // The chat's task is running (scheduled runs go beside it: background).
+        // `main` is working, for older apps (scheduled runs go beside the
+        // conversations: background).
         "busy": agent.is_busy(),
+        // How many conversations work and wait, and how many messages wait.
+        "sessions": agent.sessions_status(),
+        "budget": agent.budget().json(),
         "background": {
             "running": agent.background_run().map(|(task, schedule)| json!({"task": task, "schedule": schedule})),
             "queued": agent.store.queued_count().unwrap_or(0),
@@ -194,8 +226,14 @@ struct Limit {
     limit: Option<i64>,
 }
 
+/// `main`'s history (older apps).
 async fn messages(State(agent): App, Query(query): Query<Limit>) -> Response {
-    match agent.store.history(query.limit.unwrap_or(50).clamp(1, 500)) {
+    history(&agent, MAIN, query.limit)
+}
+
+/// A conversation's history, with saved keys redacted.
+fn history(agent: &Agent, session: &str, limit: Option<i64>) -> Response {
+    match agent.store.history_in(session, limit.unwrap_or(50).clamp(1, 500)) {
         Ok(mut history) => {
             for entry in &mut history {
                 entry.text = agent.secrets.redact(&entry.text).into_owned();
@@ -217,7 +255,14 @@ struct NewMessage {
     utc_offset: Option<i64>,
 }
 
+/// A message for `main` (older apps): as `POST /sessions/main/messages`.
 async fn post_message(State(agent): App, headers: HeaderMap, Json(body): Json<NewMessage>) -> Response {
+    post_to(&agent, MAIN, &headers, body)
+}
+
+/// A message for a conversation: 202 `{task}` when it starts, or 202
+/// `{queued: {id, position}}` when it waits its turn.
+fn post_to(agent: &Arc<Agent>, session: &str, headers: &HeaderMap, body: NewMessage) -> Response {
     let text = body.text.trim().to_string();
     if text.is_empty() {
         return error(StatusCode::BAD_REQUEST, "text is empty");
@@ -227,9 +272,13 @@ async fn post_message(State(agent): App, headers: HeaderMap, Json(body): Json<Ne
     {
         agent.set_user_clock(&clock);
     }
-    match agent.start(text, caller(&headers)) {
-        Ok(task) => (StatusCode::ACCEPTED, Json(json!({"task": task}))).into_response(),
-        Err(_) => error(StatusCode::CONFLICT, "busy with another request; stop it first"),
+    match agent.post(session, text, caller(headers)) {
+        Ok(posted) => (StatusCode::ACCEPTED, Json(posted.json())).into_response(),
+        Err(PostError::NotFound) => error(
+            StatusCode::NOT_FOUND,
+            "no such conversation (it may be archived or deleted)",
+        ),
+        Err(PostError::Failed(err)) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
     }
 }
 
@@ -238,6 +287,8 @@ struct After {
     after: Option<i64>,
     /// Comma-separated event kinds; all when absent.
     kinds: Option<String>,
+    /// Only this conversation's events, and the global ones.
+    session: Option<String>,
 }
 
 /// `a,b,c` → the kinds asked for (at most 64; none means all).
@@ -257,11 +308,12 @@ async fn events(
     State(agent): App,
     Query(query): Query<After>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let cursor = EventCursor::new(
+    let mut cursor = EventCursor::new(
         agent.clone(),
         query.after.unwrap_or(0),
         kinds(query.kinds.as_deref()),
     );
+    cursor.session = query.session.filter(|s| !s.is_empty());
     // Older events may hold a key pasted into the chat before it was saved.
     let stream = futures_util::stream::unfold(cursor, |mut cursor| async {
         let event = cursor.next().await?;
@@ -283,6 +335,8 @@ struct EventCursor {
     live: tokio::sync::broadcast::Receiver<Event>,
     after: i64,
     kinds: Vec<String>,
+    /// Only this conversation's events and the global ones; all when None.
+    session: Option<String>,
     batch: VecDeque<Event>,
 }
 
@@ -294,15 +348,21 @@ impl EventCursor {
             live,
             after,
             kinds,
+            session: None,
             batch: VecDeque::new(),
         }
+    }
+
+    fn wanted(&self, event: &Event) -> bool {
+        (self.kinds.is_empty() || self.kinds.contains(&event.kind))
+            && (self.session.is_none() || event.session.is_none() || event.session == self.session)
     }
 
     async fn next(&mut self) -> Option<Event> {
         loop {
             while let Some(event) = self.batch.pop_front() {
                 self.after = event.seq;
-                if self.kinds.is_empty() || self.kinds.contains(&event.kind) {
+                if self.wanted(&event) {
                     return Some(event);
                 }
             }
@@ -333,6 +393,8 @@ struct PageQuery {
     before: Option<i64>,
     limit: Option<i64>,
     kinds: Option<String>,
+    /// One conversation's events and the global ones; everything without.
+    session: Option<String>,
 }
 
 /// The chat a page at a time: the apps load the newest page, then older ones
@@ -340,7 +402,8 @@ struct PageQuery {
 async fn events_page(State(agent): App, Query(query): Query<PageQuery>) -> Response {
     let kinds = kinds(query.kinds.as_deref());
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    match agent.store.events_page(query.before, limit, &kinds) {
+    let session = query.session.as_deref().filter(|s| !s.is_empty());
+    match agent.store.events_page_in(query.before, limit, &kinds, session) {
         Ok(mut page) => {
             // Older events may hold a key pasted into the chat before it was saved.
             for event in &mut page.events {
@@ -377,7 +440,11 @@ async fn answer_approval(
             StatusCode::NOT_FOUND,
             "no pending approval with that id (it may have expired)",
         ),
-        Err(StartError::Busy) => error(StatusCode::CONFLICT, "busy with another request; stop it first"),
+        // Only when another card of the same conversation was just answered.
+        Err(StartError::Busy) => error(
+            StatusCode::CONFLICT,
+            "another card of this conversation was just answered; try again when it's done",
+        ),
     }
 }
 
@@ -397,15 +464,141 @@ async fn resolve_action(
         "skip" => false,
         _ => return error(StatusCode::BAD_REQUEST, "choice must be done or skip"),
     };
+    // Starts the resume in the card's conversation, or queues it.
     match agent.resolve_action(&id, done, caller(&headers)) {
-        Ok(task) => (StatusCode::ACCEPTED, Json(json!({"task": task}))).into_response(),
-        Err(StartError::NotFound) => error(StatusCode::NOT_FOUND, "no pending action with that id"),
-        Err(StartError::Busy) => error(StatusCode::CONFLICT, "busy with another request; stop it first"),
+        Ok(posted) => (StatusCode::ACCEPTED, Json(posted.json())).into_response(),
+        Err(_) => error(StatusCode::NOT_FOUND, "no pending action with that id"),
     }
 }
 
+/// `main`'s Stop (older apps): `stopping` as before, with `stopped` and
+/// `dropped` (queued messages) beside it.
 async fn stop(State(agent): App) -> Json<Value> {
-    Json(json!({"stopping": agent.stop()}))
+    let (stopped, dropped) = agent.stop(MAIN);
+    Json(json!({"stopping": stopped, "stopped": stopped, "dropped": dropped}))
+}
+
+#[derive(Deserialize)]
+struct ArchivedQuery {
+    /// `1`: the archived conversations instead.
+    archived: Option<String>,
+}
+
+/// The conversations, most recently updated first, and how many may work
+/// at once.
+async fn list_sessions(State(agent): App, Query(query): Query<ArchivedQuery>) -> Response {
+    let archived = matches!(query.archived.as_deref(), Some("1" | "true"));
+    match agent.sessions_view(archived) {
+        Ok(sessions) => {
+            Json(json!({"sessions": sessions, "running_limit": agent.cfg.max_parallel_tasks})).into_response()
+        }
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct NewSession {
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// "New conversation": an empty one.
+async fn create_session(State(agent): App, body: Option<Json<NewSession>>) -> Response {
+    let title = body.and_then(|Json(body)| body.title);
+    match agent.create_session(title.as_deref()) {
+        Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
+}
+
+async fn get_session(State(agent): App, Path(id): Path<String>) -> Response {
+    match agent.session_view(&id) {
+        Some(session) => Json(session).into_response(),
+        None => error(StatusCode::NOT_FOUND, "no such conversation"),
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionChange {
+    title: Option<String>,
+    archived: Option<bool>,
+}
+
+fn session_error(err: SessionError) -> Response {
+    match err {
+        SessionError::NotFound => error(StatusCode::NOT_FOUND, "no such conversation"),
+        SessionError::Conflict(why) => error(StatusCode::CONFLICT, why),
+        SessionError::Failed(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
+}
+
+/// Renames, archives or brings back a conversation.
+async fn update_session(
+    State(agent): App,
+    Path(id): Path<String>,
+    Json(body): Json<SessionChange>,
+) -> Response {
+    match agent.update_session(&id, body.title.as_deref(), body.archived) {
+        Ok(session) => Json(session).into_response(),
+        Err(err) => session_error(err),
+    }
+}
+
+async fn delete_session(State(agent): App, Path(id): Path<String>) -> Response {
+    match agent.delete_session(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => session_error(err),
+    }
+}
+
+async fn session_messages(State(agent): App, Path(id): Path<String>, Query(query): Query<Limit>) -> Response {
+    if agent.session_view(&id).is_none() {
+        return error(StatusCode::NOT_FOUND, "no such conversation");
+    }
+    history(&agent, &id, query.limit)
+}
+
+async fn post_session_message(
+    State(agent): App,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<NewMessage>,
+) -> Response {
+    post_to(&agent, &id, &headers, body)
+}
+
+/// The ✕ on a queued message.
+async fn unqueue(State(agent): App, Path((id, qid)): Path<(String, String)>) -> Response {
+    match agent.unqueue(&id, &qid) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error(
+            StatusCode::NOT_FOUND,
+            "no such queued message (it may have started)",
+        ),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
+}
+
+/// A conversation's Stop: its task, or the card it waits on, and its queue.
+async fn stop_session(State(agent): App, Path(id): Path<String>) -> Response {
+    if agent.session_view(&id).is_none() {
+        return error(StatusCode::NOT_FOUND, "no such conversation");
+    }
+    let (stopped, dropped) = agent.stop(&id);
+    Json(json!({"stopped": stopped, "dropped": dropped})).into_response()
+}
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    days: Option<i64>,
+}
+
+/// What the model has cost (estimates from token counts), and the budget.
+async fn usage(State(agent): App, Query(query): Query<UsageQuery>) -> Response {
+    match agent.usage(query.days.unwrap_or(30)) {
+        Ok(usage) => Json(usage).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
+    }
 }
 
 #[derive(Deserialize)]
@@ -611,8 +804,10 @@ struct MemoryEdit {
 }
 
 /// Tells a missing field (None) from an explicit null (Some(None)).
-fn double_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
-    Option::<String>::deserialize(d).map(Some)
+fn double_option<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
 }
 
 /// A user's edit: 409 with the current memory when it changed meanwhile.
@@ -1032,9 +1227,19 @@ struct SettingsUpdate {
     memory_consolidation: Option<String>,
     memory_consolidation_model: Option<String>,
     memory_consolidation_daily_cap_usd: Option<f64>,
+    /// A number sets the monthly budget; null removes it.
+    #[serde(default, deserialize_with = "double_option")]
+    monthly_budget_usd: Option<Option<f64>>,
 }
 
 async fn put_settings(State(agent): App, headers: HeaderMap, Json(body): Json<SettingsUpdate>) -> Response {
+    if let Some(budget) = body.monthly_budget_usd {
+        match agent.set_budget(budget) {
+            Ok(Err(problem)) => return error(StatusCode::BAD_REQUEST, &problem),
+            Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+            Ok(Ok(_)) => {}
+        }
+    }
     // Older clients sent the entire settings object. Their explicit turn-off
     // gesture still works. No generic update can turn Auto approve on. When
     // it's already off, nothing changes: the version a newer app holds for
@@ -1066,7 +1271,7 @@ async fn put_settings(State(agent): App, headers: HeaderMap, Json(body): Json<Se
             Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
     }
-    if !has_memory && body.auto_approve == Some(true) {
+    if !has_memory && body.monthly_budget_usd.is_none() && body.auto_approve == Some(true) {
         return error(
             StatusCode::CONFLICT,
             "Use the Auto approve confirmation endpoint to turn it on",
@@ -1271,6 +1476,161 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    async fn body(reply: Response) -> Value {
+        let bytes = axum::body::to_bytes(reply.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    fn message(text: &str) -> Json<NewMessage> {
+        Json(serde_json::from_value(json!({"text": text})).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_message_for_a_busy_conversation_is_queued_not_refused() {
+        let (agent, dir) = crate::agent::test_agent();
+        // `main` waits on a card.
+        agent
+            .store
+            .start_run("t1", "do it", None, "m", &agent.policy_version(), None)
+            .unwrap();
+        agent
+            .store
+            .park(
+                "a1",
+                "t1",
+                &json!({"kind": "shell", "command": "ls"}),
+                "{}",
+                &agent.policy_version(),
+            )
+            .unwrap();
+        let reply = post_message(State(agent.clone()), HeaderMap::new(), message("next")).await;
+        assert_eq!(reply.status(), StatusCode::ACCEPTED);
+        assert_eq!(body(reply).await["queued"]["position"], 1);
+        let reply = post_session_message(
+            State(agent.clone()),
+            Path(MAIN.into()),
+            HeaderMap::new(),
+            message("and this"),
+        )
+        .await;
+        assert_eq!(reply.status(), StatusCode::ACCEPTED);
+        let queued = body(reply).await;
+        assert_eq!(queued["queued"]["position"], 2);
+        let unknown = post_session_message(
+            State(agent.clone()),
+            Path("nope".into()),
+            HeaderMap::new(),
+            message("hi"),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let empty = post_message(State(agent.clone()), HeaderMap::new(), message("  ")).await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        // The ✕ on one, then Stop: the old shape, plus what was dropped.
+        let id = queued["queued"]["id"].as_str().unwrap().to_string();
+        let removed = unqueue(State(agent.clone()), Path((MAIN.into(), id.clone()))).await;
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+        let again = unqueue(State(agent.clone()), Path((MAIN.into(), id))).await;
+        assert_eq!(again.status(), StatusCode::NOT_FOUND);
+        let Json(stopped) = stop(State(agent.clone())).await;
+        assert_eq!(stopped, json!({"stopping": true, "stopped": true, "dropped": 1}));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn conversations_usage_and_the_budget_through_the_api() {
+        let (agent, dir) = crate::agent::test_agent();
+        let made = create_session(State(agent.clone()), None).await;
+        assert_eq!(made.status(), StatusCode::CREATED);
+        let id = body(made).await["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            get_session(State(agent.clone()), Path(id.clone())).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_session(State(agent.clone()), Path("nope".into()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let change = SessionChange {
+            title: Some("Lisbon".into()),
+            archived: None,
+        };
+        let renamed = update_session(State(agent.clone()), Path(id.clone()), Json(change)).await;
+        assert_eq!(body(renamed).await["title"], "Lisbon");
+        let listed =
+            body(list_sessions(State(agent.clone()), Query(ArchivedQuery { archived: None })).await).await;
+        assert_eq!(listed["running_limit"], 3);
+        assert_eq!(listed["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            listed["sessions"][0]["id"],
+            id.as_str(),
+            "most recently updated first"
+        );
+        let stopped = body(stop_session(State(agent.clone()), Path(id.clone())).await).await;
+        assert_eq!(stopped, json!({"stopped": false, "dropped": 0}));
+        assert_eq!(
+            delete_session(State(agent.clone()), Path(MAIN.into()))
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            delete_session(State(agent.clone()), Path(id.clone()))
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            delete_session(State(agent.clone()), Path(id.clone()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        for gone in [
+            session_messages(
+                State(agent.clone()),
+                Path(id.clone()),
+                Query(Limit { limit: None }),
+            )
+            .await,
+            stop_session(State(agent.clone()), Path(id.clone())).await,
+        ] {
+            assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        }
+        // Usage, a week of it.
+        let usage = body(usage(State(agent.clone()), Query(UsageQuery { days: Some(7) })).await).await;
+        assert_eq!(usage["daily"].as_array().unwrap().len(), 7);
+        assert_eq!(usage["currency"], "USD");
+        // The budget: a positive number up to 100,000, or null to remove it.
+        let set = |value: Value| {
+            let settings = serde_json::from_value(json!({"monthly_budget_usd": value})).unwrap();
+            put_settings(State(agent.clone()), HeaderMap::new(), Json(settings))
+        };
+        for bad in [json!(-1), json!(0), json!(100_001)] {
+            assert_eq!(set(bad.clone()).await.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert_eq!(body(set(json!(50)).await).await["monthly_budget_usd"], 50.0);
+        let Json(status) = status(State(agent.clone())).await;
+        assert_eq!(status["budget"]["monthly_usd"], 50.0);
+        assert_eq!(status["budget"]["paused"], false);
+        assert_eq!(
+            status["sessions"],
+            json!({"working": 0, "waiting": 0, "queued": 0, "running_limit": 3})
+        );
+        assert_eq!(
+            body(set(json!(null)).await).await["monthly_budget_usd"],
+            Value::Null
+        );
+        // Older apps' whole settings object leaves it alone.
+        agent.set_budget(Some(20.0)).unwrap().unwrap();
+        let settings = serde_json::from_value(json!({"model": "m", "allow_actions": true})).unwrap();
+        put_settings(State(agent.clone()), HeaderMap::new(), Json(settings)).await;
+        assert_eq!(agent.settings().monthly_budget_usd, Some(20.0));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_schedule_from_the_app_runs_without_asking_unless_told_otherwise() {
         let body = |extra: &str| {
@@ -1311,24 +1671,35 @@ mod tests {
         assert_eq!(with(|f| f.failing_effects = 1), "problem");
         for status in ["error", "interrupted", "stuck", "max_steps"] {
             assert_eq!(
-                with(|f| f.latest = Some(("t1".into(), status.into()))),
+                with(|f| f.latest = Some(("t1".into(), status.into(), "main".into()))),
                 "problem",
                 "{status}"
             );
         }
-        assert_eq!(with(|f| f.latest = Some(("t1".into(), "done".into()))), "idle");
-        assert_eq!(with(|f| f.busy = true), "working");
         assert_eq!(
-            with(|f| f.latest = Some(("t1".into(), "needs_user".into()))),
+            with(|f| f.latest = Some(("t1".into(), "done".into(), "main".into()))),
+            "idle"
+        );
+        assert_eq!(
+            with(|f| f.working = vec![("main".into(), "t1".into())]),
+            "working"
+        );
+        assert_eq!(
+            with(|f| f.latest = Some(("t1".into(), "needs_user".into(), "main".into()))),
+            "needs_you/action"
+        );
+        // An open card in a conversation that isn't the latest's.
+        assert_eq!(
+            with(|f| f.actions = vec![("t0".into(), "c2".into())]),
             "needs_you/action"
         );
         assert_eq!(
-            with(|f| f.cards = vec![("s1".into(), "secret".into())]),
+            with(|f| f.cards = vec![("s1".into(), "secret".into(), "main".into())]),
             "needs_you/secret"
         );
         for kind in ["shell", "browser", "schedule", "access", "stuck"] {
             assert_eq!(
-                with(|f| f.cards = vec![("a1".into(), kind.into())]),
+                with(|f| f.cards = vec![("a1".into(), kind.into(), "main".into())]),
                 "needs_you/approval"
             );
         }
@@ -1345,29 +1716,43 @@ mod tests {
     #[test]
     fn what_needs_the_user_comes_first() {
         let everything = StageFacts {
-            cards: vec![("s1".into(), "secret".into()), ("a1".into(), "browser".into())],
-            latest: Some(("t9".into(), "needs_user".into())),
-            busy: true,
+            cards: vec![
+                ("s1".into(), "secret".into(), "main".into()),
+                ("a1".into(), "browser".into(), "c2".into()),
+            ],
+            actions: vec![],
+            latest: Some(("t9".into(), "needs_user".into(), "main".into())),
+            working: vec![("c3".into(), "t8".into())],
             failing_effects: 3,
             next_schedule: Some((4, "Morning inbox".into(), 100)),
         };
+        // A card in any conversation, with the conversation to open.
         assert_eq!(
             stage_of(&everything),
-            ("needs_you/approval", json!({"card": "a1", "kind": "browser"}))
+            (
+                "needs_you/approval",
+                json!({"card": "a1", "kind": "browser", "session": "c2"})
+            )
         );
         let working = StageFacts {
             cards: vec![],
-            latest: Some(("t9".into(), "error".into())),
+            latest: Some(("t9".into(), "error".into(), "main".into())),
             ..everything
         };
-        assert_eq!(stage_of(&working).0, "working");
+        assert_eq!(
+            stage_of(&working),
+            ("working", json!({"run": "t8", "session": "c3"}))
+        );
         let problem = StageFacts {
-            busy: false,
+            working: vec![],
             ..working
         };
         assert_eq!(
             stage_of(&problem),
-            ("problem", json!({"run": "t9", "status": "error"}))
+            (
+                "problem",
+                json!({"run": "t9", "status": "error", "session": "main"})
+            )
         );
     }
 }

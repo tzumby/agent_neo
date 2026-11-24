@@ -1,9 +1,163 @@
-// The pages besides the chat: the desktop (take over), schedules, keys and
-// tokens, and settings. Each loads fresh when it opens.
+// The pages besides the chat: the conversation list, the desktop (take
+// over), schedules, keys and tokens, settings, and usage. Each loads fresh
+// when it opens.
 
-import { busyButton, fill, h, icon, when } from "./dom.js";
+import { MAIN, chatHash, lastLine, sessionBadge, sessionTitle } from "./conversations.js";
+import { busyButton, day, fill, h, icon, when } from "./dom.js";
 import { isValidName, normalizedName } from "./keys.js";
 import { deviceLabel, fromBase64Url, iosOutsideHomeScreen, ownSubscription, pushState, pushSupported } from "./push.js";
+import { axisMoney, budgetShare, chartDays, compact, kindRows, money, niceCeiling, shortDate, todayIn } from "./usage.js";
+
+// --- Conversations -------------------------------------------------------------------
+
+/**
+ * Every conversation, most recently updated first: its last message and what
+ * it's doing. New, rename, archive and delete; the archived ones underneath.
+ */
+export function mountChats(store, view, { newConversation }) {
+  const body = view.querySelector(".page-body");
+  let open = null; // the row showing its actions
+  let renaming = null; // the row being renamed
+  let archivedOpen = false;
+  let drawn = [];
+
+  function render(force = false) {
+    if (view.hidden) return;
+    const state = [store.sessions, store.archived, store.currentId, store.sessionsSupported, store.runningLimit, open, renaming, archivedOpen];
+    if (!force && state.every((value, i) => value === drawn[i])) return;
+    // Typing a new name: not redrawn under the person's fingers.
+    if (!force && body.querySelector(".chat-rename")?.contains(document.activeElement)) return;
+    drawn = state;
+    const add = h("button", { class: "button button-primary", type: "button" }, icon("plus"), "New conversation");
+    add.addEventListener("click", () => busyButton(add, newConversation));
+    const sessions = store.sessions;
+    fill(body,
+      h("div", { class: "page-head" },
+        h("p", { class: "lede" }, `Each has its own history and browser window. Up to ${store.runningLimit || 3} work at once; memory, keys and settings are shared.`),
+        add),
+      !sessions.length && store.sessionsSupported !== true
+        ? h("p", { class: "muted" }, "Loading conversations…")
+        : h("ul", { class: "list chat-list" }, sessions.map((s) => row(s, false))),
+      archivedSection());
+  }
+
+  function row(s, archived) {
+    const title = sessionTitle(s);
+    if (renaming === s.id) return renameRow(s);
+    const current = s.id === store.currentId;
+    const shown = open === s.id;
+    const more = h("button", {
+      class: "icon-button chat-more", type: "button", "aria-expanded": String(shown),
+      "aria-label": `Rename, archive or delete “${title}”`,
+    }, icon("more", "icon icon-dots"));
+    more.addEventListener("click", () => {
+      open = shown ? null : s.id;
+      render(true);
+    });
+    const updated = Number.isFinite(s.updated) ? new Date(s.updated * 1000) : null;
+    return h("li", { class: `chat-row${current ? " is-current" : ""}${shown ? " is-open" : ""}` },
+      h("a", { class: "chat-link", href: chatHash(s.id), "aria-current": current ? "page" : null },
+        h("span", { class: "chat-line" },
+          h("span", { class: "chat-title" }, title),
+          updated ? h("time", { class: "chat-when", datetime: updated.toISOString() }, day(updated)) : null),
+        h("span", { class: "chat-line" },
+          h("span", { class: "chat-last" }, lastLine(s) || "No messages yet"),
+          chatBadge(sessionBadge(s)))),
+      more,
+      shown ? tools(s, archived, title) : null);
+  }
+
+  function tools(s, archived, title) {
+    // agentd refuses both while a task works or waits on a card.
+    const engaged = s.state === "working" || s.state === "waiting";
+    const rename = h("button", { class: "button", type: "button" }, "Rename");
+    rename.addEventListener("click", () => {
+      renaming = s.id;
+      open = null;
+      render(true);
+      body.querySelector(".chat-rename input")?.focus();
+    });
+    const archive = h("button", { class: "button", type: "button", disabled: !archived && engaged }, archived ? "Unarchive" : "Archive");
+    archive.addEventListener("click", () => busyButton(archive, async () => {
+      if (await store.updateSession(s.id, { archived: !archived })) {
+        open = null;
+        render(true);
+      }
+    }));
+    const remove = s.id === MAIN ? null : h("button", { class: "button button-quiet", type: "button", disabled: engaged }, "Delete");
+    remove?.addEventListener("click", () => busyButton(remove, async () => {
+      if (!confirm(`Delete “${title}”? Its messages, and any waiting their turn, go for good.`)) return;
+      if (await store.deleteSession(s.id)) {
+        open = null;
+        store.notice(`Deleted “${title}”.`);
+        render(true);
+      }
+    }));
+    return h("div", { class: "chat-tools" },
+      engaged ? h("p", { class: "muted" }, "It's working or waiting on you. Archive or delete it once that's done.") : null,
+      s.id === MAIN ? h("p", { class: "muted" }, "The first conversation can be archived, not deleted.") : null,
+      h("div", { class: "card-actions card-actions-start" }, rename, archive, remove));
+  }
+
+  function renameRow(s) {
+    const input = h("input", { class: "field", value: s.title || "", placeholder: "New conversation", "aria-label": "The conversation's name", maxlength: "120" });
+    const cancel = h("button", { class: "button button-quiet", type: "button" }, "Cancel");
+    const save = h("button", { class: "button button-primary", type: "submit" }, "Save");
+    const form = h("form", { class: "chat-rename" }, input, h("div", { class: "card-actions" }, cancel, save));
+    const done = () => {
+      renaming = null;
+      render(true);
+    };
+    cancel.addEventListener("click", done);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") done();
+    });
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const title = input.value.trim();
+      if (!title) return input.focus();
+      busyButton(save, async () => {
+        if (await store.updateSession(s.id, { title })) done();
+      });
+    });
+    return h("li", { class: "chat-row is-renaming" }, form);
+  }
+
+  function archivedSection() {
+    const archived = store.archived;
+    const content = !archivedOpen ? null
+      : archived === null ? h("p", { class: "muted" }, "Loading…")
+      : archived.length ? h("ul", { class: "list chat-list" }, archived.map((s) => row(s, true)))
+      : h("p", { class: "muted" }, "Nothing archived.");
+    const details = h("details", { class: "archived", open: archivedOpen }, h("summary", null, "Archived"), content);
+    details.addEventListener("toggle", () => {
+      if (details.open === archivedOpen) return; // drawn open, not opened by the person
+      archivedOpen = details.open;
+      if (archivedOpen) store.loadArchived();
+      render(true);
+    });
+    return details;
+  }
+
+  store.subscribe(() => render());
+  return {
+    enter() {
+      render(true);
+      store.refreshSessions();
+      if (archivedOpen) store.loadArchived();
+    },
+  };
+}
+
+/** A spinner while it works; words for the rest. */
+function chatBadge(badge) {
+  if (!badge) return null;
+  if (badge.tone === "working") {
+    return h("span", { class: "chat-badge is-working", title: "Working" },
+      h("span", { class: "spinner", "aria-hidden": "true" }), h("span", { class: "visually-hidden" }, "Working"));
+  }
+  return h("span", { class: `chat-badge is-${badge.tone}` }, badge.text);
+}
 
 // --- Desktop ---------------------------------------------------------------------
 
@@ -23,7 +177,7 @@ export function mountDesktop(store, view) {
     const done = h("button", { class: "button button-primary", type: "button" }, "I'm done");
     skip.addEventListener("click", () => busyButton(skip, () => store.resolve(action, false)));
     done.addEventListener("click", () => busyButton(done, async () => {
-      if (await store.resolve(action, true)) location.hash = "#/chat";
+      if (await store.resolve(action, true)) location.hash = chatHash(store.currentId);
     }));
     bar.append(h("p", { class: "desk-ask" }, icon("desktop"), h("span", null, action.reason)), h("div", { class: "card-actions" }, skip, done));
   }
@@ -285,6 +439,7 @@ export function mountSettings(store, view, session) {
         h("label", { class: "toggle" }, autoApprove,
           h("span", null, h("span", { class: "strong" }, "Auto approve"),
             h("span", { class: "muted block" }, autoApproveDescription)))),
+      usageLink(store),
       pushSection(store),
       sitesSection(store),
       h("section", { class: "settings-group" },
@@ -303,6 +458,227 @@ export function mountSettings(store, view, session) {
   }
 
   return { enter: load };
+}
+
+/** Settings → Usage: this month so far, and the way to the page. Not on a desktop from before usage. */
+function usageLink(store) {
+  if (store.sessionsSupported === false) return null;
+  const budget = store.status?.budget;
+  const share = budgetShare(budget);
+  const said = share ? `${money(budget.spent)} of your ${money(budget.monthly_usd)} monthly budget used this month.`
+    : budget ? `${money(budget.spent)} this month. No monthly budget set.`
+    : "What the model calls cost, by day, kind, model and conversation.";
+  return h("section", { class: "settings-group" },
+    h("h2", { class: "page-h2" }, "Usage"),
+    h("p", { class: share?.tone === "over" ? "budget-said is-over" : "muted" }, said),
+    share ? meter(share) : null,
+    h("a", { class: "button", href: "#/usage" }, icon("chart"), "Usage and budget"));
+}
+
+/** How much of the budget is used: dark, orange from 80%, red once it's used up. */
+function meter(share) {
+  const used = h("span", { class: "meter-fill" });
+  used.style.width = `${share.fill * 100}%`; // CSSOM: the page's policy allows no style attributes
+  return h("div", {
+    class: `meter is-${share.tone}`, role: "progressbar", "aria-label": "Budget used this month",
+    "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": String(Math.min(share.percent, 100)),
+  }, used);
+}
+
+// --- Usage -------------------------------------------------------------------------
+
+/**
+ * What the model calls cost: the totals, the budget (set or remove it), the
+ * last 30 days as a chart, and this month by kind, model, conversation and
+ * schedule. Estimates from token counts, and it says so.
+ */
+export function mountUsage(store, view) {
+  const body = view.querySelector(".page-body");
+  let usage = null;
+
+  async function load() {
+    // Loaded before: kept on screen, dimmed, until the new figures are in.
+    if (usage) body.classList.add("is-refreshing");
+    else fill(body, back(), h("p", { class: "muted" }, "Loading usage…"));
+    try {
+      usage = await store.api.usage(30);
+    } catch (error) {
+      fill(body, back(), h("p", { class: "error" }, `Couldn't load usage: ${error.message}`));
+      return;
+    } finally {
+      body.classList.remove("is-refreshing");
+    }
+    fill(body,
+      back(),
+      h("p", { class: "lede" }, "What your agent's model calls cost. These are estimates from token counts at list prices, so your provider's bill may differ a little."),
+      totals(usage),
+      budgetSection(store, usage.budget, load),
+      daysSection(usage),
+      breakdowns(usage));
+  }
+
+  return { enter: load };
+}
+
+function back() {
+  return h("a", { class: "back-link", href: "#/settings" }, icon("back"), "Settings");
+}
+
+function totals(u) {
+  const tile = (label, value) => h("div", { class: "stat" },
+    h("p", { class: "stat-label" }, label), h("p", { class: "stat-value" }, money(value)));
+  return h("section", { class: "stats", "aria-label": "Totals" },
+    tile("Today", u.today), tile("This month", u.this_month), tile("Last month", u.last_month), tile("All time", u.all_time));
+}
+
+function budgetSection(store, budget, reload) {
+  const share = budgetShare(budget);
+  const input = h("input", {
+    class: "field", type: "number", inputmode: "decimal", min: "0.01", max: "100000", step: "0.01",
+    value: budget?.monthly_usd ?? "", placeholder: "50", "aria-label": "Budget per month, in US dollars",
+  });
+  const save = h("button", { class: "button button-primary", type: "submit" }, share ? "Save" : "Set budget");
+  const remove = share ? h("button", { class: "button button-quiet", type: "button" }, "Remove budget") : null;
+  const problem = h("p", { class: "error", hidden: true });
+  const fail = (text) => {
+    problem.hidden = false;
+    problem.textContent = text;
+  };
+  const change = (value, said) => async () => {
+    try {
+      await store.api.updateSettings({ monthly_budget_usd: value });
+    } catch (error) {
+      fail(`Couldn't change it: ${error.message}`);
+      return;
+    }
+    store.notice(said);
+    await store.reloadStatus();
+    await reload();
+  };
+  const form = h("form", { class: "budget-form" },
+    h("label", { class: "label" }, "Budget per month",
+      h("span", { class: "money-field" }, h("span", { class: "money-sign", "aria-hidden": "true" }, "$"), input)),
+    problem,
+    h("div", { class: "card-actions card-actions-start" }, save, remove));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = Math.round(Number(input.value) * 100) / 100;
+    if (!(value > 0 && value <= 100_000)) {
+      fail("A budget is an amount from $0.01 to $100,000.");
+      return input.focus();
+    }
+    busyButton(save, change(value, `Budget set to ${money(value)} a month.`));
+  });
+  remove?.addEventListener("click", () => busyButton(remove, change(null, "Budget removed.")));
+  const state = share
+    ? [
+        h("p", { class: "budget-figures" },
+          h("span", { class: "strong" }, `${money(budget.spent)} of ${money(budget.monthly_usd)}`),
+          h("span", { class: "muted" }, `${share.percent}%`)),
+        meter(share),
+        share.tone === "over"
+          ? h("p", { class: "budget-said is-over" }, icon("warning"), h("span", null, "Used up. New messages and scheduled runs wait until you raise it or the month turns over."))
+          : h("p", { class: "muted" }, "You get a notification at 80% and at 100%. At 100%, new tasks wait until you raise it or the month turns over."),
+      ]
+    : h("p", { class: "muted" }, "No monthly budget. With one, you get a notification at 80%, and new tasks wait once it's used up.");
+  return h("section", { class: "settings-group usage-group" }, h("h2", { class: "page-h2" }, "Monthly budget"), state, form);
+}
+
+/** The last 30 days, a column each, zeros included. Pointing at a day (or the arrow keys) reads it out. */
+function daysSection(u) {
+  const today = todayIn(u.timezone);
+  const days = chartDays(u.daily, { count: 30, today });
+  if (!days.length) return null;
+  const top = niceCeiling(Math.max(0, ...days.map((d) => d.cost)));
+  const total = days.reduce((sum, d) => sum + d.cost, 0);
+  const readout = h("p", { class: "chart-readout", "aria-live": "polite" });
+  const columns = days.map((d) => {
+    const mark = h("span", { class: "bar-mark" });
+    if (d.cost > 0) mark.style.height = `${(d.cost / top) * 100}%`; // a zero day is a flat stroke
+    return h("span", { class: `bar${d.cost > 0 ? "" : " is-zero"}` }, mark);
+  });
+  const plot = h("div", {
+    class: "bars", tabindex: "0", role: "group",
+    "aria-label": `Cost per day, the last ${days.length} days: ${money(total)} in all. The arrow keys read each day.`,
+  }, columns);
+  let selected = days.length - 1;
+  function select(index) {
+    selected = Math.max(0, Math.min(days.length - 1, index));
+    columns.forEach((column, i) => column.classList.toggle("is-selected", i === selected));
+    const d = days[selected];
+    fill(readout, h("strong", null, money(d.cost)), " ",
+      h("span", { class: "muted" }, `${d.date === today ? "today" : shortDate(d.date)} · ${d.runs} ${d.runs === 1 ? "run" : "runs"}`));
+  }
+  const pick = (event) => {
+    const rect = plot.getBoundingClientRect();
+    select(Math.floor(((event.clientX - rect.left) / rect.width) * days.length));
+  };
+  plot.addEventListener("pointermove", pick);
+  plot.addEventListener("pointerdown", pick);
+  plot.addEventListener("pointerleave", (event) => {
+    if (event.pointerType === "mouse") select(days.length - 1);
+  });
+  plot.addEventListener("keydown", (event) => {
+    const to = { ArrowLeft: selected - 1, ArrowRight: selected + 1, Home: 0, End: days.length - 1 }[event.key];
+    if (to === undefined) return;
+    event.preventDefault();
+    select(to);
+  });
+  select(selected);
+  const tick = (value, at) => h("span", { class: `tick tick-${at}` }, h("span", { class: "tick-label" }, axisMoney(value)));
+  const table = h("details", { class: "instructions" },
+    h("summary", null, "Each day as a table"),
+    h("div", { class: "md-table" }, h("table", null,
+      h("thead", null, h("tr", null, h("th", null, "Day"), h("th", null, "Cost"), h("th", null, "Runs"))),
+      h("tbody", null, [...days].reverse().map((d) =>
+        h("tr", null, h("td", null, shortDate(d.date)), h("td", null, money(d.cost)), h("td", null, String(d.runs))))))));
+  return h("section", { class: "settings-group usage-group" },
+    h("h2", { class: "page-h2" }, `Last ${days.length} days`),
+    readout,
+    h("div", { class: "chart" },
+      h("div", { class: "chart-plot" },
+        h("div", { class: "chart-grid", "aria-hidden": "true" }, tick(top, "top"), tick(top / 2, "mid"), tick(0, "zero")),
+        plot),
+      h("div", { class: "chart-x", "aria-hidden": "true" },
+        h("span", null, shortDate(days[0].date)), h("span", null, shortDate(days[Math.floor(days.length / 2)].date)), h("span", null, "Today"))),
+    table);
+}
+
+/** This month, most expensive first: each row's share of its group's largest as a thin bar. */
+function breakdowns(u) {
+  const runs = (n) => `${n ?? 0} ${n === 1 ? "run" : "runs"}`;
+  const group = (title, items, empty) => {
+    const top = Math.max(0, ...items.map((item) => item.cost));
+    return h("div", { class: "breakdown" },
+      h("h3", { class: "breakdown-title" }, title),
+      items.length
+        ? h("ul", { class: "breakdown-list" }, items.map((item) => {
+            const share = h("span", { class: "share-fill" });
+            share.style.width = `${top > 0 ? (item.cost / top) * 100 : 0}%`;
+            return h("li", { class: "breakdown-row" },
+              h("span", { class: "breakdown-name", title: item.full || null }, item.href ? h("a", { href: item.href }, item.name) : item.name),
+              h("span", { class: "breakdown-cost" }, money(item.cost)),
+              h("span", { class: "share", "aria-hidden": "true" }, share),
+              item.detail ? h("span", { class: "breakdown-detail" }, item.detail) : null);
+          }))
+        : h("p", { class: "muted" }, empty));
+  };
+  const list = (value) => (Array.isArray(value) ? value : []);
+  const kinds = kindRows(u.by_kind).filter((k) => k.cost > 0);
+  const models = list(u.by_model).map((m) => {
+    const tokens = [`${compact(m.input_tokens)} in`, `${compact(m.output_tokens)} out`];
+    if (m.cached_tokens > 0) tokens.push(`${compact(m.cached_tokens)} cached`);
+    return { name: String(m.model || "").split("/").pop() || "Unknown model", full: m.model, cost: m.cost ?? 0, detail: `${runs(m.runs)} · ${tokens.join(" · ")} tokens` };
+  });
+  const sessions = list(u.by_session).map((s) => ({ name: sessionTitle(s), href: chatHash(s.id), cost: s.cost ?? 0, detail: runs(s.runs) }));
+  const schedules = list(u.by_schedule).map((s) => ({ name: s.name || "A deleted schedule", cost: s.cost ?? 0, detail: runs(s.runs) }));
+  return h("section", { class: "settings-group usage-group" },
+    h("h2", { class: "page-h2" }, "This month"),
+    h("div", { class: "breakdowns" },
+      group("By kind", kinds, "Nothing yet this month."),
+      group("By model", models, "No model calls yet this month."),
+      group("By conversation", sessions, "No chats yet this month."),
+      group("By schedule", schedules, "No scheduled runs this month.")));
 }
 
 // --- Notifications (Web Push) -----------------------------------------------------

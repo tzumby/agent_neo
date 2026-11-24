@@ -1,7 +1,9 @@
 // The chat as the web app shows it, built from agentd's event log: the user's
 // messages, the agent's answers and pictures, scheduled runs as reports, the
-// cards waiting for the user, and a task's plan (the steps the agent wrote for
-// itself, ticked off as it goes). What the agent does on the way (tool calls,
+// cards waiting for the user, a task's plan (the steps the agent wrote for
+// itself, ticked off as it goes), and the messages queued behind the running
+// task. One conversation's: the store routes each its own events. What the
+// agent does on the way (tool calls,
 // commands, saves) stays out; `busy` only says that it's working.
 // Pure: apply events in order. Replaying the later part of the log gives the
 // chat of that part, so pages can be loaded from the newest.
@@ -10,6 +12,7 @@
 export const KINDS = [
   "message", "image", "task.started", "task.paused", "task.resumed", "task.stopping", "task.finished",
   "approval.requested", "approval.resolved", "action_needed", "action.resolved", "secret.saved", "plan",
+  "message.queued", "message.unqueued",
 ];
 
 const PLAN_STATUSES = ["pending", "in_progress", "done"];
@@ -44,6 +47,9 @@ export class Timeline {
     this.actionIndex = new Map();
     this.reportIndex = new Map();
     this.planIndex = new Map();
+    // Messages waiting their turn (id → message), and the ones that left.
+    this.queued = new Map();
+    this.unqueued = new Set();
     // The running chat task, and when it started (for "Working · 24 min").
     this.running = null;
     for (const event of events) this.apply(event);
@@ -176,6 +182,17 @@ export class Timeline {
       case "action.resolved":
         this.update(this.actionIndex, str(d.id), { state: d.choice === "done" ? "done" : "skipped" });
         break;
+      case "message.queued": {
+        const id = str(d.id);
+        if (id && !this.unqueued.has(id)) {
+          this.queued.set(id, { id, text: str(d.text), by: d.by ?? null, created: num(d.created) });
+        }
+        break;
+      }
+      case "message.unqueued":
+        // Started (its message follows), removed, or dropped by Stop.
+        this.dropQueued(str(d.id));
+        break;
       case "image":
         if (typeof d.url === "string") this.items.push({ type: "image", id: event.seq, url: d.url, caption: d.caption || null });
         break;
@@ -199,6 +216,29 @@ export class Timeline {
 
   expireAction(id) {
     this.update(this.actionIndex, id, { state: "expired" });
+  }
+
+  /** A queued message removed here: gone before agentd says so. */
+  dropQueued(id) {
+    this.queued.delete(id);
+    this.unqueued.add(id);
+  }
+
+  /**
+   * The messages waiting their turn, oldest first, each with its place: the
+   * ones in the events, and the ones `listed` by the desktop (queued before
+   * the loaded pages, or sent from here a moment ago), less the ones that left.
+   */
+  queue(listed = []) {
+    const all = new Map(this.queued);
+    for (const q of listed) {
+      const id = typeof q?.id === "string" ? q.id : "";
+      if (id && !all.has(id) && !this.unqueued.has(id)) {
+        all.set(id, { id, text: str(q.text), by: q.by ?? null, created: num(q.created) });
+      }
+    }
+    const items = [...all.values()].sort((a, b) => a.created - b.created);
+    return items.map((q, i) => ({ type: "queued", ...q, position: i + 1, of: items.length }));
   }
 
   update(index, id, change) {

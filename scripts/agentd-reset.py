@@ -191,8 +191,10 @@ def wait_until_up():
     return None
 
 def working(st):
-    # The chat's task, or a scheduled run beside it (agentd 0.15.10).
-    return bool(st and (st.get("busy") or (st.get("background") or {}).get("running")))
+    # A conversation's task (`main`'s is `busy`; any one's since 0.16.0), or a
+    # scheduled run beside them (agentd 0.15.10).
+    return bool(st and (st.get("busy") or (st.get("sessions") or {}).get("working")
+                        or (st.get("background") or {}).get("running")))
 
 out = {"before": counts(), "status": status()}
 if action != "survey":
@@ -330,7 +332,8 @@ def main():
     name = desktop_name(args.instance)
     survey = run_remote(args.instance, "survey", False)
     status, before = survey["status"] or {}, survey["before"]
-    running = status.get("busy") or (status.get("background") or {}).get("running")
+    running = (status.get("busy") or (status.get("sessions") or {}).get("working")
+               or (status.get("background") or {}).get("running"))
     state = "busy: a task is running" if running else "idle" if status else "agentd isn't answering"
     chrome = f", Chrome as {before['chrome_user']}" if before["chrome"] else ", no Chrome service"
     print(f"Desktop {name} ({args.instance}), agentd {status.get('version', '?')}, {state}{chrome}.")

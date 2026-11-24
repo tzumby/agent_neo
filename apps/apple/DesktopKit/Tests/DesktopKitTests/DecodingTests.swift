@@ -121,3 +121,91 @@ import Testing
                 .utf8))
     #expect(status.stage == "working" && status.stageDetail?["run"]?.string == "t1" && status.memoryV2 == true)
 }
+
+// MARK: Conversations and usage (agentd 0.16.0)
+
+@Test func decodesAConversation() throws {
+    // As in docs/conversations-and-usage.md §3.1.
+    let json = """
+        {"sessions":[{"id":"main","title":"Plan the trip to Lisbon","created":1795530000,"updated":1795532478,
+          "archived":false,"state":"waiting","needs_you":"secret",
+          "queued":[{"id":"q1a2b3c4d5e6","text":"Book the hotel","by":"iPhone","created":1795532470}],
+          "last":{"role":"assistant","text":"first 160 characters…","ts":1795532478}},
+         {"id":"s2","title":"","created":1795532500,"updated":1795532500,"archived":false,"state":"thinking",
+          "needs_you":null,"queued":[],"last":null}],
+         "running_limit":3}
+        """
+    let list = try JSONDecoder().decode(SessionList.self, from: Data(json.utf8))
+    #expect(list.runningLimit == 3)
+    let main = try #require(list.sessions.first)
+    #expect(main.id == AgentSession.main && main.displayTitle == "Plan the trip to Lisbon")
+    #expect(main.state == .waiting && main.needsYou == "secret" && !main.archived)
+    #expect(main.updated == Date(timeIntervalSince1970: 1_795_532_478))
+    #expect(main.queued == [QueuedMessage(id: "q1a2b3c4d5e6", text: "Book the hotel", by: "iPhone", created: Date(timeIntervalSince1970: 1_795_532_470))])
+    #expect(main.last?.role == "assistant" && main.last?.ts == Date(timeIntervalSince1970: 1_795_532_478))
+    let blank = list.sessions[1]
+    #expect(blank.displayTitle == "New conversation" && blank.last == nil)
+    #expect(blank.state == .idle, "a state this app doesn't know reads as idle")
+    #expect(blank.isBlank && !main.isBlank)
+}
+
+@Test func aSendStartsATaskOrQueues() throws {
+    let decode = { (json: String) in try JSONDecoder().decode(Sent.self, from: Data(json.utf8)) }
+    #expect(try decode(#"{"task":"a1b2c3"}"#) == .started(task: "a1b2c3"))
+    #expect(try decode(#"{"queued":{"id":"q1","position":2}}"#) == .queued(id: "q1", position: 2))
+}
+
+@Test func decodesTheStatusOfADesktopWithConversations() throws {
+    let json = """
+        {"desktop":"d","busy":true,"settings":{"model":"m","allow_actions":true},"last_seq":1,"known_models":["m"],
+         "shell_tool":true,"version":"0.16.0","stage":"needs_you/approval",
+         "stage_detail":{"card":"a1","kind":"browser","session":"s2"},
+         "sessions":{"working":2,"waiting":1,"queued":3,"running_limit":3},
+         "budget":{"monthly_usd":50.0,"spent":41.20,"fraction":0.824,"paused":false,"month":"2026-11"}}
+        """
+    let status = try JSONDecoder().decode(AgentStatus.self, from: Data(json.utf8))
+    #expect(status.sessions?.working == 2 && status.sessions?.queued == 3 && status.sessions?.runningLimit == 3)
+    #expect(status.budget == Budget(monthlyUsd: 50, spent: 41.2, fraction: 0.824, paused: false, month: "2026-11"))
+    #expect(status.stageDetail?["session"]?.string == "s2")
+    // Without a budget set.
+    let none = try JSONDecoder().decode(
+        Budget.self, from: Data(#"{"monthly_usd":null,"spent":3.5,"fraction":null,"paused":false,"month":"2026-11"}"#.utf8))
+    #expect(none.monthlyUsd == nil && none.fraction == nil && none.spent == 3.5)
+    // An older desktop has neither.
+    let old = try JSONDecoder().decode(
+        AgentStatus.self,
+        from: Data(#"{"desktop":"d","busy":false,"settings":{"model":"m","allow_actions":true},"last_seq":1,"known_models":[],"shell_tool":true,"version":"0.15.2"}"#.utf8))
+    #expect(old.sessions == nil && old.budget == nil)
+}
+
+@Test func decodesUsage() throws {
+    // As in docs/conversations-and-usage.md §3.5.
+    let json = """
+        {"currency":"USD","estimated":true,"timezone":"America/Toronto","month":"2026-11",
+         "today":1.23,"this_month":41.20,"last_month":38.10,"all_time":210.55,
+         "daily":[{"date":"2026-10-26","cost":0.42,"runs":7},{"date":"2026-10-27","cost":0,"runs":0}],
+         "by_kind":{"chat":30.10,"scheduled":9.80,"tidy_up":1.30},
+         "by_model":[{"model":"zai-org/GLM-5.3","cost":35.0,"runs":120,"input_tokens":1,"output_tokens":2,"cached_tokens":null}],
+         "by_session":[{"id":"main","title":"Plan the trip","cost":20.0,"runs":80}],
+         "by_schedule":[{"id":3,"name":"Morning check","cost":5.2,"runs":30},{"id":4,"name":null,"cost":1.0,"runs":2}],
+         "budget":{"monthly_usd":50.0,"spent":41.20,"fraction":0.824,"paused":false}}
+        """
+    let usage = try JSONDecoder().decode(AgentUsage.self, from: Data(json.utf8))
+    #expect(usage.estimated && usage.timezone == "America/Toronto")
+    #expect(usage.today == 1.23 && usage.thisMonth == 41.2 && usage.lastMonth == 38.1 && usage.allTime == 210.55)
+    #expect(usage.daily.map(\.cost) == [0.42, 0] && usage.daily.first?.runs == 7)
+    let day = try #require(usage.daily.first?.day)
+    #expect(Calendar.current.dateComponents([.year, .month, .day], from: day) == DateComponents(year: 2026, month: 10, day: 26))
+    #expect(usage.byKind.map(\.kind) == ["chat", "scheduled", "tidy_up"], "most expensive first")
+    #expect(usage.byModel.first?.cachedTokens == 0, "tokens from before 0.16.0 count as 0")
+    #expect(usage.bySession.first?.title == "Plan the trip")
+    #expect(usage.bySchedule.map(\.name) == ["Morning check", nil])
+    #expect(usage.budget?.paused == false && usage.budget?.month == nil)
+}
+
+@Test func theBudgetIsSetOrRemovedWithAnExplicitNull() throws {
+    let set = try JSONEncoder().encode(BudgetSetting(usd: 50))
+    #expect(String(decoding: set, as: UTF8.self) == #"{"monthly_budget_usd":50}"#)
+    let removed = try JSONEncoder().encode(BudgetSetting(usd: nil))
+    #expect(String(decoding: removed, as: UTF8.self) == #"{"monthly_budget_usd":null}"#)
+}

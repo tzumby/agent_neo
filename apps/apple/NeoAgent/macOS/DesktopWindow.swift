@@ -43,10 +43,7 @@ struct MacTakeOverView: View {
 
     /// The action as it is now (it may have been resolved meanwhile).
     private var action: Action? {
-        for case .action(let action) in store.timeline.items where action.id == actionID && action.state == .pending {
-            return action
-        }
-        return nil
+        store.action(actionID).flatMap { $0.state == .pending ? $0 : nil }
     }
 
     var body: some View {

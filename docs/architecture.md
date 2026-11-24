@@ -249,7 +249,7 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
 - **Removed:** `openssh-server`, `ec2-instance-connect`.
 - **Automatic updates** (`tasks/updates.yml`), set by the role rather than left to the image: the package lists and unattended upgrades daily (`apt-daily.timer`, `apt-daily-upgrade.timer`), from Ubuntu's security pockets (`-security`, and ESM's when there), plus Chrome from Google's repo (the desktop role's `52neo-agent-chrome`: origin `Google LLC`, label `Google`, codename `stable`). Unused kernels and dependencies are removed, and the package cache is cleaned weekly (`AutocleanInterval`). `Automatic-Reboot` is off: reboots are the maintenance window's.
 - **needrestart** is set to list only (`$nrconf{restart} = 'l'`), so unattended upgrades don't restart Xvfb, XFCE or Chrome in the middle of a task.
-- **The maintenance window** (`tasks/maintenance.yml`, `/usr/local/sbin/neo-agent-maintenance`, a timer every 15 minutes). Between 04:00 and 06:00 in your time zone (agentd's `user_timezone` setting, which the web app sends with each message; `common_maintenance_timezone`, UTC, until then), if `/run/reboot-required` exists, needrestart sees a newer kernel, or it lists services running old code (Chrome after an update above all), the desktop reboots, which brings Xvfb, XFCE, Chrome and agentd back in order. Not while agentd is busy (the chat's task or a scheduled run), not while a VNC or noVNC connection is open (someone viewing), and not within 30 minutes of a boot. It logs why it rebooted or waited, nothing else. `common_maintenance: false` turns it off.
+- **The maintenance window** (`tasks/maintenance.yml`, `/usr/local/sbin/neo-agent-maintenance`, a timer every 15 minutes). Between 04:00 and 06:00 in your time zone (agentd's `user_timezone` setting, which the web app sends with each message; `common_maintenance_timezone`, UTC, until then), if `/run/reboot-required` exists, needrestart sees a newer kernel, or it lists services running old code (Chrome after an update above all), the desktop reboots, which brings Xvfb, XFCE, Chrome and agentd back in order. Not while agentd is busy (a conversation's task or a scheduled run), not while a VNC or noVNC connection is open (someone viewing), and not within 30 minutes of a boot. It logs why it rebooted or waited, nothing else. `common_maintenance: false` turns it off.
 - **Logs kept to a size** (`tasks/logs.yml`): the journal at most 1 GB (`SystemMaxUse`), 2 GB always left free, files of 64 MB, one month (`MaxRetentionSec`). logrotate's own rules cover `/var/log`'s files; Squid's are the agentd role's (§5.6).
 - **Hardening** (`tasks/hardening.yml`), adapted from DevSec's `os_hardening` role ([dev-sec.io](https://dev-sec.io), Apache-2.0) rather than applied as is:
   - kernel and network settings (`/etc/sysctl.d/90-neo-agent-hardening.conf`): ptrace only for root (`kernel.yama.ptrace_scope = 2`), no kexec, no SysRq, no core dumps of setuid programs, protected hard links, symlinks, FIFOs and regular files, kernel pointers hidden, BPF JIT hardened, no IP forwarding, strict reverse-path filtering, no source routing or redirects (in or out), martians logged, SYN cookies. Not DevSec's IPv6 router-advertisement settings: AWS networking uses them;
@@ -397,7 +397,7 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 
 ## 6. agentd: the agent on the desktop
 
-`services/agentd` is a single static Rust binary (edition 2024, tokio, axum 0.8, rusqlite with bundled SQLite, reqwest with rustls, regex, croner and jiff). It's built with `cargo zigbuild` for `x86_64-unknown-linux-musl` (or aarch64), with Rust 1.93.1 from `rust-toolchain.toml`. It runs the model loop, owns the browser and the shell launcher, keeps all of the agent's state, and serves the API the web app uses. Version 0.15.14.
+`services/agentd` is a single static Rust binary (edition 2024, tokio, axum 0.8, rusqlite with bundled SQLite, reqwest with rustls, regex, croner and jiff). It's built with `cargo zigbuild` for `x86_64-unknown-linux-musl` (or aarch64), with Rust 1.93.1 from `rust-toolchain.toml`. It runs the model loop, owns the browser and the shell launcher, keeps all of the agent's state, and serves the API the web app uses. Version 0.16.0: several conversations, queued messages, and usage with a monthly budget ([conversations-and-usage.md](conversations-and-usage.md) is the design).
 
 ### 6.1 Process, configuration and startup
 
@@ -430,6 +430,7 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 | `SHELL_TOOL` | `on` | Whether the agent has a shell at all |
 | `DESKTOP_NAME` | `neo-agent` | Shown in the web app. Ansible sets the tailnet name (`neo-agent`) |
 | `MEMORY_V2` | `off` | Memory v2 ([memory-v2.md](memory-v2.md)). Off: the v1 memory path, on the v2 schema (always migrated). The desktop's group_vars turn it on |
+| `MAX_PARALLEL_TASKS` | `3` | How many conversations may work at the same moment (§6.6); more messages wait in the queue. At least 1 |
 
 - **Startup order:**
   1. Load the configuration.
@@ -439,7 +440,7 @@ The desktop has a separate browser network table (§5.3). File permissions prote
   5. Recover tasks a restart cut off (§6.6), settle memories an older agentd left waiting for approval, and write Squid's file of the sites you allowed from the database (§6.20).
   6. Reconcile the stored proxy policy with the active configuration.
   7. Bind the socket, refusing if another agentd already answers on it, and set it to mode 0660.
-  8. Only then start the scheduler, the background worker and the effects runner (§6.14, §6.19), so two agentd processes never both run them.
+  8. Only then start the scheduler, the background worker and the effects runner (§6.14, §6.19), so two agentd processes never both run them. The scheduler's first tick starts messages queued before the restart, as slots allow (§6.6).
   9. On SIGTERM, give open requests 3 seconds. The web app's event stream never ends on its own, and without that limit systemd would wait 90 s.
 - **Other entry point:** `agentd --version`.
 
@@ -450,7 +451,9 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 | `main.rs` | Startup, socket, graceful stop |
 | `config.rs` | Settings from files and environment |
 | `api.rs` | The HTTP + SSE API (§6.4) |
-| `agent.rs` | Tasks: start, run loop, tool dispatch, approvals and parking, resume, finish, stop, recovery; memory, schedule, key and site tools; redaction hooks |
+| `agent.rs` | Tasks: each conversation's lane, run loop, tool dispatch, approvals and parking, resume, finish, recovery, per-call usage; memory, schedule, key and site tools; the event log's conversation tags; redaction hooks |
+| `sessions.rs` | Conversations: messages started or queued, the queue (`pump`), Stop, titles, create, rename, archive, delete, and their state for the apps (§6.6) |
+| `usage.rs` | Usage figures in the user's time zone, the monthly budget and its alerts (§6.22) |
 | `tools.rs` | The system prompt and the tool schemas the model sees |
 | `llm.rs` | The chat-completions client (Together, or `LLM_URL`), `KNOWN_MODELS`, prices, reasoning handling, usage and cost, retries, `truncate` |
 | `browser.rs`, `cdp.rs` | Browser tools over the Chrome DevTools Protocol (§6.9) |
@@ -459,7 +462,7 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 | `guard.rs` | Untrusted-content labels, the context budget, loop detection, refusals (sleep, `curl \| sh`, shell scheduling, `date`, the egress controls), plain summaries, URL checks |
 | `memory.rs` | Memory v2: writes, trust, retrieval, the notes in the prompt, export and import (§6.13) |
 | `consolidate.rs` | Memory v2's tidy-up (§6.13) |
-| `store.rs` | SQLite: events, history, runs, pending approvals, memory, schedules, key metadata, settings, effects, allowed sites (§6.3) |
+| `store.rs` | SQLite: events, each conversation's history, conversations and queued messages, runs, pending approvals, memory, schedules, key metadata, settings, effects, allowed sites (§6.3) |
 | `schedule.rs` | Cron and one-time planning, the scheduler loop and the background worker (§6.14) |
 | `effects.rs` | The effects queue's runner: side effects stored first, done afterwards (§6.19) |
 | `secrets.rs` | Saved keys: files, names, redaction, the secret filter (§6.15) |
@@ -480,15 +483,19 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
   - version 5 (0.15.10) added `runs.due` and `runs.attempt`, and an index on `runs.status`: the scheduled runs' queue (§6.14);
   - version 6 (0.15.10) added `egress_hosts`, the sites you allowed (§6.20).
   - version 7 added `device_tokens`, the iPhone and Mac apps to notify by APNs (§6.17).
+  - version 8 added `runs.memory_consolidated` (each task tidied up once) and took memory text out of old events and parked checkpoints.
+  - version 9 (0.16.0, one transaction) added conversations: the `sessions` table with `main` (titled from its first message, or "First conversation"), `session` on `history` (`main`), `runs` (`main` for every task from before; null for tidy-ups), `schedules` (`main`) and `events`, and `chat_queue`; and each run's tokens (`input_tokens`, `output_tokens`, `cached_tokens`; null before). The event log's conversation events are tagged `main`: `message`, `task.*`, `run.*`, `step`, `plan`, `review`, `shell`, `shell.output`, `approval.*`, `action_needed`, `action.resolved`, `image`, and anything with a `task` except `access.*`. Indexes: `history (session, id)`, `events (session, seq)`, `runs (started)`.
 
-  Every change is additive, so an older agentd still reads and writes a newer database. 0.14.0 was tested on a v2 database.
+  Every change is additive, so an older agentd still reads and writes a newer database: its rows get `main` (history, schedules) or a null `session` (runs, read as `main`; events, global). 0.14.0 was tested on a v2 database, and 0.15's statements on a v9 one.
 
 | Table | Columns | Purpose |
 |---|---|---|
-| `events` | `seq` (autoincrement), `ts`, `kind`, `data` (JSON) | The append-only event log the web app streams and replays (§6.5) |
-| `history` | `id`, `ts`, `role`, `content`, `agent` | What the model sees as the conversation: user messages and final answers only. The last 20 entries go into each new task |
-| `settings` | `key`, `value` | `model`, `allow_actions`, `auto_approve`, `tab_target`, `vapid_pkcs8` (the notifications key, §6.17), `user_timezone`, `user_utc_offset`, and tidy-up's `memory_consolidation`, `memory_consolidation_model`, `memory_consolidation_daily_cap_usd`, `memory_last_consolidated_run` |
-| `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before); 0.15.10: `due` (unix seconds: a queued run isn't taken before then) and `attempt` (0, or 1 for the retry) | One row per task. `status` is `queued` (a scheduled run waiting for the background worker), `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `stuck`, `interrupted`, `skipped`, or `max_steps` (runs from before the supervisor) (a queued run that waited over an hour) |
+| `events` | `seq` (autoincrement), `ts`, `kind`, `data` (JSON); v9: `session` (from `data.session`; null for a global event) | The append-only event log the web app streams and replays (§6.5) |
+| `history` | `id`, `ts`, `role`, `content`, `agent`; v9: `session` | What the model sees as each conversation: user messages and final answers only. The last 20 entries of its conversation go into each new task |
+| `sessions` | `id` (`main`, or 12 hex), `agent`, `title`, `created`, `updated` (unix seconds: its last message, queued message, title change or creation), `archived`, `deleted` (when; the row stays so its runs keep their title), `tab_target` (its own browser window's tab; `main`'s is the setting) | The conversations (§6.6) |
+| `chat_queue` | `id` (12 hex), `session`, `text` (as sent: raw), `by_user`, `created` | Messages accepted but not started yet, started in `rowid` order (§6.6). They outlive restarts |
+| `settings` | `key`, `value` | `model`, `allow_actions`, `auto_approve`, `tab_target` (`main`'s tab), `vapid_pkcs8` (the notifications key, §6.17), `user_timezone`, `user_utc_offset`, tidy-up's `memory_consolidation`, `memory_consolidation_model`, `memory_consolidation_daily_cap_usd`, `memory_last_consolidated_run`, and the budget's `monthly_budget_usd` and `budget_alerted` (`YYYY-MM:80,YYYY-MM:100`, §6.22) |
+| `runs` | `id`, `agent`, `status`, `request`, `by_user`, `model`, `started`, `updated`, `steps`, `cost`, `answer`; v2: `kind` (task, consolidation), `policy_version`, `schedule`; 0.15.2: `acted` (the task ran a command, wrote in the browser or changed a schedule; null before); 0.15.10: `due` (unix seconds: a queued run isn't taken before then) and `attempt` (0, or 1 for the retry); v8: `memory_consolidated`; v9: `session` (its conversation; a scheduled run's is its schedule's), `input_tokens`, `output_tokens`, `cached_tokens` | One row per task. `cost` and the tokens are written after every model call, so a running task counts (§6.22). `status` is `queued` (a scheduled run waiting for the background worker), `running`, `waiting`, `done`, `error`, `cancelled`, `needs_user`, `stuck`, `interrupted`, `skipped` (a queued run that waited over an hour, or came due with the budget used up), or `max_steps` (runs from before the supervisor) |
 | `pending` | `id`, `kind` (`approval` or `action`), `run`, `card` (JSON), `checkpoint` (the task's serialized `RunState`), `created` (unix seconds); v2: `policy_version` | What the user is being asked: parked approvals and Action needed cards |
 | `memory` | `id`, `agent`, `text`, `trusted`, `created`; v2: `kind` (rule, preference, fact, work_log), `status` (active, superseded, expired, deleted; `pending` only before 0.15.2), `trust` (user_stated, agent_inferred, imported), `importance`, `source_run`, `source_seq`, `source_schedule`, `valid_until`, `superseded_by`, `pending_reason`, `version`, `updated`, `last_recalled`, `recall_count` | Long-term memory (§6.13). `trusted` is kept in step with `trust` and `status` by triggers, for 0.14.0 and the v1 path |
 | `memory_fts` | FTS5 (`id`, `text`; porter stemming) | Full-text index over `memory`, kept in step by triggers |
@@ -497,14 +504,14 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | `push_subscriptions` | `id` (the endpoint's SHA-256, 12 hex), `endpoint`, `p256dh`, `auth`, `label`, `created`, `last_sent` | Browsers with notifications on (§6.17) |
 | `device_tokens` | `id` (the token's SHA-256, 12 hex), `token`, `topic` (bundle id), `environment` (sandbox or production), `label`, `created`, `last_sent` | iPhone and Mac apps with notifications on, by APNs (§6.17) |
 | `egress_hosts` | `host` (primary key), `added` (unix seconds), `by_user`, `task` (the run whose card asked; null from Settings), `why` | The sites you allowed the shell to reach (§6.20); written to Squid's file at every change and at startup |
-| `schedules` | `id`, `agent`, `name`, `prompt`, `cron`, `timezone`, `next_run`, `last_run`, `paused`, `created`; v2: `policy_version`, `created_from`; v4: `auto_approve` (1 for every schedule a person sets up, 0 for one asked for after outside content; the column's default stays 0, §6.14) | Scheduled tasks (§6.14) |
+| `schedules` | `id`, `agent`, `name`, `prompt`, `cron`, `timezone`, `next_run`, `last_run`, `paused`, `created`; v2: `policy_version`, `created_from`; v4: `auto_approve` (1 for every schedule a person sets up, 0 for one asked for after outside content; the column's default stays 0, §6.14); v9: `session` (the conversation that set it up; `main` for older ones and ones added through the API) | Scheduled tasks (§6.14) |
 | `secrets` | `name`, `agent`, `label`, `created`, `updated`, `last_used` | Saved keys' names and labels, never their values (§6.15) |
 | `destinations`, `posts` | (the full edition's Slack and Teams updates) | Unused here. The base schema still creates them, so a database moves between versions with and without them |
 
 - **`images/<32 hex>.jpg`**: screenshots shown in the chat (`show_screenshot`, Action needed cards), served at `/api/v1/images/{id}`.
 - **`secrets/<NAME>`**: one file per saved key (mode 0600), written atomically through `.<NAME>.new` and a rename.
 - **`agentd.db.pre-<version>-<time>`**: a copy of the database made by the Ansible role before a new agentd version starts (SQLite online backup, as `agentd`). The last 3 are kept, for a rollback.
-- **The `agent` column** on history, runs, memory, schedules and key metadata is `main` everywhere, and every event carries `"agent": "main"`. It's there for more than one agent (the code calls them bots), which this edition doesn't have.
+- **The `agent` column** on history, runs, memory, schedules, conversations and key metadata is `main` everywhere, and every event carries `"agent": "main"`. It's there for more than one agent (the code calls them bots), which this edition doesn't have. It isn't the conversation: that's `session`, and the first conversation's id happens to be `main` too.
 
 ### 6.4 HTTP API
 
@@ -513,16 +520,23 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 
 | Method | Path | What it does |
 |---|---|---|
-| GET | `/api/v1/status` | Desktop name, `busy` (the chat's task), `background {running: {task, schedule} or null, queued}` (scheduled runs, 0.15.10), `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2`, `memory {active}`, `stage` and `stage_detail` (below the table) |
-| GET | `/api/v1/messages?limit=` | The chat history (default 50, at most 500), with saved keys redacted |
-| POST | `/api/v1/messages` | `{text, timezone, utc_offset}` starts a task. 202 `{task}`, or 409 while one runs. The time zone is remembered for later tasks and schedules |
-| GET | `/api/v1/events?after=&kinds=` | Server-Sent Events from the durable log in sequence order. `kinds` (comma-separated) filters what is sent. Each event has `id: seq`, `event: kind` and the JSON event. The live bus wakes the stream when it is caught up, including when a subscriber has fallen behind. Keep-alive comments every 15 s |
-| GET | `/api/v1/events/page?before=&limit=&kinds=` | A page of the log, oldest first: up to `limit` (default 100, at most 500) events of `kinds` before `before` (from the newest when absent). `{events, more, last_seq}`: `more` says older ones remain, and `last_seq` is the log's newest seq, read under the same lock, for the stream to go on from. Keys redacted as in the stream (0.15.1) |
-| POST | `/api/v1/approvals/{id}` | `{approved, text?}`. Resumes the parked task; `text` replaces the card's text (§6.11). 400 if it can't, 404 if unknown or expired, 409 if another task is running |
-| POST | `/api/v1/actions/{id}` | `{choice: done or skip}` on an Action needed card. Starts a new task with "I've done what you asked… continue" or "I'm skipping that step…" |
-| POST | `/api/v1/stop` | Stops the running task, or gives up on a parked one |
+| GET | `/api/v1/status` | Desktop name, `busy` (`main` is working: what an older app shows), `sessions {working, waiting, queued, running_limit}` (conversations working and waiting on a card, messages queued, `MAX_PARALLEL_TASKS`), `budget {monthly_usd, spent, fraction, paused, month}` (§6.22; `monthly_usd` and `fraction` null without a budget), `background {running: {task, schedule} or null, queued}` (scheduled runs, 0.15.10), `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2`, `memory {active}`, `stage` and `stage_detail` (below the table) |
+| GET | `/api/v1/messages?limit=` | `main`'s history (default 50, at most 500), with saved keys redacted |
+| POST | `/api/v1/messages` | `{text, timezone, utc_offset}` for `main`, as `POST /sessions/main/messages`: 202 `{task}`, or 202 `{queued: {id, position}}`. Never 409 since 0.16.0. The time zone is remembered for later tasks and schedules |
+| GET | `/api/v1/sessions?archived=` | The conversations (`archived=1`: the archived ones instead; deleted ones never), most recently updated first: `{sessions: [Session], running_limit}`. A `Session` is `{id, title, created, updated, archived, state, needs_you, queued: [{id, text, by, created}], last: {role, text, ts} or null}`: `state` is `working` › `waiting` (parked on a card) › `paused` (messages queued, budget used up) › `queued` › `idle`; `needs_you` is `secret` or `approval` for a waiting card, `action` when its latest task ended on Action needed with the card open, or null; `last` is its newest history entry, the first 160 characters, redacted |
+| POST | `/api/v1/sessions` | `{title?}`: a new, empty conversation. 201 `Session` |
+| GET, PATCH, DELETE | `/api/v1/sessions/{id}` | The `Session` (404 unknown or deleted). PATCH `{title?, archived?}` renames (titles are one line, at most 60 characters), archives or brings back; 409 archiving one that's working or waiting on a card. DELETE (204) removes its history, queued messages and open Action needed cards; its runs, events and title stay for the audit log and usage, and its schedules report to `main`; 409 if working or waiting, or for `main`. Archiving and deleting close its browser window |
+| GET, POST | `/api/v1/sessions/{id}/messages` | Its history, as `/messages`. POST `{text, timezone?, utc_offset?}`: 202 `{task}` when it starts, or 202 `{queued: {id, position}}` (1 is next in that conversation); 404 for an unknown, archived or deleted conversation; 400 for empty text |
+| DELETE | `/api/v1/sessions/{id}/queue/{qid}` | Removes a queued message (the app's ✕). 204; 404 if it's gone (started or removed) |
+| POST | `/api/v1/sessions/{id}/stop` | Stop in that conversation: `{stopped, dropped}` (a task stopped or a card given up on; how many queued messages were dropped). 404 for an unknown or deleted conversation |
+| GET | `/api/v1/usage?days=` | The usage figures (§6.22): `days` 1–90, default 30 |
+| GET | `/api/v1/events?after=&kinds=&session=` | Server-Sent Events from the durable log in sequence order: every conversation's, or with `session` that conversation's and the global ones. `kinds` (comma-separated) filters what is sent. Each event has `id: seq`, `event: kind` and the JSON event. The live bus wakes the stream when it is caught up, including when a subscriber has fallen behind. Keep-alive comments every 15 s |
+| GET | `/api/v1/events/page?before=&limit=&kinds=&session=` | A page of the log, oldest first: up to `limit` (default 100, at most 500) events of `kinds` before `before` (from the newest when absent); with `session`, that conversation's and the global ones (`session = ? OR session IS NULL`). `{events, more, last_seq}`: `more` says older ones remain, and `last_seq` is the log's newest seq, read under the same lock, for the stream to go on from. Keys redacted as in the stream (0.15.1) |
+| POST | `/api/v1/approvals/{id}` | `{approved, text?}`. Resumes the parked task in its conversation at once, past `MAX_PARALLEL_TASKS` and a used-up budget; `text` replaces the card's text (§6.11). 400 if it can't, 404 if unknown or expired, 409 only while another card of the same conversation is being resumed |
+| POST | `/api/v1/actions/{id}` | `{choice: done or skip}` on an Action needed card: a message in the card's conversation, "I've done what you asked… continue" or "I'm skipping that step…", which starts or queues. 202 `{task}` or `{queued}` |
+| POST | `/api/v1/stop` | `main`'s Stop: `{stopping, stopped, dropped}` (`stopping` as before 0.16.0) |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
-| GET, PUT | `/api/v1/settings` | Returns model, browser, Auto approve and memory consolidation settings. PUT accepts individual fields for ordinary settings. Older clients may also disable Auto approve here. `model` is stored as given (§11) |
+| GET, PUT | `/api/v1/settings` | Returns model, browser, Auto approve, memory consolidation and `monthly_budget_usd` settings. PUT accepts individual fields for ordinary settings; `monthly_budget_usd` takes a positive number up to 100,000 (400 otherwise) or null to remove it, emits `settings` and lets queued messages go if the budget allows now. Older clients may also disable Auto approve here. `model` is stored as given (§11) |
 | PUT | `/api/v1/settings/auto-approve` | `{enabled, expected_version?}`. Enabling requires the current `auto_approve_version` from settings or returns 409. Disabling always succeeds if the store is writable and invalidates earlier confirmations |
 | GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active ones by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older clients still read it |
 | POST | `/api/v1/memory/consolidate` | Memory v2: consolidate now (`{ok, tasks, mode}`); it still waits for a running task |
@@ -554,19 +568,19 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 
 The web app has no memory screen: forgetting, confirming, editing, restoring, export and import are for the apps' Memory screen (§7.4) and the API.
 
-**`stage`** is one word for what the desktop needs, from the first matching row:
+**`stage`** is one word for what the desktop needs, across every conversation, from the first matching row:
 
 | Stage | When |
 |---|---|
 | `needs_you/approval` | A command, browser, schedule, site-access or Looks stuck card is waiting |
 | `needs_you/secret` | A key request is waiting |
-| `needs_you/action` | The latest task ended with Action needed |
-| `working` | A task is running |
+| `needs_you/action` | A conversation's latest task ended with Action needed, its card still open |
+| `working` | A task is running in a conversation |
 | `problem` | The latest task ended with an error, interrupted, stuck or out of steps; or an effect gave up |
 | `scheduled` | A schedule is due within a day |
 | `idle` | Anything else |
 
-`stage_detail` carries the ids behind it (card, run, next schedule). (Until 0.15.2 a `review` stage counted memories waiting for approval; nothing waits now.)
+`stage_detail` carries the ids behind it (card, run, next schedule) and, from 0.16.0, the conversation (`session`). (Until 0.15.2 a `review` stage counted memories waiting for approval; nothing waits now.)
 
 ### 6.5 The event log
 
@@ -575,12 +589,15 @@ Every change the web app shows is an event: appended to `events` and broadcast o
 - **Replay:** the web app keeps the last `seq` it applied and reconnects with `?after=`, so after a disconnect it catches up exactly.
 - **Pages:** the web app loads the chat newest page first (`/events/page`) and older pages as you scroll up. Replaying the later part of the log gives the chat of that part, so pages can go in front of what's loaded. Replaying from 0 still rebuilds the whole chat.
 - **Redaction:** before an event is stored, `emit()` replaces any saved key's value in it (§6.15). The SSE handler redacts again as it streams, which covers events logged before a key was saved.
+- **Conversations (0.16.0):** every event about a conversation carries `"session": "<id>"`. `emit()` adds it from the event's `task` (a task → conversation map while it runs, else the run's row), and the callers name it for events without a task (`task.stopping`, `action.resolved`, a note outside a task, `message.queued` and `message.unqueued`). It goes into the `events.session` column too. **Global** kinds never carry one, even when they name a task: `settings`, `auto_approve.changed`, `secret.*`, `access.*`, `budget.alert` and `session.*`; nor do schedule changes from the API and memory changes from the apps, which have no task. The apps apply global events to every conversation. Events from before 0.16.0 were tagged `main` by the migration (§6.3), and the stream and pages put the column's value into an event's data as `session` when it isn't there.
 
 | Kind | Data | Emitted when |
 |---|---|---|
-| `message` | `role` (user or assistant), `text`, `task`, `by`, `schedule` ({id, name} for a scheduled run), `quiet` (a scheduled run that found nothing, or was stopped because its schedule was paused or cancelled: the web app shows it as one grey line when it's one short line, folded with the schedule's other such runs, and shows a longer report in full) | A request starts; an answer is final; a scheduled run ends (its instructions, with `schedule`, then its answer, one after the other: since 0.15.10 nothing of a scheduled run reaches the chat before it ends); agentd says something outside a task (e.g. a skipped schedule, or that a schedule's rules changed) |
-| `task.started` | `task`, `model` | A chat task starts (the web app shows the chat as working until `task.finished` or `task.paused`) |
-| `run.started` | `task`, `model`, `schedule` ({id, name}) | A scheduled run starts, beside the chat (0.15.10). Not `task.started`, so the web app doesn't show the chat as working |
+| `message` | `role` (user or assistant), `text`, `task`, `by`, `schedule` ({id, name} for a scheduled run), `quiet` (a scheduled run that found nothing, was stopped because its schedule was paused or cancelled, or was skipped because the budget is used up: the web app shows it as one grey line when it's one short line, folded with the schedule's other such runs, and shows a longer report in full) | A request starts; an answer is final; a scheduled run ends (its instructions, with `schedule`, then its answer, one after the other: since 0.15.10 nothing of a scheduled run reaches the chat before it ends); agentd says something outside a task (e.g. a skipped schedule, or that a schedule's rules changed) |
+| `message.queued` | `session`, `id`, `text`, `by`, `created`, `position` (in its conversation, 1 is next) | A message waits its turn (§6.6) |
+| `message.unqueued` | `session`, `id`, `reason` (`started`, `removed` or `stopped`), `task` (when started) | It left the queue; when `started`, the usual `message` (role user, with `task`) follows |
+| `task.started` | `task`, `model` | A conversation's task starts (the app shows that conversation as working until `task.finished` or `task.paused`) |
+| `run.started` | `task`, `model`, `schedule` ({id, name}) | A scheduled run starts, beside the conversations (0.15.10). Not `task.started`, so the app doesn't show its conversation as working |
 | `step` | `task`, `step`, `tool`, `args` (first 300 characters) | Each tool call, except a resumed one |
 | `plan` | `task`, `items` ([{step, status: pending, in_progress or done}]) | A chat task's `update_plan`: the whole plan each time |
 | `review` | `task`, `verdict` (progressing, nudge, stuck or failed), `reason` | Each supervisor check (§6.6) |
@@ -590,7 +607,7 @@ Every change the web app shows is an event: appended to `events` and broadcast o
 | `task.paused` | `task`, `approval` | Right after the card |
 | `approval.resolved` | `task`, `id`, `approved`, `by`, `edited`, `text`, `expired`, `reason` (`policy_changed`) | Answered (`text`: what the person changed it to), or given up on |
 | `task.resumed` | `task` | A parked task carries on |
-| `task.stopping` | (nothing) | Stop was pressed while a task ran |
+| `task.stopping` | `session` | Stop was pressed while a task ran |
 | `task.finished` | `task`, `status`, `steps`, `seconds`, `model`, `usage` ({input, output, cached}), `cost` (USD) | A chat task ends |
 | `run.finished` | The same as `task.finished`, plus `outcome` (`report_outcome`) and `retry: true` when it failed and a second try is queued (its error isn't shown) | A scheduled run ends (0.15.10; before, `task.finished`) |
 | `action_needed` | `task`, `id`, `reason`, `page` ("title \| url"), `image` | The agent called `needs_user` |
@@ -605,49 +622,62 @@ Every change the web app shows is an event: appended to `events` and broadcast o
 | `settings` | `{model, allow_actions, auto_approve, …}` | Settings changed |
 | `auto_approve.changed` | `{on, by}` | A person turned Auto approve on or off (§6.11) |
 | `approval.auto` | `{task, card}` | Auto approve let an action through with no card: what the card would have shown (§6.11) |
+| `session.created` / `session.updated` | The `Session` (§6.4) | A conversation was created; renamed, archived or brought back, or titled from its first message |
+| `session.deleted` | `id` | A conversation was deleted |
+| `budget.alert` | `level` (80 or 100), `spent`, `budget`, `month` (`YYYY-MM`) | This month's spending crossed 80% or 100% of the budget, once each a month (§6.22) |
 
 ### 6.6 Task lifecycle
 
 ```
-POST /messages ──► start(): busy=true (the chat's); give up on any parked task; spawn run()
-                   │
-run(): store the user message in history (and the event log), start a runs row,
-       build messages = [system prompt, last 20 history entries, the request]
-                   │
-drive() ──► run_loop() ──► Finished(answer, status) ──► finish(): history + event +
-   │                     │                                 runs row; busy=false
-   │                     └► Parked(card) ──► save RunState in `pending`, run status
-   │                                          "waiting", busy=false,
-   │                                          emit approval.requested + task.paused
+POST /sessions/{id}/messages ──► post(): the conversation free, nothing queued before it,
+        │                          fewer than MAX_PARALLEL_TASKS working, budget not used up?
+        │                          yes: reserve its lane, spawn run()      no: chat_queue, message.queued
+        │
+run(): store the user message in its history (and the event log), start a runs row,
+       build messages = [system prompt, its last 20 history entries, the request]
+        │
+drive() ──► run_loop() ──► Finished(answer, status) ──► finish(): history + event + runs row;
+   │                     │                                 free the lane; pump()
+   │                     └► Parked(card) ──► save RunState in `pending`, run status "waiting",
+   │                                          free the lane, emit approval.requested +
+   │                                          task.paused; pump()
    │
-POST /approvals/{id} ──► answer_approval(): load the checkpoint, remove the pending row,
-                         emit approval.resolved + task.resumed, drive(state, answer)
+POST /approvals/{id} ──► answer_approval(): take its lane (past the limit and the budget),
+                         load the checkpoint, remove the pending row, emit approval.resolved +
+                         task.resumed, drive(state, answer)
+
+pump(): while fewer than MAX_PARALLEL_TASKS work and the budget isn't used up, start the
+        oldest queued message whose conversation is free (not working, not waiting on a card,
+        not archived): message.unqueued {reason: started}, then run()
 ```
 
-- **Two lanes (0.15.10).** The chat runs one task at a time: `busy` is an `AtomicBool`, and a second message gets 409 ("busy with another request; stop it first"). Scheduled runs go beside it, one at a time, from a queue (§6.14), so a check never keeps you waiting. What they share is kept apart:
-  - **the browser:** a scheduled run opens a window of its own (`Target.createTarget` with `newWindow`, on the browser's DevTools session), only when it first needs the browser, and closes it at the end; `list_tabs` and `switch_tab` are refused there, and it never touches `tab_target`. If it ends needing you (`needs_user`), its window stays open and becomes `tab_target`, so "I'm done" carries on there;
-  - **Stop:** each lane has its own `watch` channel. Stop in the web app stops the chat's task; pausing or deleting a schedule stops its run in progress (`stop_schedule_runs`) and drops its queued ones;
-  - **shell commands:** one at a time across both lanes (`shell_turn`, a `tokio::sync::Mutex` held for the command; waiting for it can be stopped). A direct command opens the guard firewall to the shell user's uid (§6.21), which would let a command running beside it out too;
-  - **the history:** a scheduled run's instructions and report go into `history` when it ends. If a chat task is between its question and its answer then, they wait for the answer (`Thread`), so the model sees each question next to its answer;
-  - **memory sources:** the event seq of each task's current tool call is kept per task (`step_seqs`);
-  - **consolidation** waits while either lane is working (`is_working`), and doesn't let a scheduled run in progress hold back the chat's tasks;
-  - **`/api/v1/status`:** `busy` is the chat's; `background` says which run is in progress and how many are queued. The maintenance reboot (§5.2) and `agentd-reset` wait for either.
+- **Conversations and lanes (0.16.0).** Each conversation (§6.3 `sessions`; `main` holds everything from before) has a lane: the task running in it, a `watch` channel that stops it, and its history thread. A conversation runs one task at a time, and up to `MAX_PARALLEL_TASKS` (3) conversations work at once. A message starts a task at once only when its conversation isn't working or waiting on a card, has nothing queued already (no jumping the line), a slot is free and the budget isn't used up (§6.22); otherwise it's queued (`chat_queue`, with its raw text; it outlives restarts). Exception: a memory command (`remember …:`, `forget #…`, §6.13) in a conversation that isn't working runs at once, past the limit and the budget, and leaves a waiting card waiting; in a working one it queues.
+- **The queue.** `pump()` starts queued messages, oldest first and one per conversation, whenever a slot may have freed: a task ends or parks, Stop, the budget is raised or removed, unarchiving, and the scheduler's tick (at most a minute: the month turning over, agentd starting). Across conversations, the oldest queued message whose conversation is free goes first. A queued message leaves with `message.unqueued` (`started`, `removed` by the app's ✕, or `stopped`). Archived conversations' messages wait until they're brought back.
+- **Answering a card** resumes its task at once in its conversation, even with `MAX_PARALLEL_TASKS` working or the budget used up: the limit is on starting tasks, not finishing them. "I'm done" and "Skip" on an Action needed card are messages like any other: they start or queue.
+- **A new message doesn't give up on a parked card (0.16.0).** It queues behind it, and starts when the card's task finishes. Stop, or answering, ends the card.
+- **Scheduled runs** go beside the conversations, one at a time, from a queue (§6.14), so a check never keeps you waiting and doesn't count as its conversation working. What they share is kept apart:
+  - **the browser:** `main` works in the user's tab (`tab_target`, below and §6.9). Every other conversation works in a window of its own (`Target.createTarget` with `newWindow`, on the browser's DevTools session), opened the first time it needs the browser and kept for its next tasks (`sessions.tab_target`; if it was closed by hand, the next task opens another); a new tab loads in that window's tab, and `list_tabs` and `switch_tab` see only that window's tabs (`Browser.getWindowForTarget`). `main` leaves other conversations' windows alone: it doesn't list them, and a new tab Chrome puts in one of them is closed and the page loads in the current tab. When a conversation's task ends on Action needed, its window comes to the front (`Target.activateTarget`) for the take-over. Archiving or deleting a conversation closes its window. A scheduled run opens a window of its own only when it first needs the browser, and closes it at the end; `list_tabs` and `switch_tab` are refused there. If it ends needing you (`needs_user`), its window stays open and becomes its conversation's tab (`tab_target` for `main`), so "I'm done" carries on there. Each task connects to Chrome only when a tool first needs the browser, so a task that doesn't browse doesn't need Chrome;
+  - **Stop:** each lane, and the scheduled runs, has its own `watch` channel. Stop in a conversation stops its task; pausing or deleting a schedule stops its run in progress (`stop_schedule_runs`) and drops its queued ones;
+  - **shell commands:** ordinary commands of different conversations and scheduled runs run side by side: each is its own transient unit with a random name (`agentd-cmd-<12 hex>`), its own credential directory, and its own stdout and stderr pipes, and the helper's launch lock is held only while a unit registers (§6.10). A direct command (`direct_internet`) runs alone: it opens the guard firewall to the shell user's uid (§6.21), which would let a command running beside it out too. `shell_turn` is a `tokio::sync::RwLock`: ordinary commands share it, a direct one holds it alone; waiting for it can be stopped;
+  - **the history:** each conversation's own (`history.session`). A scheduled run's instructions and report go into its conversation's history when it ends. If a task of that conversation is between its question and its answer then, they wait for the answer (`Thread`), so the model sees each question next to its answer;
+  - **memory sources:** the event seq of each task's current tool call is kept per task (`step_seqs`); memory itself is shared by every conversation;
+  - **consolidation** waits while any conversation or a scheduled run is working (`is_working`), and doesn't let a scheduled run in progress hold back the conversations' tasks;
+  - **`/api/v1/status`:** `busy` is `main`'s (what an older app shows), `sessions.working` counts every conversation working; `background` says which run is in progress and how many are queued. The maintenance reboot (§5.2) and `agentd-reset` wait while any of them works.
 - **Parking.** A task that needs an answer saves its whole `RunState` and frees the desktop:
   - `RunState` holds the messages, the queue of tool calls not yet run, the step count, `tainted`, the loop detector, usage, time worked, an armed send, the schedule name, the plan, the supervisor's clock (when it last checked, and a stuck card's reason and advice) and the count of empty replies in a row.
   - The answer resumes it, after an agentd restart too.
   - The call it parked on runs again with the answer. For it to go ahead, the action as it would run now must match the card (`same_request` compares kind, action, role, target, the text around it, text, key, submit, site, command, direct, when, name, secrets and hosts). If the page changed while you decided, nothing is done and the model is told so.
-- **Expiry.** An answer more than 24 hours after the card abandons the task instead: the context is stale. Starting a new message or pressing Stop also abandons parked tasks (at most 16 at a time). Their cards expire and each task finishes as `cancelled`.
-- **Stop.** While running, Stop sets a `watch` channel:
-  - model calls and browser actions are dropped at once (`tokio::select!`);
-  - a shell command's systemd unit is stopped, which kills everything it started;
-  - the web app gets `task.stopping` immediately.
-- **Restart recovery.** Chat tasks still marked `running` when agentd starts were cut off: each gets an "I was interrupted…" answer and the status `interrupted`. A first scheduled attempt is eligible for retry only when the stored action marker is clear (§6.14). Parked tasks keep waiting.
+- **Expiry.** An answer more than 24 hours after the card abandons the task instead: the context is stale. Stop in its conversation also abandons its parked tasks (at most 16 at a time). Their cards expire and each task finishes as `cancelled`. (Before 0.16.0 a new message abandoned them too.)
+- **Stop** (per conversation) drops that conversation's queued messages first (`message.unqueued`, `stopped`), so the end of its task doesn't start the next one, then:
+  - while a task runs, sets its lane's `watch` channel: model calls and browser actions are dropped at once (`tokio::select!`), a shell command's systemd unit is stopped, which kills everything it started, and the app gets `task.stopping` (with `session`) immediately;
+  - while it waits on a card, gives up on it (above).
+- **Restart recovery.** Conversations' tasks still marked `running` when agentd starts were cut off: each gets an "I was interrupted…" answer in its own conversation's history and the status `interrupted`. Queued messages then start as slots allow. A first scheduled attempt is eligible for retry only when the stored action marker is clear (§6.14). Parked tasks keep waiting.
 - **No step limit: the supervisor** (`supervise.rs`). A task runs until it's done, you stop it, or a check finds it stuck. Before a model turn, once `REVIEW_EVERY_SECS` of working time (30 min; time parked on a card doesn't count) or `REVIEW_EVERY_STEPS` turns (60) have passed since the last check, a separate model call with a fresh context reviews the task. It sees your request, the agent's plan, the last check's verdict, and the calls since then (up to 40, arguments and results cut short; tool results are marked as data). It answers `{verdict, reason, advice}`:
   - **progressing:** carry on;
   - **nudge:** the advice goes to the agent as a user-role note, and the task carries on;
   - **stuck:** a chat task parks on a **stuck** card (the reason, working minutes, steps, plan progress). Keep going resumes it with the advice; Stop ends it with a wrap-up. Auto approve never answers this card: it's about whether to keep spending, not a permission. A scheduled run, with nobody to ask, ends with a wrap-up. Status `stuck`.
 
-  A check that gives no usable verdict is tried again before the next turn; two in a row count as stuck, so a broken check can't leave a task running unchecked. Each check is a `review` event and adds to the task's usage. The loop detector (§6.7) still catches the same failing call repeated, at once. A **wrap-up** is one more turn with no tools (`tool_choice: none`, 8,192 tokens), told why the task has to end: the model reports what it did, what's left and why.
+  A check that gives no usable verdict is tried again before the next turn; two in a row count as stuck, so a broken check can't leave a task running unchecked. Each check is a `review` event and adds to the task's usage (written to its run's row at once, like every model call's). The loop detector (§6.7) still catches the same failing call repeated, at once. A **wrap-up** is one more turn with no tools (`tool_choice: none`, 8,192 tokens), told why the task has to end: the model reports what it did, what's left and why.
 
 ### 6.7 The model loop
 
@@ -686,7 +716,7 @@ For each tool call:
 - 429, 500, 502, 503 and 504 are retried, up to 6 attempts in all.
 - The delay is `Retry-After` or 2^attempt seconds, capped at 30 s for HTTP errors. Network errors wait 2^attempt seconds, uncapped (at most 32 s).
 
-**Usage and cost:** input, cached and output tokens are added up per task and priced per model in `llm.rs`. The total goes on `task.finished` and the `runs` row. The web app doesn't show it.
+**Usage and cost:** input, cached and output tokens are added up per task and priced per model in `llm.rs`. They're written to the task's `runs` row after every model call (its turns, supervisor checks and wrap-ups), so a running task counts in the usage figures and the budget (§6.22); the total also goes on `task.finished`.
 
 **Models and prices.** `KNOWN_MODELS` in `llm.rs`, in USD per 1M tokens (Together serverless; GLM and Kimi checked 2026-10-30, DeepSeek 2026-11-02):
 
@@ -706,9 +736,9 @@ For each tool call:
 
 | Tool | Arguments | What it does | Asks the user? |
 |---|---|---|---|
-| `list_tabs` | (none) | Tabs with index, title and URL; `*` marks the current one | No |
-| `switch_tab` | `index` | Activates a tab and attaches to it | No |
-| `open_url` | `url`, `new_tab` | Navigates, waits until the page is ready (§6.9) and says whether it's a sign-in page | No. Only http(s), and never localhost, `.localhost`, `.internal`, private, link-local, CGNAT (Tailscale) or IPv6 ULA/link-local addresses |
+| `list_tabs` | (none) | Tabs with index, title and URL; `*` marks the current one. A conversation other than `main` sees only its own window's tabs; `main` doesn't see other conversations' windows (§6.6) | No |
+| `switch_tab` | `index` | Activates a tab of that list and attaches to it | No |
+| `open_url` | `url`, `new_tab` | Navigates, waits until the page is ready (§6.9) and says whether it's a sign-in page. `new_tab` opens one for `main`; in a conversation's own window or a scheduled run's, the page loads in its tab | No. Only http(s), and never localhost, `.localhost`, `.internal`, private, link-local, CGNAT (Tailscale) or IPv6 ULA/link-local addresses |
 | `read_text` | `max_chars` (12,000; 500–100,000) | `document.body.innerText`, truncated | No |
 | `snapshot` | `max_chars` | The accessibility tree, one line per element: role, name, `ref` (backend DOM node id) | No |
 | `click` | `ref`, or `role` + `name`, or `text`, with `summary` | Checks the target and requests one click | Always |
@@ -739,7 +769,8 @@ The shell tools (`run_shell`, `request_secret`, `request_access`) exist only whe
   - it matches responses to request ids;
   - it fans events out on a broadcast channel.
 - Chrome listens on `127.0.0.1:9222`. The shell user can't connect (the guard firewall, §5.5). agentd never runs anything as the desktop user.
-- agentd attaches to the tab it used last (`tab_target` setting), or the first tab, or opens one.
+- A task connects when a tool first needs the browser. `main` attaches to the tab it used last (`tab_target` setting), or the first tab outside other conversations' windows, or opens one. Another conversation reconnects to its window's tab (`sessions.tab_target`) or opens a new window, in the background; a scheduled run opens a window for itself (§6.6). The tab is remembered as soon as it changes, so a card parked on it, or the conversation's next task, finds it again.
+- Windows are opened (`Target.createTarget`) and found (`Browser.getWindowForTarget`) on the browser's own DevTools session (`/json/version`'s WebSocket), and closed tab by tab (`/json/close`).
 
 **Reading pages.**
 - The model never gets screenshots: the default models are text-only.
@@ -796,6 +827,11 @@ A command needing approval must include a plain explanation. Piped installs,
 shell scheduling, bare `sleep` and `date`, and attempts to edit egress
 policy are refused by the tool. These text checks supplement the OS and
 network controls.
+
+Commands of different conversations and scheduled runs run side by side
+(§6.6): each has its own unit name, credential directory and pipes, and the
+helper holds its launch lock only while a unit registers. A direct command
+runs alone.
 
 Agentd drains stdout and stderr continuously with bounded buffers. The model
 gets the beginning and the app log gets the end. Literal key values are
@@ -913,7 +949,7 @@ Both modes use the same mutation rules. In v1 (`MEMORY_V2=off`, agentd's default
 **Search.** `search_memory` uses the same ranking as the notes. On the evals, it rescues paraphrases that full-text matching misses.
 
 **Consolidation, "tidying up"** (phase 3, `consolidate.rs`; smaller since 0.15.2, the user's decision).
-- **When:** 10 minutes after the last finished chat task, or at once when 10 tasks wait. Task completion and enqueuing the `consolidate` effect (§6.19) share a transaction. Consolidation starts when the chat and scheduled worker are idle.
+- **When:** 10 minutes after the last finished chat task, or at once when 10 tasks wait. Task completion and enqueuing the `consolidate` effect (§6.19) share a transaction. Consolidation starts when no conversation and no scheduled run is working, and its model call waits while the monthly budget is used up (§6.22).
 - **Which tasks:** eligible finished chat tasks, tracked individually. A parked task becomes eligible when it finishes. A batch whose tasks only read or chatted (`runs.acted = 0`) and saved no memory needs no model. It runs decay and is recorded with model `none` at no cost.
 - **Batches:** at most 10 tasks per model call. A full batch that leaves more behind runs the next one 5 seconds later (`Later`). With 20 busy tasks, GLM-5.3-Flash thought for 6,000–8,000 tokens or more per call.
 - **What it does:** it sends the batch (request, answer, status, and whether each task "changed something" or "only read or chatted") and the current memories to `memory_consolidation_model` (GLM-5.3-Flash by default), with the same model client as every task. The reply is a JSON object with `work_log`, `merges` and `expire`, checked here before anything is written:
@@ -932,7 +968,7 @@ Both modes use the same mutation rules. In v1 (`MEMORY_V2=off`, agentd's default
   - inferred work-log entries expire after a year unless they have a user-set lifetime;
   - so does anything past `valid_until`.
   - Losing importance doesn't change a memory's `version` (the edit-conflict token), so an edit opened before the run still saves; expiring it does.
-- **Accounting:** each run is a `runs` row (`kind = consolidation`) with its cost, under a daily cap (`memory_consolidation_daily_cap_usd`, $0.50, at most $10), and emits `memory.consolidated`.
+- **Accounting:** each run is a `runs` row (`kind = consolidation`) with its cost and tokens, under a daily cap (`memory_consolidation_daily_cap_usd`, $0.50, at most $10), and emits `memory.consolidated`. Its cost counts toward the monthly budget (§6.22).
 - **Reply limit:** 16,384 tokens. GLM thinks before it answers, and with 4,096 tokens a batch of 20 tasks left no room for the JSON (found in the phase 6 soak). A reply without JSON records its `finish_reason` in the effect's error. Each call gets a journal line (`consolidation reply`): tasks, milliseconds, `finish_reason`, prompt, completion and reasoning tokens.
 - **No settings reads inside its transaction:** `apply` holds the store's lock, which isn't re-entrant. 0.15.0 read the time zone there (for a fact's end date) and froze agentd (found in the phase 6 evals before it reached a desktop). Facts, and so dates, are gone since 0.15.2.
 - **Cost:** about $0.0006 a run on Flash for a few tasks, about a cent for a full batch.
@@ -961,13 +997,14 @@ Both are read in the user's time zone, which the web app sends with every messag
 3. Skips a run more than 1 hour late (agentd was down, or the desktop was stopped), with a note in the chat.
 4. Moves a recurring schedule to its next run, and deletes a one-time schedule once it has run.
 
-**The background worker** (`schedule::work`, also started once the socket is bound) takes the queued run due first (`claim_run`), one at a time, beside the chat. It drops a run whose schedule was paused or deleted meanwhile (`cancelled`), and skips one that waited over an hour (`skipped`, with a note). The queue is in the database, so it outlives restarts:
+**The background worker** (`schedule::work`, also started once the socket is bound) takes the queued run due first (`claim_run`), one at a time, beside the conversations. It drops a run whose schedule was paused or deleted meanwhile (`cancelled`), skips one that waited over an hour (`skipped`, with a note), and skips one while the monthly budget is used up (`skipped`, with a quiet row "Skipped: this month's budget is used up" in its conversation, §6.22). The queue is in the database, so it outlives restarts:
 - **cut off by a restart:** a scheduled run still `running` when agentd starts becomes `interrupted`. A first attempt with no dispatched actions is retried if it is still timely. Otherwise the user is told to check for changes;
 - **failed** (`error`: the model or the network, most likely): a first attempt with no dispatched actions can retry after two minutes. Runs that might have changed something report the error;
 - the retry's failure is reported like any other.
 
 **A scheduled run.**
-- It runs beside the chat (above, and §6.6): you can keep talking to the agent meanwhile. Nothing of it reaches the chat until it ends; then its report appears whole, at the bottom.
+- It belongs to the conversation that set the schedule up (`schedules.session`; `main` for older schedules and ones added through the API, and for a deleted conversation's). Its notes, instructions and report go to that conversation's history and timeline, and its events carry that `session`.
+- It runs beside the conversations (above, and §6.6): you can keep talking to the agent meanwhile, and its conversation doesn't count as working. Nothing of it reaches the chat until it ends; then its report appears whole, at the bottom.
 - It starts without the chat history.
 - Its prompt is framed as "(agentd) This is the scheduled task "…" the user set up earlier (…). They aren't watching…", with memory v2's `report_outcome` rule and the rule for what may go ahead (below).
 - It doesn't abandon parked tasks.
@@ -1043,10 +1080,11 @@ agentd sends notifications itself, to two kinds of recipient and with no relay o
   - a card that waits on you, from `ask` (urgency high, TTL 24 h): "Needs your OK" with the command's summary, "Write this?", "Click this?", "Press …?", "Schedule this?", "Needs a key", "Let it reach a site?", or "Looks stuck";
   - Action needed, with its reason;
   - a chat task that worked over a minute and ends `done` ("Done", with the answer's first line of prose) or `error` ("Hit a problem");
-  - a scheduled run with something to report: its name, and `report_outcome`'s summary or the answer's first line. Not a quiet run (`nothing`), a cancelled one, or a failed first try that's being retried.
+  - a scheduled run with something to report: its name, and `report_outcome`'s summary or the answer's first line. Not a quiet run (`nothing`), a cancelled one, or a failed first try that's being retried;
+  - the monthly budget reaching 80% ("You've used 80% of this month's $50 budget") and 100%, once each a month (§6.22).
 
   Not: a quick chat answer, a task you stopped, or Stop on a stuck card.
-- **Payload:** title (≤ 80 characters) and body (≤ 180), with saved keys replaced by `[secret NAME]`. The task ID groups notifications. Web Push carries `url: "/#/chat"`. APNs includes the task and card IDs so the app can open the card.
+- **Payload:** title (≤ 80 characters) and body (≤ 180), with saved keys replaced by `[secret NAME]`; a task's title starts with its conversation's title ("Lisbon trip: Needs your OK") when it isn't `main`. The task ID groups notifications. Web Push carries `url: "/#/chat/<session>"`, the task's conversation (`"/#/chat"` for a notice about none: a test, a budget alert). APNs includes the task and card IDs, and the conversation (`session`), so the app can open the card.
 - **Delivery:** a `web_push` effect per browser or an `apns` effect per app, keyed by recipient and tag (§6.19), so an unsent notification is replaced by a newer one for the same task and device, and a slow service for one device never re-sends to another. Web Push: 2xx done (with `last_sent`), 404/410 the browser unsubscribed (row deleted), 429/5xx retried (after `Retry-After`), anything else dropped. APNs: 200 done, 410 or `BadDeviceToken`/`Unregistered` the token is gone (row deleted), 429/5xx retried, anything else dropped. Not delivered within an hour, or after 5 failures, a notification is dropped rather than left to show as a problem.
 - **Recipients:**
   - **browsers** (`push_subscriptions`): at most 20. An endpoint must be https on a known push service's host (`fcm.googleapis.com`, `*.push.apple.com`, `*.push.services.mozilla.com`, `*.notify.windows.com`, no port), so a subscription can't aim agentd's requests elsewhere; `PUSH_DEV_ENDPOINTS=on` (local development only) also takes `http://127.0.0.1`. Keys are checked: a 65-byte uncompressed P-256 `p256dh` and a 16-byte `auth`.
@@ -1108,6 +1146,15 @@ Direct commands require explicit approval and cannot receive saved keys.
 Scheduled runs report that they were blocked. Other worker services do
 not get the direct network grant.
 
+### 6.22 Usage and the monthly budget (`usage.rs`)
+
+What the model costs is estimated from token counts with `llm.rs`'s prices (§6.7). Everything that calls the model is a `runs` row: chat tasks (`kind = task`, `schedule` null), scheduled runs (`kind = task`, `schedule` set) and memory tidy-up (`kind = consolidation`); supervisor checks and wrap-ups are part of their task's. A run's cost and tokens are written after each model call, so running tasks count. Days and months are the user's (`user_timezone`; UTC when unknown), and a run counts on the day it started.
+
+- **`GET /api/v1/usage?days=30`** (1–90): `{currency: "USD", estimated: true, timezone, month, today, this_month, last_month, all_time, daily, by_kind, by_model, by_session, by_schedule, budget}`. `daily` is one `{date, cost, runs}` per day of the last `days` days, oldest first, zeros included. `by_kind` is `{chat, scheduled, tidy_up}`; `by_model` is `[{model, cost, runs, input_tokens, output_tokens, cached_tokens}]` (a tidy-up that needed no model isn't a model); `by_session` (a chat task's or scheduled run's conversation; deleted ones keep their title) and `by_schedule` (a deleted schedule's `name` is null) list at most 10. The `by_*` figures are this month's, most expensive first. `runs` counts runs that ran: not queued, skipped or never started ones. Tokens of runs from before 0.16.0 are unknown and count as 0. Costs are kept to a millionth of a dollar.
+- **The budget** (`monthly_budget_usd`, none by default; a positive number up to 100,000, set through `PUT /api/v1/settings`). `/status` and `/usage` show `{monthly_usd, spent, fraction, paused}` (`/status` adds `month`).
+- **Alerts:** crossing 80% and 100% of it each sends, once a month (`budget_alerted`), a `budget.alert` event and a notification (§6.17). They're checked after every recorded model call and when the budget changes.
+- **At 100%:** new tasks don't start, and messages queue (their conversation's state is `paused`); scheduled runs due meanwhile are skipped with a quiet row in their conversation; memory tidy-up's model call waits. Tasks already running finish, an answered card resumes its task, and a memory command in a conversation that isn't working still runs (it costs nothing). Raising or removing the budget, or a new month, lets the queue go again (§6.6).
+
 ## 7. tailnet-proxy, the web app and the apps
 
 ### 7.1 tailnet-proxy: the desktop on your tailnet
@@ -1143,12 +1190,16 @@ not get the direct network grant.
 
 Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no third-party code (fonts are bundled). tailnet-proxy serves it from the desktop at `https://neo-agent.<tailnet>.ts.net/`: open it on any device running Tailscale, signed in to your tailnet. Every request goes to the same host (`api.js`), so there's nothing to configure and no login page: Tailscale signs in the device.
 
-- **Pages:** Chat, Desktop, Schedules, Keys and tokens, Settings (`#/chat`, `#/desktop`, …). There's no setup page.
+- **Pages:** Conversations, Chat, Desktop, Schedules, Keys and tokens, Settings, Usage (`#/chats`, `#/chat/<id>`, `#/desktop`, …, `#/usage`). `#/chat` alone is `main` (older notifications' links); no hash opens the conversation used last on this device (localStorage). There's no setup page.
+- **Conversations** (`#/chats`, `conversations.js`): each with its title, its last message's first line, when, and a badge: a spinner while working, Needs you, N queued or Paused (the budget). New, and a ⋯ menu with Rename, Archive or Unarchive, and Delete (asks first; not offered for `main`). Archived ones fold under "Archived" and open read-only. The list is `GET /sessions`, fetched again about 300 ms after events that change it.
 - **The desktop's status,** beside the pages: the name and `stage` in words (Needs your OK, Needs a key, Needs you, Working, Hit a problem, A schedule is due, Ready), or "Can't reach it" when offline. On a phone, the top bar shows it when something needs you or went wrong, and Chat gets a "Needs you" badge while you're on another page. The status is fetched again after each event that can change it.
 - **Chat** (`chat.js`, `timeline.js`, `store.js`):
   - The chat is built from the event log. `timeline.js` reads only messages, images, `task.*`, cards and their answers, and `secret.saved`: the agent's steps, commands and their output, and memory and schedule events stay out. Replaying the later part of the log gives the chat of that part.
-  - It opens at its end: the newest page (60 events of those kinds), then the stream after its `last_seq`. Older pages load as you scroll up, without moving what's on screen. On an error it shows offline, waits 2 s and reconnects after the last seq it applied.
-  - Three dots while a task runs, with how long it has worked ("Working · 24 min", from `task.started`); Send becomes Stop. Suggestions in an empty chat.
+  - It opens at its end: the newest page of its conversation (`/events/page?session=`, 60 events of those kinds), then the stream after its `last_seq`. Older pages load as you scroll up, without moving what's on screen. On an error it shows offline, waits 2 s and reconnects after the last seq it applied.
+  - **One stream for every conversation** (`store.js`), routed by each event's `session`: a conversation event without one (from before 0.16.0) is `main`'s, and an event that isn't a conversation's (settings, keys, `budget.alert`…) reaches every conversation. A conversation that isn't open ignores its events and gets them with its first page.
+  - The top bar has the conversation's title, the conversations button (with an orange dot when another conversation needs you) and New. Drafts are kept per conversation.
+  - Three dots while a task runs, with how long it has worked ("Working · 24 min", from `task.started`), and a Stop button. **Send still works while it runs:** the message is queued, a grey "Queued" bubble below the dots ("Queued · 2 of 3" when there are more) with a ✕ to take it back, which gives way to the message itself when it starts (`message.queued`, `message.unqueued`). With messages queued, Stop says it drops them too, and asks first. Suggestions in an empty chat.
+  - **The budget:** while `status.budget.paused`, a banner says new messages wait until you raise it, with a button to Usage; a `budget.alert` shows a toast.
   - **The plan:** when the agent writes one (`update_plan`), a checklist after your message: "Plan" with "3 of 5", each step ✓ done, ◐ in progress or ○ to do, updated with each `plan` event. When the task ends it folds to "Plan · 4 of 5 done", above the answer.
   - Answers are Markdown (`markdown.js`): blocks and tables, single newlines break lines, raw HTML stays text, only web and mail links, images become links.
   - **Scheduled runs are reports,** not you speaking: the schedule's name and time, the instructions folded away, and the answer. A one-line run that found nothing is a quiet grey line, and such runs of one schedule fold into the latest.
@@ -1161,9 +1212,11 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
     - **Action needed:** the reason and a screenshot, with Skip, I'm done and Take over (the Desktop page);
     - **Looks stuck,** from the supervisor: its reason, how long it has worked, steps and plan progress, with Stop and Keep going.
 
-    On an editable card, Edit lets you change the text before approving (§6.11). A 409 says the desktop is busy; a 404 expires the card ("That request has expired.").
+    On an editable card, Edit lets you change the text before approving (§6.11). A 404 expires the card ("That request has expired."); a 409 (another answer in the same conversation resuming at that moment) says to try again.
   - **Keys in the chat:** `keys.js` spots well-known key formats in a message about to be sent (GitHub, GitLab, Anthropic, Together, Stripe, OpenAI, Slack, Hugging Face, Google, AWS) and offers to save it under Keys and tokens instead.
-- **Desktop:** noVNC in a frame (`/viewer/vnc.html?autoconnect=1&resize=scale&reconnect=1&…&path=websockify`), scaled to fit, reconnecting every 2 s. While an Action needed card waits, its reason shows above it with Skip and I'm done; I'm done goes back to the chat. Leaving the page closes the connection.
+- **Desktop:** noVNC in a frame (`/viewer/vnc.html?autoconnect=1&resize=scale&reconnect=1&…&path=websockify`), scaled to fit, reconnecting every 2 s. While an Action needed card waits, its reason shows above it with Skip and I'm done; I'm done goes back to the card's conversation. Leaving the page closes the connection.
+- **Usage** (`#/usage`, `usage.js`; from Settings → Usage): today, this month, last month and all time; the last 30 days as bars (tap or point at a day to read it, arrow keys, and a table view); this month by kind, model, conversation and schedule; the monthly budget with a progress bar and a field to set or remove it (`PUT /settings {monthly_budget_usd}`). It says the figures are estimates from token counts.
+- **A desktop from before 0.16.0** (`GET /sessions` is 404): one conversation, `main`, through the old endpoints and pages without `session`; Conversations, New and Usage are hidden, and Send is hidden while it works (the old desktop answers 409).
 - **Schedules:** each with its name, description, next and last run and instructions, with Pause or Resume and Cancel schedule. No way to add one there: schedules come from the chat.
 - **Keys and tokens:** the saved keys (never their values), add (with suggestions such as GitHub token and Together AI API key), replace and delete. Names are checked as agentd checks them.
 - **Settings:**
@@ -1173,7 +1226,7 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
   - Appearance: the theme, kept in this browser only;
   - Desktop: its name and agent version;
   - You: "Signed in as" the Tailscale login. To sign out, log out of Tailscale.
-- **Tests:** `make web-test` (`node --test`): the chat shows messages and waiting cards, never steps; card kinds keep their fields; scheduled runs as reports and folding; a run beside the chat leaves it free; the access card; an answer whose report is on an older page; Markdown; the key detector.
+- **Tests:** `make web-test` (`node --test`): the chat shows messages and waiting cards, never steps; card kinds keep their fields; scheduled runs as reports and folding; a run beside the chat leaves it free; the access card; an answer whose report is on an older page; Markdown; the key detector; routing by session and global events; queued bubbles (started, removed, stopped, ✕); Stop dropping the queue; the list's debounced refetch; routes and the remembered conversation; the old-desktop fallback; the usage chart's days. `make web-smoke` also clicks through conversations, queueing, Usage and the budget (it skips those on an older agentd).
 
 ### 7.3 Local development: `devdoor` and `make web-dev`
 
@@ -1188,13 +1241,16 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 - **`DesktopKit`** (a Swift package, shared):
   - `Tailnet`: the app's own Tailscale node (TailscaleKit: libtailscale's tsnet in Go with Swift bindings, built from source by `scripts/build-tailscalekit.sh` at a pinned commit). It signs in through the browser (`AuthURL`), keeps its identity in Application Support, and hands out a `URLSession` and a loopback SOCKS5 proxy into the tailnet. The desktop is the first peer tagged `tag:neo-agent`, online first. iOS takes the proxy away while the app is suspended, so a fresh node (same identity) starts when it comes back; the Mac app does the same after sleep.
   - `AgentAPI`: the API of §6.4 at `https://<desktop>.<tailnet>.ts.net`, the event stream (SSE) and pages.
-  - `ChatCore`: `ChatTimeline`, the same rules as the web app's `timeline.js` (the same event kinds, cards, reports, folding, plans and Looks stuck), and `ChatStore`, which loads the newest page, streams after it and reloads after a disconnect.
+  - `ChatCore`: `ChatTimeline`, the same rules as the web app's `timeline.js` (the same event kinds, cards, reports, folding, plans, Looks stuck and queued bubbles); `Conversation`, one conversation's timeline, paging and draft; and `ChatStore`, which keeps the list (`GET /sessions`, fetched again about 300 ms after the events that change it), runs one stream for every conversation and routes each event by its `session` (a conversation event without one is `main`'s; other events reach every loaded conversation), loads a conversation's newest page when it's opened (holding stream events meanwhile, then skipping what the page had), reloads after a disconnect, and remembers the conversation used last per device and desktop. A desktop from before 0.16.0 (`GET /sessions` is 404) is one conversation, `main`, through the old endpoints.
   - `DesktopViewer`: VNC (swift-rfb) through the SOCKS5 proxy to port 5900 at the desktop's tailnet IP.
-- **Screens** (`NeoAgent/Views`, shared): sign in, the chat with its stage banner, cards and suggestions, Settings (model, browser actions, auto approve, Tailscale log out), Memory (kinds, search, edit, forget, confirm, restore, export and import, tidying up), Schedules and Keys. Take over is full screen on the iPhone (tap, drag, pinch, a keyboard with Esc, Tab, Ctrl, Alt and arrows, clipboard both ways) and its own window on the Mac (⌘ shortcuts act as Ctrl on the desktop).
+- **Screens** (`NeoAgent/Views`, shared): sign in, the conversations, the chat with its stage banner, cards and suggestions, Settings (model, browser actions, auto approve, Usage, Tailscale log out), Memory (kinds, search, edit, forget, confirm, restore, export and import, tidying up), Schedules and Keys.
+  - **Conversations** (`Conversations.swift`): title, time, the last message and a badge (a spinner, Needs you, N queued, Paused). On the iPhone a list screen (`iOS/PhoneHome.swift`) with New, Settings and Archived; swipe to archive or delete (delete asks; not `main`), touch and hold to rename. The app opens on the conversation used last, pushed over the list; a notification opens its conversation. On the Mac a sidebar (`macOS/MacHome.swift`) with right-click and swipe actions, a folded Archived section and ⌘N. New reuses an empty conversation rather than making another.
+  - **The chat:** its title (with rename and archive) and the model; Send works while the agent works and queues (grey dashed "Queued" bubbles with their place and a ✕), Stop beside Send asks first when it would drop queued messages; a banner when the budget is used up (to Usage), and the Needs you banner names the conversation when the card is in another one. An archived conversation is read-only, with Unarchive.
+  - **Usage** (`UsageView.swift`, Settings → Usage): this month with the budget bar (orange from 80%, red when used up), today, last month and all time, a 30-day bar chart (Swift Charts; touch or hover a day), this month by kind, model, conversation and schedule, and the budget field. A footnote says the figures are estimates in US dollars. Take over is full screen on the iPhone (tap, drag, pinch, a keyboard with Esc, Tab, Ctrl, Alt and arrows, clipboard both ways) and its own window on the Mac (⌘ shortcuts act as Ctrl on the desktop).
 - **Identity:** the app signs in as you, so tailnet-proxy passes your login in `X-Tailscale-User` as it does for a browser, and `-allow` (`make tailscale-allow`) applies the same way.
 - **Notifications:** by APNs, direct from agentd with your own key (§6.17), the same events as the browsers' Web Push. The app asks permission on first connect and registers its token and bundle id (`POST /api/v1/devices`); an approval card shows Approve/Deny on the notification (`PushCenter`). Two things turn them on, both needing the paid Apple Developer Program: `make apns-key` for the desktop's key, and `APP_PUSH=1` at build time for the app's push capability.
 - **Not in this edition:** setup links for devices without a Tailscale account, TestFlight and notarized builds. You install with `make app-device` and `make app-mac`; a free Apple Account's builds stop opening after 7 days, and can't create the APNs key notifications need.
-- **Tests:** `make app-test` (`swift test`): the chat timeline (cards, reports, plans, Looks stuck, working time), decoding agentd's and Tailscale's JSON, Markdown, the key detector, Mac shortcuts and copying. `LiveAgentTests` and `LiveVNCTests` run against a real agentd or x11vnc when `AGENTD_URL` or `VNC_ADDR` is set. A Debug build launched with `CHAT_PREVIEW_URL` (and optionally `PREVIEW_SCREEN`) talks to that address directly, without Tailscale: `make web-dev` in the Simulator (README, Developing).
+- **Tests:** `make app-test` (`swift test`): the chat timeline (cards, reports, plans, Looks stuck, working time), decoding agentd's and Tailscale's JSON (conversations, usage and the new replies included), Markdown, the key detector, Mac shortcuts and copying; conversations against a stand-in agentd (`StubAgentd.swift`): routing by session, queued bubbles (started, removed, stopped), the old-desktop fallback. `LiveAgentTests` and `LiveVNCTests` run against a real agentd or x11vnc when `AGENTD_URL` or `VNC_ADDR` is set. A Debug build launched with `CHAT_PREVIEW_URL` (and optionally `PREVIEW_SCREEN`) talks to that address directly, without Tailscale: `make web-dev` in the Simulator (README, Developing).
 
 ## 8. End-to-end flows
 
@@ -1207,11 +1263,11 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 
 ### 8.2 A request from the chat
 
-1. `POST /messages {text, timezone, utc_offset}`. agentd:
+1. `POST /sessions/{id}/messages {text, timezone, utc_offset}`. When the conversation is working, waiting on a card or has messages queued, when 3 conversations are working, or when the monthly budget is used up, agentd stores it in `chat_queue`, emits `message.queued` and answers 202 `{queued}`; it starts later, in order (§6.6). Otherwise agentd:
    - redacts any saved key's value;
-   - stores the message;
-   - emits `message` and `task.started`;
-   - answers 202.
+   - stores the message in the conversation's history;
+   - emits `message` and `task.started` (with `session`);
+   - answers 202 `{task}`.
 2. Each model turn:
    - agentd builds the request: system prompt, last 20 history entries, the conversation so far;
    - POSTs it to Together over TLS, with your key as the bearer token, out through the NAT;
@@ -1241,7 +1297,7 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 1. The agent reaches a sign-in page. `open_url` adds a hint, or the reminder fires. The agent calls `needs_user("Sign in to Slack in the open tab")`.
 2. agentd saves a screenshot and emits `action_needed` with the page. The task ends with status `needs_user`, and the stage becomes Needs you.
 3. You click Take over. The Desktop page opens noVNC in a frame: `/viewer/` and `/websockify` through tailnet-proxy, to websockify and x11vnc. You sign in on the desktop's Chrome; the session stays in the profile.
-4. You click **I'm done**: `POST /actions/{id} {choice: done}` starts a new task, "I've done what you asked… continue". With the history, the agent carries on.
+4. You click **I'm done**: `POST /actions/{id} {choice: done}` starts a new task in the card's conversation, "I've done what you asked… continue" (or queues it, like a message). With the conversation's history and its browser window (brought to the front when the card was shown), the agent carries on.
 
 ### 8.5 A key or token
 
@@ -1403,7 +1459,7 @@ About $40/month while the desktop runs. `make stop` brings the desktop's part do
 
 | Component | Tests |
 |---|---|
-| agentd | 192 unit tests, plus 7 ignored by default that need a real Chrome or run on demand (such as the 5,000-memory speed test): sites the user allows (host checks, a card only for hosts not already reachable, Squid's file, a scheduled run that can't ask, a denied card, the proxy's refusal spotted in output), direct commands (always a card, a yes bound to `direct`, never in a scheduled run, no proxy settings, a tool connecting on its own spotted in output), scheduled runs beside the chat with a stand-in model (the chat free meanwhile, the report whole at the end, its history after the chat's answer, one quiet retry after a failure or a restart, a paused schedule stopping its run), the run queue (one per schedule, due order, cancelling), "Run without asking" for schedules a person sets up, memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, `stage`, the caller from tailnet-proxy's header only, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text report summaries, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, guards (sleep, date, piped installs, shell scheduling, the egress controls, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words, notifications (the attention budget, the card wording, the APNs provider token and payload, Apple's answers classified, an expired token dropped so the retry re-signs, the collapse id truncated at a char boundary, the `.p8` loaded two ways, an app getting one effect per notice, registration gated on an APNs key) |
+| agentd | 212 unit tests, plus 7 ignored by default that need a real Chrome or run on demand (such as the 5,000-memory speed test): conversations (queued messages starting oldest first, one per conversation, across conversations; the 3-task limit and an answered card resuming past it; a message queuing behind a parked card; a memory command running while its conversation only waits on a card and queuing while it works; Stop dropping the queue; removing a queued message; `session` on events, global kinds without, and per-conversation pages; each conversation's own history; titles; create, rename, archive and delete, with the 409s; ordinary commands side by side and a direct one alone), the API (no 409 for a busy conversation, the old Stop's shape, the conversations' status codes), usage (days and months in the user's time zone, by kind, model, conversation and schedule, a running task counting), the budget (pausing and letting the queue go, an answered card resuming meanwhile, a scheduled run skipped quietly in its conversation, the 80% and 100% alerts once a month, their notification), the schema migration from a v8 database (the event log's backfill, `main`'s title, an older agentd's statements still working), sites the user allows (host checks, a card only for hosts not already reachable, Squid's file, a scheduled run that can't ask, a denied card, the proxy's refusal spotted in output), direct commands (always a card, a yes bound to `direct`, never in a scheduled run, no proxy settings, a tool connecting on its own spotted in output), scheduled runs beside the chat with a stand-in model (the chat free meanwhile, the report whole at the end, its history after the chat's answer, one quiet retry after a failure or a restart, a paused schedule stopping its run), the run queue (one per schedule, due order, cancelling), "Run without asking" for schedules a person sets up, memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, `stage`, the caller from tailnet-proxy's header only, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text report summaries, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, guards (sleep, date, piped installs, shell scheduling, the egress controls, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words, notifications (the attention budget, the card wording, the APNs provider token and payload, Apple's answers classified, an expired token dropped so the retry re-signs, the collapse id truncated at a char boundary, the `.p8` loaded two ways, an app getting one effect per notice, registration gated on an APNs key) |
 | tailnet-proxy | Who gets in (`admits`: logins and tags), and package `door` with a Tailscale-style caller (`go test`) |
 | The web app | 10 tests (§7.2): the chat rules, card fields, scheduled runs as reports, the access card, Markdown, the key detector (`node --test`) |
 | The apps | 44 tests in DesktopKit (§7.4, `swift test`), two of them live tests skipped unless `AGENTD_URL` or `VNC_ADDR` is set |
@@ -1414,9 +1470,10 @@ Found while writing this document. None of them is a known exploit; most are tra
 
 **Security and robustness.**
 - The daemon holds the model key on the desktop. Rotate it with `make model-key` and `make agentd-deploy`.
-- Model calls have no spending limit: tasks have no daily budget, only tidy-up has its cap. No cap on a task's steps: the supervisor's checks, the context budget and loop detection limit each task, and a fast loop can run up to 60 turns before the first check.
+- Model calls have no spending limit unless you set a monthly budget (§6.22), and even then tasks already running finish and answered cards resume past it. No cap on a task's steps: the supervisor's checks, the context budget and loop detection limit each task, and a fast loop can run up to 60 turns before the first check.
 - `PUT /api/v1/settings` stores any `model` without checking `KNOWN_MODELS`; the web app offers only the known ones. A task on another model runs (Together decides), with no price, so its cost is null; a card it parks expires when answered, since today's rules refuse that model.
-- A chat command waits for an ongoing scheduled command to release the shell worker.
+- A direct command (`direct_internet`) waits for every running command, and they for it (§6.6).
+- A conversation other than `main` works in one tab of its own window: `open_url` with `new_tab` loads there, since Chrome puts a new tab in whichever window was last at the front. Tabs a page opens in that window are its own. A new tab `main` opens can still land in a conversation's window if that one was last at the front: it's closed and the page loads in `main`'s current tab instead.
 - With no `allowed_logins`, every device your tailnet's rules let through reaches the web app, agentd's API and raw VNC (`-nopw`).
 - The KMS key has the default key policy: the account's IAM decides who can use it.
 - The single fck-nat instance serves both AZs: a single point of failure.

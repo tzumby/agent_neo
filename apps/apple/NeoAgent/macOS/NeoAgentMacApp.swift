@@ -34,7 +34,8 @@ struct NeoAgentMacApp: App {
             .environment(tailnet)
             .environment(session)
         }
-        .defaultSize(width: 720, height: 860)
+        // Room for the conversations' sidebar beside the chat.
+        .defaultSize(width: 1000, height: 860)
         .commands { ChatCommands() }
 
         Window("Your desktop", id: DesktopSession.desktopWindow) {
@@ -100,6 +101,7 @@ extension FocusedValues {
 
 private struct ChatCommands: Commands {
     @FocusedValue(\.openSettings) private var settings
+    @FocusedValue(\.newConversation) private var newConversation
 
     var body: some Commands {
         CommandGroup(replacing: .appSettings) {
@@ -107,7 +109,11 @@ private struct ChatCommands: Commands {
                 .keyboardShortcut(",")
                 .disabled(settings == nil)
         }
-        // One chat window, no documents.
-        CommandGroup(replacing: .newItem) {}
+        // One chat window, no documents: ⌘N is a new conversation.
+        CommandGroup(replacing: .newItem) {
+            Button("New Conversation") { newConversation?.start() }
+                .keyboardShortcut("n")
+                .disabled(newConversation?.enabled != true)
+        }
     }
 }

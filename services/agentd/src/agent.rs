@@ -62,6 +62,12 @@ const AUTO_APPROVE_RULE: &str = "Ordinary worker commands can run without asking
 const CARD_TEXT_MAX_CHARS: usize = 4000;
 const INTERRUPTED: &str =
     "I was interrupted: the agent on your desktop restarted. Ask me to continue if you still need this.";
+/// A card answered, or found, more than a day after it was asked.
+const LATE_ANSWER: &str = "I stopped waiting for your approval: it came a day later, and the desktop has likely \
+     changed since. Ask me again if you still need this.";
+/// A task that broke off on a bug in agentd (it panicked).
+const BROKE_OFF: &str =
+    "Something went wrong inside the agent, so I stopped. Ask me again if you still need this.";
 /// Memory v2: the one reminder when the user asked to remember something and
 /// the task is ending without a save. Worded so a question ("do you
 /// remember…?") just gets its answer again.
@@ -992,7 +998,62 @@ impl Agent {
         session: String,
     ) {
         let agent = self.clone();
-        tokio::spawn(async move { agent.run(task, text, by, None, session).await });
+        let (id, lane) = (task.clone(), session.clone());
+        let run = tokio::spawn(async move { agent.run(task, text, by, None, session).await });
+        self.watch_task(id, lane, run);
+    }
+
+    /// Waits on a conversation's task: if it panics (a bug in agentd), its
+    /// run ends as an error and its lane is freed, so the conversation isn't
+    /// left working for good and what's queued behind it starts.
+    fn watch_task(self: &Arc<Self>, task: String, session: String, run: tokio::task::JoinHandle<()>) {
+        let agent = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = run.await
+                && err.is_panic()
+            {
+                agent.broke_off(&task, &session);
+                agent.pump();
+            }
+        });
+    }
+
+    /// A conversation's task that panicked: what's left of it is ended.
+    fn broke_off(&self, task: &str, session: &str) {
+        tracing::error!(%task, %session, "a task broke off (a bug in agentd)");
+        self.step_seqs.lock().unwrap().remove(task);
+        if let Err(err) = self.store.fail_run(task, BROKE_OFF) {
+            tracing::error!(%err, %task, "couldn't record the run's end");
+        }
+        self.close_thread(session, Some(BROKE_OFF));
+        self.emit(
+            "message",
+            json!({"role": "assistant", "text": BROKE_OFF, "task": task, "session": session}),
+        );
+        self.emit(
+            "task.finished",
+            json!({"task": task, "status": "error", "session": session}),
+        );
+        self.task_sessions.lock().unwrap().remove(task);
+        self.release(session, task);
+    }
+
+    /// Gives up on cards nobody answered within a day (in `session`, or in
+    /// every conversation): too late to resume, they mustn't hold their
+    /// conversation's queue. True if any. The caller starts what's queued.
+    pub(crate) fn expire_stale_cards(&self, session: Option<&str>) -> bool {
+        let cutoff = unix_now() - APPROVAL_TTL_SECS;
+        let mut any = false;
+        for parked in self.store.stale_cards(cutoff).unwrap_or_default() {
+            let of = self.session_of(&parked.run).unwrap_or_else(main_session);
+            if session.is_some_and(|session| session != of) {
+                continue;
+            }
+            tracing::info!(approval = %parked.id, session = %of, "a card nobody answered for a day: given up on");
+            self.abandon(parked, LATE_ANSWER);
+            any = true;
+        }
+        any
     }
 
     /// Runs a queued scheduled run to its end, beside the conversations (the
@@ -1007,9 +1068,19 @@ impl Agent {
         self.background_cancel.send_replace(false);
         let prompt = schedule.prompt.clone();
         let session = schedule.session.clone();
-        self.clone()
-            .run(queued.id, prompt, None, Some(schedule), session)
-            .await;
+        let task = queued.id.clone();
+        // A panic (a bug in agentd) ends the run as an error rather than
+        // the background worker.
+        let run = tokio::spawn(self.clone().run(queued.id, prompt, None, Some(schedule), session));
+        if let Err(err) = run.await
+            && err.is_panic()
+        {
+            tracing::error!(%task, "a scheduled run broke off (a bug in agentd)");
+            self.step_seqs.lock().unwrap().remove(&task);
+            let _ = self.store.fail_run(&task, BROKE_OFF);
+            self.emit("run.finished", json!({"task": task, "status": "error"}));
+            self.task_sessions.lock().unwrap().remove(&task);
+        }
         *self.background.lock().unwrap() = None;
     }
 
@@ -1124,19 +1195,19 @@ impl Agent {
         let Ok(Some(parked)) = self.store.parked(id) else {
             return Err(StartError::NotFound);
         };
+        // A card given up on here frees its conversation: what's queued
+        // behind it starts (pump).
         if approved
             && ((parked.card["kind"] == "shell" && parked.card["timeout"].is_null())
                 || (parked.card["kind"] == "browser" && parked.card["binding"].is_null()))
         {
             self.abandon_because(parked, POLICY_CHANGED, Some("policy_changed"));
+            self.pump();
             return Err(StartError::NotFound);
         }
         if unix_now() - parked.created > APPROVAL_TTL_SECS {
-            self.abandon(
-                parked,
-                "I stopped waiting for your approval: it came a day later, and the desktop has likely \
-                 changed since. Ask me again if you still need this.",
-            );
+            self.abandon(parked, LATE_ANSWER);
+            self.pump();
             return Err(StartError::NotFound);
         }
         // Parked under other rules: if today's would refuse it outright, it
@@ -1152,6 +1223,7 @@ impl Agent {
             if let Some(why) = self.refused_now(&parked.card, model.as_deref()) {
                 tracing::info!(approval = id, why, "parked under other rules: expired");
                 self.abandon_because(parked, POLICY_CHANGED, Some("policy_changed"));
+                self.pump();
                 return Err(StartError::NotFound);
             }
         }
@@ -1211,7 +1283,9 @@ impl Agent {
             by: by.clone(),
             edited,
         };
-        tokio::spawn(async move { agent.drive(state, Some(answer)).await });
+        let task = state.task.clone();
+        let drive = tokio::spawn(async move { agent.drive(state, Some(answer)).await });
+        self.watch_task(task, session, drive);
         Ok(())
     }
 
@@ -1336,6 +1410,9 @@ impl Agent {
 
     /// "I'm done" or "Skip" on an action-needed card: a message like any
     /// other in the card's conversation, which starts the resume or queues it.
+    /// The card is claimed first, so a second answer finds it gone. An
+    /// archived conversation comes back for it, and a scheduled run's kept
+    /// window goes with the resume.
     pub fn resolve_action(
         self: &Arc<Self>,
         id: &str,
@@ -1345,17 +1422,27 @@ impl Agent {
         let Ok(Some(action)) = self.store.action(id) else {
             return Err(StartError::NotFound);
         };
+        if !self.store.remove_pending(id).unwrap_or(false) {
+            return Err(StartError::NotFound); // answered meanwhile
+        }
         let session = self.session_of(&action.run).unwrap_or_else(main_session);
+        if let Ok(Some(row)) = self.store.session(&session)
+            && row.archived
+            && row.deleted.is_none()
+            && self.store.set_session_archived(&session, false).is_ok()
+            && let Some(view) = self.session_view(&session)
+        {
+            self.emit("session.updated", view);
+        }
         let text = if done {
             tools::RESUME_TEXT
         } else {
             tools::SKIP_TEXT
         };
-        // An archived conversation's card still resumes there.
+        let tab = action.card["tab"].as_str().map(String::from);
         let posted = self
-            .post_to(&session, text.to_string(), by.clone(), true)
+            .post_to(&session, text.to_string(), by.clone(), tab)
             .map_err(|_| StartError::NotFound)?;
-        let _ = self.store.remove_pending(id);
         self.emit(
             "action.resolved",
             json!({"id": id, "choice": if done { "done" } else { "skip" }, "by": by, "session": session}),
@@ -2167,12 +2254,15 @@ impl Agent {
         };
         if background {
             // Its window stays open for the user only when it needs them
-            // (needs_user), and "I'm done" carries on there, in its
-            // conversation; otherwise it's closed when the browser is dropped.
+            // (needs_user), on its Action needed card: "I'm done" carries on
+            // there, and only then does it become its conversation's window
+            // (whose own may be in use meanwhile). Otherwise it's closed when
+            // the browser is dropped.
             if matches!(outcome, Outcome::Finished(_, "needs_user"))
                 && let Some(target) = browser.keep_own_window()
+                && let Err(err) = self.store.set_action_tab(&state.task, &target)
             {
-                self.set_tab_target(&state.session, &target);
+                tracing::warn!(%err, "couldn't keep a scheduled run's window on its card");
             }
         } else if let Some(target) = browser.current_target()
             && tab.as_ref() != Some(&target)
@@ -2184,7 +2274,7 @@ impl Agent {
 
     /// Remembers a conversation's tab: `main`'s in settings, another's on
     /// its row.
-    fn set_tab_target(&self, session: &str, target: &str) {
+    pub(crate) fn set_tab_target(&self, session: &str, target: &str) {
         let saved = if session == MAIN {
             self.store.set_setting("tab_target", target)
         } else {
@@ -2195,14 +2285,48 @@ impl Agent {
         }
     }
 
-    /// A tab of each other conversation's window, which `main` leaves alone.
-    fn foreign_tabs(&self) -> Vec<String> {
-        self.store
+    /// A tab of each other conversation's window, and of each window an
+    /// Action needed card keeps for the user, which `main` leaves alone.
+    pub(crate) fn foreign_tabs(&self) -> Vec<String> {
+        let mut tabs: Vec<String> = self
+            .store
             .session_tabs()
             .unwrap_or_default()
             .into_iter()
             .map(|(_, tab)| tab)
-            .collect()
+            .collect();
+        tabs.extend(
+            self.store
+                .action_tabs()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, tab)| tab),
+        );
+        tabs
+    }
+
+    /// A scheduled run's kept window becomes its conversation's, as the
+    /// resume after "I'm done" starts there: the conversation's previous
+    /// window closes, since it isn't in use when a task starts (`main`'s is
+    /// the user's tab, which stays).
+    pub(crate) fn adopt_window(&self, session: &str, tab: &str) {
+        if session != MAIN
+            && let Ok(Some(row)) = self.store.session(session)
+            && let Some(old) = row.tab_target.filter(|old| old != tab)
+        {
+            self.close_tab_window(old);
+        }
+        self.set_tab_target(session, tab);
+    }
+
+    /// Closes the window a tab is in, in the background.
+    pub(crate) fn close_tab_window(&self, tab: String) {
+        let cdp = self.cdp.clone();
+        tokio::spawn(async move {
+            if let Err(err) = cdp.close_window_of(&tab).await {
+                tracing::warn!(err = %format!("{err:#}"), "couldn't close a window");
+            }
+        });
     }
 
     /// The task has to end before it's done (`why`, for the model): one last

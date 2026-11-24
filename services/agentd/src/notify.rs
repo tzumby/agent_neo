@@ -329,7 +329,9 @@ impl Agent {
             && let Some(row) = self.store.session(session).ok().flatten()
             && !row.title.is_empty()
         {
-            notice.title = clip(&format!("{}: {}", row.title, notice.title), TITLE_CHARS);
+            // Redacted before it's cut to size, so no part of a key is left.
+            let title = self.secrets.redact(&row.title);
+            notice.title = clip(&format!("{title}: {}", notice.title), TITLE_CHARS);
         }
         if let Err(err) = self.notify(&notice, None) {
             tracing::warn!(%err, "couldn't queue a notification");

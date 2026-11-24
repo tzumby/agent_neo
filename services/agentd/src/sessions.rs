@@ -53,6 +53,24 @@ pub enum PostError {
     Failed(anyhow::Error),
 }
 
+/// What Stop did.
+#[derive(Debug, PartialEq)]
+pub struct Stopped {
+    /// A running task was told to stop (`task.stopping`; `task.finished` follows).
+    pub stopping: bool,
+    /// Anything was: a running task, or a card given up on.
+    pub stopped: bool,
+    /// Queued messages dropped.
+    pub dropped: usize,
+}
+
+impl Stopped {
+    /// The API's answer: `{stopping, stopped, dropped}`.
+    pub fn json(&self) -> Value {
+        json!({"stopping": self.stopping, "stopped": self.stopped, "dropped": self.dropped})
+    }
+}
+
 /// Why a conversation couldn't be changed.
 #[derive(Debug)]
 pub enum SessionError {
@@ -87,55 +105,66 @@ impl Agent {
         text: String,
         by: Option<String>,
     ) -> Result<Posted, PostError> {
-        self.post_to(session, text, by, false)
+        self.post_to(session, text, by, None)
     }
 
-    /// `post`; `archived`: an archived conversation takes it too ("I'm done"
-    /// on a card there).
+    /// `post`; `tab`: the window it carries on in ("I'm done" after a
+    /// scheduled run kept one), which becomes the conversation's when it
+    /// starts.
     pub(crate) fn post_to(
         self: &Arc<Self>,
         session: &str,
         text: String,
         by: Option<String>,
-        archived: bool,
+        tab: Option<String>,
     ) -> Result<Posted, PostError> {
         let row = match self.store.session(session) {
-            Ok(Some(row)) if row.deleted.is_none() && (archived || !row.archived) => row,
+            Ok(Some(row)) if row.deleted.is_none() && !row.archived => row,
             Ok(_) => return Err(PostError::NotFound),
             Err(err) => return Err(PostError::Failed(err)),
         };
         if row.title.is_empty() {
             self.retitle(session, &title_from(&self.secrets.redact(&text)));
         }
+        // A card nobody answered for a day can't be resumed: it mustn't hold
+        // this message back.
+        self.expire_stale_cards(Some(session));
         // A memory command isn't a task for the model: it costs nothing and
         // leaves a card waiting, so neither the limit nor the budget holds
-        // it back. It still waits behind a running task.
+        // it back. It still waits behind a running task or queued messages.
         let memory_command = self.is_memory_command(&text, by.as_deref());
         let paused = self.budget_paused();
         let now = unix_now();
         let mut lanes = self.lanes.lock().unwrap();
+        // Again under the lanes' lock, which archiving and deleting hold:
+        // no task starts in a conversation going away.
+        match self.store.session(session) {
+            Ok(Some(row)) if row.deleted.is_none() && !row.archived => {}
+            Ok(_) => return Err(PostError::NotFound),
+            Err(err) => return Err(PostError::Failed(err)),
+        }
         let working = lanes.values().filter(|lane| lane.running.is_some()).count();
         let lane = lanes.entry(session.to_string()).or_insert_with(Lane::new);
         let waiting = self.store.waiting_in(session).map_err(PostError::Failed)?;
         let queued = self.store.queued_in(session).map_err(PostError::Failed)?.len();
         let start = lane.running.is_none()
-            && if memory_command {
-                waiting || queued == 0
-            } else {
-                !waiting && queued == 0 && working < self.cfg.max_parallel_tasks && !paused
-            };
+            && queued == 0
+            && (memory_command || (!waiting && working < self.cfg.max_parallel_tasks && !paused));
         if start {
             let task = short_id();
             lane.running = Some(task.clone());
             lane.cancel.send_replace(false);
             drop(lanes);
+            if let Some(tab) = &tab {
+                self.adopt_window(session, tab);
+            }
             self.spawn_task(task.clone(), text, by, session.to_string());
             return Ok(Posted::Started(task));
         }
         let id = short_id();
         let position = self
             .store
-            .queue_message(&id, session, &text, by.as_deref(), now)
+            .queue_message(&id, session, &text, by.as_deref(), tab.as_deref(), now)
             .map_err(PostError::Failed)?;
         drop(lanes);
         tracing::info!(%session, queued = %id, position, "message queued");
@@ -192,13 +221,16 @@ impl Agent {
                 "message.unqueued",
                 json!({"session": next.session, "id": next.id, "reason": "started", "task": task}),
             );
+            if let Some(tab) = &next.tab {
+                self.adopt_window(&next.session, tab);
+            }
             self.spawn_task(task, next.text, next.by, next.session);
         }
     }
 
     /// Stop in a conversation: stops its running task, or gives up on the
-    /// one parked on a card, and drops its queued messages. (stopped, dropped).
-    pub fn stop(self: &Arc<Self>, session: &str) -> (bool, usize) {
+    /// one parked on a card, and drops its queued messages.
+    pub fn stop(self: &Arc<Self>, session: &str) -> Stopped {
         // First, so the end of the task doesn't start the next one.
         let dropped = self.drop_queue(session);
         let running = match self.lanes.lock().unwrap().get(session) {
@@ -213,12 +245,36 @@ impl Agent {
         if running {
             // Said at once; task.finished follows.
             self.emit("task.stopping", json!({"session": session}));
-            return (true, dropped);
+            return Stopped {
+                stopping: true,
+                stopped: true,
+                dropped,
+            };
         }
         // Waiting for an approval: stopping it means giving up on it.
         let stopped = self.abandon_parked(session, "Stopped.");
+        // An answer that won the race resumed the task meanwhile: Stop wins.
+        let resumed = match self.lanes.lock().unwrap().get(session) {
+            Some(lane) if lane.running.is_some() => {
+                lane.cancel.send_replace(true);
+                true
+            }
+            _ => false,
+        };
+        if resumed {
+            self.emit("task.stopping", json!({"session": session}));
+            return Stopped {
+                stopping: true,
+                stopped: true,
+                dropped,
+            };
+        }
         self.pump();
-        (stopped, dropped)
+        Stopped {
+            stopping: false,
+            stopped,
+            dropped,
+        }
     }
 
     /// Drops a conversation's queued messages; how many.
@@ -327,8 +383,9 @@ impl Agent {
                 };
                 json!({"role": role, "text": text, "ts": ts})
             });
+        // A key saved after the title was made doesn't show in it.
         json!({
-            "id": row.id, "title": row.title, "created": row.created, "updated": row.updated,
+            "id": row.id, "title": self.secrets.redact(&row.title), "created": row.created, "updated": row.updated,
             "archived": row.archived, "state": state, "needs_you": needs_you, "queued": queued,
             "last": last,
         })
@@ -366,7 +423,7 @@ impl Agent {
     }
 
     /// Renames, archives or brings back a conversation. Archiving one that's
-    /// working or waiting on a card is refused; archiving closes its window.
+    /// working or waiting on a card is refused; archiving closes its windows.
     pub fn update_session(
         self: &Arc<Self>,
         id: &str,
@@ -377,30 +434,38 @@ impl Agent {
             Some(row) if row.deleted.is_none() => row,
             _ => return Err(SessionError::NotFound),
         };
-        if archived == Some(true) && !row.archived && self.busy_with(id)? {
-            return Err(SessionError::Conflict(
-                "it's working or waiting on a card: stop it first",
-            ));
-        }
-        if let Some(title) = title {
-            self.store.set_session_title(id, &title_from(title), unix_now())?;
-        }
-        if let Some(archived) = archived.filter(|a| *a != row.archived) {
-            self.store.set_session_archived(id, archived)?;
-            if archived {
-                self.close_window(&row);
-            } else {
-                // Its queued messages can go again.
-                self.pump();
+        let change = archived.filter(|archived| *archived != row.archived);
+        {
+            // The check and the change under the lanes' lock, which a
+            // message starting a task takes too.
+            let lanes = self.lanes.lock().unwrap();
+            if change == Some(true) && self.busy_in(&lanes, id)? {
+                return Err(SessionError::Conflict(
+                    "it's working or waiting on a card: stop it first",
+                ));
             }
+            if let Some(title) = title {
+                self.store.set_session_title(id, &title_from(title), unix_now())?;
+            }
+            if let Some(archived) = change {
+                self.store.set_session_archived(id, archived)?;
+                if archived {
+                    self.close_windows(&row);
+                }
+            }
+        }
+        if change == Some(false) {
+            // Its queued messages can go again.
+            self.pump();
         }
         let view = self.session_view(id).ok_or(SessionError::NotFound)?;
         self.emit("session.updated", view.clone());
         Ok(view)
     }
 
-    /// Deletes a conversation (never `main`): its history and queued
-    /// messages go; its runs and events stay for the audit log and usage.
+    /// Deletes a conversation (never `main`): its history, queued messages
+    /// and open Action needed cards go; its runs and events stay for the
+    /// audit log and usage.
     pub fn delete_session(&self, id: &str) -> Result<(), SessionError> {
         if id == MAIN {
             return Err(SessionError::Conflict("the first conversation can't be deleted"));
@@ -409,39 +474,51 @@ impl Agent {
             Some(row) if row.deleted.is_none() => row,
             _ => return Err(SessionError::NotFound),
         };
-        if self.busy_with(id)? {
-            return Err(SessionError::Conflict(
-                "it's working or waiting on a card: stop it first",
-            ));
+        {
+            // As archiving: no task starts in it meanwhile.
+            let mut lanes = self.lanes.lock().unwrap();
+            if self.busy_in(&lanes, id)? {
+                return Err(SessionError::Conflict(
+                    "it's working or waiting on a card: stop it first",
+                ));
+            }
+            // Before its cards go with it.
+            self.close_windows(&row);
+            self.store.delete_session(id, unix_now())?;
+            lanes.remove(id);
         }
-        self.close_window(&row);
-        self.store.delete_session(id, unix_now())?;
-        self.lanes.lock().unwrap().remove(id);
         tracing::info!(session = %id, "conversation deleted");
         self.emit("session.deleted", json!({"id": id}));
         Ok(())
     }
 
-    /// Working, or waiting on a card.
-    fn busy_with(&self, id: &str) -> Result<bool> {
-        Ok(self.is_working_in(id) || self.store.waiting_in(id)?)
+    /// Working, or waiting on a card, with the lanes' lock held.
+    fn busy_in(&self, lanes: &HashMap<String, Lane>, id: &str) -> Result<bool> {
+        Ok(lanes.get(id).is_some_and(|lane| lane.running.is_some()) || self.store.waiting_in(id)?)
     }
 
-    /// Closes a conversation's own window (`main` has none: it works in the
-    /// user's tab).
-    fn close_window(&self, row: &SessionRow) {
-        let (false, Some(tab)) = (row.id == MAIN, row.tab_target.clone()) else {
-            return;
-        };
-        if let Err(err) = self.store.set_session_tab(&row.id, None) {
-            tracing::warn!(%err, session = %row.id, "couldn't forget the conversation's window");
-        }
-        let cdp = self.cdp.clone();
-        tokio::spawn(async move {
-            if let Err(err) = cdp.close_window_of(&tab).await {
-                tracing::warn!(err = %format!("{err:#}"), "couldn't close a conversation's window");
+    /// Closes a conversation's windows: its own (`main` has none: it works
+    /// in the user's tab), and those its Action needed cards keep.
+    fn close_windows(&self, row: &SessionRow) {
+        let mut tabs: Vec<String> = self
+            .store
+            .action_tabs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(session, _)| *session == row.id)
+            .map(|(_, tab)| tab)
+            .collect();
+        if row.id != MAIN
+            && let Some(tab) = row.tab_target.clone()
+        {
+            if let Err(err) = self.store.set_session_tab(&row.id, None) {
+                tracing::warn!(%err, session = %row.id, "couldn't forget the conversation's window");
             }
-        });
+            tabs.push(tab);
+        }
+        for tab in tabs {
+            self.close_tab_window(tab);
+        }
     }
 
     /// For `/status`: how many conversations work and wait, how many
@@ -466,6 +543,7 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::*;
+    use crate::agent::StartError;
     use crate::llm::Usage;
 
     /// A stand-in model: a request whose last user message says "hold"
@@ -751,7 +829,14 @@ mod tests {
         queued(agent.post(MAIN, "a".into(), None));
         queued(agent.post(MAIN, "b".into(), None));
         let other = new_session(&agent);
-        assert_eq!(agent.stop(MAIN), (true, 2));
+        assert_eq!(
+            agent.stop(MAIN),
+            Stopped {
+                stopping: true,
+                stopped: true,
+                dropped: 2
+            }
+        );
         let dropped = events(&agent, "message.unqueued");
         assert_eq!(dropped.len(), 2);
         assert!(
@@ -771,7 +856,14 @@ mod tests {
         // Stop on a conversation waiting on a card gives up on it, and its queue.
         let card = park_in(&agent, &other, "t-parked", "list my files");
         queued(agent.post(&other, "x".into(), None));
-        assert_eq!(agent.stop(&other), (true, 1));
+        assert_eq!(
+            agent.stop(&other),
+            Stopped {
+                stopping: false,
+                stopped: true,
+                dropped: 1
+            }
+        );
         assert!(agent.store.parked(&card).unwrap().is_none());
         let resolved = events(&agent, "approval.resolved");
         assert_eq!(
@@ -779,7 +871,14 @@ mod tests {
             (Some(true), Some(other.as_str()))
         );
         // Nothing to stop.
-        assert_eq!(agent.stop(&other), (false, 0));
+        assert_eq!(
+            agent.stop(&other),
+            Stopped {
+                stopping: false,
+                stopped: false,
+                dropped: 0
+            }
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1026,6 +1125,284 @@ mod tests {
             })
             .unwrap();
         assert_eq!(kept, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Ages a card, as if it had waited `days` days.
+    fn age(agent: &Agent, card: &str, days: i64) {
+        agent
+            .store
+            .transact(|tx| {
+                tx.execute(
+                    "UPDATE pending SET created = created - ?2 WHERE id = ?1",
+                    rusqlite::params![card, days * 86_400],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_card_nobody_answered_for_a_day_doesnt_hold_the_queue() {
+        let (model, _gate, _) = gated_model().await;
+        let (agent, dir) = agent_on(&model, false);
+        let card = park_in(&agent, MAIN, "t-old", "list my files");
+        age(&agent, &card, 2);
+        // A new message gives up on it and starts at once.
+        let posted = agent.post(MAIN, "something new".into(), None).unwrap();
+        assert!(matches!(posted, Posted::Started(_)), "{posted:?}");
+        assert!(agent.store.parked(&card).unwrap().is_none());
+        assert_eq!(events(&agent, "approval.resolved")[0]["expired"], true);
+        until("the new task ends", || !agent.is_busy()).await;
+        let finished = &events(&agent, "task.finished")[0];
+        assert_eq!(
+            (finished["task"].as_str(), finished["status"].as_str()),
+            (Some("t-old"), Some("cancelled"))
+        );
+        let history: Vec<String> = agent
+            .store
+            .history_in(MAIN, 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.text)
+            .collect();
+        assert!(
+            history[0].starts_with("I stopped waiting for your approval"),
+            "{history:?}"
+        );
+        assert_eq!(history[1..], ["something new", "Done: something new"]);
+        // Queued behind a card that then grew old: answering it gives up on
+        // it, and what's queued starts at once, not at the next tick.
+        let c1 = new_session(&agent);
+        let card = park_in(&agent, &c1, "t-c1", "list my files");
+        let (id, _) = queued(agent.post(&c1, "behind it".into(), None));
+        age(&agent, &card, 2);
+        assert!(matches!(
+            agent.answer_approval(&card, true, None, None),
+            Err(StartError::NotFound)
+        ));
+        assert_eq!(started(&agent), [id]);
+        // The scheduler's tick gives up on them in every conversation.
+        let c2 = new_session(&agent);
+        let card = park_in(&agent, &c2, "t-c2", "list my files");
+        assert!(!agent.expire_stale_cards(None), "a fresh card waits");
+        age(&agent, &card, 2);
+        assert!(agent.expire_stale_cards(None));
+        assert!(agent.store.parked(&card).unwrap().is_none());
+        until("everything ends", || agent.working().is_empty()).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A scheduled run of `session` that ended on Action needed (its card
+    /// `card`), keeping its window `tab` for the user.
+    fn needs_user_keeping(agent: &Agent, session: &str, run: &str, card: &str, tab: &str) {
+        agent
+            .store
+            .start_run_in(
+                session,
+                run,
+                "Check the build",
+                Some("schedule"),
+                "zai-org/GLM-5.3",
+                "v",
+                Some(1),
+            )
+            .unwrap();
+        agent.store.set_run_status(run, "needs_user").unwrap();
+        agent.store.add_action(card, run).unwrap();
+        agent.store.set_action_tab(run, tab).unwrap();
+    }
+
+    #[tokio::test]
+    async fn im_done_carries_on_in_the_window_a_scheduled_run_kept() {
+        let (model, gate, _) = gated_model().await;
+        let (agent, dir) = agent_on(&model, false);
+        let c1 = new_session(&agent);
+        agent.store.set_session_tab(&c1, Some("W1")).unwrap();
+        needs_user_keeping(&agent, &c1, "sched1", "act1", "W2");
+        // Meanwhile the conversation keeps its own window, and main leaves
+        // the kept one alone.
+        let tab = |agent: &Agent| agent.store.session(&c1).unwrap().unwrap().tab_target;
+        assert_eq!(tab(&agent).as_deref(), Some("W1"));
+        assert!(agent.foreign_tabs().contains(&"W2".to_string()));
+        assert_eq!(agent.session_view(&c1).unwrap()["needs_you"], "action");
+        // "I'm done" while it works: the resume queues, its window with it.
+        agent.post(&c1, "hold on".into(), None).unwrap();
+        let (id, _) = queued(
+            agent
+                .resolve_action("act1", true, None)
+                .map_err(|_| PostError::NotFound),
+        );
+        assert_eq!(tab(&agent).as_deref(), Some("W1"), "W1 is in use");
+        gate.add_permits(1);
+        until("the resume ran", || {
+            started(&agent) == [id.clone()] && !agent.is_working_in(&c1)
+        })
+        .await;
+        // When it started, W2 became the conversation's window (W1 closes).
+        assert_eq!(tab(&agent).as_deref(), Some("W2"));
+        assert!(agent.store.action_tabs().unwrap().is_empty(), "the card is gone");
+        assert!(
+            agent.foreign_tabs().contains(&"W2".to_string()),
+            "now c1's own window"
+        );
+        // In `main`, the kept window becomes main's tab.
+        needs_user_keeping(&agent, MAIN, "sched2", "act2", "W3");
+        assert!(matches!(
+            agent.resolve_action("act2", false, None),
+            Ok(Posted::Started(_))
+        ));
+        assert_eq!(agent.store.setting("tab_target").unwrap().as_deref(), Some("W3"));
+        until("everything ends", || agent.working().is_empty()).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn im_done_twice_resumes_once() {
+        let (model, _gate, _) = gated_model().await;
+        let (agent, dir) = agent_on(&model, false);
+        agent
+            .store
+            .start_run("t1", "Sign in to Slack", None, "zai-org/GLM-5.3", "v", None)
+            .unwrap();
+        agent.store.set_run_status("t1", "needs_user").unwrap();
+        agent.store.add_action("act1", "t1").unwrap();
+        assert!(matches!(
+            agent.resolve_action("act1", true, None),
+            Ok(Posted::Started(_))
+        ));
+        assert!(matches!(
+            agent.resolve_action("act1", true, None),
+            Err(StartError::NotFound)
+        ));
+        until("the resume ends", || !agent.is_busy()).await;
+        assert_eq!(events(&agent, "task.started").len(), 1);
+        assert_eq!(events(&agent, "action.resolved").len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn im_done_in_an_archived_conversation_brings_it_back() {
+        let (model, gate, _) = gated_model().await;
+        let (agent, dir) = agent_on(&model, false);
+        let c: Vec<String> = (0..3).map(|_| new_session(&agent)).collect();
+        agent
+            .store
+            .start_run_in(
+                &c[2],
+                "t1",
+                "Sign in to Slack",
+                None,
+                "zai-org/GLM-5.3",
+                "v",
+                None,
+            )
+            .unwrap();
+        agent.store.set_run_status("t1", "needs_user").unwrap();
+        agent.store.add_action("act1", "t1").unwrap();
+        agent.update_session(&c[2], None, Some(true)).unwrap();
+        // Every slot taken: the resume queues, in a conversation that's back.
+        for session in [MAIN, &c[0], &c[1]] {
+            agent.post(session, "hold on".into(), None).unwrap();
+        }
+        let (id, _) = queued(
+            agent
+                .resolve_action("act1", true, None)
+                .map_err(|_| PostError::NotFound),
+        );
+        let view = agent.session_view(&c[2]).unwrap();
+        assert_eq!(
+            (view["archived"].as_bool(), view["state"].as_str()),
+            (Some(false), Some("queued"))
+        );
+        assert!(
+            events(&agent, "session.updated")
+                .iter()
+                .any(|e| e["id"] == c[2].as_str() && e["archived"] == false)
+        );
+        gate.add_permits(1);
+        until("the resume ran", || started(&agent) == [id.clone()]).await;
+        gate.add_permits(2);
+        until("everything ends", || agent.working().is_empty()).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_saved_later_never_shows_in_a_title() {
+        let (model, _gate, _) = gated_model().await;
+        let (agent, dir) = agent_on(&model, false);
+        let c1 = new_session(&agent);
+        agent
+            .post(&c1, "Deploy with tok-1234567890abcdef please".into(), None)
+            .unwrap();
+        until("the task ends", || !agent.is_working_in(&c1)).await;
+        assert_eq!(
+            agent.session_view(&c1).unwrap()["title"],
+            "Deploy with tok-1234567890abcdef please"
+        );
+        agent.secrets.put("DEPLOY_TOKEN", "tok-1234567890abcdef").unwrap();
+        let shown = "Deploy with [secret DEPLOY_TOKEN] please";
+        assert_eq!(agent.session_view(&c1).unwrap()["title"], shown);
+        assert!(
+            agent
+                .sessions_view(false)
+                .unwrap()
+                .iter()
+                .any(|s| s["title"] == shown)
+        );
+        let usage = agent.usage(30).unwrap();
+        let line = usage["by_session"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == c1.as_str())
+            .unwrap();
+        assert_eq!(line["title"], shown);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_task_that_panics_frees_its_conversation() {
+        let (model, _gate, _) = gated_model().await;
+        let (agent, dir) = agent_on(&model, false);
+        // A checkpoint with no messages at all: the resumed task panics.
+        agent
+            .store
+            .start_run(
+                "t1",
+                "list my files",
+                None,
+                "zai-org/GLM-5.3",
+                &agent.policy_version(),
+                None,
+            )
+            .unwrap();
+        let state = json!({
+            "task": "t1", "model": "zai-org/GLM-5.3", "messages": [], "queue": [], "step": 1,
+            "tainted": false, "reminded": false, "loops": crate::guard::LoopDetector::default(),
+            "usage": Usage::default(), "seconds": 1.0,
+        });
+        let card = json!({"kind": "shell", "id": "a1", "task": "t1", "command": "ls", "timeout": 120});
+        agent
+            .store
+            .park("a1", "t1", &card, &state.to_string(), &agent.policy_version())
+            .unwrap();
+        let (id, _) = queued(agent.post(MAIN, "next".into(), None));
+        assert!(agent.answer_approval("a1", true, None, None).is_ok());
+        until("the queued message ran", || {
+            started(&agent) == [id.clone()] && !agent.is_busy()
+        })
+        .await;
+        let finished = &events(&agent, "task.finished")[0];
+        assert_eq!(
+            (finished["task"].as_str(), finished["status"].as_str()),
+            (Some("t1"), Some("error"))
+        );
+        let status: String = agent
+            .store
+            .read(|conn| Ok(conn.query_row("SELECT status FROM runs WHERE id = 't1'", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(status, "error");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

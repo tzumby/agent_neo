@@ -327,12 +327,21 @@ impl Browser {
         match self.mode {
             Mode::Shared => {
                 let pages = self.cdp.pages().await?;
-                let remembered = pages.iter().find(|t| Some(&t.id) == self.remembered.as_ref());
-                let target = match remembered.or_else(|| pages.iter().find(|t| !self.foreign.contains(&t.id)))
-                {
-                    Some(t) => t.clone(),
-                    None => self.cdp.new_page().await?,
-                };
+                if let Some(target) = pages.iter().find(|t| Some(&t.id) == self.remembered.as_ref()) {
+                    return self.connect(&target.clone()).await;
+                }
+                // The first tab outside other conversations' windows (tabs()).
+                if let Some(target) = self.tabs().await?.into_iter().next() {
+                    return self.connect(&target).await;
+                }
+                let target = self.cdp.new_page().await?;
+                if self.in_foreign_window(&target.id).await {
+                    // Chrome put it in another conversation's window: a
+                    // window of main's own instead.
+                    let _ = self.cdp.close(&target.id).await;
+                    let target = self.cdp.new_window().await?;
+                    return self.connect(&target).await;
+                }
                 self.connect(&target).await
             }
             Mode::Window => {

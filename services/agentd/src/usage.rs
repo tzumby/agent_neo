@@ -133,8 +133,10 @@ impl Agent {
         Ok(Ok(settings))
     }
 
-    /// Alerts at 80% and 100% of the monthly budget, each once a month
-    /// (`budget_alerted`): a `budget.alert` event and a notification.
+    /// Alerts at 80% and 100% of the monthly budget, each once a month for
+    /// a given budget (`budget_alerted`: `YYYY-MM:<level>:<budget>`, so
+    /// raising the budget arms both again): a `budget.alert` event and a
+    /// notification.
     pub fn check_budget(&self) {
         self.check_budget_at(Timestamp::now());
     }
@@ -161,7 +163,7 @@ impl Agent {
             .map(String::from)
             .collect();
         for (level, reached) in [(80, budget.spent >= limit * 0.8), (100, budget.spent >= limit)] {
-            let mark = format!("{this_month}{level}");
+            let mark = format!("{this_month}{level}:{limit}");
             if !reached || alerted.contains(&mark) {
                 continue;
             }
@@ -291,7 +293,13 @@ impl Agent {
             list.sort_by(|a, b| b.1.0.total_cmp(&a.1.0).then(b.1.1.cmp(&a.1.1)));
             list
         }
-        let titles: HashMap<String, String> = self.store.session_titles()?.into_iter().collect();
+        // A key saved after a title was made doesn't show in it.
+        let titles: HashMap<String, String> = self
+            .store
+            .session_titles()?
+            .into_iter()
+            .map(|(id, title)| (id, self.secrets.redact(&title).into_owned()))
+            .collect();
         let names: HashMap<i64, String> = self
             .store
             .schedules()?
@@ -613,8 +621,76 @@ mod tests {
         assert_eq!(alerts(&agent).len(), 4);
         assert_eq!(
             agent.store.setting("budget_alerted").unwrap().as_deref(),
-            Some(format!("{month}:80,{month}:100").as_str())
+            Some(format!("{month}:80:10,{month}:100:10").as_str())
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn raising_the_budget_arms_its_alerts_again() {
+        let (agent, dir) = crate::agent::test_agent();
+        let now = Timestamp::now();
+        let levels = |agent: &Agent| -> Vec<(i64, f64)> {
+            agent
+                .store
+                .events_after(0, 1000)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == "budget.alert")
+                .map(|e| {
+                    (
+                        e.data["level"].as_i64().unwrap(),
+                        e.data["budget"].as_f64().unwrap(),
+                    )
+                })
+                .collect()
+        };
+        agent.store.set_setting("monthly_budget_usd", "10").unwrap();
+        run(
+            &agent,
+            "a",
+            &iso(now),
+            Some(10.5),
+            "task",
+            None,
+            Some("main"),
+            "done",
+        );
+        agent.check_budget_at(now);
+        assert_eq!(levels(&agent), [(80, 10.0), (100, 10.0)]);
+        // Raised to $20: both alerts again for that budget, each once.
+        agent.store.set_setting("monthly_budget_usd", "20").unwrap();
+        agent.check_budget_at(now);
+        assert_eq!(levels(&agent).len(), 2, "10.5 is under 80% of 20");
+        run(
+            &agent,
+            "b",
+            &iso(now),
+            Some(6.0),
+            "task",
+            None,
+            Some("main"),
+            "done",
+        );
+        agent.check_budget_at(now);
+        agent.check_budget_at(now);
+        assert_eq!(levels(&agent)[2..], [(80, 20.0)]);
+        run(
+            &agent,
+            "c",
+            &iso(now),
+            Some(4.0),
+            "task",
+            None,
+            Some("main"),
+            "done",
+        );
+        agent.check_budget_at(now);
+        assert_eq!(levels(&agent)[2..], [(80, 20.0), (100, 20.0)]);
+        // Back to $10: already said this month for that budget.
+        agent.store.set_setting("monthly_budget_usd", "10").unwrap();
+        agent.check_budget_at(now);
+        assert_eq!(levels(&agent).len(), 4);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

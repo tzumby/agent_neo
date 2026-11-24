@@ -88,7 +88,13 @@ pub struct QueuedMessage {
     pub by: Option<String>,
     /// Unix seconds.
     pub created: i64,
+    /// "I'm done" after a scheduled run: the window it kept for the user,
+    /// where the resume carries on.
+    #[serde(skip)]
+    pub tab: Option<String>,
 }
+
+const QUEUED_COLUMNS: &str = "id, session, text, by_user, created, tab_target";
 
 fn queued_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage> {
     Ok(QueuedMessage {
@@ -97,6 +103,7 @@ fn queued_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedMessage
         text: row.get(2)?,
         by: row.get(3)?,
         created: row.get(4)?,
+        tab: row.get(5)?,
     })
 }
 
@@ -1054,19 +1061,22 @@ impl Store {
 
     // --- Queued messages ------------------------------------------------------------
 
-    /// Queues a message; its position in its conversation's queue (1 = next).
+    /// Queues a message (`tab`: the window it carries on in); its position
+    /// in its conversation's queue (1 = next).
     pub fn queue_message(
         &self,
         id: &str,
         session: &str,
         text: &str,
         by: Option<&str>,
+        tab: Option<&str>,
         now: i64,
     ) -> Result<i64> {
         self.transact(|tx| {
             tx.execute(
-                "INSERT INTO chat_queue (id, session, text, by_user, created) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, session, text, by, now],
+                "INSERT INTO chat_queue (id, session, text, by_user, created, tab_target)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, session, text, by, now, tab],
             )?;
             tx.execute(
                 "UPDATE sessions SET updated = MAX(updated, ?2) WHERE id = ?1",
@@ -1083,9 +1093,9 @@ impl Store {
     /// A conversation's queued messages, oldest first.
     pub fn queued_in(&self, session: &str) -> Result<Vec<QueuedMessage>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, session, text, by_user, created FROM chat_queue WHERE session = ?1 ORDER BY rowid",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {QUEUED_COLUMNS} FROM chat_queue WHERE session = ?1 ORDER BY rowid"
+        ))?;
         let rows = stmt.query_map(params![session], queued_message_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -1095,7 +1105,7 @@ impl Store {
     pub fn queue_heads(&self) -> Result<Vec<QueuedMessage>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT q.id, q.session, q.text, q.by_user, q.created FROM chat_queue q
+            "SELECT q.id, q.session, q.text, q.by_user, q.created, q.tab_target FROM chat_queue q
              JOIN sessions s ON s.id = q.session
              WHERE s.archived = 0 AND s.deleted IS NULL
                AND q.rowid = (SELECT MIN(rowid) FROM chat_queue WHERE session = q.session)
@@ -1391,8 +1401,9 @@ impl Store {
             .flatten())
     }
 
-    /// Open Action needed cards that are their conversation's latest task's:
-    /// (run, conversation), newest first.
+    /// Open Action needed cards that are their conversation's latest chat
+    /// task's (a scheduled run since doesn't hide one): (run, conversation),
+    /// newest first.
     pub fn open_actions(&self) -> Result<Vec<(String, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1400,12 +1411,59 @@ impl Store {
              WHERE r.kind = 'task' AND r.status = 'needs_user'
                AND EXISTS (SELECT 1 FROM pending p WHERE p.kind = 'action' AND p.run = r.id)
                AND NOT EXISTS (SELECT 1 FROM runs n WHERE n.kind = 'task' AND n.rowid > r.rowid
+                 AND n.schedule IS NULL
                  AND COALESCE(n.session, 'main') = COALESCE(r.session, 'main')
                  AND n.status NOT IN ('queued', 'skipped'))
              ORDER BY r.rowid DESC",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Cards parked before `cutoff` (unix seconds): too old to resume.
+    pub fn stale_cards(&self, cutoff: i64) -> Result<Vec<Pending>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, run, card, checkpoint, created, policy_version FROM pending
+             WHERE kind = 'approval' AND created < ?1 ORDER BY created",
+        )?;
+        let rows = stmt.query_map(params![cutoff], pending_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A scheduled run kept its window for the user: it goes on the run's
+    /// Action needed card, for "I'm done" to carry on there.
+    pub fn set_action_tab(&self, run: &str, tab: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pending SET card = json_set(CASE WHEN json_valid(card) THEN card ELSE '{}' END, '$.tab', ?2)
+             WHERE kind = 'action' AND run = ?1",
+            params![run, tab],
+        )?;
+        Ok(())
+    }
+
+    /// The windows open Action needed cards keep: (conversation, tab).
+    pub fn action_tabs(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(r.session, 'main'), json_extract(p.card, '$.tab')
+             FROM pending p LEFT JOIN runs r ON r.id = p.run
+             WHERE p.kind = 'action' AND json_valid(p.card) AND json_extract(p.card, '$.tab') IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A task that broke off (agentd's own fault): an error, with what it
+    /// cost so far left as recorded.
+    pub fn fail_run(&self, id: &str, answer: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            &format!("UPDATE runs SET status = 'error', answer = ?2, updated = {NOW} WHERE id = ?1"),
+            params![id, answer],
+        )?;
+        Ok(())
     }
 
     /// The latest task (not a consolidation): (id, status, conversation).
@@ -2006,6 +2064,11 @@ fn migrate_to(conn: &Connection, target: i64) -> Result<()> {
         tx.execute_batch("PRAGMA user_version = 9")?;
         tx.commit()?;
     }
+    // A queued resume's window came after 0.16.0's first builds made
+    // `chat_queue`: their databases get it too.
+    if target >= 9 && conn.prepare("SELECT tab_target FROM chat_queue LIMIT 0").is_err() {
+        conn.execute_batch("ALTER TABLE chat_queue ADD COLUMN tab_target TEXT")?;
+    }
     Ok(())
 }
 
@@ -2039,7 +2102,7 @@ const MIGRATION_9: &str = "
     CREATE INDEX IF NOT EXISTS events_by_session ON events (session, seq);
     CREATE TABLE IF NOT EXISTS chat_queue (
       id TEXT PRIMARY KEY, session TEXT NOT NULL, text TEXT NOT NULL,
-      by_user TEXT, created INTEGER NOT NULL);
+      by_user TEXT, created INTEGER NOT NULL, tab_target TEXT);
 ";
 
 /// Memory v2 (kinds, trust, status, history, full-text search), the effects
@@ -2717,6 +2780,27 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(history, [("forget".into(), None), ("purge".into(), None)]);
+    }
+
+    #[test]
+    fn a_scheduled_run_doesnt_hide_an_open_action_card() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store.start_run("t1", "Sign in", None, "m", "v", None).unwrap();
+        store.set_run_status("t1", "needs_user").unwrap();
+        store.add_action("a1", "t1").unwrap();
+        let open = vec![("t1".to_string(), MAIN.to_string())];
+        assert_eq!(store.open_actions().unwrap(), open);
+        // An hourly check since: the card is still the conversation's latest.
+        store
+            .start_run("s1", "Check", Some("schedule"), "m", "v", Some(3))
+            .unwrap();
+        store.finish_run("s1", "done", 2, None, "ok").unwrap();
+        assert_eq!(store.open_actions().unwrap(), open);
+        // A chat task since: the conversation moved on.
+        store
+            .start_run("t2", "Something else", None, "m", "v", None)
+            .unwrap();
+        assert!(store.open_actions().unwrap().is_empty());
     }
 
     /// agentd 0.15's database (schema version 8) with a chat, a parked card,

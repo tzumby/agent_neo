@@ -294,6 +294,9 @@ pub fn json(schedule: &Schedule) -> serde_json::Value {
 /// turns over and the budget is fresh.
 pub async fn run(agent: Arc<Agent>) {
     loop {
+        // Cards nobody answered for a day can't resume: they don't hold
+        // their conversation's queue.
+        agent.expire_stale_cards(None);
         agent.pump();
         let now = Timestamp::now().as_second();
         match agent.store.due_schedules(now) {

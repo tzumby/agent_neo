@@ -474,8 +474,7 @@ async fn resolve_action(
 /// `main`'s Stop (older apps): `stopping` as before, with `stopped` and
 /// `dropped` (queued messages) beside it.
 async fn stop(State(agent): App) -> Json<Value> {
-    let (stopped, dropped) = agent.stop(MAIN);
-    Json(json!({"stopping": stopped, "stopped": stopped, "dropped": dropped}))
+    Json(agent.stop(MAIN).json())
 }
 
 #[derive(Deserialize)]
@@ -584,8 +583,7 @@ async fn stop_session(State(agent): App, Path(id): Path<String>) -> Response {
     if agent.session_view(&id).is_none() {
         return error(StatusCode::NOT_FOUND, "no such conversation");
     }
-    let (stopped, dropped) = agent.stop(&id);
-    Json(json!({"stopped": stopped, "dropped": dropped})).into_response()
+    Json(agent.stop(&id).json()).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1533,7 +1531,8 @@ mod tests {
         let again = unqueue(State(agent.clone()), Path((MAIN.into(), id))).await;
         assert_eq!(again.status(), StatusCode::NOT_FOUND);
         let Json(stopped) = stop(State(agent.clone())).await;
-        assert_eq!(stopped, json!({"stopping": true, "stopped": true, "dropped": 1}));
+        // A card given up on: something stopped, no running task.
+        assert_eq!(stopped, json!({"stopping": false, "stopped": true, "dropped": 1}));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1569,7 +1568,10 @@ mod tests {
             "most recently updated first"
         );
         let stopped = body(stop_session(State(agent.clone()), Path(id.clone())).await).await;
-        assert_eq!(stopped, json!({"stopped": false, "dropped": 0}));
+        assert_eq!(
+            stopped,
+            json!({"stopping": false, "stopped": false, "dropped": 0})
+        );
         assert_eq!(
             delete_session(State(agent.clone()), Path(MAIN.into()))
                 .await

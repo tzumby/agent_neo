@@ -56,6 +56,8 @@ mountChat(store, views.chat.el, {
 // --- Navigation ------------------------------------------------------------------
 
 let current = null;
+/** The conversation the address last opened; the store differing from it means the store moved by itself. */
+let routed = null;
 function route() {
   let { view, id } = parseRoute(location.hash);
   // Opening the app: the conversation this device used last.
@@ -71,7 +73,9 @@ function route() {
     history.replaceState(null, "", "#/chat");
   }
   if (view === "chat") {
+    routed = older ? MAIN : id || MAIN; // before open(), whose change runs the subscriber below
     store.open(id);
+    routed = store.currentId;
     rememberConversation(store.currentId);
   }
   if (view !== current) {
@@ -131,8 +135,11 @@ store.subscribe(() => {
     route();
   }
   // The store moved on by itself (the conversation was deleted, or an older
-  // desktop has only main): the address follows.
-  if (current === "chat" && parseRoute(location.hash).id !== store.currentId) {
+  // desktop has only main): the address follows. Only then: a new address
+  // (a link, New) comes before its hashchange, and an event landing between
+  // the two mustn't send it back.
+  if (current === "chat" && store.currentId !== routed) {
+    routed = store.currentId;
     history.replaceState(null, "", chatHash(store.currentId));
     rememberConversation(store.currentId);
   }

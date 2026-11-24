@@ -54,12 +54,21 @@ queued message whose conversation is free goes first.
 - **Answering a card** always resumes the task at once, even when 3 are
   working (the limit is on starting tasks, not finishing them).
 - **"I'm done" / "Skip"** on an Action needed card is a message like any other:
-  it starts the resume task, or queues it.
+  it starts the resume task, or queues it. The card is claimed first, so a
+  second answer gets 404. In an archived conversation it brings the
+  conversation back (`session.updated`).
 - **Stop** (per conversation) stops the running task, or gives up on the parked
   one, *and* drops that conversation's queued messages.
 - **Removing** a queued message: the app's ✕ on its bubble.
 - **A new message no longer abandons a parked card.** It queues behind it.
-  (Stop, or answering, still ends the card.)
+  (Stop, or answering, still ends the card.) A card nobody answered for a day
+  can't be resumed any more, so it doesn't hold the queue: a new message for
+  its conversation, or the scheduler's tick (at most a minute), gives up on it
+  ("I stopped waiting for your approval: it came a day later…") and the queue
+  goes on. Answering such a card late also gives up on it, and the queue
+  starts at once.
+- **Stop racing an answer:** if the answer resumes the task first, Stop stops
+  it.
 - Queued messages are stored (they survive a restart) with the raw text;
   events carry it redacted like every event.
 
@@ -76,9 +85,14 @@ queued message whose conversation is free goes first.
   (`sessions.tab_target`); if it's gone (closed by hand), the next task opens a
   new one. The window has a single tab (`open_url` with `new_tab` loads in it:
   CDP can't open a tab in a chosen window), and `list_tabs` and `switch_tab`
-  only see that window; `main` doesn't see these windows. When it ends on Action needed, its window is brought to the
+  only see that window; `main` doesn't see these windows, nor attach to a tab
+  in one. When it ends on Action needed, its window is brought to the
   front (`Target.activateTarget`) for the take-over. Archiving or deleting a
-  conversation closes its window.
+  conversation closes its window. A scheduled run that ends on Action needed
+  keeps its window on the card (`pending.card.tab`): "I'm done" carries on
+  there, and that window becomes the conversation's when the resume starts
+  (the previous one, idle then, closes). Until then the conversation keeps its
+  own, which may be in use.
 - **Shell commands:** commands of different conversations may run at the same
   time, except a direct command (`direct_internet`, §6.21), which opens the
   guard firewall to the worker's uid and so runs alone (a read-write lock:
@@ -118,9 +132,11 @@ part of their task's cost.
 ### 2.4 Monthly budget
 
 - Setting `monthly_budget_usd`: a positive number, or none (the default).
-- **80%:** once a month, a notification ("You've used 80% of this month's $50
-  budget") and a `budget.alert` event.
-- **100%:** once a month, a notification and `budget.alert`; then:
+- **80%:** once a month for a given budget, a notification ("You've used 80%
+  of this month's $50 budget") and a `budget.alert` event. Raising the budget
+  arms both alerts again, for the new amount.
+- **100%:** once a month for a given budget, a notification and
+  `budget.alert`; then:
   - new chat tasks don't start: messages queue (the conversation shows
     "Paused: monthly budget reached");
   - scheduled runs due meanwhile are skipped, each with a quiet row in its
@@ -167,8 +183,10 @@ All paths under `/api/v1`. Unchanged endpoints keep working for older apps.
   (has queued messages and the budget is used up) › `queued` (has queued
   messages waiting for a free slot) › `idle`.
 - `needs_you`: a waiting card's kind (`secret` for a key request, `approval`
-  otherwise), or `action` when its latest task ended on Action needed with the
-  card still open; null otherwise.
+  otherwise), or `action` when its latest chat task ended on Action needed with
+  the card still open (a scheduled run since doesn't hide it); null otherwise.
+- `title`: with any saved key's value redacted, as everywhere a title leaves
+  agentd (a key saved after the title was made too).
 - `updated`: its last message, queued message, title change or creation.
 - `last`: its newest history entry (redacted), or null.
 
@@ -181,8 +199,8 @@ All paths under `/api/v1`. Unchanged endpoints keep working for older apps.
   `dropped`.
 - `POST /approvals/{id}`: unchanged; the card's own conversation. 409 only
   while another card of the same conversation is resuming at that moment.
-- `POST /actions/{id}`: starts or queues the resume in the card's conversation;
-  202 `{task}` or `{queued}`.
+- `POST /actions/{id}`: starts or queues the resume in the card's conversation,
+  bringing it back if archived; 202 `{task}` or `{queued}`; 404 once answered.
 
 ### 3.3 Events
 
@@ -219,7 +237,7 @@ New kinds:
 | `session.created` | the `Session` | A conversation was created |
 | `session.updated` | the `Session` | Renamed, archived or unarchived, or its title was set from the first message |
 | `session.deleted` | `id` | Deleted |
-| `budget.alert` | `level` (80 or 100), `spent`, `budget`, `month` (`YYYY-MM`) | Crossing 80% or 100% of the monthly budget (once each per month) |
+| `budget.alert` | `level` (80 or 100), `spent`, `budget`, `month` (`YYYY-MM`) | Crossing 80% or 100% of the monthly budget (once each per month for a given budget) |
 
 The list's `state`, `needs_you`, `queued` and `last` change with conversation
 events; the apps refetch `GET /sessions` (debounced, ~300 ms) when they see
@@ -299,12 +317,14 @@ ALTER TABLE schedules ADD COLUMN session TEXT NOT NULL DEFAULT 'main';
 ALTER TABLE events ADD COLUMN session TEXT;  -- backfilled, indexed (session, seq)
 CREATE TABLE chat_queue (
   id TEXT PRIMARY KEY, session TEXT NOT NULL, text TEXT NOT NULL,
-  by_user TEXT, created INTEGER NOT NULL);   -- started in rowid order
+  by_user TEXT, created INTEGER NOT NULL,    -- started in rowid order
+  tab_target TEXT);                          -- a queued "I'm done"'s kept window
 ```
 
 `main`'s title: its first user message's first line, as for new ones, or
 "First conversation" when there's no history. Settings gain
-`monthly_budget_usd` and `budget_alerted` (`YYYY-MM:80`, `YYYY-MM:100`).
+`monthly_budget_usd` and `budget_alerted` (`YYYY-MM:80:<budget>`,
+`YYYY-MM:100:<budget>`, comma-separated: once per budget amount a month).
 
 ## 5. The apps
 

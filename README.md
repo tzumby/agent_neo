@@ -239,6 +239,10 @@ on every `make` gives a second, separate deployment in the same account.
 
 ## Using it
 
+For an existing desktop, `make deploy` updates the browser firewall,
+worker launcher, API, and web app in order. Rebuild the native apps to use
+the current approval and settings screens.
+
 - **Chat**: ask for something. The agent works in its own browser and shell.
   Three dots mean it's working, with how long it's been at it, and Stop cancels
   the task. On anything with three or more steps the agent writes a **plan**,
@@ -252,20 +256,24 @@ on every `make` gives a second, separate deployment in the same account.
   you get a **Looks stuck** card with the reason: **Keep going** or **Stop**
   (Stop ends with what's done and what's left). A stuck scheduled run, with
   nobody to ask, stops with that summary.
-- **Approval cards**: risky commands, commands as root, anything the agent
-  types or sends in the browser, new sites for the shell, and schedules set up
-  after it read outside content all wait for you. On a card about text (a
-  command, a message, a schedule's instructions) you can edit it first, and your
-  version is what runs. **Auto approve** in Settings (off by default) stops the
-  asking; keys still come from you, and outright refusals stay.
+- **Approval cards** show the command or browser input the agent wants to
+  run. All browser clicks, typing, and key presses need review. Typing and
+  submitting are separate actions. Auto approve applies to eligible worker
+  commands and schedule setup. Saved keys, direct network access, and new
+  proxy sites each need explicit approval. System administration is available
+  to the owner through SSM.
 - **Signing in to sites**: when a site needs you (a login, 2FA, a CAPTCHA),
   an "Action needed" card offers **Take over**. That opens the desktop in the
   page, and the agent carries on when you're done. Chrome stays signed in.
-- **Keys and tokens** (a GitHub token, an API key) go to the desktop without
-  passing through the model or the chat. The agent asks for one with a card,
-  or you add it under Keys and tokens. A command gets a key only when it names
-  it (`$GITHUB_TOKEN`), and agentd replaces every saved value with
-  `[secret NAME]` before the model sees anything.
+- **Keys and tokens** go to the desktop through a secure card or the Keys
+  screen. Review the exact command before granting a key. The approved
+  worker gets the credential for that command, through the proxy. The
+  command runs in the agent's workspace, so anything the agent put there
+  that the command uses (a tool it installed, a repository's git config or
+  hooks, package scripts) runs with the key too.
+- **Local servers**: the agent's commands can reach the internet only
+  through the proxy, and nothing on the desktop itself, not even a dev server
+  the same command started. Run those checks on your own computer.
 - **Schedules**: "every weekday at 8, summarize my inbox" or "tomorrow at 9,
   check PR 12". Each run is an ordinary task with the saved instructions, and
   its answer lands in the chat. The Schedules page pauses and cancels them.
@@ -280,10 +288,12 @@ on every `make` gives a second, separate deployment in the same account.
   address the push services see. The iPhone and Mac apps get the same
   notifications over APNs once you set up a key
   ([Notifications for the apps](#notifications-for-the-apps-optional)).
-- **Memory**: the agent remembers facts across conversations, and tidies up
-  duplicates and things that are no longer true. To fix or forget a memory in
-  the web app, ask the agent. The iPhone and Mac apps also have a Memory
-  screen for editing, forgetting, exporting and importing.
+- **Memory** keeps inferred notes across conversations. To save a standing
+  instruction in chat, send `remember rule: …`, `remember preference: …`,
+  or `remember fact: …` (any letter case). Use `forget #ID` to remove an
+  exact memory. Neither cancels a card waiting for your approval. The
+  Apple apps provide a Memory screen for confirmation, editing, import, and export.
+  Imported memories stay hints until you confirm or edit them there.
 - **Skills** (`services/agentd/skills`) are how-tos the agent reads when it
   needs them. They cover installing software (Nix, no `curl | bash`), Python
   with uv, Node, git and GitHub, opencode with Together AI, and deploying to Fly.
@@ -307,8 +317,8 @@ Native apps for iPhone (iOS 26 or later) and Mac (macOS 15.6 or later, Apple
 silicon), in `apps/apple`. They have the same chat as the web app: plans,
 approval cards, **Looks stuck**, keys and schedules. Take over shows the desktop
 natively, with the phone's keyboard and gestures or the Mac's keyboard and
-pointer. The apps also have a Memory screen, and push notifications — with
-Approve and Deny right on an approval notification — if you set up an APNs key
+pointer. The apps also have a Memory screen and push notifications if you set
+up an APNs key
 ([Notifications for the apps](#notifications-for-the-apps-optional)).
 
 Each app has its own Tailscale node built in. You sign in with your Tailscale
@@ -381,12 +391,17 @@ tagged `tag:neo-agent` is online: check that the desktop is running
 
 ### Notifications for the apps (optional)
 
-The apps get a notification when a card needs you (with Approve and Deny on the
-notification itself), when Action needed comes up, when a chat task that ran
+The apps get a notification when a card needs you, when Action needed comes up,
+when a chat task that ran
 over a minute finishes, and when a scheduled run finds something. agentd sends
 these to Apple directly with your own APNs key — there's no push relay and
 nothing extra in AWS, the same as the browsers' Web Push. It's off until you
-set up a key.
+set up a key. Tap an approval notification to review the full card: the app
+opens the chat at that card once it has caught up, or just opens the chat if
+the desktop can't be reached in time. Web Settings → Notifications lists the
+registered app devices and lets you remove them. Logging out in an app first
+asks the desktop to stop notifying that device (for up to 5 seconds); if that
+fails, the app says so, and you can remove the device in web Settings.
 
 Notifications need the **Apple Developer Program** ($99 a year): a free account
 can't create an APNs key or use the push entitlement. With that:
@@ -437,6 +452,38 @@ make app-mac app-device # the apps, if you use them
 ```
 
 To rotate the model key, run `make model-key` and then `make agentd-deploy`.
+
+## Desktop backups
+
+Set `enable_desktop_backups = true` in `terraform/personal/terraform.tfvars`
+and run `make plan` and `make apply`. The default is off. When enabled,
+Amazon Data Lifecycle Manager starts a daily snapshot around 03:00 UTC and
+keeps the latest seven for the current desktop. EBS storage charges apply.
+Snapshots contain the desktop's chat, memory, saved keys, and Chrome profile.
+They use its existing KMS key and remain in the deployment's account and
+Region. Keep that key available for recovery. Older snapshots can still
+contain data deleted from the desktop. [EBS snapshot encryption](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-creating-snapshot.html)
+
+### Restore drill
+
+1. In EC2 → Snapshots, choose a completed snapshot with the
+   `NeoAgentBackup` tag for your deployment. Confirm the source volume and
+   timestamp, and note the snapshot and KMS key IDs.
+2. Create a temporary encrypted volume from that snapshot in the
+   Availability Zone of a trusted recovery instance. Attach it as a data
+   volume. Leave the production desktop and its root device untouched.
+   [Create an EBS volume from a snapshot](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-creating-volume.html)
+3. On the recovery instance, use `lsblk -f` to identify the restored Linux
+   root partition. For ext4, mount it with `mount -o ro,noload` to inspect
+   files without replaying the journal on that volume. Copy
+   `/var/lib/agentd/agentd.db` and its `-wal` companion, if available, from
+   the mounted filesystem to an encrypted scratch directory with restricted
+   access. Run `sqlite3 agentd.db 'PRAGMA quick_check;'` on the copy and
+   expect `ok`. Verify that the expected memory rows and files are present.
+4. Unmount the copy and detach the temporary volume. Remove the drill volume
+   and scratch data after verifying the result. Inspect older snapshots
+   manually after replacing the desktop or disabling backups. DLM stops
+   pruning those snapshots. [DLM retention behavior](https://docs.aws.amazon.com/ebs/latest/userguide/snapshot-ami-policy.html)
 
 ## How it keeps things apart
 

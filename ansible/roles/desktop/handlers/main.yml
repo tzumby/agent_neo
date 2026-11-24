@@ -4,3 +4,9 @@
     state: restarted
     daemon_reload: true
   loop: "{{ desktop_unit_files.results | selectattr('changed') | map(attribute='item') | list }}"
+
+- name: Reload the browser network rules
+  ansible.builtin.systemd_service:
+    name: neo-agent-browser-guard
+    state: reloaded
+    daemon_reload: true

@@ -7,8 +7,15 @@ struct SettingsView: View {
     let store: ChatStore
     let client: AgentClient
     @Environment(TailnetService.self) private var tailnet
+    @Environment(PushCenter.self) private var push
     @Environment(\.dismiss) private var dismiss
-    @State private var confirmingAutoApprove = false
+    @State private var autoApproveConfirmationVersion: String?
+    @State private var loggingOut = false
+    /// The desktop didn't confirm it stopped notifying this device.
+    @State private var stillRegistered = false
+    /// A setting that didn't save (the chat's own alert can't show over this sheet).
+    @State private var problem: String?
+    private let autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content."
 
     var body: some View {
         GroupedList {
@@ -19,9 +26,7 @@ struct SettingsView: View {
                         selection: Binding(
                             get: { status.settings.model },
                             set: { model in
-                                var settings = status.settings
-                                settings.model = model
-                                Task { await store.update(settings: settings, client: client) }
+                                Task { problem = await store.updateSettings(model: model, client: client) }
                             })
                     ) {
                         ForEach(status.knownModels, id: \.self) { Text(shortName($0)).tag($0) }
@@ -31,9 +36,7 @@ struct SettingsView: View {
                         isOn: Binding(
                             get: { status.settings.allowActions },
                             set: { allow in
-                                var settings = status.settings
-                                settings.allowActions = allow
-                                Task { await store.update(settings: settings, client: client) }
+                                Task { problem = await store.updateSettings(allowActions: allow, client: client) }
                             })
                     )
                     Toggle(
@@ -42,25 +45,31 @@ struct SettingsView: View {
                             get: { status.settings.autoApprove },
                             set: { on in
                                 if on {
-                                    confirmingAutoApprove = true
+                                    autoApproveConfirmationVersion = status.settings.autoApproveVersion
                                 } else {
-                                    setAutoApprove(false, status)
+                                    setAutoApprove(false, version: status.settings.autoApproveVersion)
                                 }
                             })
                     )
+                    .disabled(!status.settings.autoApprove && status.settings.autoApproveVersion == nil)
                     .confirmationDialog(
-                        "Turn on Auto approve?", isPresented: $confirmingAutoApprove, titleVisibility: .visible
-                    ) {
-                        Button("Turn on", role: .destructive) { setAutoApprove(true, status) }
+                        "Turn on Auto approve?",
+                        isPresented: Binding(
+                            get: { autoApproveConfirmationVersion != nil },
+                            set: { if !$0 { autoApproveConfirmationVersion = nil } }),
+                        titleVisibility: .visible,
+                        presenting: autoApproveConfirmationVersion
+                    ) { version in
+                        Button("Turn on", role: .destructive) { setAutoApprove(true, version: version) }
                         Button("Cancel", role: .cancel) {}
-                    } message: {
-                        Text("Nothing will wait for your OK, including commands as root and changes in your logged-in browser, even if a page or log has fooled the agent.")
+                    } message: { _ in
+                        Text(autoApproveDescription)
                     }
                     LabeledContent("agentd", value: status.version)
                 } header: {
                     Text("Agent")
                 } footer: {
-                    Text("Browser actions on: the agent can type, click and send in the browser, and asks you before each change. Off: it can only read and navigate.\n\nAuto approve on: nothing waits for your OK, in chats or scheduled runs. Keys still come from you, and what the agent is never allowed to do stays refused.")
+                    Text(autoApproveDescription)
                 }
             }
             Section {
@@ -77,21 +86,71 @@ struct SettingsView: View {
             Section("Tailscale") {
                 LabeledContent("Signed in as", value: tailnet.status?.loginName ?? "…")
                 LabeledContent("This device", value: tailnet.status?.selfNode?.hostName ?? "…")
-                Button("Log out of Tailscale", role: .destructive) {
-                    dismiss()
-                    Task { await tailnet.logOut() }
+                Button(role: .destructive) {
+                    logOut()
+                } label: {
+                    HStack {
+                        Text(loggingOut ? "Logging out…" : "Log out of Tailscale")
+                        if loggingOut {
+                            Spacer()
+                            ProgressView().controlSize(.small)
+                        }
+                    }
                 }
+                .disabled(loggingOut)
+            }
+            .alert(
+                "Notifications may continue",
+                // However it's dismissed, signing out goes on.
+                isPresented: Binding(
+                    get: { stillRegistered },
+                    set: { shown in
+                        guard !shown, stillRegistered else { return }
+                        stillRegistered = false
+                        Task { await finishLogOut() }
+                    })
+            ) {
+                Button("Log Out") {}
+            } message: {
+                Text("Your desktop didn't confirm that it stopped notifying this device. It may keep sending notifications here until you remove this device in the web app, under Settings → Notifications.")
             }
         }
         .navigationTitle("Settings")
         .inlineTitle()
-        .toolbar { Button("Done") { dismiss() } }
+        .toolbar { Button("Done") { dismiss() }.disabled(loggingOut) }
+        // Signing out finishes here (its warning shows on this sheet).
+        .interactiveDismissDisabled(loggingOut)
+        .alert(
+            "Settings",
+            isPresented: Binding(get: { problem != nil }, set: { if !$0 { problem = nil } })
+        ) {
+            Button("OK") {}
+        } message: {
+            Text(problem ?? "")
+        }
     }
 
-    private func setAutoApprove(_ on: Bool, _ status: AgentStatus) {
-        var settings = status.settings
-        settings.autoApprove = on
-        Task { await store.update(settings: settings, client: client) }
+    private func setAutoApprove(_ enabled: Bool, version: String?) {
+        Task { problem = await store.setAutoApprove(enabled, expectedVersion: version, client: client) }
+    }
+
+    /// Stops this device's notifications first (bounded, so an unreachable
+    /// desktop doesn't hold it up), then signs out of the tailnet.
+    private func logOut() {
+        loggingOut = true
+        Task {
+            if await push.revokeBeforeLogout(on: client) {
+                await finishLogOut()
+            } else {
+                stillRegistered = true
+            }
+        }
+    }
+
+    private func finishLogOut() async {
+        dismiss()
+        await tailnet.logOut()
+        push.finishLogout()
     }
 
     private func shortName(_ model: String) -> String {

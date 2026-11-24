@@ -7,6 +7,8 @@ import { test } from "node:test";
 import { findKey, isValidName, normalizedName } from "../public/assets/js/keys.js";
 import { inline, parse, safeHref } from "../public/assets/js/markdown.js";
 import { deviceLabel, fromBase64Url, iosOutsideHomeScreen, isIOS, ownSubscription, pushState, pushSupported } from "../public/assets/js/push.js";
+import { ApiError } from "../public/assets/js/api.js";
+import { Store } from "../public/assets/js/store.js";
 import { Timeline, duration, rowKey, workingFor } from "../public/assets/js/timeline.js";
 
 let seq = 0;
@@ -44,11 +46,13 @@ test("card kinds keep their fields", () => {
   assert.equal(browser.editable, false, "only a card that says it takes an edit offers one");
   const click = new Timeline([ev("approval.requested", {
     id: "c", kind: "browser", action: "click", target: "Confirm", role: "button", summary: "Pay the March invoice",
-    page: "Invoices", url: "acme.com/invoices", around: "March, $120 Confirm", image: "/api/v1/images/ab",
+    page: "Invoices", url: "https://acme.com/invoices?month=march", destination: "https://acme.com/confirm",
+    around: "March, $120 Confirm", image: "/api/v1/images/ab",
   })]).visible()[0];
   assert.equal(click.summary, "Pay the March invoice");
-  assert.deepEqual([click.browser.role, click.browser.page, click.browser.url, click.browser.around, click.browser.image],
-    ["button", "Invoices", "acme.com/invoices", "March, $120 Confirm", "/api/v1/images/ab"]);
+  assert.deepEqual(
+    [click.browser.role, click.browser.page, click.browser.url, click.browser.destination, click.browser.around, click.browser.image],
+    ["button", "Invoices", "https://acme.com/invoices?month=march", "https://acme.com/confirm", "March, $120 Confirm", "/api/v1/images/ab"]);
   assert.equal(new Timeline([ev("approval.requested", { id: "e", kind: "browser", action: "type", text: "hi", editable: true })]).visible()[0].editable, true);
   assert.equal(schedule.schedule.when, "Weekdays at 08:00");
   assert.equal(secret.secret.host, "dash.cloudflare.com");
@@ -58,6 +62,20 @@ test("card kinds keep their fields", () => {
   t.apply(ev("action.resolved", { id: "x", choice: "done" }));
   t.expireApproval("b");
   assert.deepEqual(t.visible().map((i) => i.id), ["s", "k"]);
+});
+
+test("shell approval cards preserve the full command and its access details", () => {
+  const command = "gh pr list\ngh issue list";
+  const t = new Timeline([
+    ev("approval.requested", { id: "key", kind: "shell", command, secrets: ["GITHUB_TOKEN"] }),
+    ev("approval.requested", { id: "direct", kind: "shell", command: "git fetch", direct: true }),
+  ]);
+  const [key, direct] = t.visible();
+  assert.equal(key.command, command);
+  assert.deepEqual(key.savedKeys, ["GITHUB_TOKEN"]);
+  assert.equal(key.direct, false);
+  assert.equal(direct.direct, true);
+  assert.deepEqual(direct.savedKeys, []);
 });
 
 test("scheduled runs are reports, and quiet runs of one schedule fold", () => {
@@ -281,4 +299,45 @@ test("push: what the browser can do, and what Settings shows", () => {
   assert.equal(ownSubscription(subs, "https://web.push.apple.com/y").id, "b2");
   assert.equal(ownSubscription(subs, "https://elsewhere/z"), null);
   assert.equal(ownSubscription(subs, undefined), null);
+});
+
+test("Auto approve confirms the desktop's current revision and reports what it has", async () => {
+  // A stand-in desktop: turning it on needs the revision it has now.
+  let server = { auto_approve: false, auto_approve_version: "false:b" };
+  let reachable = true;
+  const sent = [];
+  const api = {
+    async setAutoApprove(enabled, version) {
+      sent.push([enabled, version]);
+      if (!reachable) throw new ApiError(0, "Can't reach your desktop.");
+      if (enabled && version !== server.auto_approve_version) throw new ApiError(409, "Auto approve changed.");
+      server = { auto_approve: enabled, auto_approve_version: `${enabled}:${sent.length}` };
+      return server;
+    },
+    async status() {
+      if (!reachable) throw new ApiError(0, "Can't reach your desktop.");
+      return { settings: { ...server } };
+    },
+  };
+  const store = new Store(api);
+  // What the page was drawn from, before another device changed it.
+  store.status = { settings: { auto_approve: false, auto_approve_version: "initial" } };
+
+  let result = await store.setAutoApprove(true);
+  assert.equal(result.error.status, 409);
+  assert.equal(result.on, false, "a refused change shows as off");
+  // The status was read again, so the next try confirms the current revision.
+  result = await store.setAutoApprove(true);
+  assert.deepEqual([result.on, result.error], [true, null]);
+  assert.deepEqual(sent.map(([, version]) => version), ["initial", "false:b"]);
+  // Off, then on again from the same page: no stale revision.
+  assert.equal((await store.setAutoApprove(false)).on, false);
+  assert.equal((await store.setAutoApprove(true)).on, true);
+  assert.equal(sent.at(-1)[1], "false:3", "the revision the turn-off left");
+
+  // Unreachable: the setting is assumed unchanged.
+  reachable = false;
+  result = await store.setAutoApprove(false);
+  assert.equal(result.on, true);
+  assert.equal(result.error.status, 0);
 });

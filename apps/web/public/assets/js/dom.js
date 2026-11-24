@@ -91,10 +91,3 @@ export async function busyButton(button, work) {
     button.disabled = false;
   }
 }
-
-/** "app.slack.com" → "slack.com" */
-export function site(host) {
-  let h = host || "";
-  for (const prefix of ["www.", "app.", "mail."]) if (h.startsWith(prefix)) h = h.slice(prefix.length);
-  return h;
-}

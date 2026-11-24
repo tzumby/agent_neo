@@ -24,10 +24,13 @@ own. Use these steps instead of working that out again.
 
 ## Deploy
 
-Run this with `secrets: ["FLY_API_TOKEN"]` and `timeout: 900`, since builds are
-slow:
+Resolve the installed executable's absolute path in a regular shell command
+with `command -v fly`. The credential-bearing command uses a clean system
+PATH. Request the saved token for the command with `secrets: ["FLY_API_TOKEN"]`
+and `timeout: 900`, since builds are slow. Substitute the resolved executable
+for `<fly-executable>`:
 
-    FLY_WIREGUARD_TOKEN_MODE=1 fly deploy --depot=false --builder-pool=false --remote-only
+    FLY_WIREGUARD_TOKEN_MODE=1 <fly-executable> deploy --depot=false --builder-pool=false --remote-only
 
 - `--depot=false --builder-pool=false`: the organization's own builder. Both of
   the others are reached by direct connections.
@@ -35,8 +38,8 @@ slow:
   to `gateway.machines.dev`, by name, through the proxy.
 - `--remote-only`: there's no Docker on this desktop.
 
-`fly ssh console` uses the same tunnel, so give it the same variable and the
-token: `FLY_WIREGUARD_TOKEN_MODE=1 fly ssh console -a <app> -C '<command>'`.
+`fly ssh console` uses the same tunnel, executable path, and saved token.
+Run `FLY_WIREGUARD_TOKEN_MODE=1 <fly-executable> ssh console -a <app> -C '<command>'`.
 `fly status`, `fly logs` and `fly secrets` only need the proxy.
 
 ## These don't work here
@@ -55,13 +58,9 @@ Token mode is new, and this route hasn't been proven on every setup. If the
 token is refused, ask for a new one with request_secret (`replace`). An
 organization token (`fly tokens create org`) may work where an app's doesn't.
 
-Otherwise stop after one failed attempt. Tell the user the exact error, and
-offer the two ways that don't depend on it:
-
-1. **This one deploy with `direct_internet: true`**: plain `fly deploy`, with
-   the token, and no flags or hosts needed. The user approves it on a card.
-2. **A GitHub Actions workflow in the app's repository**, for deploys from now
-   on. Actions runners connect freely. The user adds the token to the
-   repository's secrets, and you watch the run with `gh run watch`.
+Otherwise stop after one failed attempt and tell the user the exact error.
+They can run the deployment from their own computer or use a GitHub Actions
+workflow in the app's repository. The user adds the token to the repository's
+secrets and you watch the run with `gh run watch`.
 
 A build over 15 minutes doesn't fit in one command here, so use Actions for it.

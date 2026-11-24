@@ -325,12 +325,19 @@ impl Secrets {
         text
     }
 
-    /// Redacts every string in a JSON value.
     /// Whether the text holds a saved key's value.
     pub fn holds_a_value(&self, text: &str) -> bool {
         matches!(self.redact(text), Cow::Owned(_))
     }
 
+    /// Every saved (name, value), longest value first: for redacting output
+    /// before it's cut to size (shell.rs), where `redact` afterwards could
+    /// miss a value split at the cut. Never for anything the model sees.
+    pub fn snapshot(&self) -> Vec<(String, String)> {
+        self.values.read().unwrap().clone()
+    }
+
+    /// Redacts every string in a JSON value.
     pub fn redact_json(&self, value: &mut Value) {
         if self.values.read().unwrap().is_empty() {
             return;

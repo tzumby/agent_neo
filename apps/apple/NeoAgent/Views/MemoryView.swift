@@ -105,7 +105,7 @@ struct MemoryView: View {
                     .swipeActions(edge: .leading) {
                         if memory.isGone {
                             Button("Restore") { Task { await restore(memory) } }.tint(.blue)
-                        } else if memory.isInferred {
+                        } else if memory.needsConfirmation {
                             Button("Confirm") { Task { await confirm(memory) } }.tint(.green)
                         }
                     }
@@ -113,7 +113,7 @@ struct MemoryView: View {
                         if memory.isGone {
                             Button("Restore") { Task { await restore(memory) } }
                         } else {
-                            if memory.isInferred {
+                            if memory.needsConfirmation {
                                 Button("Confirm") { Task { await confirm(memory) } }
                             }
                             Button("Forget", role: .destructive) { Task { await forget(memory) } }
@@ -136,10 +136,10 @@ struct MemoryView: View {
 
     private static func empty(_ kind: String) -> String {
         switch kind {
-        case "rule": "No rules yet. Tell the agent, like “From now on, reply in English.”"
-        case "preference": "No preferences yet, like “I prefer summaries under 100 words.”"
+        case "rule": "No rules yet. Type “remember rule: Reply in English” in chat."
+        case "preference": "No preferences yet. Type “remember preference: Keep summaries under 100 words” in chat."
         case "work_log": "No work log yet: after a task that changes something, the agent notes what it did."
-        default: "No facts yet. Tell the agent something to keep, like “Remember that my manager is Lawrence.”"
+        default: "No facts yet. Type “remember fact: My manager is Lawrence” in chat."
         }
     }
 
@@ -173,9 +173,9 @@ struct MemoryView: View {
                 Text("To confirm")
             } footer: {
                 #if os(macOS)
-                    Text("Saved after the agent read a web page, an email or command output, so they could come from that content. It treats them as hints until you confirm them: right-click to confirm or forget.")
+                    Text("The agent uses these as hints. Right-click to confirm or forget an entry.")
                 #else
-                    Text("Saved after the agent read a web page, an email or command output, so they could come from that content. It treats them as hints until you confirm them: swipe right to confirm, left to forget.")
+                    Text("The agent uses these as hints. Swipe right to confirm an entry, or left to forget it.")
                 #endif
             }
         }
@@ -254,7 +254,7 @@ struct MemoryView: View {
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             let done = try await client.importMemory(try Data(contentsOf: url))
             notice = done.rejected.isEmpty
-                ? "Imported \(done.imported). The agent uses them from now on; fix or forget any here."
+                ? "Imported \(done.imported). The agent treats them as hints until you confirm them here; fix or forget any."
                 : "Imported \(done.imported); skipped \(done.rejected.count) (\(done.rejected.first?.reason ?? ""))."
         } catch {
             problem = error.localizedDescription
@@ -289,7 +289,7 @@ struct MemoryRow: View {
         default:
             switch memory.trust {
             case "agent_inferred": parts.append("a hint (saved after outside content)")
-            case "imported": parts.append("imported")
+            case "imported": parts.append("imported, a hint until you confirm it")
             default: break
             }
         }
@@ -434,7 +434,7 @@ private struct MemoryEditor: View {
                 if memory.isGone {
                     Button("Restore") { Task { await act { try await client.restore(memory: memory.id) } } }
                 } else {
-                    if memory.isInferred {
+                    if memory.needsConfirmation {
                         Button("Confirm it") { Task { await act { try await client.confirm(memory: memory.id) } } }
                     }
                     Button("Forget", role: .destructive) {
@@ -470,7 +470,7 @@ private struct MemoryEditor: View {
         switch (memory.origin, memory.trust) {
         case ("consolidator", _): return "Noted while the agent tidied up its memory, on \(date)."
         case ("user", _): return "You added or edited it, on \(date)."
-        case (_, "imported"): return "Imported on \(date)."
+        case (_, "imported"): return "Imported on \(date). It's a hint until you confirm it."
         case (_, "agent_inferred"):
             return "The agent saved it on \(date), after reading a page, an email or command output, so it's a hint, never an instruction."
         default: return "You told the agent in a conversation, on \(date)."

@@ -12,9 +12,6 @@ agentd_workdir: /home/worker/work
 agentd_shell_memory_max: 2G
 agentd_shell_tasks_max: "512"
 agentd_shell_cpu_quota: 200%
-# Local ports of the desktop's controls the shell user may not reach:
-# Chrome DevTools, VNC, noVNC.
-agentd_guarded_ports: [9222, 5900, 6080]
 # The shell user reaches the internet only through this proxy (Squid on
 # localhost): listed hosts, never internal addresses, every request logged.
 # A leading dot also allows subdomains.

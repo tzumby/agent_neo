@@ -129,7 +129,11 @@ export class Timeline {
           command: str(d.command), reason: str(d.reason), summary: d.summary || null, tainted: d.tainted === true,
           editable: d.editable === true,
         };
-        if (card.kind === "secret") {
+        if (card.kind === "shell") {
+          card.savedKeys = Array.isArray(d.secrets)
+            ? d.secrets.filter((name) => typeof name === "string" && name.length > 0) : [];
+          card.direct = d.direct === true;
+        } else if (card.kind === "secret") {
           card.secret = {
             name: str(d.name), label: str(d.label), why: str(d.why), how: str(d.how),
             url: d.url || null, host: d.host || null, replace: d.replace === true, saved: false,
@@ -146,7 +150,8 @@ export class Timeline {
           card.browser = {
             action: str(d.action), target: str(d.target), text: d.text ?? null, key: d.key ?? null,
             submit: d.submit === true, sends: d.sends === true, site: str(d.site),
-            role: str(d.role), page: str(d.page), url: str(d.url), around: str(d.around), image: d.image || null,
+            role: str(d.role), page: str(d.page), url: str(d.url), destination: str(d.destination),
+            around: str(d.around), image: d.image || null,
           };
         }
         this.approvalIndex.set(id, this.items.length);

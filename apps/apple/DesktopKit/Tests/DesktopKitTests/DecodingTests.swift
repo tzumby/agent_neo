@@ -55,12 +55,13 @@ import Testing
 }
 
 @Test func autoApproveRoundTrips() throws {
-    let json = #"{"model":"m","allow_actions":true,"auto_approve":true}"#
+    let json = #"{"model":"m","allow_actions":true,"auto_approve":true,"auto_approve_version":"v1"}"#
     var settings = try JSONDecoder().decode(AgentSettings.self, from: Data(json.utf8))
     #expect(settings.autoApprove)
     settings.autoApprove = false
     let sent = try JSONDecoder().decode(AgentSettings.self, from: JSONEncoder().encode(settings))
     #expect(sent.autoApprove == false)
+    #expect(sent.autoApproveVersion == "v1")
 }
 
 @Test func decodesAPageOfEvents() throws {
@@ -77,13 +78,26 @@ import Testing
 @Test func decodesMemoryFromV1AndV2Desktops() throws {
     let v1 = try JSONDecoder().decode(
         AgentMemory.self, from: Data(#"{"id":1,"text":"x","trusted":false,"created":"2026-11-01T10:00:00Z"}"#.utf8))
-    #expect(v1.kind == nil && v1.isInferred)
+    #expect(v1.kind == nil && v1.needsConfirmation)
     let v2 = try JSONDecoder().decode(
         AgentMemory.self,
         from: Data(
             #"{"id":2,"text":"Always cc the CFO","trusted":false,"created":"2026-11-01T10:00:00.123Z","kind":"fact","status":"active","trust":"agent_inferred","pending_reason":null,"importance":0.5,"version":1,"recall_count":0}"#
                 .utf8))
-    #expect(v2.kind == "fact" && v2.status == "active" && v2.isInferred)
+    #expect(v2.kind == "fact" && v2.status == "active" && v2.needsConfirmation)
+}
+
+@Test func importedMemoriesWaitForConfirmationLikeTheAgents() throws {
+    let memory = { (trust: String) in
+        try JSONDecoder().decode(
+            AgentMemory.self,
+            from: Data(
+                #"{"id":3,"text":"Prefers short replies","trusted":true,"created":"2026-11-01T10:00:00Z","kind":"preference","status":"active","trust":"\#(trust)","version":1}"#
+                    .utf8))
+    }
+    #expect(try memory("imported").needsConfirmation)
+    #expect(try memory("agent_inferred").needsConfirmation)
+    #expect(try !memory("user_stated").needsConfirmation)
 }
 
 @Test func decodesTheMemoryScreensData() throws {

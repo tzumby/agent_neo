@@ -70,28 +70,83 @@
     group: "{{ agentd_shell_user }}"
     mode: "0644"
 
+# Older installations scheduled worker-owned code outside command isolation.
+- name: Find the legacy Nix cleanup units
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ item }}"
+  loop: [agentd-nix-gc.timer, agentd-nix-gc.service]
+  register: agentd_legacy_nix_cleanup
+
+- name: Stop the legacy Nix cleanup timer and service
+  ansible.builtin.systemd_service:
+    name: "{{ item.item }}"
+    state: stopped
+    enabled: "{{ false if item.item.endswith('.timer') else omit }}"
+  loop: "{{ agentd_legacy_nix_cleanup.results }}"
+  when: item.stat.exists
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Remove the legacy Nix cleanup units
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}"
+    state: absent
+  loop: [agentd-nix-gc.timer, agentd-nix-gc.service]
+
 # Old generations of what the agent installed, weekly: the store would
-# otherwise only grow. What's installed now stays.
-- name: Install the Nix clean-up units
+# otherwise only grow. nix-collect-garbage is the shell user's own binary, so
+# it runs as confined as the agent's commands and without any network at all:
+# a binary the agent replaced can do nothing here that its next command
+# couldn't.
+- name: Install the confined Nix clean-up units
   ansible.builtin.copy:
     dest: "/etc/systemd/system/{{ item.name }}"
     content: "{{ item.content }}"
+    owner: root
+    group: root
     mode: "0644"
   loop:
-    - name: agentd-nix-gc.service
+    - name: neo-agent-nix-gc.service
       content: |
         # Managed by Ansible (agentd role: tasks/nix.yml).
         [Unit]
         Description=Remove old Nix generations and unused store paths of the shell user
+        BindsTo=neo-agent-guard.service
+        After=neo-agent-guard.service
 
         [Service]
         Type=oneshot
         User={{ agentd_shell_user }}
         Environment=HOME={{ agentd_shell_home }}
+        UnsetEnvironment=BASH_ENV ENV CDPATH
         ExecStart={{ agentd_shell_home }}/.nix-profile/bin/nix-collect-garbage --delete-older-than 30d
+        TimeoutStartSec=1h
         Nice=19
         IOSchedulingClass=idle
-    - name: agentd-nix-gc.timer
+        PrivateNetwork=yes
+        RestrictAddressFamilies=AF_UNIX
+        NoNewPrivileges=yes
+        CapabilityBoundingSet=
+        AmbientCapabilities=
+        PrivateTmp=yes
+        PrivateDevices=yes
+        ProtectSystem=full
+        ProtectKernelTunables=yes
+        ProtectKernelModules=yes
+        ProtectKernelLogs=yes
+        ProtectControlGroups=yes
+        ProtectClock=yes
+        ProtectHostname=yes
+        ProtectProc=invisible
+        RestrictSUIDSGID=yes
+        RestrictRealtime=yes
+        LockPersonality=yes
+        KillMode=control-group
+        InaccessiblePaths=-/run/systemd/resolve/io.systemd.Resolve -/run/dbus/system_bus_socket -/run/nscd/socket
+        MemoryMax={{ agentd_shell_memory_max }}
+        TasksMax={{ agentd_shell_tasks_max }}
+        CPUQuota={{ agentd_shell_cpu_quota }}
+    - name: neo-agent-nix-gc.timer
       content: |
         # Managed by Ansible (agentd role: tasks/nix.yml).
         [Unit]
@@ -109,7 +164,7 @@
 
 - name: Run the Nix clean-up weekly
   ansible.builtin.systemd_service:
-    name: agentd-nix-gc.timer
+    name: neo-agent-nix-gc.timer
     enabled: true
     state: started
     daemon_reload: true

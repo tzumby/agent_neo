@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Network restrictions for the desktop user
+Wants=network-pre.target
+After=nftables.service
+Before=network-pre.target chrome.service xfce.service x11vnc.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f {{ desktop_config_dir }}/browser-guard.nft
+ExecReload=/usr/sbin/nft -f {{ desktop_config_dir }}/browser-guard.nft
+
+[Install]
+WantedBy=multi-user.target

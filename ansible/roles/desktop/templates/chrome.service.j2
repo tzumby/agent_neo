@@ -4,7 +4,8 @@
 [Unit]
 Description=Google Chrome on {{ desktop_display }}
 Wants=xfce.service
-After=xfce.service
+BindsTo=neo-agent-browser-guard.service
+After=xfce.service neo-agent-browser-guard.service
 StartLimitIntervalSec=0
 
 [Service]

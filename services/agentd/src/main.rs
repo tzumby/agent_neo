@@ -53,8 +53,6 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(cfg.state_dir.join("images")).context("creating the state directory")?;
     let agent = Arc::new(agent::Agent::new(cfg.clone())?);
     let app = api::router(agent.clone());
-    // A direct command's opening left by an agentd that stopped mid-command.
-    agent.clear_direct_egress();
 
     if let Some(path) = cfg.listen.strip_prefix("unix:") {
         // Only agentd and tailnet-proxy (via the socket's group) can connect;

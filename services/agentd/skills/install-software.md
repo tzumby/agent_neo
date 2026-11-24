@@ -28,13 +28,11 @@ current.
 - Python: uv (read the python skill). Never `sudo pip` or `pip install --user`.
 - JavaScript: npm in the project (read the node skill).
 
-## Desktop apps and system packages: these need root, so the user approves
+## Desktop apps and system packages
 
-- Desktop apps for the user (Slack, Zoom, Spotify, VS Code):
-  `sudo snap install slack`. They appear in the desktop's menu. You can't
-  operate them yourself: your browser tools only drive Chrome.
-- System libraries or drivers that only Ubuntu has: `sudo apt-get install -y <package>`.
-- Say in a sentence why root is needed; the user sees the command.
+The owner installs desktop apps, system libraries, and drivers through SSM.
+Explain what package is needed and why. Use Nix for worker tools you can
+install without administrator access.
 
 ## Never
 

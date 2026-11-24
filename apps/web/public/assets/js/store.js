@@ -107,6 +107,34 @@ export class Store {
     }, 150);
   }
 
+  /** The status at once, after a settings change. Whether the desktop answered. */
+  async reloadStatus() {
+    try {
+      this.status = await this.api.status();
+      this.changed();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Turns Auto approve on, for the revision the desktop has now (not the one a
+   * page showed when it was drawn), or off. Resolves to `{on, error}`: what the
+   * desktop has afterwards, and what went wrong, if anything.
+   */
+  async setAutoApprove(enabled) {
+    let error = null;
+    try {
+      await this.api.setAutoApprove(enabled, this.status?.settings?.auto_approve_version);
+    } catch (failure) {
+      error = failure;
+    }
+    // Without an answer, assume a failed change changed nothing.
+    const on = (await this.reloadStatus()) ? this.status?.settings?.auto_approve === true : error ? !enabled : enabled;
+    return { on, error };
+  }
+
   async loadNewest() {
     const page = await this.api.page(null, PAGE, KINDS);
     this.history = page.events;

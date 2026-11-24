@@ -227,27 +227,40 @@ export function mountSettings(store, view, session) {
       return;
     }
     const settings = status.settings || {};
+    const autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content.";
     const models = [...new Set([settings.model, ...(status.known_models || [])])].filter(Boolean);
     const model = h("select", { class: "field" }, models.map((m) => h("option", { value: m, selected: m === settings.model }, m)));
     const actions = h("input", { type: "checkbox", checked: settings.allow_actions === true });
-    const autoApprove = h("input", { type: "checkbox", checked: settings.auto_approve === true });
-    const save = async () => {
+    const autoApprove = h("input", {
+      type: "checkbox", checked: settings.auto_approve === true,
+      disabled: !settings.auto_approve && settings.auto_approve_version === undefined,
+    });
+    // The page isn't redrawn while it has focus, so each control is set back
+    // to what the desktop has once it answers (a failed change shows as one).
+    const save = async (update, sync) => {
       try {
-        await store.api.updateSettings({ model: model.value, allow_actions: actions.checked, auto_approve: autoApprove.checked });
-        store.refreshStatus();
+        await update();
         store.notice("Settings saved.");
       } catch (error) {
         store.notice(error.message);
       }
+      if (await store.reloadStatus()) sync(store.status.settings || {});
     };
-    model.addEventListener("change", save);
-    actions.addEventListener("change", save);
-    autoApprove.addEventListener("change", () => {
-      if (autoApprove.checked && !confirm("Turn on Auto approve? Nothing will wait for your OK, including commands as root and changes in your logged-in browser, even if a page or log has fooled the agent.")) {
+    model.addEventListener("change", () => save(() => store.api.updateSettings({ model: model.value }),
+      (now) => { if (now.model) model.value = now.model; }));
+    actions.addEventListener("change", () => save(() => store.api.updateSettings({ allow_actions: actions.checked }),
+      (now) => { actions.checked = now.allow_actions === true; }));
+    autoApprove.addEventListener("change", async () => {
+      const enabled = autoApprove.checked;
+      if (enabled && !confirm(`Turn on Auto approve?\n\n${autoApproveDescription}`)) {
         autoApprove.checked = false;
         return;
       }
-      save();
+      autoApprove.disabled = true;
+      const { on, error } = await store.setAutoApprove(enabled);
+      autoApprove.checked = on;
+      autoApprove.disabled = false;
+      store.notice(error ? error.message : `Auto approve is ${on ? "on" : "off"}.`);
     });
     let current = "light";
     try {
@@ -268,10 +281,10 @@ export function mountSettings(store, view, session) {
         h("label", { class: "label" }, "Model", model),
         h("label", { class: "toggle" }, actions,
           h("span", null, h("span", { class: "strong" }, "Browser actions"),
-            h("span", { class: "muted block" }, "Lets the agent click, type and press keys in your desktop's browser. It still asks you before anything that sends or changes things. Off, it only reads pages."))),
+            h("span", { class: "muted block" }, "Lets the agent ask before typing, clicking, or pressing a key in your desktop's browser."))),
         h("label", { class: "toggle" }, autoApprove,
           h("span", null, h("span", { class: "strong" }, "Auto approve"),
-            h("span", { class: "muted block" }, "Nothing waits for your OK, in chats or scheduled runs. Commands as root, direct connections, browser changes, new sites and schedules all go ahead, even if a page or log has fooled the agent. Keys still come from you, and what the agent is never allowed to do stays refused.")))),
+            h("span", { class: "muted block" }, autoApproveDescription)))),
       pushSection(store),
       sitesSection(store),
       h("section", { class: "settings-group" },
@@ -354,7 +367,10 @@ function pushSection(store) {
       permission: supported ? Notification.permission : "default",
       subscribed: Boolean(own),
     });
-    const others = subscriptions.filter((s) => s !== own);
+    const others = [
+      ...subscriptions.filter((s) => s !== own).map((s) => ({ ...s, remove: store.api.deletePush })),
+      ...(info.devices || []).map((device) => ({ ...device, remove: store.api.deleteDevice })),
+    ];
     fill(section, heading(), what(), thisDevice(state, own, info, mine), problem, othersList(others));
   }
 
@@ -432,7 +448,7 @@ function pushSection(store) {
         remove.addEventListener("click", () => busyButton(remove, async () => {
           if (!confirm(`Stop notifying ${s.label || "that device"}?`)) return;
           try {
-            await store.api.deletePush(s.id);
+            await s.remove(s.id);
           } catch (error) {
             fail(`Couldn't remove it: ${error.message}`);
             return;

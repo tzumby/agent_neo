@@ -79,6 +79,12 @@ variable "disk_size_gb" {
   default     = 20
 }
 
+variable "enable_desktop_backups" {
+  description = "Create daily encrypted EBS snapshots of the desktop root volume and retain seven snapshots."
+  type        = bool
+  default     = false
+}
+
 variable "ubuntu_version" {
   description = "Ubuntu LTS release for the desktop's base image."
   type        = string

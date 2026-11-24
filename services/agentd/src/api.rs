@@ -2,6 +2,7 @@
 //! socket): `tailnet-proxy`, which sets `X-Tailscale-User` from the caller's
 //! Tailscale identity and removes any copy the caller sent.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -15,7 +16,6 @@ use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
 
 use crate::agent::{Agent, SecretError, StartError};
 use crate::clock::UserClock;
@@ -37,6 +37,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/stop", post(stop))
         .route("/api/v1/images/{id}", get(image))
         .route("/api/v1/settings", get(settings).put(put_settings))
+        .route("/api/v1/settings/auto-approve", put(set_auto_approve))
         .route("/api/v1/memory", get(memories))
         .route("/api/v1/memory/consolidate", post(consolidate_now))
         .route("/api/v1/memory/consolidation", get(consolidation))
@@ -256,18 +257,17 @@ async fn events(
     State(agent): App,
     Query(query): Query<After>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let live = BroadcastStream::new(agent.bus.subscribe()); // subscribe before reading the backlog
-    let backlog = agent
-        .store
-        .events_after(query.after.unwrap_or(0), 5_000)
-        .unwrap_or_default();
-    let last = backlog.last().map_or(query.after.unwrap_or(0), |e| e.seq);
-    let kinds = kinds(query.kinds.as_deref());
-    let wanted = move |event: &Event| kinds.is_empty() || kinds.contains(&event.kind);
-    let backlog: Vec<Event> = backlog.into_iter().filter(&wanted).collect();
-    let live = live.filter_map(move |event| event.ok().filter(|e| e.seq > last && wanted(e)));
+    let cursor = EventCursor::new(
+        agent.clone(),
+        query.after.unwrap_or(0),
+        kinds(query.kinds.as_deref()),
+    );
     // Older events may hold a key pasted into the chat before it was saved.
-    let stream = tokio_stream::iter(backlog).chain(live).map(move |mut event| {
+    let stream = futures_util::stream::unfold(cursor, |mut cursor| async {
+        let event = cursor.next().await?;
+        Some((event, cursor))
+    })
+    .map(move |mut event| {
         agent.secrets.redact_json(&mut event.data);
         Ok(SseEvent::default()
             .id(event.seq.to_string())
@@ -275,6 +275,57 @@ async fn events(
             .data(serde_json::to_string(&event).unwrap_or_default()))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// SQLite owns the stream order. The broadcast only wakes a cursor that's caught up.
+struct EventCursor {
+    agent: Arc<Agent>,
+    live: tokio::sync::broadcast::Receiver<Event>,
+    after: i64,
+    kinds: Vec<String>,
+    batch: VecDeque<Event>,
+}
+
+impl EventCursor {
+    fn new(agent: Arc<Agent>, after: i64, kinds: Vec<String>) -> Self {
+        let live = agent.bus.subscribe();
+        Self {
+            agent,
+            live,
+            after,
+            kinds,
+            batch: VecDeque::new(),
+        }
+    }
+
+    async fn next(&mut self) -> Option<Event> {
+        loop {
+            while let Some(event) = self.batch.pop_front() {
+                self.after = event.seq;
+                if self.kinds.is_empty() || self.kinds.contains(&event.kind) {
+                    return Some(event);
+                }
+            }
+            match self.agent.store.events_after(self.after, 256) {
+                Ok(events) if !events.is_empty() => {
+                    self.batch = events.into();
+                    tokio::task::yield_now().await;
+                }
+                Ok(_) => loop {
+                    use tokio::sync::broadcast::error::RecvError;
+                    match self.live.recv().await {
+                        Ok(event) if event.seq <= self.after => continue,
+                        Ok(_) | Err(RecvError::Lagged(_)) => break,
+                        Err(RecvError::Closed) => return None,
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(%err, after = self.after, "couldn't read event stream");
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -405,7 +456,7 @@ async fn consolidate_now(State(agent): App, headers: HeaderMap) -> Response {
     if !agent.cfg.memory_v2 {
         return v2_off();
     }
-    let waiting = crate::consolidate::batch(&agent.store).map_or(0, |(runs, _)| runs.len());
+    let waiting = crate::consolidate::batch(&agent.store).map_or(0, |runs| runs.len());
     let now = crate::memory::unix_now();
     match agent.enqueue("consolidate", "main", &json!({}), now) {
         Ok(()) => {
@@ -448,7 +499,7 @@ async fn restore_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderM
     }
     let by = caller(&headers);
     match memory::restore(&agent.store, memory::Actor::User { login: by.as_deref() }, id) {
-        Ok(Some((item, replaced))) => {
+        Ok(memory::Restored::Done { item, replaced }) => {
             agent.emit(
                 "memory.updated",
                 json!({"id": id, "version": item.version, "by": by, "restored": true}),
@@ -461,9 +512,17 @@ async fn restore_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderM
             }
             Json(json!({"memory": item})).into_response()
         }
-        Ok(None) => error(
+        Ok(memory::Restored::NotFound) => error(
             StatusCode::NOT_FOUND,
             "no expired or replaced memory with that id",
+        ),
+        // Like the other limits here (sites): the request is fine, the state isn't.
+        Ok(memory::Restored::Full) => error(
+            StatusCode::CONFLICT,
+            &format!(
+                "too many active memories ({}): forget some before restoring this one",
+                memory::MAX_ACTIVE
+            ),
         ),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
@@ -516,17 +575,12 @@ async fn import_memory(State(agent): App, headers: HeaderMap, Json(body): Json<V
 
 async fn forget_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
     let by = caller(&headers);
-    let forgotten = if agent.cfg.memory_v2 {
-        memory::forget(&agent.store, memory::Actor::User { login: by.as_deref() }, id).map(|m| m.is_some())
-    } else {
-        agent.store.forget(id)
-    };
-    match forgotten {
-        Ok(true) => {
+    match memory::forget(&agent.store, memory::Actor::User { login: by.as_deref() }, id) {
+        Ok(memory::Forgot::Forgotten(_)) => {
             agent.emit("memory.forgotten", json!({"id": id, "by": by}));
             Json(json!({"ok": true})).into_response()
         }
-        Ok(false) => error(StatusCode::NOT_FOUND, "no such memory"),
+        Ok(_) => error(StatusCode::NOT_FOUND, "no such memory"),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
@@ -535,16 +589,6 @@ async fn forget_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMa
 /// they said.
 async fn confirm_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
     let by = caller(&headers);
-    if !agent.cfg.memory_v2 {
-        return match agent.store.confirm_memory(id) {
-            Ok(true) => {
-                agent.emit("memory.confirmed", json!({"id": id, "by": by}));
-                Json(json!({"ok": true})).into_response()
-            }
-            Ok(false) => error(StatusCode::NOT_FOUND, "no such memory"),
-            Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
-        };
-    }
     match memory::approve(&agent.store, memory::Actor::User { login: by.as_deref() }, id) {
         Ok(Some(item)) => {
             agent.emit("memory.confirmed", json!({"id": id, "by": by}));
@@ -991,23 +1035,67 @@ struct SettingsUpdate {
 }
 
 async fn put_settings(State(agent): App, headers: HeaderMap, Json(body): Json<SettingsUpdate>) -> Response {
-    let memory = agent.update_memory_settings(
-        body.memory_consolidation.as_deref(),
-        body.memory_consolidation_model.as_deref(),
-        body.memory_consolidation_daily_cap_usd,
-    );
-    match memory {
-        Ok(Err(problem)) => return error(StatusCode::BAD_REQUEST, &problem),
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
-        Ok(Ok(_)) => {}
+    // Older clients sent the entire settings object. Their explicit turn-off
+    // gesture still works. No generic update can turn Auto approve on. When
+    // it's already off, nothing changes: the version a newer app holds for
+    // its confirmation stays valid, and no change is announced.
+    if body.auto_approve == Some(false)
+        && agent.settings().auto_approve
+        && let Err(err) = agent.set_auto_approve(false, None, caller(&headers).as_deref())
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
     }
-    match agent.update_settings(
-        body.model.as_deref(),
-        body.allow_actions,
-        body.auto_approve,
+    let has_memory = body.memory_consolidation.is_some()
+        || body.memory_consolidation_model.is_some()
+        || body.memory_consolidation_daily_cap_usd.is_some();
+    if has_memory {
+        match agent.update_memory_settings(
+            body.memory_consolidation.as_deref(),
+            body.memory_consolidation_model.as_deref(),
+            body.memory_consolidation_daily_cap_usd,
+        ) {
+            Ok(Err(problem)) => return error(StatusCode::BAD_REQUEST, &problem),
+            Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+            Ok(Ok(_)) => {}
+        }
+    }
+    if body.model.is_some() || body.allow_actions.is_some() {
+        // Older clients include the whole settings object on unrelated edits.
+        return match agent.update_settings(body.model.as_deref(), body.allow_actions) {
+            Ok(settings) => Json(json!(settings)).into_response(),
+            Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        };
+    }
+    if !has_memory && body.auto_approve == Some(true) {
+        return error(
+            StatusCode::CONFLICT,
+            "Use the Auto approve confirmation endpoint to turn it on",
+        );
+    }
+    Json(json!(agent.settings())).into_response()
+}
+
+#[derive(Deserialize)]
+struct AutoApproveUpdate {
+    enabled: bool,
+    expected_version: Option<String>,
+}
+
+async fn set_auto_approve(
+    State(agent): App,
+    headers: HeaderMap,
+    Json(body): Json<AutoApproveUpdate>,
+) -> Response {
+    match agent.set_auto_approve(
+        body.enabled,
+        body.expected_version.as_deref(),
         caller(&headers).as_deref(),
     ) {
-        Ok(settings) => Json(json!(settings)).into_response(),
+        Ok(Some(settings)) => Json(json!(settings)).into_response(),
+        Ok(None) => error(
+            StatusCode::CONFLICT,
+            "Auto approve changed. Review the current setting and confirm again.",
+        ),
         Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
@@ -1015,6 +1103,173 @@ async fn put_settings(State(agent): App, headers: HeaderMap, Json(body): Json<Se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn auto_approve_needs_current_confirmation_and_ignores_whole_legacy_settings() {
+        let (agent, dir) = crate::agent::test_agent();
+        let update = |body: Value| {
+            let settings = serde_json::from_value(body).unwrap();
+            put_settings(State(agent.clone()), HeaderMap::new(), Json(settings))
+        };
+        let confirm = |enabled, expected_version| {
+            set_auto_approve(
+                State(agent.clone()),
+                HeaderMap::new(),
+                Json(AutoApproveUpdate {
+                    enabled,
+                    expected_version,
+                }),
+            )
+        };
+        let initial = agent.settings().auto_approve_version;
+        assert_eq!(confirm(true, None).await.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            update(json!({"auto_approve": true})).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(confirm(false, None).await.status(), StatusCode::OK);
+        assert_eq!(confirm(true, Some(initial)).await.status(), StatusCode::CONFLICT);
+        let current = agent.settings().auto_approve_version;
+        assert_eq!(
+            confirm(true, Some(current.clone())).await.status(),
+            StatusCode::OK
+        );
+        assert!(agent.settings().auto_approve);
+        assert_eq!(confirm(true, Some(current)).await.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            update(json!({"model": "legacy model", "auto_approve": false}))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            update(json!({"model": "new model", "allow_actions": false, "auto_approve": true}))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let settings = agent.settings();
+        assert_eq!(settings.model, "new model");
+        assert!(!settings.allow_actions);
+        assert!(!settings.auto_approve);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_legacy_turn_off_when_already_off_changes_nothing() {
+        let (agent, dir) = crate::agent::test_agent();
+        let update = |body: Value| {
+            let settings = serde_json::from_value(body).unwrap();
+            put_settings(State(agent.clone()), HeaderMap::new(), Json(settings))
+        };
+        let changes = || {
+            agent
+                .store
+                .events_after(0, 10_000)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "auto_approve.changed")
+                .count()
+        };
+        let version = agent.settings().auto_approve_version;
+        assert_eq!(
+            update(json!({"model": "m", "allow_actions": true, "auto_approve": false}))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            update(json!({"auto_approve": false})).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(agent.settings().auto_approve_version, version);
+        assert_eq!(changes(), 0);
+        // A newer app's confirmation against that version still applies.
+        let confirmed = set_auto_approve(
+            State(agent.clone()),
+            HeaderMap::new(),
+            Json(AutoApproveUpdate {
+                enabled: true,
+                expected_version: Some(version),
+            }),
+        )
+        .await;
+        assert_eq!(confirmed.status(), StatusCode::OK);
+        // On, the legacy turn-off still turns it off.
+        assert_eq!(
+            update(json!({"auto_approve": false})).await.status(),
+            StatusCode::OK
+        );
+        assert!(!agent.settings().auto_approve);
+        assert_eq!(changes(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restoring_at_the_memory_cap_is_a_conflict_not_a_missing_memory() {
+        let (agent, dir) = crate::agent::test_agent();
+        let expired: i64 = agent
+            .store
+            .transact(|tx| {
+                let id = tx.query_row(
+                    "INSERT INTO memory (text, trusted, trust, status)
+                     VALUES ('Old note', 0, 'agent_inferred', 'expired') RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )?;
+                for i in 0..memory::MAX_ACTIVE {
+                    tx.execute(
+                        "INSERT INTO memory (text, trusted, trust) VALUES (?1, 0, 'agent_inferred')",
+                        rusqlite::params![format!("filler {i}")],
+                    )?;
+                }
+                Ok(id)
+            })
+            .unwrap();
+        let restore = |id: i64| restore_memory(State(agent.clone()), Path(id), HeaderMap::new());
+        let full = restore(expired).await;
+        assert_eq!(full.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(full.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("too many active memories"));
+        assert_eq!(restore(expired + 100_000).await.status(), StatusCode::NOT_FOUND);
+        // With room again, it comes back.
+        let filler: i64 = agent
+            .store
+            .read(|conn| {
+                Ok(conn.query_row("SELECT id FROM memory WHERE text = 'filler 0'", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        memory::forget(&agent.store, memory::Actor::User { login: None }, filler).unwrap();
+        assert_eq!(restore(expired).await.status(), StatusCode::OK);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_cursor_replays_a_long_filtered_backlog_and_recovers_when_broadcast_lags() {
+        let (agent, dir) = crate::agent::test_agent();
+        for _ in 0..5_100 {
+            agent.store.append_event("step", &Value::Null).unwrap();
+        }
+        let first = agent.emit("message", Value::Null).unwrap();
+        let mut cursor = EventCursor::new(agent.clone(), 0, vec!["message".into()]);
+        assert_eq!(cursor.next().await.unwrap().seq, first);
+
+        let third = {
+            let next = cursor.next();
+            tokio::pin!(next);
+            let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            assert!(std::future::Future::poll(next.as_mut(), &mut cx).is_pending());
+            let second = agent.emit("message", Value::Null).unwrap();
+            for _ in 0..1_100 {
+                agent.emit("step", Value::Null).unwrap();
+            }
+            let third = agent.emit("message", Value::Null).unwrap();
+            assert_eq!(next.await.unwrap().seq, second);
+            third
+        };
+        assert_eq!(cursor.next().await.unwrap().seq, third);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_schedule_from_the_app_runs_without_asking_unless_told_otherwise() {

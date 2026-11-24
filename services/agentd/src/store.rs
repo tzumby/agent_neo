@@ -343,6 +343,7 @@ impl Store {
                  last_sent INTEGER);"
         ))?;
         migrate(&conn)?;
+        reconcile_legacy_memory_provenance(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -396,6 +397,18 @@ impl Store {
         Ok(())
     }
 
+    /// Only a run with a durable record of zero dispatched actions may be retried.
+    /// Older records with unknown action status are treated conservatively.
+    pub fn run_has_no_actions(&self, id: &str) -> Result<bool> {
+        self.read(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE id = ?1 AND acted = 0)",
+                params![id],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     pub fn set_run_status(&self, id: &str, status: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -413,14 +426,30 @@ impl Store {
         cost: Option<f64>,
         answer: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            &format!(
-                "UPDATE runs SET status = ?2, steps = ?3, cost = ?4, answer = ?5, updated = {NOW} WHERE id = ?1"
-            ),
-            params![id, status, steps, cost, answer],
-        )?;
-        Ok(())
+        self.finish_run_and_enqueue(id, status, steps, cost, answer, false)
+    }
+
+    pub fn finish_run_and_enqueue(
+        &self,
+        id: &str,
+        status: &str,
+        steps: u32,
+        cost: Option<f64>,
+        answer: &str,
+        consolidate: bool,
+    ) -> Result<()> {
+        self.transact(|tx| {
+            let changed = tx.execute(
+                &format!(
+                    "UPDATE runs SET status = ?2, steps = ?3, cost = ?4, answer = ?5, updated = {NOW} WHERE id = ?1"
+                ),
+                params![id, status, steps, cost, answer],
+            )?;
+            if changed > 0 && consolidate && status != "cancelled" {
+                crate::consolidate::enqueue_after_run(tx, id)?;
+            }
+            Ok(())
+        })
     }
 
     /// A schedule's run joins the queue, due at `due`, unless the schedule
@@ -570,6 +599,7 @@ impl Store {
 
     // --- Memory -------------------------------------------------------------------
 
+    #[cfg(test)]
     pub fn remember(&self, text: &str, trusted: bool) -> Result<Memory> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.query_row(
@@ -584,19 +614,22 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, text, trusted, created FROM
-               (SELECT id, text, trusted, created FROM memory ORDER BY id DESC LIMIT ?1)
+               (SELECT id, text, trusted, created FROM memory WHERE agent = 'main' AND status = 'active'
+                  AND (valid_until IS NULL OR valid_until > ?2) ORDER BY id DESC LIMIT ?1)
              ORDER BY id",
         )?;
-        let rows = stmt.query_map(params![limit], memory_row)?;
+        let rows = stmt.query_map(params![limit, unix_now()], memory_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    #[cfg(test)]
     pub fn forget(&self, id: i64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute("DELETE FROM memory WHERE id = ?1", params![id])? > 0)
     }
 
     /// The user vouches for an unverified memory.
+    #[cfg(test)]
     pub fn confirm_memory(&self, id: i64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute("UPDATE memory SET trusted = 1 WHERE id = ?1", params![id])? > 0)
@@ -913,14 +946,9 @@ impl Store {
             .optional()?)
     }
 
-    /// Memory counts: (active, pending).
+    /// The number of memories eligible for recall.
     pub fn memory_counts(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM memory WHERE agent = 'main' AND status = 'active'",
-            [],
-            |r| r.get(0),
-        )?)
+        self.read(crate::memory::active_count)
     }
 
     /// The parked approval with this ID.
@@ -1080,6 +1108,17 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    pub fn compare_and_set_setting(&self, key: &str, expected: Option<&str>, value: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "INSERT INTO settings (key, value)
+             SELECT ?1, ?3 WHERE (SELECT value FROM settings WHERE key = ?1) IS ?2
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, expected, value],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Adds a browser's subscription, or updates the one with its endpoint
@@ -1256,6 +1295,61 @@ fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
     })
 }
 
+/// Audit rows that show the user vouched for a memory: their own action, or
+/// a v1 confirmation from the event log, copied into the audit trail once
+/// (`legacy_confirmed`) by `reconcile_legacy_memory_provenance`.
+const USER_PROVENANCE: &str = "(actor = 'user' AND action IN ('create', 'approve', 'update'))
+    OR (actor = 'agentd' AND action = 'legacy_confirmed')";
+
+/// Older binaries can still write to the same database after a rollback.
+/// Keep their notes, but require a user action in the audit trail for trust:
+/// a user-stated memory without one becomes inferred. A v1 confirmation
+/// (a `memory.confirmed` event naming a signed-in user) counts as one.
+///
+/// It runs at every open, so it stays cheap: the audit index settles every
+/// memory seen before, and the event log is read once, only when a
+/// user-stated memory has no audit evidence yet. A v1 confirmation found
+/// there goes into the audit trail, so it's never looked up again.
+fn reconcile_legacy_memory_provenance(conn: &Connection) -> Result<()> {
+    let unproven = format!(
+        "memory.trust = 'user_stated' AND NOT EXISTS (
+           SELECT 1 FROM memory_events WHERE memory_id = memory.id AND ({USER_PROVENANCE}))"
+    );
+    let any: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM memory WHERE {unproven})"),
+        [],
+        |r| r.get(0),
+    )?;
+    if !any {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    // One pass over the event log; the earliest confirmation of each memory.
+    tx.execute(
+        &format!(
+            "WITH confirmed AS MATERIALIZED (
+               SELECT CASE WHEN json_valid(data) THEN json_extract(data, '$.id') END AS memory_id,
+                      CASE WHEN json_valid(data) THEN TRIM(json_extract(data, '$.by')) END AS by_user,
+                      CAST(strftime('%s', ts) AS INTEGER) AS at, seq
+               FROM events WHERE kind = 'memory.confirmed')
+             INSERT INTO memory_events (memory_id, actor, action, by_user, created)
+             SELECT id, 'agentd', 'legacy_confirmed', by_user, at FROM (
+               SELECT memory.id AS id, confirmed.by_user AS by_user, COALESCE(confirmed.at, ?1) AS at,
+                      MIN(confirmed.seq)
+               FROM memory JOIN confirmed ON confirmed.memory_id = memory.id
+               WHERE {unproven} AND LENGTH(confirmed.by_user) > 0
+               GROUP BY memory.id)"
+        ),
+        params![unix_now()],
+    )?;
+    tx.execute(
+        &format!("UPDATE memory SET trust = 'agent_inferred', version = version + 1 WHERE {unproven}"),
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Schema changes to databases made by earlier versions (PRAGMA user_version).
 /// Every change is additive, so an older agentd still reads and writes a
 /// newer database (it ignores versions above its own).
@@ -1320,6 +1414,27 @@ fn migrate(conn: &Connection) -> Result<()> {
                  created INTEGER NOT NULL,
                  last_sent INTEGER);
              PRAGMA user_version = 7; COMMIT;",
+        )?;
+    }
+    if version < 8 {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE runs ADD COLUMN memory_consolidated INTEGER NOT NULL DEFAULT 0;
+             UPDATE runs SET memory_consolidated = 1
+               WHERE kind = 'task' AND schedule IS NULL AND rowid <= COALESCE((
+                 SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'memory_last_consolidated_run'
+               ), 0);
+             CREATE INDEX IF NOT EXISTS runs_pending_consolidation ON runs(memory_consolidated)
+               WHERE kind = 'task' AND agent = 'main' AND schedule IS NULL;
+             UPDATE events SET data = json_remove(data, '$.text')
+               WHERE kind = 'memory.saved' AND json_valid(data);
+             UPDATE events SET data = json_remove(data, '$.args')
+               WHERE kind = 'step' AND json_valid(data)
+                 AND json_extract(data, '$.tool') IN ('remember', 'forget', 'search_memory');
+             UPDATE pending SET checkpoint = json_set(json_remove(checkpoint, '$.memory_block'),
+               '$.messages[0].content', '') WHERE json_valid(checkpoint);
+             PRAGMA user_version = 8;
+             COMMIT;",
         )?;
     }
     Ok(())
@@ -1655,8 +1770,8 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(version, 7);
-            // The latest migration added the apps' device-token table.
+            assert_eq!(version, 8);
+            // The apps' device-token table remains available.
             assert!(
                 conn.prepare("SELECT token, topic FROM device_tokens LIMIT 0")
                     .is_ok()
@@ -1680,7 +1795,7 @@ mod tests {
                 .unwrap()
                 .flatten();
             assert_eq!(acted, None);
-            // Every existing memory is an active fact; trust follows `trusted`.
+            // Legacy memories remain active facts. They have no user audit provenance.
             let updated: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM memory WHERE updated > 1700000000",
@@ -1711,9 +1826,9 @@ mod tests {
         assert_eq!(
             summary,
             [
-                (true, "user_stated", "active", "fact"),
                 (false, "agent_inferred", "active", "fact"),
-                (true, "user_stated", "active", "fact"),
+                (false, "agent_inferred", "active", "fact"),
+                (false, "agent_inferred", "active", "fact"),
             ]
         );
         // The full-text index holds the existing memories.
@@ -1768,6 +1883,131 @@ mod tests {
             .unwrap();
         }
         assert!(memory_rows(&store).iter().any(|r| r.0 == hint.id && r.2));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The reconciliation as it was before it kept v1 confirmations in the
+    /// audit trail: one scan of the event log per memory, at every open.
+    const PER_ROW_RECONCILE: &str = "UPDATE memory SET trust = 'agent_inferred', version = version + 1
+         WHERE trust = 'user_stated'
+           AND NOT EXISTS (
+             SELECT 1 FROM memory_events WHERE memory_id = memory.id AND actor = 'user'
+               AND action IN ('create', 'approve', 'update')
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM events WHERE kind = 'memory.confirmed'
+               AND CASE WHEN json_valid(data) THEN json_extract(data, '$.id') END = memory.id
+               AND CASE WHEN json_valid(data) THEN LENGTH(TRIM(json_extract(data, '$.by'))) END > 0
+           )";
+
+    /// User-stated memories as an earlier agentd left them, with and without
+    /// evidence of a user action.
+    fn seed_provenance(conn: &Connection) {
+        conn.execute_batch(
+            r#"INSERT INTO memory (id, text, trusted, trust) VALUES
+                 (1, 'Said in the app', 1, 'user_stated'),
+                 (2, 'Confirmed in v1', 1, 'user_stated'),
+                 (3, 'Confirmed without a login', 1, 'user_stated'),
+                 (4, 'Saved by a v1 task', 1, 'user_stated'),
+                 (5, 'Saved by a v2 task', 1, 'user_stated'),
+                 (6, 'Confirmed, id as text', 1, 'user_stated'),
+                 (7, 'Confirmed with a null login', 1, 'user_stated'),
+                 (8, 'A hint', 0, 'agent_inferred');
+               INSERT INTO memory_events (memory_id, actor, action, created) VALUES
+                 (1, 'user', 'create', 1), (5, 'agent', 'create', 1), (8, 'user', 'forget', 1);
+               INSERT INTO events (kind, data) VALUES
+                 ('memory.confirmed', '{"id": 2, "by": "me@example.com"}'),
+                 ('memory.confirmed', '{"id": 2, "by": "later@example.com"}'),
+                 ('memory.confirmed', '{"id": 3, "by": "  "}'),
+                 ('memory.confirmed', '{"id": "6", "by": "me@example.com"}'),
+                 ('memory.confirmed', '{"id": 7, "by": null}'),
+                 ('memory.confirmed', 'not json'),
+                 ('memory.saved', '{"id": 4, "by": "me@example.com"}');"#,
+        )
+        .unwrap();
+    }
+
+    fn trusts(store: &Store) -> Vec<(i64, String, bool, i64)> {
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, trust, trusted, version FROM memory ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn provenance_reconciles_like_the_per_row_check_and_reads_the_event_log_once() {
+        let dir = std::env::temp_dir().join(format!("agentd-prov-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agentd.db");
+        seed_provenance(&Store::open(&path).unwrap().conn.lock().unwrap());
+        let store = Store::open(&path).unwrap();
+        // The same data under the per-row check.
+        let before = Store::open(Path::new(":memory:")).unwrap();
+        {
+            let conn = before.conn.lock().unwrap();
+            seed_provenance(&conn);
+            conn.execute(PER_ROW_RECONCILE, []).unwrap();
+        }
+        let reconciled = trusts(&store);
+        assert_eq!(reconciled, trusts(&before));
+        let user_stated: Vec<i64> = reconciled
+            .iter()
+            .filter(|(_, trust, trusted, _)| trust == "user_stated" && *trusted)
+            .map(|row| row.0)
+            .collect();
+        assert_eq!(user_stated, [1, 2, 6]);
+        // The v1 confirmations are in the audit trail now, the earliest one's login with each.
+        let legacy = |store: &Store| -> Vec<(i64, Option<String>)> {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT memory_id, by_user FROM memory_events WHERE action = 'legacy_confirmed' ORDER BY memory_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            legacy(&store),
+            [
+                (2, Some("me@example.com".into())),
+                (6, Some("me@example.com".into()))
+            ]
+        );
+        // Later opens settle everything from the audit trail: no event log
+        // needed, nothing recorded twice, no version churn.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM events", [])
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(trusts(&reopened), reconciled);
+        assert_eq!(legacy(&reopened).len(), 2);
+        // A memory an older binary marks user-stated after a rollback is still caught.
+        reopened
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO memory (id, text, trusted, trust) VALUES (9, 'From a rollback', 1, 'user_stated')",
+                [],
+            )
+            .unwrap();
+        drop(reopened);
+        let again = Store::open(&path).unwrap();
+        assert_eq!(
+            trusts(&again).last().map(|row| row.1.clone()),
+            Some("agent_inferred".into())
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

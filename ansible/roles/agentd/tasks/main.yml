@@ -54,14 +54,48 @@
     group: "{{ agentd_shell_user }}"
     mode: "0700"
 
+- name: Install the firewall, proxy, and trusted credential client
+  ansible.builtin.apt:
+    name: [nftables, squid, gh]
+    state: present
+
 - name: Look up user IDs for the firewall
   ansible.builtin.getent:
     database: passwd
 
-- name: Install nftables
-  ansible.builtin.apt:
-    name: nftables
-    state: present
+- name: Create the firewall configuration directory
+  ansible.builtin.file:
+    path: /etc/neo-agent
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the direct shell slice
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/neodirect.slice
+    content: |
+      [Unit]
+      Description=Explicitly approved direct shell commands
+
+      [Slice]
+      TasksMax={{ agentd_shell_tasks_max }}
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload the firewall rules
+
+# nftables looks up neodirect.slice's cgroup when it loads the rules, so the
+# slice has to be running first. Starting the guard starts it (Requires=), but
+# on a desktop that already has the guard the handler only reloads it, and a
+# reload doesn't start new requirements.
+- name: Start the direct shell slice
+  ansible.builtin.systemd_service:
+    name: neodirect.slice
+    state: started
+    daemon_reload: true
+  # A dry run hasn't written the unit yet.
+  ignore_errors: "{{ ansible_check_mode }}"
 
 - name: Write the firewall rules (metadata service, desktop controls)
   ansible.builtin.template:
@@ -73,6 +107,7 @@
   vars:
     # In check mode the shell user isn't created yet: show a placeholder.
     agentd_shell_uid: "{{ ansible_facts.getent_passwd.get(agentd_shell_user, ['', 'NEW-USER'])[1] }}"
+    agentd_proxy_uid: "{{ ansible_facts.getent_passwd.get('proxy', ['', 'NEW-USER'])[1] }}"
   notify: Reload the firewall rules
 
 - name: Install the firewall unit
@@ -220,7 +255,23 @@
   when: agentd_dangerous | length == 0
   notify: Restart agentd
 
-- name: Let agentd start command units (as the shell user, or as root after approval)
+- name: Create the privileged helper directory
+  ansible.builtin.file:
+    path: /usr/local/libexec
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the fixed worker and proxy administrative helper
+  ansible.builtin.template:
+    src: privileged.py.j2
+    dest: /usr/local/libexec/neo-agent-privileged
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Allow agentd to use the limited administrative helper
   ansible.builtin.template:
     src: sudoers.j2
     dest: /etc/sudoers.d/agentd

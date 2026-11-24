@@ -121,23 +121,12 @@ pub fn daily_cap(store: &Store) -> f64 {
         .unwrap_or(DEFAULT_DAILY_CAP_USD)
 }
 
-/// The last task run consolidated (its rowid: run ids are random).
-fn watermark(conn: &rusqlite::Connection) -> Result<i64> {
-    Ok(conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'memory_last_consolidated_run'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0))
-}
+const ELIGIBLE_RUNS: &str = "kind = 'task' AND agent = 'main' AND schedule IS NULL
+    AND memory_consolidated = 0 AND status NOT IN ('running', 'waiting', 'queued', 'cancelled')";
 
 /// A finished task to consolidate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Run {
-    pub rowid: i64,
     pub id: String,
     pub started: String,
     pub request: String,
@@ -156,53 +145,35 @@ impl Run {
     }
 }
 
-/// The tasks to consolidate: those after the watermark, in order, stopping at
-/// one still running or waiting (so none is skipped), at most `MAX_BATCH`.
-/// Stopped tasks and scheduled runs are passed over. Returns them and the new
-/// watermark.
-pub fn batch(store: &Store) -> Result<(Vec<Run>, i64)> {
+/// Finished tasks that still need consolidation, oldest first. A parked task
+/// becomes eligible when it finishes, independently of later tasks.
+pub fn batch(store: &Store) -> Result<Vec<Run>> {
     store.read(|conn| {
-        let mark = watermark(conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT rowid, id, started, request, COALESCE(answer, ''), status, schedule, cost, acted FROM runs
-             WHERE kind = 'task' AND agent = ?1 AND rowid > ?2 ORDER BY rowid",
-        )?;
-        let rows: Vec<Run> = stmt
-            .query_map(params![AGENT, mark], |r| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, started, request, COALESCE(answer, ''), status, schedule, cost, acted FROM runs
+             WHERE {ELIGIBLE_RUNS} ORDER BY rowid LIMIT ?1"
+        ))?;
+        let rows = stmt
+            .query_map(params![MAX_BATCH], |r| {
                 Ok(Run {
-                    rowid: r.get(0)?,
-                    id: r.get(1)?,
-                    started: r.get(2)?,
-                    request: r.get(3)?,
-                    answer: r.get(4)?,
-                    status: r.get(5)?,
-                    schedule: r.get(6)?,
-                    cost: r.get(7)?,
-                    acted: r.get(8)?,
+                    id: r.get(0)?,
+                    started: r.get(1)?,
+                    request: r.get(2)?,
+                    answer: r.get(3)?,
+                    status: r.get(4)?,
+                    schedule: r.get(5)?,
+                    cost: r.get(6)?,
+                    acted: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let mut runs = Vec::new();
-        let mut new_mark = mark;
-        for run in rows {
-            // A scheduled run in the queue or in progress is passed over
-            // anyway, so it doesn't hold the chat's tasks back.
-            let unfinished = matches!(run.status.as_str(), "running" | "waiting");
-            if (unfinished && run.schedule.is_none()) || runs.len() as i64 >= MAX_BATCH {
-                break;
-            }
-            new_mark = run.rowid;
-            if run.status != "cancelled" && run.schedule.is_none() {
-                runs.push(run);
-            }
-        }
-        Ok((runs, new_mark))
+        Ok(rows)
     })
 }
 
 /// How many finished tasks wait for consolidation (at most a batch).
 fn waiting(store: &Store) -> i64 {
-    batch(store).map_or(0, |(runs, _)| runs.len() as i64)
+    batch(store).map_or(0, |runs| runs.len() as i64)
 }
 
 /// After a batch of `taken` tasks: whether a full one left more behind.
@@ -210,21 +181,30 @@ fn more_waiting(store: &Store, taken: usize) -> bool {
     taken as i64 >= MAX_BATCH && waiting(store) > 0
 }
 
-/// After a task: consolidate in 10 minutes (or now, if a full batch waits). A later
-/// task pushes it out again, so a burst of tasks consolidates once.
-pub fn trigger(agent: &Agent) {
-    if !agent.cfg.memory_v2 || mode(&agent.store) == Mode::Off {
-        return;
-    }
+/// Enqueues consolidation in the transaction that finishes an eligible run.
+pub(crate) fn enqueue_after_run(tx: &Transaction, run: &str) -> Result<()> {
+    let waiting: i64 = tx.query_row(
+        &format!("SELECT COUNT(*) FROM (SELECT 1 FROM runs WHERE {ELIGIBLE_RUNS} LIMIT ?1)"),
+        params![MAX_BATCH],
+        |row| row.get(0),
+    )?;
     let now = memory::unix_now();
-    let due = if waiting(&agent.store) >= MAX_BATCH {
+    let due = if waiting >= MAX_BATCH {
         now
     } else {
         now + DELAY_SECS
     };
-    if let Err(err) = agent.enqueue("consolidate", AGENT, &json!({}), due) {
-        tracing::error!(%err, "couldn't schedule memory consolidation");
+    crate::store::enqueue_effect(tx, "consolidate", AGENT, &json!({"run": run}), due)
+}
+
+/// Picks up eligible tasks from upgrades or interrupted earlier versions.
+pub(crate) fn recover(agent: &Agent) -> Result<()> {
+    if agent.cfg.memory_v2 && mode(&agent.store) == Mode::Auto && !batch(&agent.store)?.is_empty() {
+        agent
+            .store
+            .ensure_effect("consolidate", AGENT, &json!({}), memory::unix_now() + DELAY_SECS)?;
     }
+    Ok(())
 }
 
 /// What the model answers with.
@@ -283,7 +263,9 @@ pub struct Applied {
 }
 
 fn active(tx: &Transaction, id: i64) -> Result<Option<Item>> {
-    Ok(memory::get(tx, id)?.filter(|item| item.status == "active"))
+    Ok(memory::get(tx, id)?.filter(|item| {
+        item.status == "active" && item.valid_until.is_none_or(|until| until > memory::unix_now())
+    }))
 }
 
 /// Inserts a consolidator memory (a work-log entry) and records it.
@@ -308,8 +290,8 @@ fn insert(
     Ok(item)
 }
 
-/// Applies a model's output under the checks, with decay, the watermark and
-/// the accounting row, all in one transaction (a crash re-runs the same
+/// Applies a model's output under the checks, with decay, per-run completion
+/// and accounting in one transaction (a crash re-runs the same
 /// batch; the work log's unique index keeps it from doubling).
 #[allow(clippy::too_many_arguments)]
 pub fn apply(
@@ -318,12 +300,12 @@ pub fn apply(
     run_id: &str,
     runs: &[Run],
     output: &Output,
-    watermark: i64,
     accounting: Option<(&str, f64)>,
 ) -> Result<Applied> {
     let actor = Actor::Consolidator { run: run_id };
     let mut done = Applied::default();
     store.transact(|tx| {
+        let mut active_items = memory::active_count(tx)?;
         // Work log: one entry per task of this batch that changed something.
         let mut logged: HashSet<String> = HashSet::new();
         for entry in &output.work_log {
@@ -340,11 +322,16 @@ pub fn apply(
                 params![run.id],
                 |r| r.get(0),
             )?;
-            if exists || !logged.insert(run.id.clone()) || memory::check_text(text, keys).is_err() {
+            if exists
+                || !logged.insert(run.id.clone())
+                || active_items >= memory::MAX_ACTIVE
+                || memory::check_text(text, keys).is_err()
+            {
                 done.rejected += 1;
                 continue;
             }
             insert(tx, &actor, "work_log", text, Some(&run.id), run.schedule)?;
+            active_items += 1;
             done.saved += 1;
         }
 
@@ -357,9 +344,10 @@ pub fn apply(
         // never merged away or rewritten; it can absorb its duplicates.
         for merge in &output.merges {
             let mut items = Vec::new();
+            let mut ids = HashSet::new();
             for id in std::iter::once(merge.keep).chain(merge.drop.iter().copied()) {
                 match active(tx, id)? {
-                    Some(item) if matches!(item.kind.as_str(), "fact" | "preference" | "work_log") => {
+                    Some(item) if matches!(item.kind.as_str(), "fact" | "work_log") && ids.insert(id) => {
                         items.push(item)
                     }
                     _ => {}
@@ -368,12 +356,20 @@ pub fn apply(
             let text = merge.text.as_deref().map(str::trim).filter(|t| !t.is_empty());
             let bad_text = text.is_some_and(|t| memory::check_text(t, keys).is_err());
             let keep = items.first().filter(|k| k.id == merge.keep);
-            let drops_stated = items.iter().skip(1).any(|i| i.trust == "user_stated");
-            let Some(keep) = keep.filter(|_| items.len() >= 2 && !bad_text && !drops_stated) else {
+            let Some(keep) = keep.filter(|keep| {
+                items.len() >= 2
+                    && items.len() == merge.drop.len() + 1
+                    && !bad_text
+                    && items[1..].iter().all(|item| {
+                        item.trust == "agent_inferred"
+                            && item.kind == keep.kind
+                            && item.valid_until == keep.valid_until
+                    })
+            }) else {
                 done.rejected += 1;
                 continue;
             };
-            if let Some(text) = text.filter(|_| keep.trust != "user_stated") {
+            if let Some(text) = text.filter(|_| keep.trust == "agent_inferred") {
                 let before = keep.snapshot();
                 tx.execute(
                     "UPDATE memory SET text = ?2, version = version + 1, updated = ?3 WHERE id = ?1",
@@ -391,7 +387,7 @@ pub fn apply(
         // Expiries: no longer true (never what the user stated).
         for &id in &output.expire {
             let Some(item) = active(tx, id)?
-                .filter(|i| matches!(i.kind.as_str(), "fact" | "work_log") && i.trust != "user_stated")
+                .filter(|i| matches!(i.kind.as_str(), "fact" | "work_log") && i.trust == "agent_inferred")
             else {
                 done.rejected += 1;
                 continue;
@@ -405,11 +401,12 @@ pub fn apply(
         }
 
         done.expired += decay(tx, &actor, memory::unix_now())?;
-        tx.execute(
-            "INSERT INTO settings (key, value) VALUES ('memory_last_consolidated_run', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![watermark.to_string()],
-        )?;
+        for run in runs {
+            tx.execute(
+                "UPDATE runs SET memory_consolidated = 1 WHERE id = ?1",
+                params![run.id],
+            )?;
+        }
         if let Some((model, cost)) = accounting {
             record_run(tx, run_id, model, "done", Some(cost), &done, runs.len())?;
         }
@@ -444,8 +441,10 @@ pub fn decay(tx: &Transaction, actor: &Actor, now: i64) -> Result<usize> {
     let mut stmt = tx.prepare(&format!(
         "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status = 'active' AND (
            (valid_until IS NOT NULL AND valid_until <= ?2)
-           OR (kind = 'fact' AND importance < 0.15 AND COALESCE(last_recalled, updated, 0) < ?3)
-           OR (kind = 'work_log' AND valid_until IS NULL AND COALESCE(updated, 0) < ?4))"
+           OR (trust = 'agent_inferred' AND kind = 'fact' AND importance < 0.15
+                 AND COALESCE(last_recalled, updated, 0) < ?3)
+           OR (trust = 'agent_inferred' AND kind = 'work_log' AND valid_until IS NULL
+                 AND COALESCE(updated, 0) < ?4))"
     ))?;
     let expiring: Vec<Item> = stmt
         .query_map(
@@ -465,9 +464,12 @@ pub fn decay(tx: &Transaction, actor: &Actor, now: i64) -> Result<usize> {
         )?;
         memory::record(tx, item.id, actor, "expire", Some(item.snapshot()), None)?;
     }
+    // Importance only: `version` is the Memory screen's edit token, and a
+    // background decay mustn't make the user's edit conflict.
     tx.execute(
         "UPDATE memory SET importance = MAX(0.1, importance * 0.9)
-         WHERE agent = ?1 AND status = 'active' AND kind = 'fact' AND COALESCE(last_recalled, updated, 0) < ?2",
+         WHERE agent = ?1 AND status = 'active' AND kind = 'fact' AND trust = 'agent_inferred'
+           AND importance > 0.1 AND COALESCE(last_recalled, updated, 0) < ?2",
         params![AGENT, now - DECAY_AFTER_DAYS * DAY],
     )?;
     Ok(expiring.len())
@@ -530,7 +532,7 @@ pub fn stats(store: &Store, default_model: &str) -> Value {
     json!({
         "mode": mode(store).name(), "model": model(store, default_model), "daily_cap_usd": daily_cap(store),
         "month_cost": (month_cost * 1e6).round() / 1e6, "last_run": last,
-        "waiting_tasks": batch(store).map_or(0, |(runs, _)| runs.len()),
+        "waiting_tasks": batch(store).map_or(0, |runs| runs.len()),
     })
 }
 
@@ -575,8 +577,7 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 /// What the model is given: the tasks, then what's already remembered (facts
-/// and work log most recently recalled first, capped; rules and preferences
-/// read-only).
+/// and work log most recently recalled first, capped).
 pub fn prompt(store: &Store, runs: &[Run]) -> Result<String> {
     let mut text = String::from("Tasks finished since the last consolidation:\n");
     for run in runs {
@@ -594,24 +595,17 @@ pub fn prompt(store: &Store, runs: &[Run]) -> Result<String> {
             clip(&run.answer, ANSWER_CHARS),
         ));
     }
-    let (rules, facts) = store.read(|conn| {
-        let query = |kinds: &str, order: &str| -> Result<Vec<Item>> {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status = 'active' AND kind IN ({kinds})
-                 ORDER BY {order}"
-            ))?;
-            Ok(stmt.query_map(params![AGENT], Item::from_row)?.collect::<rusqlite::Result<_>>()?)
-        };
-        Ok((
-            query("'rule', 'preference'", "id")?,
-            query("'fact', 'work_log'", "COALESCE(last_recalled, 0) DESC, id DESC")?,
-        ))
+    let facts = store.read(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM memory WHERE agent = ?1 AND status = 'active'
+               AND kind IN ('fact', 'work_log') AND (valid_until IS NULL OR valid_until > ?2)
+             ORDER BY COALESCE(last_recalled, 0) DESC, id DESC"
+        ))?;
+        Ok(stmt
+            .query_map(params![AGENT, memory::unix_now()], Item::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     })?;
-    text.push_str("\nAlready remembered.\nRules and preferences (read-only):\n");
-    for item in &rules {
-        text.push_str(&format!("- #{} [{}] {}\n", item.id, item.kind, item.text));
-    }
-    text.push_str("Facts and work log:\n");
+    text.push_str("\nAlready remembered. Facts and work log:\n");
     let mut used = 0;
     for item in &facts {
         let line = format!(
@@ -643,13 +637,8 @@ pub async fn run(agent: &Agent) -> Outcome {
     if agent.is_working() {
         return Outcome::Later(Duration::from_secs(60));
     }
-    let cap = daily_cap(store);
-    if spent_today(store) >= cap {
-        tracing::info!(cap, "memory consolidation skipped: today's cap is spent");
-        return Outcome::Done;
-    }
-    let (runs, mark) = match batch(store) {
-        Ok(batch) => batch,
+    let runs = match batch(store) {
+        Ok(runs) => runs,
         Err(err) => return Outcome::Failed(format!("{err:#}")),
     };
     let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
@@ -660,9 +649,7 @@ pub async fn run(agent: &Agent) -> Outcome {
         Err(err) => return Outcome::Failed(format!("{err:#}")),
     };
     if !worth {
-        // Only decay, and the watermark past tasks that left nothing to tidy
-        // (scheduled runs, stopped tasks, tasks that only read). Tasks passed
-        // over without a model still show as a run, at no cost, in the app.
+        // Tasks that need no model still show as a run, at no cost.
         let accounting = (!runs.is_empty()).then_some(("none", 0.0));
         let result = apply(
             store,
@@ -670,7 +657,6 @@ pub async fn run(agent: &Agent) -> Outcome {
             &run_id,
             &runs,
             &Output::default(),
-            mark,
             accounting,
         );
         return match result {
@@ -678,6 +664,12 @@ pub async fn run(agent: &Agent) -> Outcome {
             Ok(_) => Outcome::Done,
             Err(err) => Outcome::Failed(format!("{err:#}")),
         };
+    }
+    let cap = daily_cap(store);
+    if spent_today(store) >= cap {
+        tracing::info!(cap, "memory consolidation postponed: today's cap is spent");
+        let seconds = DAY - memory::unix_now().rem_euclid(DAY);
+        return Outcome::Later(Duration::from_secs(seconds as u64));
     }
     let user = match prompt(store, &runs) {
         Ok(text) => text,
@@ -748,7 +740,6 @@ pub async fn run(agent: &Agent) -> Outcome {
         &run_id,
         &runs,
         &output,
-        mark,
         Some((&model, cost)),
     ) {
         Ok(applied) => {
@@ -854,43 +845,49 @@ mod tests {
     }
 
     fn go(store: &Store, keys: &Secrets, json: &str) -> Applied {
-        let (runs, mark) = batch(store).unwrap();
+        let runs = batch(store).unwrap();
         let output = parse(json).unwrap();
-        apply(store, keys, "c1", &runs, &output, mark, Some(("m", 0.002))).unwrap()
+        apply(store, keys, "c1", &runs, &output, Some(("m", 0.002))).unwrap()
     }
 
     #[test]
-    fn the_batch_stops_at_unfinished_tasks_and_skips_stopped_and_scheduled_ones() {
+    fn parked_tasks_do_not_block_later_finished_tasks() {
         let (store, _keys) = setup();
         task(&store, "t1", "done", None);
         task(&store, "t2", "cancelled", None);
         task(&store, "t3", "done", Some(4));
-        task(&store, "t4", "running", None);
+        task(&store, "t4", "waiting", None);
         task(&store, "t5", "done", None);
-        let (runs, mark) = batch(&store).unwrap();
-        assert_eq!(runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["t1"]);
-        // The watermark passes the scheduled run, and stops before the running task.
-        let t3: i64 = store
-            .read(|conn| Ok(conn.query_row("SELECT rowid FROM runs WHERE id = 't3'", [], |r| r.get(0))?))
-            .unwrap();
-        assert_eq!(mark, t3);
+        let runs = batch(&store).unwrap();
+        assert_eq!(
+            runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["t1", "t5"]
+        );
+        apply(&store, &_keys, "c1", &runs, &Output::default(), None).unwrap();
+        store.finish_run("t4", "done", 2, None, "done").unwrap();
+        assert_eq!(
+            batch(&store)
+                .unwrap()
+                .into_iter()
+                .map(|run| run.id)
+                .collect::<Vec<_>>(),
+            ["t4"]
+        );
     }
 
     #[test]
     fn a_full_batch_leaves_the_rest_for_the_next_one() {
-        let (store, _keys) = setup();
+        let (store, keys) = setup();
         for i in 0..13 {
             task(&store, &format!("t{i:02}"), "done", None);
         }
-        let (runs, mark) = batch(&store).unwrap();
+        let runs = batch(&store).unwrap();
         assert_eq!(runs.len() as i64, MAX_BATCH);
         assert_eq!(runs.last().unwrap().id, "t09");
         // Consolidated up to t09: three wait, so the effect runs again soon.
-        store
-            .set_setting("memory_last_consolidated_run", &mark.to_string())
-            .unwrap();
+        apply(&store, &keys, "c1", &runs, &Output::default(), None).unwrap();
         assert!(more_waiting(&store, runs.len()));
-        let (rest, _) = batch(&store).unwrap();
+        let rest = batch(&store).unwrap();
         assert_eq!(rest.len(), 3);
         // A batch that wasn't full took everything there was.
         assert!(!more_waiting(&store, rest.len()));
@@ -950,8 +947,8 @@ mod tests {
                 ),
             ]
         );
-        // The watermark moved; a second run with the same batch finds nothing.
-        assert!(batch(&store).unwrap().0.is_empty());
+        // A second batch finds nothing once the runs are marked complete.
+        assert!(batch(&store).unwrap().is_empty());
         let cost: Option<f64> = store
             .read(|conn| {
                 Ok(
@@ -969,7 +966,7 @@ mod tests {
         let (store, _keys) = setup();
         task(&store, "t1", "done", None);
         set_acted(&store, "t1", Some(0));
-        let (runs, _) = batch(&store).unwrap();
+        let runs = batch(&store).unwrap();
         assert!(!worth_a_call(&store, &runs).unwrap());
         // …unless the task saved a memory, which may duplicate another.
         store
@@ -1040,7 +1037,6 @@ mod tests {
         assert_eq!(first.saved, 1);
         // The same batch again (a crash before the watermark moved): no second entry.
         let runs = vec![Run {
-            rowid: 1,
             id: "t1".into(),
             started: String::new(),
             request: String::new(),
@@ -1050,14 +1046,14 @@ mod tests {
             cost: None,
             acted: Some(true),
         }];
-        let again = apply(&store, &keys, "c2", &runs, &parse(json).unwrap(), 1, None).unwrap();
+        let again = apply(&store, &keys, "c2", &runs, &parse(json).unwrap(), None).unwrap();
         assert_eq!(again.saved, 0);
         assert_eq!(rows(&store, "kind = 'work_log'").len(), 1);
     }
 
     #[test]
     fn decay_and_expiry_follow_time_alone() {
-        let (store, _keys) = setup();
+        let (store, keys) = setup();
         let now = memory::unix_now();
         let ids: Vec<i64> = [
             ("Trip to Lisbon", "fact", Some(now - 10), now, None, 0.5), // past its date
@@ -1079,28 +1075,64 @@ mod tests {
             ), // decays
             ("Recent", "fact", None, now, Some(now), 0.5),              // untouched
             ("Year-old work", "work_log", None, now - 400 * DAY, None, 0.5), // expires
+            ("Confirmed fact", "fact", None, now - 200 * DAY, None, 0.12), // protected
         ]
         .iter()
-        .map(|(text, kind, until, updated, recalled, importance)| {
+        .enumerate()
+        .map(|(index, (text, kind, until, updated, recalled, importance))| {
+            let trusted = matches!(index, 0 | 5);
+            let trust = if trusted { "user_stated" } else { "agent_inferred" };
             store
                 .read(|conn| {
                     Ok(conn.query_row(
                         "INSERT INTO memory (agent, text, trusted, kind, status, trust, valid_until, updated,
                            last_recalled, importance)
-                         VALUES ('main', ?1, 1, ?2, 'active', 'user_stated', ?3, ?4, ?5, ?6) RETURNING id",
-                        params![text, kind, until, updated, recalled, importance],
+                         VALUES ('main', ?1, ?7, ?2, 'active', ?8, ?3, ?4, ?5, ?6) RETURNING id",
+                        params![text, kind, until, updated, recalled, importance, trusted, trust],
                         |r| r.get(0),
                     )?)
                 })
                 .unwrap()
         })
         .collect();
+        let version_of = |id: i64| -> i64 {
+            store
+                .read(|conn| {
+                    Ok(
+                        conn.query_row("SELECT version FROM memory WHERE id = ?1", params![id], |r| {
+                            r.get(0)
+                        })?,
+                    )
+                })
+                .unwrap()
+        };
+        let decaying_version = version_of(ids[2]);
         let expired = store
             .transact(|tx| decay(tx, &Actor::Consolidator { run: "c1" }, now))
             .unwrap();
         assert_eq!(expired, 3);
+        // A decay-only change keeps the edit token: an edit started before it still applies.
+        assert_eq!(version_of(ids[2]), decaying_version);
+        assert!(matches!(
+            memory::edit(
+                &store,
+                &keys,
+                Actor::User { login: None },
+                ids[2],
+                memory::Edit {
+                    text: Some("Old but still useful".into()),
+                    ..memory::Edit::default()
+                },
+                decaying_version,
+            )
+            .unwrap(),
+            memory::Edited::Done(_)
+        ));
         let statuses: Vec<String> = ids.iter().map(|id| status(&store, *id)).collect();
-        assert_eq!(statuses, ["expired", "expired", "active", "active", "expired"]);
+        assert_eq!(
+            statuses,
+            ["expired", "expired", "active", "active", "expired", "active"]
+        );
         let importance: f64 = store
             .read(|conn| {
                 Ok(conn.query_row(

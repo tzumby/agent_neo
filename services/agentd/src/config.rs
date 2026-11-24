@@ -28,10 +28,6 @@ pub struct Config {
     /// desktop user: it can't reach the browser, the screen or the Chrome
     /// profile. Empty: run as agentd's own user (local development).
     pub run_as: String,
-    /// Limits for each shell command (systemd MemoryMax, TasksMax, CPUQuota).
-    pub shell_memory_max: String,
-    pub shell_tasks_max: String,
-    pub shell_cpu_quota: String,
     /// The shell user's egress proxy, e.g. http://127.0.0.1:3128 (empty: none).
     pub shell_proxy: String,
     /// The file of sites the user allowed, which Squid reads (access.rs);
@@ -119,10 +115,7 @@ impl Config {
             cdp_url: get("CDP_URL", "http://127.0.0.1:9222"),
             state_dir: get("STATE_DIR", "/var/lib/agentd").into(),
             workdir: get("WORKDIR", "/home/worker/work").into(),
-            run_as: get("RUN_AS", "worker"),
-            shell_memory_max: get("SHELL_MEMORY_MAX", "2G"),
-            shell_tasks_max: get("SHELL_TASKS_MAX", "512"),
-            shell_cpu_quota: get("SHELL_CPU_QUOTA", "200%"),
+            run_as: std::env::var("RUN_AS").unwrap_or_else(|_| get("RUN_AS", "worker")),
             shell_proxy: get("SHELL_PROXY", ""),
             egress_user_hosts: get("EGRESS_USER_HOSTS", ""),
             egress_base_hosts: get("EGRESS_BASE_HOSTS", "")

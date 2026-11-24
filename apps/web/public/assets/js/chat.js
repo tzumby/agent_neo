@@ -6,7 +6,7 @@
 
 import { findKey } from "./keys.js";
 import { parse, render, safeHref } from "./markdown.js";
-import { busyButton, h, icon, site, time, when } from "./dom.js";
+import { busyButton, h, icon, time, when } from "./dom.js";
 import { duration, rowKey, workingFor } from "./timeline.js";
 
 export function mountChat(store, view, { openDesktop, openKeys }) {
@@ -233,13 +233,13 @@ function buttons(...list) {
   return h("div", { class: "card-actions" }, ...list);
 }
 
-function answerButtons(card, ctx, edit) {
+function answerButtons(card, ctx, edit, approvalDisabled = false) {
   const deny = h("button", { class: "button", type: "button" }, "Deny");
-  const approve = h("button", { class: "button button-primary", type: "button" }, "Approve");
+  const approve = h("button", { class: "button button-primary", type: "button", disabled: approvalDisabled }, "Approve");
   deny.addEventListener("click", () => busyButton(deny, () => ctx.store.answer(card, false)));
   approve.addEventListener("click", () => busyButton(approve, () => ctx.store.answer(card, true, edit?.changed())));
   if (!edit?.button) return buttons(deny, approve);
-  edit.onChange = () => (approve.disabled = edit.blank());
+  edit.onChange = () => (approve.disabled = approvalDisabled || edit.blank());
   return buttons(edit.button, deny, approve);
 }
 
@@ -293,13 +293,18 @@ function approvalCard(card, ctx) {
     h("h3", { class: "card-title" }, card.summary || "Run a command on your desktop"),
     card.reason ? h("p", { class: "card-text" }, `It ${card.reason}.`) : null,
     card.tainted ? warning("The agent read web pages or other outside content before asking. Check the command if this isn't what you asked for.") : null,
-    h("details", { class: "command" }, h("summary", null, "Show the command"), command, edit.input),
+    card.direct ? warning("Direct internet access outside the proxy for this command.") : null,
+    card.savedKeys?.length ? h("div", { class: "card-inset" },
+      h("p", { class: "strong" }, "Saved keys this command can use"),
+      h("p", { class: "card-value" }, h("code", null, card.savedKeys.join(", ")))) : null,
+    h("details", { class: "command", open: true }, h("summary", null, "Command"), command, edit.input),
     answerButtons(card, ctx, edit));
 }
 
 function browserCard(card, ctx) {
   const b = card.browser;
-  const title = b.action === "type" ? (b.submit || b.sends ? "Write and send this?" : "Write this?")
+  const legacySend = b.action === "type" && b.sends && !b.submit;
+  const title = b.action === "type" ? (b.submit ? "Write this and press Enter?" : "Write this?")
     : b.action === "key" ? `Press ${b.key || "a key"}?` : "Click this?";
   let what;
   let edit;
@@ -317,19 +322,21 @@ function browserCard(card, ctx) {
   // A click or key says little by itself: the agent's reason first, then what the
   // page itself shows, which the agent's words can't change.
   const said = b.action !== "type" && card.summary ? h("p", { class: "card-text strong" }, `The agent says: ${card.summary}`) : null;
-  const facts = b.action === "type" ? null : [
+  const facts = [
     b.around ? h("div", { class: "card-inset" }, h("p", { class: "strong" }, "Around it on the page"), h("p", { class: "muted" }, b.around)) : null,
-    b.page || b.url ? h("p", { class: "card-text muted" }, [b.page, b.url].filter(Boolean).join(", ")) : null,
-    b.image ? picture(b.image, "The page, with what it would click outlined") : null,
+    b.page ? h("p", { class: "card-text muted" }, b.page) : null,
+    b.url || b.site ? h("p", { class: "card-text muted card-value" }, b.url || b.site) : null,
+    b.destination ? h("p", { class: "card-text muted card-value" }, `Destination: ${b.destination}`) : null,
+    b.image ? picture(b.image, "The page, with the target outlined") : null,
   ];
-  const note = b.action === "type" && b.submit ? warning("Then presses Enter, which may send it.")
-    : b.action === "type" && b.sends ? warning("Approving also lets it send this.")
+  const note = legacySend ? warning("This older request bundled typing and sending. Deny it and ask again after updating the desktop.")
+    : b.action === "type" && b.submit ? warning("Then presses Enter, which may send it.")
     : b.action !== "type" && card.reason ? h("p", { class: "card-text muted" }, `It ${card.reason}.`) : null;
   return h("section", { class: "card card-needs", "aria-label": title },
     h("div", { class: "card-head" },
       h("h3", { class: "card-title" }, icon(b.action === "click" ? "click" : "keyboard"), title),
-      b.site ? h("span", { class: "card-site" }, icon("globe"), site(b.site)) : null),
-    said, what, facts, note, answerButtons(card, ctx, edit));
+      b.site ? h("span", { class: "card-site" }, icon("globe"), b.site) : null),
+    said, what, facts, note, answerButtons(card, ctx, edit, legacySend));
 }
 
 function scheduleCard(card, ctx) {
@@ -538,10 +545,9 @@ function mountComposer(store, view, { openKeys, onSent }) {
     submit();
   });
   model.addEventListener("change", async () => {
-    const settings = store.status?.settings;
-    if (!settings) return;
+    if (!store.status?.settings) return;
     try {
-      await store.api.updateSettings({ model: model.value, allow_actions: settings.allow_actions });
+      await store.api.updateSettings({ model: model.value });
       store.refreshStatus();
     } catch (error) {
       store.notice(error.message);

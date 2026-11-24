@@ -5,13 +5,13 @@
 //! Ansible lists (`EGRESS_BASE_HOSTS`, read-only here) and the ones the user
 //! allowed: from a card in the chat when the agent asks (`request_access`), or
 //! in Settings. Those live in the `egress_hosts` table and are written to a
-//! file Squid reads (`EGRESS_USER_HOSTS`, in a directory only agentd and Squid
-//! can read), after which Squid reloads its configuration. The agent's own
-//! commands can't touch that file or Squid (guard.rs: touches_egress_policy).
+//! file Squid reads by the fixed privileged helper. It restarts the proxy when
+//! the desired policy changes, closing any tunnels governed by the old policy.
 //!
 //! Exact host names only: no wildcards, IP addresses or internal names. Squid
 //! refuses internal addresses whatever the name resolves to.
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -120,18 +120,25 @@ pub fn write_list(path: &Path, hosts: &[String]) -> Result<bool> {
     Ok(true)
 }
 
-/// Squid reads its configuration (and the hosts file) again. Connections in
-/// progress carry on.
-pub fn reload_squid() -> Result<()> {
-    let status = std::process::Command::new("sudo")
-        .args(["-n", "squid", "-k", "reconfigure"])
-        .stdin(std::process::Stdio::null())
+/// Reconciles desired policy with the active Squid service. If the helper
+/// cannot start Squid with a changed policy, the service stays stopped.
+pub fn apply_proxy(hosts: &[String]) -> Result<()> {
+    let mut child = std::process::Command::new("/usr/bin/sudo")
+        .args(["-n", "--", crate::shell::PRIVILEGED_HELPER, "apply-proxy"])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .context("running squid -k reconfigure")?;
+        .spawn()
+        .context("starting the proxy policy helper")?;
+    let write = child
+        .stdin
+        .take()
+        .context("opening the proxy policy input")?
+        .write_all(hosts.join("\n").as_bytes());
+    let status = child.wait().context("waiting for the proxy policy helper")?;
+    write.context("sending the proxy host list")?;
     if !status.success() {
-        bail!("squid -k reconfigure exited with {status}");
+        bail!("the proxy policy helper exited with {status}");
     }
     Ok(())
 }
@@ -148,10 +155,20 @@ pub fn refused_by_proxy(output: &str) -> bool {
     REFUSED.is_match(output)
 }
 
+/// A host that means this machine: localhost, loopback, or the any-address.
+fn this_machine(host: &str) -> bool {
+    let host = host.trim_start_matches('[').to_ascii_lowercase();
+    ["localhost", "127.", "::1", "0.0.0.0", "::ffff:127."]
+        .iter()
+        .any(|start| host.starts_with(start))
+}
+
 /// What a command's output says when it tried to connect on its own, not
 /// through the proxy, and the guard firewall stopped it: no DNS, or a refused
-/// connection to somewhere other than this machine (a local server being down
-/// is something else). Adding a host to the proxy's list can't help these.
+/// connection to somewhere other than this machine. Refused connections to
+/// this machine are the firewall too, but `connected_locally`'s case: the
+/// proxy and direct internet can't help those. Adding a host to the proxy's
+/// list can't help these either.
 pub fn connected_directly(output: &str) -> bool {
     static NO_DNS: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
@@ -166,12 +183,6 @@ pub fn connected_directly(output: &str) -> bool {
         )
         .expect("valid regex")
     });
-    let this_machine = |address: &str| {
-        let host = address.trim_start_matches('[');
-        ["localhost", "127.", "::1", "0.0.0.0"]
-            .iter()
-            .any(|start| host.starts_with(start))
-    };
     NO_DNS.is_match(output)
         || REFUSED.captures_iter(output).any(|found| {
             found
@@ -180,6 +191,50 @@ pub fn connected_directly(output: &str) -> bool {
                 .flatten()
                 .next()
                 .is_some_and(|address| !this_machine(address.as_str()))
+        })
+}
+
+/// What a command's output says when a connection to a server on this
+/// machine (localhost, 127.x, ::1, 0.0.0.0) was refused. The guard firewall
+/// lets the agent's commands reach only the proxy, so this happens even for a
+/// server the same command started; it isn't a server being down. A refused
+/// connection to the proxy itself (`proxy_port` on loopback) isn't counted.
+pub fn connected_locally(output: &str, proxy_port: u16) -> bool {
+    // Go, Node, Redis: "host:port". curl, ssh, nc, requests/urllib3, wget and
+    // libpq name the host and the port apart.
+    static ADDRESS: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)dial tcp (?P<a1>\S+): connect: connection refused|connect ECONNREFUSED (?P<a2>\S+)|Could not connect to \S+ at (?P<a3>\S+): Connection refused",
+        )
+        .expect("valid regex")
+    });
+    static HOST_PORT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?i)Failed to connect to (?P<h1>\S+) port (?P<p1>\d+)",
+            r"|connect to (?:host )?(?P<h2>\S+) port (?P<p2>\d+)(?: \(tcp\))?:? (?:failed: )?Connection refused",
+            r"|Pool\(host='(?P<h3>[^']+)', port=(?P<p3>\d+)\).*Connection refused",
+            r"|\|(?P<h4>[^|\s]+)\|:(?P<p4>\d+)\.\.\. failed: Connection refused",
+            r#"|server at "[^"]*" \((?P<h5>[^)]+)\), port (?P<p5>\d+) failed: Connection refused"#,
+        ))
+        .expect("valid regex")
+    });
+    let local = |host: &str, port: Option<u16>| this_machine(host) && port != Some(proxy_port);
+    let named = ADDRESS.captures_iter(output).any(|found| {
+        found.iter().skip(1).flatten().next().is_some_and(|address| {
+            let address = address
+                .as_str()
+                .trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+            let (host, port) = address.rsplit_once(':').unwrap_or((address, ""));
+            local(host.trim_end_matches(']'), port.parse().ok())
+        })
+    });
+    named
+        || HOST_PORT.captures_iter(output).any(|found| {
+            (1..=5).any(|n| {
+                let host = found.name(&format!("h{n}"));
+                let port = found.name(&format!("p{n}"));
+                host.is_some_and(|host| local(host.as_str(), port.and_then(|p| p.as_str().parse().ok())))
+            })
         })
 }
 
@@ -283,7 +338,7 @@ mod tests {
             assert!(connected_directly(output), "{output}");
         }
         for output in [
-            // This machine: a local server that isn't up, or the proxy itself.
+            // This machine (connected_locally's), or the proxy itself.
             "curl: (7) Failed to connect to localhost port 3000 after 0 ms: Couldn't connect to server",
             "fatal: unable to access 'https://github.com/': Failed to connect to 127.0.0.1 port 3128",
             "dial tcp 127.0.0.1:5432: connect: connection refused",
@@ -297,5 +352,48 @@ mod tests {
         ] {
             assert!(!connected_directly(output), "{output}");
         }
+    }
+
+    #[test]
+    fn spots_a_refused_connection_to_this_machine() {
+        for output in [
+            "curl: (7) Failed to connect to localhost port 3000 after 0 ms: Couldn't connect to server",
+            "curl: (7) Failed to connect to ::1 port 8080 after 0 ms: Connection refused",
+            "dial tcp 127.0.0.1:5432: connect: connection refused",
+            "dial tcp [::1]:8080: connect: connection refused",
+            "Error: connect ECONNREFUSED 127.0.0.1:3000",
+            "Error: connect ECONNREFUSED ::1:5173\n    at TCPConnectWrapper.afterConnect",
+            "HTTPConnectionPool(host='localhost', port=8000): Max retries exceeded (Caused by \
+             NewConnectionError('[Errno 111] Connection refused'))",
+            "ssh: connect to host localhost port 22: Connection refused",
+            "nc: connect to 127.0.0.1 port 6379 (tcp) failed: Connection refused",
+            "Connecting to localhost (localhost)|127.0.0.1|:8000... failed: Connection refused.",
+            "psql: error: connection to server at \"localhost\" (127.0.0.1), port 5432 failed: Connection refused",
+            "Could not connect to Redis at 127.0.0.1:6379: Connection refused",
+            "curl: (7) Failed to connect to 0.0.0.0 port 8000 after 0 ms: Couldn't connect to server",
+        ] {
+            assert!(connected_locally(output, 3128), "{output}");
+        }
+        for output in [
+            // The proxy itself: Squid isn't running, not a server the command needs.
+            "fatal: unable to access 'https://github.com/': Failed to connect to 127.0.0.1 port 3128",
+            "Error: connect ECONNREFUSED 127.0.0.1:3128",
+            // Elsewhere: connected_directly's, or the proxy's refusal.
+            "curl: (7) Failed to connect to 1.2.3.4 port 443 after 0 ms: Couldn't connect to server",
+            "dial tcp 149.248.212.172:443: connect: connection refused",
+            "ssh: connect to host github.com port 22: Connection refused",
+            "Get \"https://api.fly.io/\": dial tcp: lookup api.fly.io on 127.0.0.53:53: read udp \
+             127.0.0.1:40000->127.0.0.53:53: read: connection refused",
+            "curl: (56) CONNECT tunnel failed, response 403",
+            "listening on http://localhost:3000",
+            "all good",
+        ] {
+            assert!(!connected_locally(output, 3128), "{output}");
+        }
+        // Another proxy port is the proxy's own.
+        assert!(!connected_locally(
+            "Error: connect ECONNREFUSED 127.0.0.1:8888",
+            8888
+        ));
     }
 }

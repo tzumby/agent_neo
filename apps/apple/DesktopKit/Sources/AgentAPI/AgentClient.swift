@@ -51,8 +51,11 @@ public struct AgentMemory: Decodable, Sendable, Equatable, Identifiable {
 
     /// Expired or replaced: it can be restored.
     public var isGone: Bool { status == "expired" || status == "superseded" }
-    /// Saved after the agent read outside content: a hint, not an instruction.
-    public var isInferred: Bool { trust.map { $0 == "agent_inferred" } ?? !trusted }
+    /// A hint until the user confirms it: saved by the agent (after it read
+    /// outside content) or imported. agentd's confirm accepts both.
+    public var needsConfirmation: Bool {
+        trust.map { $0 == "agent_inferred" || $0 == "imported" } ?? !trusted
+    }
     public var endDate: Date? { validUntil.map { Date(timeIntervalSince1970: TimeInterval($0)) } }
 }
 
@@ -224,13 +227,15 @@ struct ApprovalAnswer: Encodable, Equatable {
 public struct AgentSettings: Codable, Sendable, Equatable {
     public var model: String
     public var allowActions: Bool
-    /// Nothing waits for the user's OK. An agentd from before 0.15.12 doesn't send it.
+    /// Eligible shell actions and schedules can run without waiting for the user.
     public var autoApprove: Bool
+    public let autoApproveVersion: String?
 
     enum CodingKeys: String, CodingKey {
         case model
         case allowActions = "allow_actions"
         case autoApprove = "auto_approve"
+        case autoApproveVersion = "auto_approve_version"
     }
 
     public init(from decoder: Decoder) throws {
@@ -238,6 +243,7 @@ public struct AgentSettings: Codable, Sendable, Equatable {
         model = try container.decode(String.self, forKey: .model)
         allowActions = try container.decode(Bool.self, forKey: .allowActions)
         autoApprove = try container.decodeIfPresent(Bool.self, forKey: .autoApprove) ?? false
+        autoApproveVersion = try container.decodeIfPresent(String.self, forKey: .autoApproveVersion)
     }
 }
 
@@ -373,13 +379,43 @@ public struct AgentClient: Sendable {
     /// the APNs servers the token is for (sandbox for Xcode installs,
     /// production for TestFlight or a notarized build). 400 when this desktop
     /// has no APNs key (notifications to the apps aren't set up).
-    public func registerDevice(token: String, name: String, environment: String, topic: String) async throws {
-        let _: [String: String] = try await post(
+    public func registerDevice(token: String, name: String, environment: String, topic: String) async throws -> String {
+        struct Registration: Decodable { let id: String }
+        let registration: Registration = try await post(
             "/api/v1/devices", body: ["token": token, "name": name, "environment": environment, "topic": topic])
+        return registration.id
     }
 
-    public func update(settings: AgentSettings) async throws -> AgentSettings {
-        try await send("PUT", "/api/v1/settings", body: settings)
+    public func unregisterDevice(id: String) async throws {
+        let _: [String: Bool] = try await send("DELETE", "/api/v1/devices/\(id)", body: [String: String]())
+    }
+
+    public func updateSettings(model: String? = nil, allowActions: Bool? = nil) async throws -> AgentSettings {
+        struct Update: Encodable {
+            let model: String?
+            let allowActions: Bool?
+            enum CodingKeys: String, CodingKey {
+                case model
+                case allowActions = "allow_actions"
+            }
+        }
+        return try await send("PUT", "/api/v1/settings", body: Update(model: model, allowActions: allowActions))
+    }
+
+    public func setAutoApprove(_ enabled: Bool, expectedVersion: String?) async throws -> AgentSettings {
+        if !enabled, expectedVersion == nil {
+            return try await send("PUT", "/api/v1/settings", body: ["auto_approve": false])
+        }
+        struct Update: Encodable {
+            let enabled: Bool
+            let expectedVersion: String?
+            enum CodingKeys: String, CodingKey {
+                case enabled
+                case expectedVersion = "expected_version"
+            }
+        }
+        return try await send(
+            "PUT", "/api/v1/settings/auto-approve", body: Update(enabled: enabled, expectedVersion: expectedVersion))
     }
 
     /// What the agent remembers across conversations.

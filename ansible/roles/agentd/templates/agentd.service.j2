@@ -2,7 +2,8 @@
 [Unit]
 Description=agentd: the agent on this desktop (model loop, browser and shell tools, chat API)
 Wants=network-online.target chrome.service
-After=network-online.target chrome.service
+BindsTo=neo-agent-guard.service
+After=network-online.target chrome.service neo-agent-guard.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -15,9 +16,7 @@ Environment=RUST_LOG=agentd=info
 ExecStart=/usr/local/bin/agentd
 Restart=always
 RestartSec=5
-# The agent's commands run in their own systemd units (sudo systemd-run), not
-# in this service, so agentd itself can be confined. No NoNewPrivileges: sudo
-# needs it off.
+# Shell units start through the fixed root-owned helper. sudo needs to gain privileges.
 PrivateTmp=yes
 ProtectHome=yes
 

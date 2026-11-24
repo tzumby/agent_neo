@@ -50,6 +50,9 @@ export const api = {
   stop: () => request("POST", "/api/v1/stop", {}),
   settings: () => request("GET", "/api/v1/settings"),
   updateSettings: (settings) => request("PUT", "/api/v1/settings", settings),
+  setAutoApprove: (enabled, version) => version === undefined && !enabled
+    ? request("PUT", "/api/v1/settings", { auto_approve: false })
+    : request("PUT", "/api/v1/settings/auto-approve", { enabled, expected_version: version }),
   schedules: async () => (await request("GET", "/api/v1/schedules")).schedules,
   deleteSchedule: (id) => request("DELETE", `/api/v1/schedules/${enc(id)}`, {}),
   pauseSchedule: (id, paused) => request("POST", `/api/v1/schedules/${enc(id)}/${paused ? "pause" : "resume"}`, {}),
@@ -61,6 +64,7 @@ export const api = {
   push: () => request("GET", "/api/v1/push"),
   subscribePush: (subscription) => request("POST", "/api/v1/push/subscriptions", subscription),
   deletePush: (id) => request("DELETE", `/api/v1/push/subscriptions/${enc(id)}`, {}),
+  deleteDevice: (id) => request("DELETE", `/api/v1/devices/${enc(id)}`, {}),
   testPush: (id) => request("POST", "/api/v1/push/test", id ? { id } : {}),
   access: () => request("GET", "/api/v1/access"),
   allowSite: (host) => request("POST", "/api/v1/access", { host }),

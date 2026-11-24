@@ -196,6 +196,8 @@ public struct ChatTimeline: Sendable, Equatable {
             approval.summary = data["summary"]?.string.flatMap { $0.isEmpty ? nil : $0 }
             approval.tainted = data["tainted"]?.bool ?? false
             approval.editable = data["editable"]?.bool ?? false
+            approval.savedKeys = data["secrets"]?.array?.compactMap(\.string).filter { !$0.isEmpty } ?? []
+            approval.directInternet = data["direct"]?.bool ?? false
             if data["kind"]?.string == "secret" {
                 approval.secret = SecretRequest(
                     name: data["name"]?.string ?? "", label: data["label"]?.string ?? "",
@@ -223,6 +225,7 @@ public struct ChatTimeline: Sendable, Equatable {
                 action.role = data["role"]?.string ?? ""
                 action.page = data["page"]?.string ?? ""
                 action.url = data["url"]?.string ?? ""
+                action.destination = data["destination"]?.string ?? ""
                 action.around = data["around"]?.string ?? ""
                 action.imagePath = data["image"]?.string
                 approval.browser = action
@@ -390,9 +393,12 @@ public struct Approval: Sendable, Equatable {
     public let command: String
     public let reason: String
     public var state: State = .pending
-    /// For a command: what it does in plain words (the agent's), shown
-    /// instead of the command, which is a tap away.
+    /// The agent's description, shown alongside the command.
     public var summary: String?
+    /// Saved credential names available to the command.
+    public var savedKeys: [String] = []
+    /// The command can connect outside the egress proxy.
+    public var directInternet = false
     /// Asked for after the agent read outside content (a page, an email,
     /// command output), so its words may have been steered by that content.
     public var tainted = false
@@ -528,15 +534,17 @@ public struct BrowserAction: Sendable, Equatable {
     public let key: String?
     /// Presses Enter after typing.
     public let submit: Bool
-    /// Typed into a message field: approving it also lets the agent send it.
+    /// An older server bundled typing and sending.
     public let sends: Bool
     /// The page's host, e.g. app.slack.com.
     public let site: String
     /// What it is ("button"), for a click.
     public var role = ""
-    /// The page's title and address, for a click or key.
+    /// The page's title and address.
     public var page = ""
     public var url = ""
+    /// The link or form target, when applicable.
+    public var destination = ""
     /// The text around it on the page: the dialog, row or form it's in.
     public var around = ""
     /// The page, with what it would click outlined.

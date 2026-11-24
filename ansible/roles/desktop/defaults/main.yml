@@ -22,6 +22,7 @@ novnc_bind: 127.0.0.1
 vnc_password_enabled: false
 
 desktop_packages:
+  - nftables
   - xvfb
   - xfce4
   - xfce4-terminal

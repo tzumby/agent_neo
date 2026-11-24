@@ -119,14 +119,16 @@ private func aTask() throws -> [AgentEvent] {
     timeline.apply(
         try event(
             1, "approval.requested",
-            #"{"task":"t1","id":"c1","kind":"browser","action":"click","target":"Confirm","role":"button","site":"acme.com","summary":"Pay the March invoice","page":"Invoices","url":"acme.com/invoices","around":"March, $120 Confirm","image":"/api/v1/images/ab"}"#
+            #"{"task":"t1","id":"c1","kind":"browser","action":"click","target":"Confirm","role":"button","site":"acme.com","summary":"Pay the March invoice","page":"Invoices","url":"https://acme.com/invoices?month=march","destination":"https://acme.com/confirm","around":"March, $120 Confirm","image":"/api/v1/images/ab"}"#
         ))
     guard case .approval(let card) = timeline.visibleItems.last, let action = card.browser else {
         Issue.record("no click card")
         return
     }
     #expect(card.summary == "Pay the March invoice")
-    #expect(action.role == "button" && action.page == "Invoices" && action.url == "acme.com/invoices")
+    #expect(action.role == "button" && action.page == "Invoices")
+    #expect(action.url == "https://acme.com/invoices?month=march")
+    #expect(action.destination == "https://acme.com/confirm")
     #expect(action.around == "March, $120 Confirm" && action.imagePath == "/api/v1/images/ab")
 }
 
@@ -141,6 +143,28 @@ private func aTask() throws -> [AgentEvent] {
         return
     }
     #expect(card.editable)
+}
+
+@Test func aShellCardKeepsTheFullCommandAndItsAccess() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(
+        try event(
+            1, "approval.requested",
+            #"{"id":"a1","kind":"shell","command":"gh pr list\ngh issue list","secrets":["GITHUB_TOKEN"]}"#
+        ))
+    timeline.apply(
+        try event(2, "approval.requested", #"{"id":"a2","kind":"shell","command":"git fetch","direct":true}"#))
+    guard case .approval(let key) = timeline.visibleItems.first,
+        case .approval(let direct) = timeline.visibleItems.last
+    else {
+        Issue.record("Missing shell approval cards")
+        return
+    }
+    #expect(key.command == "gh pr list\ngh issue list")
+    #expect(key.savedKeys == ["GITHUB_TOKEN"])
+    #expect(!key.directInternet)
+    #expect(direct.directInternet)
+    #expect(direct.savedKeys.isEmpty)
 }
 
 @Test func browserAndScheduleCardsShowWhileTheyWait() throws {

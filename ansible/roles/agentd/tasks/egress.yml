@@ -3,30 +3,45 @@
 # of its own; the proxy allows listed hosts, refuses internal addresses (also
 # when a listed name resolves to one) and logs every request.
 
-- name: Install Squid
-  ansible.builtin.apt:
-    name: squid
-    state: present
+- name: Create the Squid systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/squid.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
 
-# The sites the user allowed in the app (services/agentd/src/access.rs):
-# agentd writes the file and reloads Squid; Squid reads it through the
-# directory's group. The shell user can't read or change either.
+- name: Bind Squid to the network guard
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/squid.service.d/neo-agent-guard.conf
+    content: |
+      [Unit]
+      BindsTo=neo-agent-guard.service
+      After=neo-agent-guard.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart Squid
+
+# The root-owned helper applies the app's exact hostname list and restarts Squid.
 - name: Create the directory for the sites the user allowed
   ansible.builtin.file:
     path: "{{ agentd_egress_user_hosts | dirname }}"
     state: directory
-    owner: agentd
+    owner: root
     group: proxy
-    mode: "2750"
+    mode: "0750"
+  when: agentd_egress_user_hosts | length > 0
 
 - name: Start the list of sites the user allowed (agentd keeps it after)
   ansible.builtin.copy:
     dest: "{{ agentd_egress_user_hosts }}"
-    content: "# Sites the user allowed in the app. agentd writes this file; don't edit it.\n"
-    owner: agentd
+    content: "# Sites allowed through the app.\n"
+    owner: root
     group: proxy
     mode: "0640"
     force: false
+  when: agentd_egress_user_hosts | length > 0
 
 - name: Configure Squid as the shell user's egress proxy
   ansible.builtin.template:

@@ -1,0 +1,22 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed }}
+table inet neo_agent_browser
+delete table inet neo_agent_browser
+
+table inet neo_agent_browser {
+  chain public_only {
+    # Permit CDP and VNC replies to connections opened by the host, plus
+    # DNS to Ubuntu's local stub. All other local destinations are blocked.
+    ct direction reply ct state established accept
+    ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
+    oifname "lo" counter reject
+    fib daddr type local counter reject
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 } counter reject
+    ip6 daddr != 2000::/3 counter reject
+  }
+
+  chain output {
+    type filter hook output priority filter; policy accept;
+    meta skuid {{ desktop_user_info.uid | default('NEW-USER') }} jump public_only
+  }
+}

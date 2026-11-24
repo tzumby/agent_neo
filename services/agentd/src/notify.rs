@@ -48,16 +48,12 @@ pub struct Notice {
     pub urgency: &'static str,
     /// How long the push service keeps it for an offline browser.
     pub ttl: u32,
-    /// The apps' notification category: "APPROVAL" adds Approve/Deny buttons
-    /// (apps/apple PushCenter); None just opens the app. Web browsers ignore it.
-    pub category: Option<&'static str>,
-    /// Short ids for the apps to act on and deep-link: `{task, approval?, action?}`.
+    /// The app can open the corresponding task or card: `{task, approval?, action?}`.
     pub data: Value,
 }
 
 impl Notice {
-    /// A notification with no category and only its task in `data` (a finished
-    /// task, a test): the common case.
+    /// A notification with only its task in `data` (a finished task or a test).
     pub fn plain(title: String, body: String, tag: String, urgency: &'static str, ttl: u32) -> Self {
         let data = json!({ "task": tag });
         Self {
@@ -66,7 +62,6 @@ impl Notice {
             tag,
             urgency,
             ttl,
-            category: None,
             data,
         }
     }
@@ -116,7 +111,6 @@ pub fn card_notice(card: &Value) -> Option<(String, String)> {
             text("summary").or(text("command"))?.to_string(),
         ),
         "browser" => match text("action")? {
-            "type" if card["sends"] == true => ("Write and send this?".into(), text("text")?.to_string()),
             "type" => ("Write this?".into(), text("text")?.to_string()),
             "key" => (
                 format!("Press {}?", text("key").unwrap_or("a key")),
@@ -299,7 +293,7 @@ impl Agent {
                 let payload = json!({
                     "device": device.id, "title": title, "body": body, "tag": notice.tag,
                     "urgency": notice.urgency, "ttl": notice.ttl, "created": now,
-                    "category": notice.category, "data": notice.data,
+                    "data": notice.data,
                 });
                 self.enqueue("apns", &format!("{}:{}", device.id, notice.tag), &payload, now)?;
                 queued += 1;
@@ -314,16 +308,9 @@ impl Agent {
         }
     }
 
-    /// A parked task's card: it waits on you. On the apps, a command, a
-    /// browser action or a stuck task shows Approve/Deny on the notification
-    /// itself; a key, a site or a schedule just opens the app (you can't paste
-    /// a key or weigh a schedule from the lock screen).
+    /// A parked task's card waits for review in the app.
     pub fn notify_card(&self, task: &str, card: &Value) {
         if let Some((title, body)) = card_notice(card) {
-            let category = match card["kind"].as_str() {
-                Some("shell" | "browser" | "stuck") => Some("APPROVAL"),
-                _ => None,
-            };
             let id = card["id"].as_str().unwrap_or_default();
             self.notify_quietly(Notice {
                 title,
@@ -331,7 +318,6 @@ impl Agent {
                 tag: task.to_string(),
                 urgency: "high",
                 ttl: 86_400,
-                category,
                 data: json!({"task": task, "approval": id}),
             });
         }
@@ -344,7 +330,6 @@ impl Agent {
             tag: task.to_string(),
             urgency: "high",
             ttl: 86_400,
-            category: None,
             data: json!({"task": task, "action": id}),
         });
     }
@@ -490,17 +475,14 @@ pub async fn deliver_apns(agent: &Agent, effect: &Effect) -> Outcome {
     }
 }
 
-/// The APNs payload: the `aps` dictionary (alert, sound, thread, category) and
+/// The APNs payload: the `aps` dictionary (alert, sound, thread) and
 /// the app's own keys (task, approval or action) at the top level.
 fn apns_message(p: &Value) -> Value {
-    let mut aps = json!({
+    let aps = json!({
         "alert": {"title": p["title"], "body": p["body"]},
         "sound": "default",
         "thread-id": p["tag"],
     });
-    if let Some(category) = p["category"].as_str() {
-        aps["category"] = json!(category);
-    }
     let mut message = json!({ "aps": aps });
     if let Some(data) = p["data"].as_object() {
         for (key, value) in data {
@@ -723,7 +705,7 @@ mod tests {
         );
         assert_eq!(
             n(json!({"kind": "browser", "action": "type", "text": "Hi Lawrence", "sends": true})).0,
-            "Write and send this?"
+            "Write this?"
         );
         assert_eq!(
             n(
@@ -767,9 +749,8 @@ mod tests {
     }
 
     #[test]
-    fn the_apns_payload_carries_the_alert_category_and_ids() {
-        // An approval card: Approve/Deny on the notification (category), and
-        // the approval id at the top level for the app to act on.
+    fn the_apns_payload_opens_the_card_and_discards_legacy_approval_actions() {
+        // A queued notification from an earlier version may still carry the category.
         let effect = json!({
             "title": "Needs your OK", "body": "rm -rf build", "tag": "t1",
             "category": "APPROVAL", "data": {"task": "t1", "approval": "a9"},
@@ -778,7 +759,7 @@ mod tests {
         assert_eq!(message["aps"]["alert"]["title"], "Needs your OK");
         assert_eq!(message["aps"]["alert"]["body"], "rm -rf build");
         assert_eq!(message["aps"]["thread-id"], "t1");
-        assert_eq!(message["aps"]["category"], "APPROVAL");
+        assert!(message["aps"].get("category").is_none());
         assert_eq!(message["aps"]["sound"], "default");
         assert_eq!(message["approval"], "a9");
         assert_eq!(message["task"], "t1");
@@ -810,7 +791,7 @@ mod tests {
         // Keys stay on the desktop: the token and topic aren't listed.
         assert!(agent.push_info().unwrap()["devices"][0].get("token").is_none());
 
-        // A command card: one apns effect, with Approve/Deny and the ids.
+        // A command card: one apns effect, with the id for the app to open.
         agent.notify_card(
             "t1",
             &json!({"kind": "shell", "id": "a9", "summary": "Clear the build", "command": "rm -rf build"}),
@@ -826,7 +807,7 @@ mod tests {
         let p = &effects[0].payload;
         assert_eq!(p["device"], id);
         assert_eq!(p["title"], "Needs your OK");
-        assert_eq!(p["category"], "APPROVAL");
+        assert!(p.get("category").is_none());
         assert_eq!(p["data"]["approval"], "a9");
         std::fs::remove_dir_all(dir).unwrap();
     }

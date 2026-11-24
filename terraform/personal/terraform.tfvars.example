@@ -5,6 +5,7 @@
 # desktop_instance_type = "t3a.medium"
 # disk_size_gb          = 20
 # tailnet_hostname      = "neo-agent"
+# enable_desktop_backups = true
 
 # Internet access: fck-nat (default, cheapest) or AWS's NAT gateway.
 # enable_nat_instance = true

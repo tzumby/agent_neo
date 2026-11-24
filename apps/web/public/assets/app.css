@@ -244,6 +244,7 @@ h4.md-h, h5.md-h, h6.md-h { font-size: 1rem; font-weight: 650; }
 .card-title .icon { color: var(--signal-text); }
 .card-site { display: inline-flex; align-items: center; gap: 0.3rem; color: var(--slate); font-size: 0.84rem; white-space: nowrap; }
 .card-text { margin: 0; }
+.card-value { overflow-wrap: anywhere; }
 .card-actions.card-actions-start { justify-content: flex-start; align-items: center; flex-wrap: wrap; }
 .push-others { width: 100%; }
 .push-others .list { margin: 0.4rem 0 0; }

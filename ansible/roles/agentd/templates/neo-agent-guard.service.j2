@@ -2,14 +2,16 @@
 [Unit]
 Description=Firewall rules for the desktop (metadata service, desktop controls)
 Wants=network-pre.target
-Before=network-pre.target agentd.service
+Requires=neodirect.slice
+After=nftables.service neodirect.slice
+Before=network-pre.target agentd.service squid.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/neo-agent/guard.nft
 ExecReload=/usr/sbin/nft -f /etc/neo-agent/guard.nft
-ExecStop=/usr/sbin/nft delete table inet neo_agent_guard
+# Keep the restrictions installed across stops. Reloads replace them atomically.
 
 [Install]
 WantedBy=multi-user.target

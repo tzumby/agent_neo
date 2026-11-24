@@ -1,0 +1,269 @@
+#!/usr/bin/python3 -I
+"""Fixed privileged operations used by agentd. The model's code runs as worker."""
+
+from contextlib import contextmanager
+import fcntl
+import grp
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+
+WORKER = {{ agentd_shell_user | to_json }}
+WORKER_HOME = {{ agentd_shell_home | to_json }}
+WORKDIR = {{ agentd_workdir | to_json }}
+DESKTOP_USER = {{ agentd_desktop_user | to_json }}
+PROXY = "http://127.0.0.1:{{ agentd_egress_proxy_port }}"
+NO_PROXY = "localhost,127.0.0.1,::1"
+ALLOWED_HOSTS = Path({{ agentd_egress_user_hosts | to_json }})
+RUNTIME_DIR = Path("/run")
+APPLIED = RUNTIME_DIR / "neo-agent-proxy-applied"
+PROXY_LOCK = RUNTIME_DIR / "neo-agent-proxy.lock"
+WORKER_STATE = RUNTIME_DIR / "neo-agent-worker"
+SYSTEMCTL = "/usr/bin/systemctl"
+GUARD = "neo-agent-guard.service"
+UNIT = re.compile(r"agentd-cmd-[0-9a-f]{12}")
+KEY = re.compile(r"[A-Z][A-Z0-9_]{1,63}")
+LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+TRUSTED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+SAFE_WORKER_PROPERTIES = (
+    "NoNewPrivileges=yes",
+    "CapabilityBoundingSet=",
+    "AmbientCapabilities=",
+    "PrivateTmp=yes",
+    "PrivateDevices=yes",
+    "ProtectSystem=full",
+    "ProtectKernelTunables=yes",
+    "ProtectKernelModules=yes",
+    "ProtectKernelLogs=yes",
+    "ProtectControlGroups=yes",
+    "ProtectClock=yes",
+    "ProtectHostname=yes",
+    "ProtectProc=invisible",
+    "RestrictSUIDSGID=yes",
+    "RestrictRealtime=yes",
+    "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+    "LockPersonality=yes",
+    "KillMode=control-group",
+    "TimeoutStopSec=5s",
+    "UnsetEnvironment=BASH_ENV ENV CDPATH",
+    f"BindsTo={GUARD} agentd.service",
+    f"After={GUARD} agentd.service",
+    "InaccessiblePaths=-/run/systemd/resolve/io.systemd.Resolve -/run/dbus/system_bus_socket -/run/nscd/socket",
+    "MemoryMax={{ agentd_shell_memory_max }}",
+    "TasksMax={{ agentd_shell_tasks_max }}",
+    "CPUQuota={{ agentd_shell_cpu_quota }}",
+)
+
+
+def systemctl(*args):
+    return subprocess.run([SYSTEMCTL, *args], stdin=subprocess.DEVNULL, timeout=30)
+
+
+def active(unit):
+    return systemctl("is-active", "--quiet", unit).returncode == 0
+
+
+def read_input(limit):
+    data = sys.stdin.buffer.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("request too large")
+    return data.decode("utf-8")
+
+
+def check_unit(unit):
+    if not isinstance(unit, str) or not UNIT.fullmatch(unit):
+        raise ValueError("invalid worker unit")
+    return unit
+
+
+@contextmanager
+def launch_lock(unit):
+    WORKER_STATE.mkdir(mode=0o700, exist_ok=True)
+    with (WORKER_STATE / "lock").open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # A stop before the launcher received its request can leave a marker.
+        for stale in WORKER_STATE.glob("agentd-cmd-*"):
+            if time.time() - stale.stat().st_mtime > 3600:
+                stale.unlink()
+        yield WORKER_STATE / unit
+
+
+def loaded(unit):
+    result = subprocess.run(
+        [SYSTEMCTL, "list-units", "--all", "--full", "--plain", "--no-legend", f"{unit}.service"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode:
+        raise ValueError("could not verify the worker unit")
+    return result.stdout.split()[:2] == [f"{unit}.service", "loaded"]
+
+
+def validate_run(request):
+    if not isinstance(request, dict) or set(request) != {"unit", "command", "seconds", "route", "keys"}:
+        raise ValueError("invalid worker request")
+    check_unit(request["unit"])
+    command = request["command"]
+    if not isinstance(command, str) or not command.strip() or "\0" in command or len(command.encode()) > 65_536:
+        raise ValueError("invalid command")
+    seconds = request["seconds"]
+    if type(seconds) is not int or not 1 <= seconds <= 900:
+        raise ValueError("invalid time limit")
+    route = request["route"]
+    keys = request["keys"]
+    if route not in ("proxy", "direct") or not isinstance(keys, dict) or len(keys) > 50:
+        raise ValueError("invalid route or credentials")
+    if route == "direct" and keys:
+        raise ValueError("direct network access cannot use saved credentials")
+    for name, value in keys.items():
+        if not KEY.fullmatch(name) or not isinstance(value, str) or "\0" in value or len(value.encode()) > 8192:
+            raise ValueError("invalid credential")
+
+
+def runner_args(request, credential_dir):
+    seconds = request["seconds"]
+    route = request["route"]
+    keys = request["keys"]
+    sensitive = bool(keys) or route == "direct"
+    args = [
+        "/usr/bin/systemd-run", "--quiet", "--pipe", "--wait", "--collect",
+        "--service-type=exec", "--expand-environment=no", "--description=Neo Agent worker command",
+        f'--unit={request["unit"]}.service', f"--uid={WORKER}", f"--property=RuntimeMaxSec={seconds}s",
+    ]
+    args.extend(f"--property={prop}" for prop in SAFE_WORKER_PROPERTIES)
+    args.append(f"--setenv=HOME={'/tmp' if sensitive else WORKER_HOME}")
+    path = TRUSTED_PATH if sensitive else f"{WORKER_HOME}/.nix-profile/bin:{WORKER_HOME}/.npm-global/bin:{TRUSTED_PATH}"
+    args.append(f"--setenv=PATH={path}")
+    if route == "direct":
+        args.append("--slice=neodirect.slice")
+    else:
+        args.extend(f"--setenv={name}={PROXY}" for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"))
+        # Local addresses skip Squid, so the firewall refuses them outright
+        # instead of Squid answering 403 as if the site weren't listed.
+        args.extend(f"--setenv={name}={NO_PROXY}" for name in ("NO_PROXY", "no_proxy"))
+    script = [f"cd -- {shlex.quote(WORKDIR)} || exit"]
+    for name, value in keys.items():
+        path = credential_dir / name
+        path.write_text(value, encoding="utf-8")
+        path.chmod(0o600)
+        args.append(f"--property=LoadCredential={name}:{path}")
+        script.append(f'export {name}="$(< "$CREDENTIALS_DIRECTORY/{name}")"')
+    script.append(request["command"])
+    return [*args, "--", "/usr/bin/bash", "--noprofile", "--norc", "-c", "\n".join(script)]
+
+
+def run_worker():
+    request = json.loads(read_input(1_048_576))
+    validate_run(request)
+    worker = pwd.getpwnam(WORKER)
+    if worker.pw_uid == 0 or WORKER in {"root", "agentd", DESKTOP_USER, "proxy"}:
+        raise ValueError("the worker must be a dedicated unprivileged user")
+    if not active(GUARD) or subprocess.run(
+        ["/usr/sbin/nft", "list", "chain", "inet", "neo_agent_guard", "output"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=10,
+    ).returncode != 0:
+        raise ValueError("worker firewall unavailable")
+    with tempfile.TemporaryDirectory(prefix="neo-agent-creds-", dir=RUNTIME_DIR) as directory:
+        unit = request["unit"]
+        with launch_lock(unit) as cancelled:
+            if cancelled.is_file():
+                cancelled.unlink()
+                return 1
+            runner = subprocess.Popen(runner_args(request, Path(directory)), stdin=subprocess.DEVNULL)
+            try:
+                # A stop waits for registration. The worker may finish first.
+                registration_deadline = time.monotonic() + 10
+                while runner.poll() is None and not loaded(unit):
+                    if time.monotonic() >= registration_deadline:
+                        raise ValueError("worker unit did not register in time")
+                    time.sleep(0.025)
+            except (ValueError, subprocess.SubprocessError):
+                runner.kill()
+                runner.wait()
+                systemctl("stop", f"{unit}.service")
+                raise
+        return runner.wait()
+
+
+def stop_worker(unit):
+    with launch_lock(unit) as cancelled:
+        if not loaded(unit):
+            cancelled.touch(mode=0o600)
+            return 0
+        return systemctl("stop", f"{unit}.service").returncode
+
+
+def host_list(text):
+    hosts = sorted(set(text.splitlines()))
+    if len(hosts) > 100:
+        raise ValueError("too many proxy hosts")
+    for host in hosts:
+        labels = host.split(".")
+        if len(host) > 253 or len(labels) < 2 or not all(LABEL.fullmatch(label) for label in labels):
+            raise ValueError("invalid proxy hostname")
+        if not labels[-1].isalpha() and not labels[-1].startswith("xn--"):
+            raise ValueError("proxy hosts must be DNS names")
+    return "# Sites allowed through the app.\n" + "".join(f"{host}\n" for host in hosts)
+
+
+def write_hosts(content):
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=ALLOWED_HOSTS.parent, delete=False) as file:
+        try:
+            file.write(content)
+            file.flush()
+            os.fchown(file.fileno(), 0, grp.getgrnam("proxy").gr_gid)
+            os.fchmod(file.fileno(), 0o640)
+            os.replace(file.name, ALLOWED_HOSTS)
+        finally:
+            Path(file.name).unlink(missing_ok=True)
+
+
+def apply_proxy():
+    content = host_list(read_input(25_500))
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    with PROXY_LOCK.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        unchanged = ALLOWED_HOSTS.is_file() and ALLOWED_HOSTS.read_text(encoding="utf-8") == content
+        applied = APPLIED.is_file() and APPLIED.read_text(encoding="utf-8") == digest
+        if unchanged and applied and active("squid.service"):
+            return 0
+        # Close any open tunnels before making a changed or uncertain policy visible.
+        APPLIED.unlink(missing_ok=True)
+        if systemctl("stop", "squid.service").returncode:
+            return 1
+        if not unchanged:
+            write_hosts(content)
+        if systemctl("start", "squid.service").returncode or not active("squid.service"):
+            return 1
+        APPLIED.write_text(digest, encoding="utf-8")
+        return 0
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 2:
+        return 1
+    match sys.argv[1]:
+        case "run-worker":
+            return run_worker()
+        case "stop-worker":
+            return stop_worker(check_unit(read_input(23)))
+        case "apply-proxy":
+            return apply_proxy()
+        case _:
+            return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (KeyError, OSError, ValueError, subprocess.SubprocessError):
+        print("Neo Agent: privileged operation failed or received invalid input", file=sys.stderr)
+        sys.exit(1)

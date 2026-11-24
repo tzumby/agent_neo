@@ -131,13 +131,13 @@ resource "aws_instance" "desktop" {
     delete_on_termination = true
   }
 
-  tags = {
+  tags = merge({
     Name = "${local.name}-desktop"
     # For Ansible (ansible/inventory/aws_ec2.yml.tmpl): what it is, and its
     # device name on your tailnet.
     Role        = "desktop"
     TailnetName = var.tailnet_hostname
-  }
+  }, var.enable_desktop_backups ? local.desktop_backup_tags : {})
 
   lifecycle {
     # Don't replace the instance whenever Canonical publishes a new AMI.

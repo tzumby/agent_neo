@@ -63,6 +63,9 @@ pub async fn run(agent: Arc<Agent>) {
     {
         tracing::error!(%err, "couldn't schedule the daily purge");
     }
+    if let Err(err) = crate::consolidate::recover(&agent) {
+        tracing::error!(%err, "couldn't recover pending consolidation");
+    }
     let running: Arc<Mutex<HashSet<String>>> = Arc::default();
     loop {
         let due = agent.store.due_effects(unix_now(), 50).unwrap_or_else(|err| {

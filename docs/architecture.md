@@ -1,6 +1,6 @@
 # Architecture
 
-*Status: describes the personal edition in this working tree on 2026-11-10: one person deploys one agent desktop into their own AWS account and reaches it over their own Tailscale tailnet. It covers agentd 0.15.14 (memory v2 is in [memory-v2.md](memory-v2.md)), tailnet-proxy, the web app, the Terraform `personal` root module and the Ansible roles. [README.md](../README.md) has the setup steps.*
+*Status: describes the personal edition in this working tree on 2026-11-23: one person deploys one agent desktop into their own AWS account and reaches it over their own Tailscale tailnet. It covers agentd 0.15.14 (memory v2 is in [memory-v2.md](memory-v2.md)), tailnet-proxy, the web app, the Terraform `personal` root module and the Ansible roles. [README.md](../README.md) has the setup steps.*
 
 ## Contents
 
@@ -44,7 +44,7 @@ The pieces:
  VNC viewer ──────────┼──►│                       :5900             ─► x11vnc 127.0.0.1:5900 ─► Xvfb :1    │  │
                       │   │                                                                                │  │
                       │   │ agentd ──CDP 127.0.0.1:9222──► Chrome (user `agent`, logged-in profile)        │  │
-                      │   │   │   └─sudo systemd-run──► worker commands ──► Squid :3128 ──► listed hosts   │  │
+                      │   │   │   └─privileged helper──► worker commands ──► Squid :3128 ──► listed hosts   │  │
                       │   │   │                          (no DevTools, VNC, IMDS, DNS)                     │  │
                       │   │   ├─ SQLite, images, saved keys (/var/lib/agentd, 0700)                        │  │
                       │   │   ├─ the model key (/etc/agentd/secrets.env, root:agentd 0640)                 │  │
@@ -86,9 +86,7 @@ The rules the code keeps to:
    - The desktop's own IAM role is denied the project's SSM parameters.
    - Logs carry metadata only.
 6. **The model key is on the desktop.** It's in `/etc/agentd/secrets.env` (root:agentd 0640), so agentd and root can read it; the shell user and the browser can't. agentd calls Together directly, with no gateway in between. Anyone with root on the desktop can read the key, and that's you, over SSM.
-7. **The agent acts only with your approval for anything consequential**, unless you turn on Auto approve (§6.11).
-   - Sending, writing, deleting, buying, running as root, sending data out after reading outside content, scheduling after outside content.
-   - You see the exact action (the text to be typed, the command) before approving.
+7. **The owner reviews actions that need additional authority.** Browser input, saved credentials, new proxy sites, and direct network access require explicit approval. The owner handles system administration through SSM. Auto approve applies to eligible worker commands and scheduled-task setup (§6.11).
 8. **Untrusted content is data, not instructions.** It's labelled, it taints the task, and the privilege split limits what an injected instruction could do (§6.12).
 9. **No dependency on a single model vendor.** Models are reached through an OpenAI-compatible API: Together by default, another endpoint with `LLM_URL`.
 10. **Every apply is shown first.** `make plan` saves a plan for you to review, and `make apply` applies only that plan.
@@ -210,7 +208,7 @@ Terraform creates no parameters. You create these with `scripts/put-secret.py` (
 | S3 `neo-agent-<env>-ssm-<account>-<region>` | Ansible's SSM file transfers | Objects expire after 1 day |
 | SSM Parameter Store | The parameters above | Until you delete them |
 
-**Never in AWS-side stores:** chat history, prompts, memory, saved keys, screenshots. They live only on the desktop's disk.
+Chat history, memory, saved keys, and screenshots live on the desktop volume. Opt-in encrypted EBS snapshots also retain them under the desktop KMS key. See the [restore drill](../README.md#desktop-backups).
 
 ### 4.10 Outputs
 
@@ -293,20 +291,21 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
   - **X:** a cookie regenerated at each start, readable only by `agent`. No TCP.
   - **VNC and noVNC:** no password, but listening on localhost only. They're reached through SSM port forwarding (`make viewer`) or tailnet-proxy, whose WhoIs check is the access control.
   - **Chrome DevTools** (`127.0.0.1:9222`, no authentication): agentd's way in. The guard firewall keeps the shell user out (§5.5), and `make cdp` forwards it to your machine.
+  - **Browser networking:** `neo-agent-browser-guard.service` installs a UID-based nftables policy before Chrome starts. The desktop user can initiate public connections and use the local DNS stub. The firewall rejects connections to loopback, host-local and private destinations, including connections made after browser redirects or DNS resolution. Replies to inbound CDP and VNC connections remain available to the host services that opened them.
 
 ### 5.4 Role `agentd`: users, files and units
 
-**Order.** Users and directories, the guard firewall, the shell's egress proxy (Squid), then a handler flush (Squid runs with its allowlist before Nix downloads anything), Nix, and only then agentd's binary, a copy of its database, its settings, the model key, skills, approval rules, sudoers and unit. Nothing before the flush may notify "Restart agentd": on a new desktop its unit doesn't exist yet, and the restart would fail the play.
+**Order.** Users and directories, `neodirect.slice` (started before the firewall loads, since nftables looks up its cgroup when the rules load; an existing guard is only reloaded, which doesn't start new requirements), the guard firewall, the shell's egress proxy (Squid), then a handler flush (Squid runs with its allowlist before Nix downloads anything), Nix, and only then agentd's binary, a copy of its database, its settings, the model key, skills, approval rules, sudoers and unit. Nothing before the flush may notify "Restart agentd": on a new desktop its unit doesn't exist yet, and the restart would fail the play.
 
 **Users.**
 
 | User | Kind | Home | Purpose |
 |---|---|---|---|
 | `agent` | regular | `/home/agent` (0750) | Desktop session and Chrome. agentd never runs anything as it |
-| `agentd` | system, nologin | `/var/lib/agentd` (0700) | agentd. Sudo for `systemd-run` (below) |
+| `agentd` | system, nologin | `/var/lib/agentd` (0700) | Agent controller. Sudo for the fixed launcher and proxy configuration helper |
 | `worker` | regular, bash | `/home/worker` (0750), `work/` 0700 | The agent's shell commands. No sudo, not in any privileged group |
 | `tailnet-proxy` | system, nologin | `/var/lib/tailnet-proxy` (0700) | The tailnet node. Supplementary group `agentd`, which gives it the API socket |
-| root | — | — | The SSM agent; approved `sudo` commands |
+| root | — | — | The SSM agent and operator administration |
 
 **Files.**
 
@@ -314,44 +313,40 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
 |---|---|---|
 | `/usr/local/bin/agentd` | root 0755 | The binary |
 | `/etc/agentd/` | root:agentd 0750 | Configuration directory |
-| `/etc/agentd/agentd.env` | root:agentd 0640 | `LISTEN`, `MODEL`, `CDP_URL`, `STATE_DIR`, `WORKDIR`, `RUN_AS=worker`, shell limits, `POLICY`, `REVIEW_EVERY_SECS`, `REVIEW_EVERY_STEPS`, `SHELL_TOOL`, `MEMORY_V2`, `DESKTOP_NAME`, `SHELL_PROXY=http://127.0.0.1:3128`, `EGRESS_USER_HOSTS`, `EGRESS_BASE_HOSTS` |
+| `/etc/agentd/agentd.env` | root:agentd 0640 | `LISTEN`, `MODEL`, `CDP_URL`, `STATE_DIR`, `WORKDIR`, `RUN_AS=worker`, `POLICY`, `REVIEW_EVERY_SECS`, `REVIEW_EVERY_STEPS`, `SHELL_TOOL`, `MEMORY_V2`, `DESKTOP_NAME`, `SHELL_PROXY=http://127.0.0.1:3128`, `EGRESS_USER_HOSTS`, `EGRESS_BASE_HOSTS` |
 | `/etc/agentd/secrets.env` | root:agentd 0640 | `TOGETHER_API_KEY`, read from SSM `<prefix>/llm/together_api_key` on your machine at each deploy (`no_log`). agentd reads it; the shell user can't |
 | `/etc/agentd/policy.toml` | root:agentd 0640 | Only when `agentd_dangerous` overrides the built-in approval rules |
 | `/etc/agentd/skills/*.md` | root:agentd 0640 | Skills |
-| `/etc/sudoers.d/agentd` | root 0440 (validated by `visudo`) | `agentd ALL=(root) NOPASSWD: ALL`. agentd uses it only for `systemd-run`, `systemctl stop`, `squid -k reconfigure` and the guard firewall's `direct_egress` set (`nft`), and enforces approvals for root commands itself |
+| `/usr/local/libexec/neo-agent-privileged` | root 0755 | Fixed worker launch and stop operations, plus Squid policy reconciliation. The launcher sets the worker identity, sandbox configuration, and shell limits from Ansible |
+| `/etc/sudoers.d/agentd` | root 0440 (validated by `visudo`) | Grants agentd the helper's three fixed operations. No `Defaults`: agentd runs sudo without a terminal, and Ubuntu 26.04's `sudo-rs` reads the file too |
 | `/var/lib/agentd/` | agentd 0700 | SQLite, images, saved keys (§6.3) |
 | `/run/agentd/agentd.sock` | agentd:agentd 0660 in a 0750 directory | The API. Reachable by agentd and tailnet-proxy only |
 | `/etc/neo-agent/guard.nft` | root 0644 | Firewall rules (§5.5) |
-| `/etc/squid/agentd/allowed-hosts.txt` | agentd:proxy 0640, in a 2750 directory | The sites you allowed (§6.20). agentd writes it, Squid reads it, `worker` can't |
+| `/etc/squid/agentd/allowed-hosts.txt` | root:proxy 0640, in a 0750 directory | The sites you allowed (§6.20). The privileged helper applies the list, and Squid reads it |
 
 **Units.**
 - `agentd.service` (§6.1).
-- `neo-agent-guard.service`: a oneshot before `network-pre.target` and agentd, `nft -f /etc/neo-agent/guard.nft`.
+- `neo-agent-guard.service`: a oneshot before `network-pre.target` and agentd. `neodirect.slice` starts before it so nftables can restrict direct network use by socket cgroup. Agentd and transient worker units require the guard. Stopping the service leaves its current firewall rules installed.
 - `squid.service`.
-- `agentd-nix-gc.timer` (§5.7).
 
 ### 5.5 The guard firewall (`neo-agent-guard`)
 
-A single nftables table, `inet neo_agent_guard`, with one `output` chain (policy accept) and one set, `direct_egress`. The file deletes and re-creates the table, so a reload is atomic. The rules, in order:
+A single nftables table, `inet neo_agent_guard`, governs worker and proxy connections and instance metadata. A reload replaces the table atomically. The rules, in order:
 
 1. **Instance metadata** (`169.254.169.254` and `fd00:ec2::254`): rejected for every uid except root (the SSM agent). agentd, Chrome, the shell user, tailnet-proxy, websockify and Squid can't get the instance role's credentials. agentd has no use for them: it reads the model key from its secrets file.
-2. **The desktop's controls:** `worker` → `127.0.0.0/8` and `::1` ports 9222 (DevTools), 5900 (VNC) and 6080 (noVNC) are rejected. The shell can't drive the logged-in browser around the approvals.
-3. **A direct command:** while `worker` is in the set `direct_egress` (agentd adds it for the length of a command you approved, §6.21; entries also expire by themselves), it may use the local DNS resolver (`lo`, port 53) and connect to the public internet. Internal destinations stay rejected: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`, `fe80::/10` (Squid's list, §5.6; loopback goes on to the rules here). Each new connection is logged, since Squid doesn't see it: `journalctl -k | grep agentd-direct` gives the destination and port.
-4. **DNS:** `worker` → any port 53 (TCP or UDP) is rejected, including the local stub resolver. No data goes out through lookups.
-5. **Loopback:** other `worker` traffic to `lo` is accepted (Squid, dev servers).
-6. **Everything else** from `worker` is rejected: it reaches the internet only through Squid.
+2. **Squid:** the `proxy` account may reply to incoming connections, use the local DNS stub, and reach public addresses. The firewall checks the actual network destination.
+3. **Direct commands:** the privileged helper places approved direct commands in `neodirect.slice` (§6.21). The firewall grants the slice access to the local DNS stub and public internet. New connections are logged with a rate limit. `journalctl -k | grep agentd-direct` shows their destinations.
+4. **Proxied commands:** `worker` can connect only to the local Squid listener, never to other local servers, including one the same command started. The launcher sets `NO_PROXY=localhost,127.0.0.1,::1`, so such attempts fail as refused connections, and agentd tells the model why. The launcher also blocks the worker's local system-wide resolver and D-Bus sockets.
 
-Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a network port; it's protected by file permissions.
+The desktop has a separate browser network table (§5.3). File permissions protect agentd's Unix socket.
 
 ### 5.6 The shell's egress proxy (Squid)
 
-- **Listener:** `http_port 127.0.0.1:3128`. agentd sets `HTTP(S)_PROXY` for every `worker` command; `NO_PROXY` covers localhost.
+- **Listener:** `http_port 127.0.0.1:3128`. The launcher sets `HTTP_PROXY` and `HTTPS_PROXY` for proxied commands.
 - **Rules, in order:**
-  1. Deny internal destinations, checked on the **resolved** address: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` (Tailscale), `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, `::1`, `fc00::/7`, `fe80::/10`. A listed name that resolves to an internal address is refused too.
-  2. Deny `CONNECT` to ports other than 443.
-  3. Allow `dstdomain` in `agentd_shell_allowed_domains` and `agentd_shell_extra_domains` (a leading dot allows subdomains).
-  4. Allow `dstdomain` from `/etc/squid/agentd/allowed-hosts.txt`: the sites you allowed in the web app (§6.20). Exact hosts, one per line, written by agentd.
-  5. Deny everything else.
+  1. Allow web traffic on ports 80 and 443, with CONNECT limited to 443.
+  2. Compare the hostname against the Ansible domains and the exact hosts from the web app before doing a DNS lookup. A leading dot in the Ansible list covers subdomains.
+  3. Resolve candidates and deny internal addresses. nftables separately enforces the actual destination for the proxy process.
 - **The allowlist:**
   - `.github.com`, `.githubusercontent.com`;
   - `.npmjs.org`, `.yarnpkg.com`, `nodejs.org`;
@@ -364,7 +359,6 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
   - `.nixos.org`.
 - **No cache, no `X-Forwarded-For`, no `Via`.**
 - **Every request** is logged in `/var/log/squid/access.log`, rotated by logrotate only (`/etc/logrotate.d/squid`: daily, `agentd_squid_log_days` = 14 kept, compressed, also at 200 MB). Squid's own rotation is off (`logfile_rotate 0`), so it's not rotated twice.
-- **Known gap:** there's no `Safe_ports` rule, so plain-HTTP requests to listed hosts aren't limited by port.
 
 ### 5.7 Nix for the shell user
 
@@ -375,9 +369,9 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
   - `experimental-features = nix-command flakes`;
   - `sandbox = false`, because Ubuntu's AppArmor blocks unprivileged user namespaces;
   - packages from `nixpkgs` (unstable) through the flake registry.
-- **Profile:** `~/.profile` sources Nix and adds `~/.npm-global/bin` (npm's global prefix). Commands run in `bash -lc`, so they get both.
+- **Profile:** interactive sessions use `~/.profile`. The launcher skips shell startup files. Ordinary commands get explicit Nix and npm paths. Credential-bearing and direct commands start with a private temporary home and system PATH. That keeps a planted `~/.gitconfig` or a shadowing binary on the PATH from seeing the key, but the command still runs in `worker`'s workspace: a binary it names by path, or files it reads there (a repository's `.git/config` and hooks, package scripts, a Makefile), are the agent's own and run with the key. The approval card is the control.
 - **Preinstalled once:** `uv`, `nodejs`, `gh`, `jq`, `ripgrep`.
-- **Cleaned weekly:** `agentd-nix-gc.timer` runs `nix-collect-garbage --delete-older-than 30d` as `worker`, at the lowest priority: old generations go, what's installed now stays.
+- **Maintenance:** `neo-agent-nix-gc.timer` runs `nix-collect-garbage --delete-older-than 30d` weekly as `worker`. The binary is the worker's own, so the unit gets the command launcher's confinement plus `PrivateNetwork=yes`: a replaced binary can do nothing there that the agent's next command couldn't. Deployment removes the former unconfined `agentd-nix-gc` units.
 
 ### 5.8 Roles `tailnet_proxy` and `web_app`
 
@@ -406,7 +400,7 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 
 ### 6.1 Process, configuration and startup
 
-- **systemd unit** `agentd.service`: `User=agentd`, `Group=agentd`, `RuntimeDirectory=agentd` (mode 0750, so the socket's group can reach it), `PrivateTmp=yes`, `ProtectHome=yes`, `Restart=always`, `RUST_LOG=agentd=info`, after `chrome.service`. There's no `NoNewPrivileges`, because agentd launches commands through `sudo systemd-run` (§6.10).
+- **systemd unit** `agentd.service`: `User=agentd`, `Group=agentd`, `RuntimeDirectory=agentd` (mode 0750, so the socket's group can reach it), `PrivateTmp=yes`, `ProtectHome=yes`, `Restart=always`, `RUST_LOG=agentd=info`, after Chrome and bound to the worker guard. The sudo policy permits the root-owned helper's fixed operations (§6.10).
 - **Refuses to run as root:** `main.rs` checks the owner of `/proc/self` and exits.
 - **Configuration** (`config.rs`): `KEY=VALUE` files `/etc/agentd/agentd.env` (`AGENTD_CONFIG`) and `/etc/agentd/secrets.env` (`AGENTD_SECRETS`), then the environment, which wins.
 
@@ -442,7 +436,7 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
   3. Open SQLite and run migrations.
   4. Load the policy, the saved keys (`STATE_DIR/secrets`, created with mode 0700) and the skills.
   5. Recover tasks a restart cut off (§6.6), settle memories an older agentd left waiting for approval, and write Squid's file of the sites you allowed from the database (§6.20).
-  6. Flush the guard firewall's `direct_egress` set, in case an agentd stopped mid-command (§6.21).
+  6. Reconcile the stored proxy policy with the active configuration.
   7. Bind the socket, refusing if another agentd already answers on it, and set it to mode 0660.
   8. Only then start the scheduler, the background worker and the effects runner (§6.14, §6.19), so two agentd processes never both run them.
   9. On SIGTERM, give open requests 3 seconds. The web app's event stream never ends on its own, and without that limit systemd would wait 90 s.
@@ -521,18 +515,19 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/status` | Desktop name, `busy` (the chat's task), `background {running: {task, schedule} or null, queued}` (scheduled runs, 0.15.10), `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2`, `memory {active}`, `stage` and `stage_detail` (below the table) |
 | GET | `/api/v1/messages?limit=` | The chat history (default 50, at most 500), with saved keys redacted |
 | POST | `/api/v1/messages` | `{text, timezone, utc_offset}` starts a task. 202 `{task}`, or 409 while one runs. The time zone is remembered for later tasks and schedules |
-| GET | `/api/v1/events?after=&kinds=` | Server-Sent Events: up to 5,000 logged events after `after`, then live ones; `kinds` (comma-separated) keeps only those. Each SSE message has `id: seq`, `event: kind` and the JSON event. Keep-alive comments every 15 s. Subscribes to the live bus before reading the backlog, so nothing falls between them |
+| GET | `/api/v1/events?after=&kinds=` | Server-Sent Events from the durable log in sequence order. `kinds` (comma-separated) filters what is sent. Each event has `id: seq`, `event: kind` and the JSON event. The live bus wakes the stream when it is caught up, including when a subscriber has fallen behind. Keep-alive comments every 15 s |
 | GET | `/api/v1/events/page?before=&limit=&kinds=` | A page of the log, oldest first: up to `limit` (default 100, at most 500) events of `kinds` before `before` (from the newest when absent). `{events, more, last_seq}`: `more` says older ones remain, and `last_seq` is the log's newest seq, read under the same lock, for the stream to go on from. Keys redacted as in the stream (0.15.1) |
 | POST | `/api/v1/approvals/{id}` | `{approved, text?}`. Resumes the parked task; `text` replaces the card's text (§6.11). 400 if it can't, 404 if unknown or expired, 409 if another task is running |
 | POST | `/api/v1/actions/{id}` | `{choice: done or skip}` on an Action needed card. Starts a new task with "I've done what you asked… continue" or "I'm skipping that step…" |
 | POST | `/api/v1/stop` | Stops the running task, or gives up on a parked one |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
-| GET, PUT | `/api/v1/settings` | `{model, allow_actions, auto_approve, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}`. `model` is stored as given (§11) |
+| GET, PUT | `/api/v1/settings` | Returns model, browser, Auto approve and memory consolidation settings. PUT accepts individual fields for ordinary settings. Older clients may also disable Auto approve here. `model` is stored as given (§11) |
+| PUT | `/api/v1/settings/auto-approve` | `{enabled, expected_version?}`. Enabling requires the current `auto_approve_version` from settings or returns 409. Disabling always succeeds if the store is writable and invalidates earlier confirmations |
 | GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active ones by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older clients still read it |
 | POST | `/api/v1/memory/consolidate` | Memory v2: consolidate now (`{ok, tasks, mode}`); it still waits for a running task |
 | GET | `/api/v1/memory/consolidation` | Memory v2: consolidation's mode, model, daily cap, this month's cost, last run and how many tasks wait |
-| POST | `/api/v1/memory/{id}/restore` | Memory v2: brings back an expired or replaced memory (a replaced one replaces its successor in turn) |
-| GET | `/api/v1/memory/export?format=json\|markdown` | Memory v2: JSON is `{version: 1, exported_at, agent, memories}` (all but deleted); Markdown is the active ones by kind |
+| POST | `/api/v1/memory/{id}/restore` | Memory v2: brings back an expired or replaced memory (a replaced one replaces its successor in turn). Resets what decay looks at (`last_recalled` to now when it had one; a model-saved fact's importance to at least 0.5), so the next run doesn't expire it again. 409 at the 2,000 active-memory cap, 404 for an unknown id |
+| GET | `/api/v1/memory/export?format=json\|markdown` | Memory v2: JSON is `{version: 1, exported_at, agent, memories}` (all but deleted; an active memory past `valid_until` exports as `expired`, as the list shows it, so import passes over it without a skip); Markdown is the ones still in effect, by kind |
 | POST | `/api/v1/memory/import` | Memory v2: a JSON export (its active memories) or `[{text, kind?}]`, at most 2,000 (and under the 2,000-memory cap). Each goes through the content checks and is in use at once, marked `imported`: nothing waits for approval. Returns `{imported, rejected: [{text, reason}]}` |
 | DELETE | `/api/v1/memory/{id}` | Forget. Memory v2: status `deleted` (purged after 30 days) |
 | POST | `/api/v1/memory/{id}/confirm` | Vouch for an unverified memory. Memory v2: an inferred or imported memory (a hint) becomes user-stated |
@@ -645,7 +640,7 @@ POST /approvals/{id} ──► answer_approval(): load the checkpoint, remove th
   - model calls and browser actions are dropped at once (`tokio::select!`);
   - a shell command's systemd unit is stopped, which kills everything it started;
   - the web app gets `task.stopping` immediately.
-- **Restart recovery.** Chat tasks still marked `running` when agentd starts were cut off: each gets an "I was interrupted…" answer and the status `interrupted`. Scheduled runs are queued again once, quietly (§6.14). Parked tasks keep waiting.
+- **Restart recovery.** Chat tasks still marked `running` when agentd starts were cut off: each gets an "I was interrupted…" answer and the status `interrupted`. A first scheduled attempt is eligible for retry only when the stored action marker is clear (§6.14). Parked tasks keep waiting.
 - **No step limit: the supervisor** (`supervise.rs`). A task runs until it's done, you stop it, or a check finds it stuck. Before a model turn, once `REVIEW_EVERY_SECS` of working time (30 min; time parked on a card doesn't count) or `REVIEW_EVERY_STEPS` turns (60) have passed since the last check, a separate model call with a fresh context reviews the task. It sees your request, the agent's plan, the last check's verdict, and the calls since then (up to 40, arguments and results cut short; tool results are marked as data). It answers `{verdict, reason, advice}`:
   - **progressing:** carry on;
   - **nudge:** the advice goes to the agent as a user-role note, and the task carries on;
@@ -678,7 +673,7 @@ For each tool call:
   - a bare `sleep`: the browser tools already wait;
   - `curl … | sh` and its variants;
   - scheduling through the shell (`crontab`, `at`, `batch`, `systemd-run --on-*`, enabling a `.timer`);
-  - anything touching the egress controls (§6.10);
+  - anything touching the egress controls (§6.10): Squid's configuration, the guard firewall, `neodirect.slice` and the privileged helper;
   - a bare `date`: the model is told the user's date instead.
 - **Shown** as a `step` event, then dispatched (`call_tool`). Errors become `error: …` text for the model; a `Park` error parks the task.
 - **Redacted** of saved key values.
@@ -715,19 +710,19 @@ For each tool call:
 | `open_url` | `url`, `new_tab` | Navigates, waits until the page is ready (§6.9) and says whether it's a sign-in page | No. Only http(s), and never localhost, `.localhost`, `.internal`, private, link-local, CGNAT (Tailscale) or IPv6 ULA/link-local addresses |
 | `read_text` | `max_chars` (12,000; 500–100,000) | `document.body.innerText`, truncated | No |
 | `snapshot` | `max_chars` | The accessibility tree, one line per element: role, name, `ref` (backend DOM node id) | No |
-| `click` | `ref`, or `role` + `name`, or `text`; `summary` (§6.11) | Scrolls into view, checks it's actionable, clicks at its centre | Yes for risky labels (send, delete, archive, buy, pay, submit, confirm, sign out…), unless it's a navigation role (link, row, tab, option, treeitem, gridcell, heading) or the Send button of a message just approved. Refused in read-only mode |
-| `type_text` | `ref` or `role` + `name`, `text`, `submit` | Focuses and inserts text, then optionally presses Enter | Yes, except in search fields. In a message field (Message…, Reply…, Comment…), approving the text also lets it press Enter or Send within the next 3 calls ("one approval per message") |
-| `press_key` | `key`, `summary` (§6.11) | A key press | Navigation keys never ask; Enter in a search box or combobox doesn't either. Other keys ask (letters are app shortcuts). Only navigation keys in read-only mode |
+| `click` | `ref`, or `role` + `name`, or `text`, with `summary` | Checks the target and requests one click | Always |
+| `type_text` | `ref` or `role` + `name`, and `text` | Requests approval to insert the full text into the field | Always |
+| `press_key` | `key`, `summary` | Requests one key press at the focused control | Always |
 | `wait_for` | `text`, `timeout` (10 s; 1–25) | Until the text appears, or the page is idle without it | No |
 | `show_screenshot` | `caption` | Saves a JPEG and shows it in the chat | No |
 | `needs_user` | `reason` | Ends the task with an Action needed card: a screenshot and the page | Not an approval: you sign in or solve the CAPTCHA, then I'm done, Skip or Take over |
 | `update_plan` | `items` ([{step ≤ 120 characters, status: pending, in_progress or done}], 1–20) | Replaces the task's plan; a chat task's goes to the web app as a `plan` event, the checklist. The prompt asks for one on tasks of three or more steps. The supervisor reads it to judge progress | No |
-| `remember` / `forget` | `text` / `id` | Long-term memory (§6.13) | Not an approval, but memories saved after outside content are unverified |
-| `remember` / `forget` / `search_memory` (memory v2) | `text`, `kind` (rule, preference, fact), `replaces`, `valid_until` / `id` or `query` / `query`, `kinds`, `limit` | Memory v2 (§6.13): save with a kind, possibly replacing a note; forget by id or by a clear description; search beyond the notes in the prompt | No: nothing waits for approval since 0.15.2. Outside content makes a rule or preference an inferred fact (§6.13) |
+| `remember` / `forget` | `text` / `id` | Save or remove an inferred note (§6.13) | Standing changes require the owner |
+| `remember` / `forget` / `search_memory` (memory v2) | `text`, `kind` (rule, preference, fact), `replaces`, `valid_until` / `id` or `query` / `query`, `kinds`, `limit` | Save or replace inferred notes, forget by ID or description, and search memory (§6.13) | Standing changes require the owner |
 | `schedule_task` | `name`, `prompt`, `cron` or `at` | Sets up a scheduled task (§6.14) | Only after outside content. Refused in scheduled runs |
 | `list_schedules`, `cancel_schedule` | `id` | Manage schedules | No |
 | `read_skill` | `name` | Returns a skill's Markdown (§6.16) | No |
-| `run_shell` | `command`, `summary` (what it does in plain words, for the approval card), `timeout` (120 s; 1–900), `secrets`, `direct_internet` (§6.21) | Runs bash as `worker` (§6.10) | `sudo …`, `direct_internet`, dangerous patterns, and data-out after outside content |
+| `run_shell` | `command`, `summary`, `timeout` (1–900 s), `secrets`, `direct_internet` | Runs Bash as `worker` (§6.10) | Always for saved keys, direct internet, and recognized data-out after outside content. Other risky commands follow Auto approve |
 | `request_secret` | `name`, `label`, `why`, `how`, `url`, `replace` | Asks you for an API key or token (§6.15) | Always: it's a card with a secure field |
 | `request_access` | `hosts` (at most 5), `why` | Asks you to let the shell reach sites the proxy refuses (§6.20) | Always: it's an `access` card |
 | `report_outcome` (memory v2, scheduled runs only) | `outcome` (result, nothing, blocked), `summary` (≤ 180 characters) | Ends a scheduled run. `nothing` leaves a quiet row in the chat; `result` and `blocked` show the report in full. The outcome goes on `run.finished` and in the journal | No |
@@ -780,143 +775,80 @@ The cap is a safety net: 10 s for `open_url`, and the `wait_for` timeout. Measur
 
 **Sign-in detection.** A heuristic: a visible password field, or a sign-in URL. It adds a hint to `open_url` results and triggers the one-time `needs_user` reminder.
 
-**Screenshots.** `Page.captureScreenshot`, JPEG quality 70, only for `show_screenshot`, Action needed cards and click or key cards (§6.11).
+**Screenshots.** `Page.captureScreenshot` produces JPEGs for `show_screenshot`, Action needed, and browser approval cards. Approval screenshots leave the document unchanged.
 
 ### 6.10 The shell tool
 
-**Unit.** Each command runs as a transient systemd unit:
+Each command runs as `worker` in a transient systemd unit. The root-owned
+`neo-agent-privileged` helper accepts fixed operations to launch or stop a
+worker and apply proxy policy. It validates requests and chooses the account,
+unit settings, resource limits, and route. The owner uses SSM for system
+administration.
 
-```
-sudo -n -- systemd-run --quiet --pipe --wait --collect --service-type=exec
-  --unit=agentd-cmd-<12 hex> --working-directory=/home/worker/work
-  --property=RuntimeMaxSec=<timeout> --uid=worker
-  --property=NoNewPrivileges=yes --property=CapabilityBoundingSet= --property=AmbientCapabilities=
-  --property=PrivateTmp=yes --property=ProtectSystem=full --property=ProtectKernelTunables=yes
-  --property=ProtectKernelModules=yes --property=ProtectKernelLogs=yes --property=ProtectControlGroups=yes
-  --property=ProtectClock=yes --property=ProtectHostname=yes --property=RestrictSUIDSGID=yes
-  --property=RestrictRealtime=yes --property=LockPersonality=yes
-  --setenv=HTTP_PROXY=… --setenv=HTTPS_PROXY=… --setenv=NO_PROXY=localhost,127.0.0.1,::1 (and lower case)
-  --property=MemoryMax=2G --property=TasksMax=512 --property=CPUQuota=200%
-  [--property=LoadCredential=NAME:/var/lib/agentd/secrets/NAME …]
-  -- bash -lc '<exports of the named keys>\n<command>'
-```
+The runner uses Bash without profile files. Commands with saved keys or
+direct networking get a temporary home and a system-only executable path.
+Saved keys are passed to the exact approved command via systemd credentials.
+An approved process can use the token while it runs. Give it a narrowly
+scoped token and review the command that will receive it.
 
-The hardening follows moltis' container settings (MIT).
+A command needing approval must include a plain explanation. Piped installs,
+shell scheduling, bare `sleep` and `date`, and attempts to edit egress
+policy are refused by the tool. These text checks supplement the OS and
+network controls.
 
-**Commands starting with `sudo`** run as root in the same kind of unit without `--uid` or the hardening: approved root commands may need to change the system. They always ask first. The guard firewall doesn't filter root and no proxy is set, so they also have unfiltered internet, and can read everything on the desktop, the model key included.
+Agentd drains stdout and stderr continuously with bounded buffers. The model
+gets the beginning and the app log gets the end. Literal key values are
+redacted with the command's credential snapshot. Systemd enforces the
+command's time limit and stops its process group when cancelled.
 
-**Direct commands** (§6.21) keep the hardening and the limits, without the proxy's variables.
-
-**Refused outright, not even asked** (`guard.rs`; the model is told why, and nothing is shown):
-- a bare `sleep` or `date`, a piped install script, scheduling through the shell;
-- anything touching the egress controls: Squid (`/etc/squid`, `squid -k`, the service; your list in `/etc/squid/agentd` too) or the guard firewall (`neo-agent-guard`, its table `neo_agent_guard`, `guard.nft`, `/etc/neo-agent`). These stop injected instructions from sending data anywhere, so they're the deployment's (Ansible's `agentd_shell_allowed_domains`/`agentd_shell_extra_domains`) and yours (§6.20: a card the agent can only ask for, or Settings), never the agent's commands'.
-
-**A command that needs approval must come with a plain summary** (`guard::is_plain_summary`): present, not the command itself, no shell symbols or flags, and not starting with a program's name. Otherwise it isn't shown or logged, and the model is asked to call again with one (`SUMMARY_REFUSAL`). The card leads with it; the command is a click away.
-
-**Output.**
-- stdout, then stderr, trimmed.
-- The model gets `exit code N` and the first 8,000 characters.
-- The web app's log gets the last 4,000 (`shell.output`; the chat doesn't show it).
-- Saved key values are redacted before either cut.
-
-**Timeouts and Stop.**
-- `RuntimeMaxSec` ends the unit at the timeout (clamped to 1–900 s).
-- agentd's own backstop is the timeout plus 15 s.
-- Stop runs `systemctl stop` on the unit, which kills its whole process tree.
-
-**Who can do what.**
-
-| User | Can |
-|---|---|
-| `agentd` | `sudo` anything (the `sudoers` rule), but it only ever runs `systemd-run`, `systemctl stop`, `squid -k reconfigure` and `nft` on the `direct_egress` set. Reaches Chrome DevTools. Reads the model key. Not the metadata service (§5.5) |
-| `worker` | Its own home, Nix, the proxy. No sudo; no DevTools, VNC, noVNC, metadata or DNS (§5.5). Can't read `/var/lib/agentd`, `/etc/agentd` or the agentd socket |
-| `agent` (desktop) | Runs X, XFCE and Chrome. `/home/agent` (the Chrome profile) is private. agentd never runs anything as it |
-
-**Local development.** With `RUN_AS` empty, commands run as `bash -lc 'cd <workdir> && <command>'` with a cleared environment (`PATH`, `HOME` and the named keys).
+Local development with `RUN_AS` empty uses the current account and a
+cleared environment. Use a production runner for worker and egress isolation.
 
 ### 6.11 Approvals and policy
 
-**Command approvals** (`policy.rs`). A command asks if:
-1. it starts with `sudo` ("runs as root"); or
-2. it matches a dangerous pattern. The defaults, overridable through `policy.toml` from the Ansible variable `agentd_dangerous`, are:
-   - `su`, `doas`;
-   - recursive or forced `rm`;
-   - disk tools (mkfs, dd, shred, wipefs, fdisk, parted);
-   - shutdown and reboot;
-   - `systemctl stop|disable|mask|kill|restart`;
-   - `kill`, `pkill`, `killall`;
-   - downloaded scripts piped into a shell;
-   - `chown`, and `chmod` that makes system paths writable;
-   - writes to `/etc`, sudoers, passwd and shadow;
-   - `crontab`, `at now`;
-   - force-push;
-   - SSH keys;
-   - anything naming agentd, tailnet-proxy or `/run/agentd`;
-   - listening sockets and firewall tools;
-   - user management;
-   - the Chrome profile;
-   - `tailscale`.
+**Shell.** Saved keys, direct network access, and commands identified as
+data-out after outside content always ask. Other risky commands follow the
+deployment's patterns and Auto approve setting. Cards contain the command,
+the requested keys, the reason, and the model's summary. Edits cannot add
+credentials to an existing grant.
 
-   Or:
-3. the task is tainted and the command can send data out:
-   - `curl`, `wget`, `nc`, `ncat`, `netcat`, `socat`, `telnet`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `mail`, `sendmail`;
-   - `git push`, `git send-email`;
-   - `gh` commands that write (`api`; `gist create|edit`; `issue`/`pr` `create|comment|edit|close|reopen|merge|review`; `release create|upload|edit`; `repo create|fork|edit|rename|delete|sync`);
-   - `npm`, `pnpm` and `yarn` `publish`, `cargo publish`, `twine upload`.
+**Browser.** Every click, typing action, and key press needs a separate
+approval. Browser actions off and unattended runs block these inputs.
+Cards include the page URL, destination when available, nearby context, and
+the entire text to be typed. URLs on cards show scheme, host, port and path
+only: query strings and fragments can carry tokens, so the binding keeps a
+SHA-256 digest of the full address instead. Submission has its own approval.
+Agentd binds review to the tab, document, target node, and current form
+state, then checks the binding again before sending input. The checks run in
+an isolated world and read form and document properties through their
+prototypes, so fields named `action`, `elements` or `title` can't hide the
+destination or a password field. A text target binds its element, and
+targets inside open shadow roots are supported. Just before a click,
+an isolated-world hit test at the click point must land on the target, a
+label of it, or something inside it. Otherwise nothing is clicked and the
+model is told the page changed. Typing re-checks that focus is on the
+reviewed field and not on a password or one-time-code input. Use Take over
+for sensitive fields or a target the tool cannot verify. A generic website controls what happens
+after input or navigation. Its interface cannot establish all server-side
+effects.
 
-These patterns are a speed bump against mistakes and injected instructions, not a security boundary. The boundaries are the privilege split, the guard firewall and the egress allowlist.
+**Editing.** The web and Apple apps can edit cards that carry
+`editable: true`. Shell, typing, and schedule edits re-enter the same
+validation path. Unchanged authority and a matching target are required for
+resuming the action. Older parked shell and browser cards without the current
+binding expire on approval.
 
-**Browser gates.** Clicks, typing and keys are gated as in §6.8. With **Browser actions** off (read-only mode), they're refused rather than asked.
+**Auto approve.** This off-by-default setting affects eligible worker
+commands and schedule setup. Approval is still required for browser input,
+saved keys, direct networking, proxy allowlist grants, and recognized
+data-out after outside content. Only a user can enable it through the
+version-checked settings endpoint (§6.4). `auto_approve.changed` and
+`approval.auto` record the decisions. A background run reports an action
+it could not take if it would need a person to answer.
 
-**Cards.** The card kinds and what they show:
-
-| Kind | Shows |
-|---|---|
-| `shell` | Plain summary, reason, keys used, taint, and the command behind "Show the command" |
-| `browser` | Action (type, key or click), target, the exact text, submit/sends, site, reason. A click or key also has the agent's `summary`, the page's `page` and `url`, the text `around` it, and an `image` |
-| `schedule` | Name, prompt, when |
-| `secret` | Label, why, how (Markdown), link and its host, replace, tainted |
-| `access` | The hosts, why, tainted (§6.20) |
-| `stuck` | From the supervisor, not an action (§6.6): the reason, working `minutes`, `steps`, `plan` ({done, total} or null). Approve is Keep going, deny is Stop; nothing to edit, and Auto approve never answers it |
-
-Each answer records who gave it (`by`, from `X-Tailscale-User`).
-
-**What a click or key card shows** (0.15.14). A button's name rarely says enough ("Confirm"), so these cards carry two kinds of information, and the web app keeps them apart.
-- **The agent's reason:** `summary`, what it does and why, in plain words. Without one, or with only the button's name, the model is told to call again with one, and no card is shown (`BROWSER_SUMMARY_REFUSAL`). A fooled model can write a misleading one.
-- **What the page shows, which the model can't change:** the title and address (without the query, which can hold tokens), the text around the element (the dialog, row or form it's in, at most 300 characters), and a screenshot with the element outlined for a moment (`Browser::place_of`, `picture_of`). All of it is redacted like any event, though the screenshot can show whatever's on the page.
-- **Still the same action?** `same_request` also compares the text around it. Found by name, "Delete" could be another row's by the time you answer. A row that changes by itself (a live counter) gives "the page changed", and the agent asks again.
-- A scheduled run or Auto approve shows no card, so none of this is gathered for them.
-
-**Editing a card** (0.15.13). On a card about text the agent wrote, you can change it before approving: a command, what to type in the browser, or a schedule's instructions (not its name or time). The web app offers Edit only on a card with `editable: true`, because an older agentd would ignore the edit and run the agent's words. `POST /api/v1/approvals/{id}` takes `text` alongside `approved`; blank text or a card that can't be edited gets a 400, and nothing runs.
-- **It goes through the same checks:** the task resumes by running its parked call again, so the edit is written into that call (`apply_edit`), not just the card. A command you edit to something refused outright (§6.10) stays refused, and one that now needs no approval simply runs. The card is rebuilt to match, including which saved keys the command names, so the action still counts as the one approved. A schedule keeps its name.
-- **Who knows:** the model's own call still shows its words, so its result ends with a note saying what you approved, redacted like any result and outside the `<untrusted>` label. `approval.resolved` carries `edited: true` and the text.
-
-**Never in a scheduled run.** Nobody is watching, so `approve()` returns `Decision::Unattended` instead of parking the task, whatever the card: the action isn't done and the model is told to say so in its report ("not run: it runs as root, and a scheduled run can't wait for the user's OK…"; a key request gets "not asked: a scheduled run can't ask for keys…"). A schedule set to **run without asking** lets its commands go ahead instead, except root and direct ones (§6.14, §6.21). The run's framing says which (`UNATTENDED_RULE`, `AUTO_APPROVE_RULE`).
-
-**Auto approve** (0.15.12; the setting `auto_approve`, off by default). One switch for the whole desktop, in the web app's Settings, which asks for confirmation before turning it on. It's set only through `PUT /api/v1/settings`: the model has no tool for it, and the shell can't reach the API socket or the database. While it's on, nothing waits for anyone's OK, in a chat or a scheduled run, whatever a schedule's own "Run without asking" says (§6.14). Commands as root, direct connections (§6.21), dangerous patterns, data-out after outside content, browser changes, new sites (§6.20, recorded as allowed by "Auto approve") and schedules after outside content all go ahead, with no plain summary needed. Scheduled runs are told so in their framing (`AUTO_APPROVE_ALL_RULE`).
-- **What stays:** a key request still needs a person, who has the value (a chat shows the card, a scheduled run reports it missing). So do Action needed cards. Browser actions off still refuses browser changes, since that's a refusal, not a question. The outright refusals in `guard.rs` (§6.10) stay, and a scheduled run still can't set up schedules.
-- **When it applies:** it's read at each action, so turning it off applies to the next one. A card already waiting when it's turned on stays until someone answers it.
-- **What's recorded:** `auto_approve.changed` says who turned it on or off. Each action it lets through gets an `approval.auto` event holding what the card would have shown, redacted like every event, and a journal line with only the kind. The policy version differs while it's on, so runs under it can be told apart.
-- **What it gives up:** every approval. Text that fools the model can run commands as root, which reach everything on the desktop (saved keys, the model key, the Chrome profile, the firewall and proxy settings, this setting), and act in your logged-in browser, with no card. It's for desktops holding nothing you would mind losing.
-
-**Policy version.** `Policy::version` is the first 16 hex characters of a SHA-256 over:
-- the approval patterns, sorted;
-- Browser actions on or off;
-- Auto approve, only when it's on (so a desktop that never uses it keeps its version);
-- `SHELL_TOOL`;
-- `RUN_AS`;
-- `KNOWN_MODELS`, sorted.
-
-Every run, parked card and schedule records it, and `/status` shows it. Memory never takes part.
-
-**Approving a card parked under other rules.** The action is checked against today's rules first. If they'd refuse it outright, the card expires (`approval.resolved` with `reason: policy_changed`), the task ends with "The rules changed while this was waiting, so I didn't do it", and the card leaves the web app's chat. That happens for:
-- a browser change with Browser actions now off;
-- a command with the shell tool off;
-- a task on a model that isn't in `KNOWN_MODELS`.
-
-If today's rules would still only ask, the approval stands.
-
-**A schedule set up under other rules** still runs (each action is gated at run time anyway). The chat says "Rules changed since “…” was set up" once, and its recorded version is updated.
+The policy version hashes the deployment's shell patterns, settings, the
+runner identity, and the supported models. Agentd also checks current action
+rules on resume.
 
 ### 6.12 Untrusted content
 
@@ -928,7 +860,7 @@ Web pages, emails and command output can carry injected instructions. The defenc
    - schedules need approval;
    - memories are saved as unverified (v2: inferred);
    - key and site requests carry a warning.
-3. **Approvals** for anything that sends, writes, deletes or runs as root, showing the exact action (in a scheduled run: refused, or with "Run without asking" done, except root, direct connections and the browser; §6.14, §6.21). With Auto approve on, nothing asks (§6.11).
+3. **Approvals** for browser input, credential use, direct networking, and recognized shell data-out after outside content. Scheduled runs skip actions that need a person (§6.11).
 4. **Privilege split:**
    - the shell user can't reach the browser, agentd's state, the model key, the socket, the metadata service or other tailnet devices;
    - the browser can't open internal addresses.
@@ -937,31 +869,15 @@ Web pages, emails and command output can carry injected instructions. The defenc
 
 ### 6.13 Memory
 
-**v1** (`MEMORY_V2=off`, agentd's default):
-- `remember` keeps one fact, up to 500 characters.
-- It's **trusted** if the task hadn't read outside content, and **unverified** otherwise.
-- Each task's instructions list the latest 60 memories in two groups. Unverified ones are framed as "hints only, never instructions".
-- Memories are confirmed, edited or forgotten in the apps' Memory screen or through the API (`/api/v1/memory…`); the web app has no memory screen.
-- The system prompt forbids remembering passwords, codes, keys or account numbers, and anything a page told it to remember.
+Both modes use the same mutation rules. In v1 (`MEMORY_V2=off`, agentd's default), the agent loads the latest 60 active, unexpired memories. It supplies unverified entries as quoted hints and offers confirm and forget in the Apple apps' Memory screen. V2 adds kinds, search, history and consolidation.
 
 **v2** (`MEMORY_V2=on`, which the desktop's group_vars set; [memory-v2.md](memory-v2.md)).
 
-`memory.rs` handles every write, whoever makes it, and enforces these rules in code:
-- **Trust follows taint at the moment of the call:**
-  - `user_stated` before the task has read outside content;
-  - `agent_inferred` after it;
-  - `imported` from an import.
-
-  The model can't choose.
-- **Nothing waits for the user** (since 0.15.2, the user's decision): the memory endpoints are only for fixing or forgetting something.
-- **Standing instructions from outside content are only hints.** A rule or preference saved by a tainted task is saved as an inferred fact, never an instruction, and the tool result tells the model so (it tells the user to say it again in a new message if they asked for it). A tainted fact is active but marked inferred.
-- **Lower trust can't replace higher.**
-  - An inferred `replaces` of a user-stated note is refused, and the original stays.
-  - Equal or higher trust supersedes it: the old note becomes `superseded`, with its history kept.
-- **Who writes what:**
-  - the model writes rules, preferences and facts, but not in a scheduled run: its report is its record;
-  - only consolidation writes the work log, and nothing else.
-- **Left waiting by an older agentd:** settled at startup (`settle_pending`). Imports and outside-content rules become active (the rule as a fact); tidying up's proposals and conflicts are deleted.
+`memory.rs` enforces trust and lifetime rules for memory mutations.
+- Direct user commands, edits and confirmations produce `user_stated` entries. Model saves are `agent_inferred` facts. Imports keep their kind, expiry and importance and have `imported` trust until the user edits or confirms them.
+- The authenticated desktop chat accepts `remember rule: …`, `remember preference: …`, `remember fact: …` and `forget #id`. It applies these exact commands before calling the model. The local TCP development listener uses the Memory API for direct actions.
+- A model can replace or forget eligible inferred entries. User-stated and imported entries require a direct user action. Scheduled tasks can search memory and carry their own reports forward.
+- Upgrades retain older notes as hints when the audit history lacks a direct user action. Legacy pending imports and tainted rules are settled at startup. The Memory screen can confirm or edit the retained notes.
 - **No secrets** (`secrets::looks_like_secret`), refused with a pointer to `request_secret`:
   - key formats (GitHub, OpenAI, Anthropic, Together, Slack, AWS, Google, Hugging Face, Stripe, GitLab);
   - card numbers that pass Luhn;
@@ -971,14 +887,14 @@ Web pages, emails and command output can carry injected instructions. The defenc
 
   Emails, phone numbers and addresses pass.
 - **Caps:** 500 characters per memory, 2,000 active memories.
-- **History:** every change is a `memory_events` row and an event.
+- **History:** memory changes have audit rows. Memory step and save events carry metadata. Forget removes a note from recall immediately. The daily purge removes the note, its search entry and its audit text after 30 days. Chat transcripts and deployment database copies have separate retention.
 - **Forget by description:**
   - removes only a clear match: the only hit, or one twice as relevant as the next (bm25);
   - otherwise lists candidates;
-  - rules are forgotten by id only.
+  - rules and other protected entries require a direct user action.
 
-**The notes in the prompt** (phase 2). They're built once per task and kept in its state, so a resumed task has the same notes. They go at the end of the system prompt, after the skills and the v2 memory instructions:
-- **"Your rules and the user's preferences":** always shown, within about 1,500 tokens; the least important preferences are dropped first.
+**The notes in model context.** Agentd builds them when a task starts and rebuilds them when a parked task resumes. Only user-stated rules and preferences go in the system prompt. Earlier reports and the recalled hints arrive in a separate quoted data message.
+- **"Your rules and the user's preferences":** shown within about 1,500 tokens. The least important preferences are dropped first.
 - **"This schedule's last reports"** (a scheduled run only): its last three finished reports from `runs`, newest first, one line each (at most 760 characters each, 2,400 in all), labelled as data. That's how a run knows what's new since last time; scheduled runs write no memories.
 - **"Things you remember (dated hints; the live page wins)":** the facts and work-log entries most relevant to the request: the top 8, about 2,000 tokens.
 
@@ -996,24 +912,25 @@ Web pages, emails and command output can carry injected instructions. The defenc
 **Search.** `search_memory` uses the same ranking as the notes. On the evals, it rescues paraphrases that full-text matching misses.
 
 **Consolidation, "tidying up"** (phase 3, `consolidate.rs`; smaller since 0.15.2, the user's decision).
-- **When:** 10 minutes after the last finished task (a burst consolidates once), or at once when 10 tasks wait. It's a `consolidate` effect (§6.19), never alongside a task.
-- **Which tasks:** finished ones, not stopped, not scheduled runs (the watermark passes them). A batch whose tasks only read or chatted (`runs.acted = 0`) and saved no memory needs no model: it only decays, and is recorded as a run with model `none` at no cost.
+- **When:** 10 minutes after the last finished chat task, or at once when 10 tasks wait. Task completion and enqueuing the `consolidate` effect (§6.19) share a transaction. Consolidation starts when the chat and scheduled worker are idle.
+- **Which tasks:** eligible finished chat tasks, tracked individually. A parked task becomes eligible when it finishes. A batch whose tasks only read or chatted (`runs.acted = 0`) and saved no memory needs no model. It runs decay and is recorded with model `none` at no cost.
 - **Batches:** at most 10 tasks per model call. A full batch that leaves more behind runs the next one 5 seconds later (`Later`). With 20 busy tasks, GLM-5.3-Flash thought for 6,000–8,000 tokens or more per call.
 - **What it does:** it sends the batch (request, answer, status, and whether each task "changed something" or "only read or chatted") and the current memories to `memory_consolidation_model` (GLM-5.3-Flash by default), with the same model client as every task. The reply is a JSON object with `work_log`, `merges` and `expire`, checked here before anything is written:
   - ids must be real and active;
   - texts pass the length and secret checks;
   - one work-log entry per task, only for a task that changed something: what it changed and what's left open, not what it found (at most 200 characters asked);
   - no facts, preferences or rules: a `facts` key is ignored. Task results went stale as facts (2026-11-02);
-  - never changes what the user stated: a merge that would drop it is dropped, a merge into it keeps its words, an expiry of it is dropped.
+  - only inferred facts and work logs can be rewritten or removed in model-proposed merges and expiries. Merges require a shared kind and expiry. User-stated and imported entries can absorb eligible duplicates while keeping their text.
 
   Everything that passes applies at once; nothing is proposed.
-- **A task "changed something"** (`runs.acted`) when it ran a command, made a browser change the gates count as a write (a risky click, typing outside a search field, a key other than navigation, the approved send), or set up or cancelled a schedule. Older tasks (null) count as having acted.
+- **A task "changed something"** (`runs.acted`) when it ran a command, made approved browser input (any click, typing or key press), set up or cancelled a schedule, or had a site request approved. Opening or reading a page doesn't count, so a scheduled run that only browsed keeps its quiet retry. Older tasks (null) count as having acted.
 - **Modes (`memory_consolidation`):** `auto` ("Tidy up after tasks" on, the default) or `off`. A saved `observe` ("Review first", removed in 0.15.2) reads as `auto`.
 - **Decay:**
-  - facts not recalled for 60 days lose 10% importance per run;
-  - unimportant ones not recalled for 180 days expire;
-  - work-log entries expire after a year;
+  - inferred facts not recalled for 60 days lose 10% importance per run;
+  - unimportant inferred facts not recalled for 180 days expire;
+  - inferred work-log entries expire after a year unless they have a user-set lifetime;
   - so does anything past `valid_until`.
+  - Losing importance doesn't change a memory's `version` (the edit-conflict token), so an edit opened before the run still saves; expiring it does.
 - **Accounting:** each run is a `runs` row (`kind = consolidation`) with its cost, under a daily cap (`memory_consolidation_daily_cap_usd`, $0.50, at most $10), and emits `memory.consolidated`.
 - **Reply limit:** 16,384 tokens. GLM thinks before it answers, and with 4,096 tokens a batch of 20 tasks left no room for the JSON (found in the phase 6 soak). A reply without JSON records its `finish_reason` in the effect's error. Each call gets a journal line (`consolidation reply`): tasks, milliseconds, `finish_reason`, prompt, completion and reasoning tokens.
 - **No settings reads inside its transaction:** `apply` holds the store's lock, which isn't re-entrant. 0.15.0 read the time zone there (for a fact's end date) and froze agentd (found in the phase 6 evals before it reached a desktop). Facts, and so dates, are gone since 0.15.2.
@@ -1044,8 +961,8 @@ Both are read in the user's time zone, which the web app sends with every messag
 4. Moves a recurring schedule to its next run, and deletes a one-time schedule once it has run.
 
 **The background worker** (`schedule::work`, also started once the socket is bound) takes the queued run due first (`claim_run`), one at a time, beside the chat. It drops a run whose schedule was paused or deleted meanwhile (`cancelled`), and skips one that waited over an hour (`skipped`, with a note). The queue is in the database, so it outlives restarts:
-- **cut off by a restart:** a scheduled run still `running` when agentd starts becomes `interrupted` and is queued again once (`attempt` 1), quietly, unless it's over an hour late;
-- **failed** (`error`: the model or the network, most likely): queued again once, 2 minutes later. Only the retry's report reaches the chat;
+- **cut off by a restart:** a scheduled run still `running` when agentd starts becomes `interrupted`. A first attempt with no dispatched actions is retried if it is still timely. Otherwise the user is told to check for changes;
+- **failed** (`error`: the model or the network, most likely): a first attempt with no dispatched actions can retry after two minutes. Runs that might have changed something report the error;
 - the retry's failure is reported like any other.
 
 **A scheduled run.**
@@ -1053,15 +970,15 @@ Both are read in the user's time zone, which the web app sends with every messag
 - It starts without the chat history.
 - Its prompt is framed as "(agentd) This is the scheduled task "…" the user set up earlier (…). They aren't watching…", with memory v2's `report_outcome` rule and the rule for what may go ahead (below).
 - It doesn't abandon parked tasks.
-- It can't create schedules.
+- It can't create or cancel schedules.
 - It never waits on a card: what would ask is refused, and its report says so (§6.11), unless the schedule runs without asking.
 - Its commands go out through Squid like a chat's, with the same allowlist and request log.
 
 **"Run without asking"** (`schedules.auto_approve`), per schedule, **on for every schedule a person sets up**: one asked for in a chat that hadn't read outside content (`schedule_task`), or one added through `POST /api/v1/schedules`. The web app doesn't show the switch anywhere.
 - **The exception:** a schedule asked for after outside content (a page, an email or command output) needs a card first, and even once approved it stays off (`created_from = agent_tainted`), so its runs skip whatever would ask.
-- **With it on,** a run's commands go ahead with what would otherwise ask (the policy's patterns, data-out after outside content), **except commands as root and direct ones**, which are refused. Browser changes, key requests and new sites are refused either way.
+- **With it on,** eligible worker commands may proceed. Browser inputs, saved keys, direct network access, proxy allowlist changes, and recognized data-out after outside content still require a person.
 - **Turning it off** is a person's: `PUT /api/v1/schedules/{id}`. It's read at each command, so it applies to the next one.
-- **What it still allows:** a run's commands can send data to any host on the allowlist or that you allowed (§6.20), with whatever account a command brings. In a chat nothing changes: commands ask as in §6.11. Auto approve (§6.11) goes further, for every schedule: root, direct connections and browser changes go ahead too.
+- **Network reach.** Scheduled commands remain subject to the same proxy allowlist as ordinary worker commands.
 
 **Shell scheduling** (`crontab`, `at`, timers) is refused, so every scheduled action goes through the model and the approvals. While the desktop is stopped (`make stop`), schedules don't run.
 
@@ -1086,7 +1003,7 @@ Both are read in the user's time zone, which the web app sends with every messag
 - A command that uses a key and could send data out, after outside content, asks first ("…with your saved key…").
 
 **Redaction.** Every saved value (longest first) becomes `[secret NAME]`:
-- in every tool result before the model sees it, and in shell output before truncation;
+- in every tool result before the model sees it, and in shell output before truncation. Each stream keeps its first 16 KiB and last 8 KiB, captured with an extra 8 KiB (the longest saved value) on each side, so a value is found whole before the cut and a cut never splits one;
 - in every event before it's stored, and again as it streams;
 - in the chat history sent to the model and to the web app;
 - in incoming user messages.
@@ -1107,7 +1024,7 @@ The model therefore never sees a value, even if a command prints one or you past
 
 | Skill | Covers |
 |---|---|
-| `install-software` | Nix first (`nix shell`, `nix profile add`), uv/npm for language packages, `sudo snap`/`apt` (approved) for desktop apps, never `curl \| bash` |
+| `install-software` | Nix first, uv/npm for language packages, and owner administrator access over SSM for system packages |
 | `python` | uv projects, scripts, Python versions |
 | `node` | npm/pnpm/yarn, global CLIs in `~/.npm-global`, no long-running servers between commands |
 | `git-github` | Cloning, branches, commits. A GitHub token via `request_secret`, with a pre-filled fine-grained token URL (`/settings/personal-access-tokens/new?name=…&expires_in=90&contents=write&pull_requests=write`) and steps. A git credential helper that reads `$GITHUB_TOKEN` from the environment (nothing on disk). gh reading `GITHUB_TOKEN`. What 401 and 403 mean |
@@ -1119,21 +1036,21 @@ The model therefore never sees a value, even if a command prints one or you past
 agentd sends notifications itself, to two kinds of recipient and with no relay or app-store server in between: **browsers** by Web Push (RFC 8030), and the **iPhone and Mac apps** by APNs. `notify.rs` decides what to say and queues one effect per recipient; `webpush.rs` and `apns.rs` are the two deliveries. What notifies you, and when, is the same for both.
 
 - **Web Push to browsers:** to the browsers where you turned notifications on in the web app (Settings → Notifications, §7.2). The push service in between (Apple's for Safari, Google's FCM for Chrome and Edge on a Mac, Mozilla's, Microsoft's WNS) carries ciphertext only: the payload is encrypted to the browser (RFC 8291, `aes128gcm`, one 4096-byte record), and each request is signed with this desktop's VAPID key (RFC 8292, ES256), made on first use and kept in `settings` (`vapid_pkcs8`), so `agentd-reset` makes a new one. Its token names the push service's origin, expires in 12 h, and carries `VAPID_SUBJECT` as the contact. Browsers subscribe with its public half.
-- **APNs to the apps:** off unless an APNs key is configured (`APNS_AUTH_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID` in `secrets.env`, from `make apns-key`; `Apns::from_config`). agentd signs a provider token (a JWT, ES256, with your `.p8` key, cached ~40 min) and POSTs to `api.push.apple.com` or `api.sandbox.push.apple.com` over HTTP/2, TLS the only encryption. The app registers its device token and its own bundle id (the APNs topic) through `POST /api/v1/devices`; the key never leaves the desktop, and needs the paid Apple Developer Program. An approval card's notification carries category `APPROVAL`, so the app shows Approve and Deny on the notification itself (apps/apple `PushCenter`); the answer goes back over the tailnet when the app opens.
+- **APNs to the apps:** off unless an APNs key is configured (`APNS_AUTH_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID` in `secrets.env`, from `make apns-key`). agentd signs an ES256 provider token with your `.p8` key and sends over HTTP/2 with TLS to Apple. The app registers its device token and bundle ID through `POST /api/v1/devices`. Tapping an approval notification opens the full card for review. The app attempts to remove its registration before signing out. You can remove a recipient from web Settings → Notifications if the app could not reach the desktop at sign-out.
 
 - **What notifies you:**
-  - a card that waits on you, from `ask` (urgency high, TTL 24 h): "Needs your OK" with the command's summary, "Write this?" / "Write and send this?" / "Click this?" / "Press …?", "Schedule this?", "Needs a key", "Let it reach a site?", "Looks stuck";
+  - a card that waits on you, from `ask` (urgency high, TTL 24 h): "Needs your OK" with the command's summary, "Write this?", "Click this?", "Press …?", "Schedule this?", "Needs a key", "Let it reach a site?", or "Looks stuck";
   - Action needed, with its reason;
   - a chat task that worked over a minute and ends `done` ("Done", with the answer's first line of prose) or `error` ("Hit a problem");
   - a scheduled run with something to report: its name, and `report_outcome`'s summary or the answer's first line. Not a quiet run (`nothing`), a cancelled one, or a failed first try that's being retried.
 
   Not: a quick chat answer, a task you stopped, or Stop on a stuck card.
-- **Payload:** title (≤ 80 characters) and body (≤ 180), saved keys replaced with `[secret NAME]` first. The tag is the task's id, so a newer notification about a task replaces the older one: on the web it's the Web Push `tag` with `url: "/#/chat"`; on the apps the APNs `thread-id` and `apns-collapse-id`, plus the task and card ids as top-level keys the app deep-links and acts on.
+- **Payload:** title (≤ 80 characters) and body (≤ 180), with saved keys replaced by `[secret NAME]`. The task ID groups notifications. Web Push carries `url: "/#/chat"`. APNs includes the task and card IDs so the app can open the card.
 - **Delivery:** a `web_push` effect per browser or an `apns` effect per app, keyed by recipient and tag (§6.19), so an unsent notification is replaced by a newer one for the same task and device, and a slow service for one device never re-sends to another. Web Push: 2xx done (with `last_sent`), 404/410 the browser unsubscribed (row deleted), 429/5xx retried (after `Retry-After`), anything else dropped. APNs: 200 done, 410 or `BadDeviceToken`/`Unregistered` the token is gone (row deleted), 429/5xx retried, anything else dropped. Not delivered within an hour, or after 5 failures, a notification is dropped rather than left to show as a problem.
 - **Recipients:**
   - **browsers** (`push_subscriptions`): at most 20. An endpoint must be https on a known push service's host (`fcm.googleapis.com`, `*.push.apple.com`, `*.push.services.mozilla.com`, `*.notify.windows.com`, no port), so a subscription can't aim agentd's requests elsewhere; `PUSH_DEV_ENDPOINTS=on` (local development only) also takes `http://127.0.0.1`. Keys are checked: a 65-byte uncompressed P-256 `p256dh` and a 16-byte `auth`.
   - **apps** (`device_tokens`): a hex device token, the app's bundle id as the topic, and `sandbox` or `production` (which APNs host to use). They stay on the desktop: the API lists browsers and apps by label, never their tokens or keys.
-- **Tests:** RFC 8291's worked example byte for byte with its intermediate values; the VAPID signature verified; the whole Web Push path to a stand-in service, decrypted with the browser's key; the APNs provider token's header, claims and caching; Apple's answers classified (gone, refused, retry); the `.p8` loaded as PEM or base64; the APNs payload's alert, category and ids; a registered app getting one `apns` effect per notification; saved keys cut out; a 410 forgetting the recipient. On 2026-11-11 a test notification went through Mozilla's real push service to a scripted browser and decrypted correctly.
+- **Tests:** RFC 8291's worked example, VAPID signing, Web Push delivery to a stand-in service, APNs key parsing and token signing, response classification and recipient removal, and APNs card links with legacy action categories removed.
 
 ### 6.18 The user's clock
 
@@ -1167,38 +1084,28 @@ Side effects are stored first and done afterwards. Each is a row in `effects`, w
 
 ### 6.20 Sites the agent can reach (`access.rs`)
 
-Until 0.15.10 a new site for the shell meant changing Ansible's list and deploying. Now the agent asks, and you decide in the chat:
+The worker proxy accepts deployment hosts and exact public DNS names
+approved by the owner. A proxy refusal suggests the `request_access` tool,
+and Settings offers direct owner edits. Scheduled runs report new sites they
+need. Auto approve cannot grant a site.
 
-1. **A refused site.** Squid answers `403` to a `CONNECT` for a host that isn't listed. When a command's output shows that (curl's `CONNECT tunnel failed, response 403`, git's `HTTP code 403 from proxy`, Python's `Tunnel connection failed: 403`, wget's, Squid's `ERR_ACCESS_DENIED`), agentd adds a note for the model: call `request_access` with that exact host. The prompt says the same, and never to work around the proxy.
-2. **The card.** `request_access {hosts, why}` checks each host (`access::check_host`) and drops those already reachable, the deployment's list included (`.github.com` covers `api.github.com`). Then it parks on an `access` card: the hosts, why, and, after outside content, a warning (`tainted`). The card also carries `summary`, `reason` and `command`, so a client that doesn't know the kind shows it as "Let your agent reach …" rather than as an empty command.
-3. **Allow.** agentd saves the hosts (`egress_hosts`, with who allowed them, the task and why), writes Squid's file whole (renamed into place), and runs `sudo -n squid -k reconfigure`. If Squid can't be told, the hosts are taken back off and the model hears so. The task resumes and retries. "Don't allow" opens nothing, and the model is told not to try another way.
-4. **Settings → Sites your agent can reach** (web app) lists your sites, with who allowed them and why. You can remove one, or allow one by name (`POST /api/v1/access`). The deployment's list is shown too, read-only.
-
-**What can be asked for:** exact public host names. Not wildcards (`*.example.com`, `.example.com`), IP addresses, single-label names, or internal suffixes (`localhost`, `local`, `internal`, `lan`, `home`, `corp`, `intranet`, `home.arpa`, the reverse-DNS zones, `ts.net`). At most 5 hosts a request, 100 in all. Squid still refuses internal addresses whatever a name resolves to (§5.6, rule 1).
-
-**What it doesn't change:**
-- the agent's commands can't edit the list or reload Squid (`guard::touches_egress_policy`, even with approval);
-- a scheduled run can't ask: it reports the host it needed, and you allow it in Settings. Once allowed, a host is reachable by scheduled runs too, and the card says so ("scheduled checks included");
-- where `EGRESS_USER_HOSTS` isn't set, the deployment decides alone: the tool says so, and Settings shows the list read-only.
-
-**Setup (Ansible, agentd role):** `agentd_egress_user_hosts` (default `/etc/squid/agentd/allowed-hosts.txt`) creates the directory and an empty file before Squid's configuration is validated. agentd gets `EGRESS_USER_HOSTS` and `EGRESS_BASE_HOSTS` (the deployment's list). At startup agentd writes the file from the database and reloads Squid if it changed, so a restored database and Squid agree. Squid is reloaded only where the shell uses it (`SHELL_PROXY` set), not in local development.
+The database is the desired policy. The privileged helper closes existing
+proxy connections before installing a changed policy and records which
+version has successfully started. Startup and repeat removal requests
+reconcile any incomplete updates. The Squid rules reject unlisted names
+before destination lookup and enforce public addresses at connection time.
 
 ### 6.21 Commands that can't use the proxy (`direct_internet`)
 
-Some tools ignore `HTTPS_PROXY` and connect on their own, often to an address no name leads to (flyctl's Depot builder dials a fresh IP for each build). No host name can be allowed for those, so §6.20 can't help. Since 0.15.11 there are two things for them.
+An attended command may request direct networking if its tool cannot use
+a proxy. The card binds approval to the command, time limit, and routing
+mode. The helper puts only that command's transient unit into the direct
+network slice. The guard blocks local controls, metadata, and other
+nonpublic addresses, and logs new direct connections.
 
-1. **Spotting it.** When a command fails and its output shows no DNS, or a connection refused to somewhere other than this machine (`access::connected_directly`: Go, curl, Node, ssh, wget, Python), agentd adds a note for the model: `request_access` can't help, look for the tool's proxy setting, and otherwise ask for direct internet or tell you what has to run elsewhere. A scheduled run's note says to report it. Root commands, direct commands and local development get no note: the firewall isn't what stopped them.
-2. **One command, if you agree.** `run_shell` takes `direct_internet: true`:
-   - **It always asks,** however harmless the command, on a normal `shell` card with `direct: true` and the reason "connects directly to the internet and can reach any site, not just the allowed ones" (and the policy's reason, if the command is dangerous too). A yes counts only for the same command with the same `direct` (`same_request`).
-   - **The firewall opens for that command.** Holding `shell_turn`, agentd adds `worker` to the guard firewall's `direct_egress` set (§5.5) and takes it out when the command ends. The entry expires by itself 60 seconds past the command's limit, and startup flushes the set, so a stopped agentd can't leave it open. If the entry can't be added, the command doesn't run.
-   - **The command** runs as `worker` in its usual hardened unit, without the proxy's variables (`Route::Direct`).
-   - With `sudo`, it's an ordinary root card: root isn't firewalled.
-
-**What stays closed:** internal addresses, the instance metadata service and the desktop's controls (§5.5). A scheduled run never gets it, even with "Run without asking": nobody is there to decide (only Auto approve, §6.11, lets one). The agent's commands can't add to the set themselves (`guard::touches_egress_policy`, even with approval).
-
-**What it gives up:** while the command runs it can send data to any public address, with any saved keys it was given, and Squid doesn't log it. The kernel log has each connection's destination and port (`journalctl -k | grep agentd-direct`), not what was sent. After outside content the card warns that the request may be steered (`tainted`). An approved `sudo` command has unfiltered internet anyway, so this is the same decision by you with less privilege.
-
-**Per user, not per command:** the set matches `worker`'s uid. Only the approved command can use it because commands run one at a time (`shell_turn`) and a unit's processes end with it.
+Direct commands require explicit approval and cannot receive saved keys.
+Scheduled runs report that they were blocked. Other worker services do
+not get the direct network grant.
 
 ## 7. tailnet-proxy, the web app and the apps
 
@@ -1374,7 +1281,7 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
    - handlers restart what changed.
 3. On restart:
    - parked tasks survive;
-   - a running chat task becomes `interrupted`, and a scheduled run is queued again once;
+   - a running chat task becomes `interrupted`. A scheduled run is retried once only if no action was dispatched;
    - the web app's stream drops (SIGTERM gives open requests 3 s) and resumes from its last `seq`.
 
 ## 9. Security model
@@ -1386,18 +1293,18 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 | The internet ↔ the desktop | Anyone; the desktop | No public IP and no inbound rules: tailnet-proxy and the SSM agent dial out |
 | Your devices ↔ the desktop | Devices on your tailnet; the desktop | Tailscale (WireGuard end to end), your tailnet's access rules, tailnet-proxy's optional login allowlist (WhoIs), and `door`'s same-site checks against other sites' pages |
 | agentd ↔ the agent's commands | `agentd` vs `worker` | Unix users and file modes (`/var/lib/agentd` 0700, `/etc/agentd` 0750, socket 0660 in a 0750 directory); hardened systemd units; the guard firewall (no DevTools, VNC, noVNC, IMDS or DNS for `worker`); the Squid allowlist; no sudo for `worker` |
-| agentd ↔ the browser | `agentd` vs `agent` | agentd reaches Chrome only over CDP on localhost. The Chrome profile and X cookie are private to `agent`. `open_url` refuses internal addresses and `file:` |
+| agentd ↔ the browser | `agentd` and `agent` | CDP is on localhost. Chrome's socket traffic is filtered independently of browser URL validation. |
 | The model ↔ the desktop | The model's tool calls | agentd's tool layer: approvals, gates, refusals, the step budget, redaction. The model never sees secrets |
 | The desktop ↔ the model provider | agentd; Together | TLS with the system's CAs and your key as a bearer token. What Together keeps is your account's setting |
 | The desktop ↔ your AWS account | The instance role | SSM's managed policy only, denied the project's parameters; the metadata service is root-only on the desktop |
-| You ↔ the agent | Root over SSM; agentd | You administer the desktop as root. The agent gets root only for a command you approve (or under Auto approve) |
+| You ↔ the agent | Root over SSM and agentd | The owner administers the desktop through SSM. Agentd can call only fixed privileged helper operations. |
 
 ### 9.2 Where each kind of data lives
 
 | Data | Where | Who can read it |
 |---|---|---|
 | Chat history, events, task runs, memory, schedules | `/var/lib/agentd/agentd.db` on the encrypted disk | agentd; root (you, over SSM) |
-| Saved keys | `/var/lib/agentd/secrets/*` (0600) | agentd; root; a command that names them |
+| Saved keys | `/var/lib/agentd/secrets/*` (0600) | agentd; root; a command explicitly approved to use them |
 | Screenshots | `/var/lib/agentd/images` | agentd; root; the web app (over the tailnet) |
 | Logged-in sessions (cookies) | `/home/agent/chrome-profile` | `agent` (Chrome); agentd through CDP; root |
 | The agent's files | `/home/worker` | `worker`; root |
@@ -1411,19 +1318,19 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 
 | Threat | Answer |
 |---|---|
-| A web page or email injects instructions | `<untrusted>` labels; taint makes data-out, schedules and key requests ask, and makes memories unverified. You approve anything consequential and see exact text and commands. The shell is boxed in (no browser, no secrets, allowlist). `open_url` refuses internal targets |
-| The agent sends data to an attacker | Data-out commands ask after outside content; browser sends ask; Squid only reaches listed hosts; `worker` has no DNS. A key given to a command could still be misused against an allowed host (e.g. a GitHub token creating a gist), which is why `gh` writes ask after outside content too. A schedule that runs without asking doesn't ask (§6.14) |
+| A web page or email injects instructions | Outside content and inferred memories enter as data. Browser input, saved credentials, and extra egress require explicit review. |
+| The agent sends data to an attacker | Browser input requires approval. The shell's proxy filters destinations and recognized data-out after outside content requires review. Approved programs can send data to allowed destinations. |
 | The agent approves its own actions | The API is on a socket the shell user can't open. Approvals come only from the web app, through tailnet-proxy |
-| You turned on Auto approve | No answer while it's on: a fooled model can act as root and in the logged-in browser with no card (§6.11). It's off by default, the web app confirms before turning it on, and the model can't set it (though an auto-approved root command could). `approval.auto` events record what went ahead |
-| The agent drives the logged-in browser from the shell | The guard firewall blocks `worker` from 9222, 5900 and 6080; the X cookie and profile are private |
+| You turned on Auto approve | Eligible worker and schedule actions can proceed. Browser input, saved-key use, new proxy sites, and direct internet require explicit approval. |
+| The agent drives the logged-in browser from the shell | The guard firewall lets `worker` reach only Squid on localhost (so not 9222, 5900 or 6080); the X cookie and profile are private |
 | The agent steals AWS credentials | The guard firewall blocks the metadata service for everyone but root. The desktop's role can't read the project's SSM parameters anyway, and has only SSM's managed policy |
-| The agent reads the model key | It's in agentd's secrets file, which `worker` and the browser can't read, and it never goes into a prompt. A root command can read it, so one you approve (or any, under Auto approve) could |
-| The model sees or leaks a saved key | Keys are never in the model's context: they're injected per command through systemd credentials, and every result, event and history entry is redacted |
+| The agent reads the model key | Only the daemon and the owner through SSM can read its local credential file. Worker units run without root. |
+| The model sees or leaks a saved key | Use requires approval for the actual command. Agentd redacts literal values from output. An approved process can use its token. |
 | Someone else on your tailnet | Every device your tailnet's rules let through gets in, unless `make tailscale-allow` names logins. Other sites' pages can't act on the desktop through your browser (`door`'s cross-origin checks) |
 | Runaway model cost | The supervisor's checks (every 30 min of work or 60 turns: a stuck chat task waits on a card, a stuck scheduled run stops), the context budget, loop detection, tidy-up's daily cap ($0.50). Tasks have no daily budget: Together bills your account |
 | A lost laptop or phone | Remove the device in Tailscale's admin console. Keys can't be read back from the web app |
-| Destructive commands by mistake | Dangerous patterns ask; root asks; Stop kills the unit; limits on memory, processes, CPU and time |
-| Losing your data | The disk's own KMS key keeps it private, not safe: state is on the root volume, with no snapshots or backups in Terraform. `make agentd-deploy` keeps the last 3 copies of the database on the same disk |
+| Destructive commands by mistake | Ordinary shell patterns ask when Auto approve is off. The worker has no root authority. Stop and runtime limits apply to its unit. |
+| Losing your data | Optional encrypted EBS snapshots retain seven daily recovery points. Pre-deploy database copies provide a local rollback path. |
 
 ## 10. Operations
 
@@ -1495,7 +1402,7 @@ About $40/month while the desktop runs. `make stop` brings the desktop's part do
 
 | Component | Tests |
 |---|---|
-| agentd | 171 unit tests, plus 5 ignored by default that need a real Chrome or run on demand (such as the 5,000-memory speed test): sites the user allows (host checks, a card only for hosts not already reachable, Squid's file, a scheduled run that can't ask, a denied card, the proxy's refusal spotted in output), direct commands (always a card, a yes bound to `direct`, never in a scheduled run, no proxy settings, a tool connecting on its own spotted in output), scheduled runs beside the chat with a stand-in model (the chat free meanwhile, the report whole at the end, its history after the chat's answer, one quiet retry after a failure or a restart, a paused schedule stopping its run), the run queue (one per schedule, due order, cancelling), "Run without asking" for schedules a person sets up, memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, `stage`, the caller from tailnet-proxy's header only, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text report summaries, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, guards (sleep, date, piped installs, shell scheduling, the egress controls, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words, notifications (the attention budget, the card wording, the APNs provider token and payload, Apple's answers classified, an expired token dropped so the retry re-signs, the collapse id truncated at a char boundary, the `.p8` loaded two ways, an app getting one effect per notice, registration gated on an APNs key) |
+| agentd | 192 unit tests, plus 7 ignored by default that need a real Chrome or run on demand (such as the 5,000-memory speed test): sites the user allows (host checks, a card only for hosts not already reachable, Squid's file, a scheduled run that can't ask, a denied card, the proxy's refusal spotted in output), direct commands (always a card, a yes bound to `direct`, never in a scheduled run, no proxy settings, a tool connecting on its own spotted in output), scheduled runs beside the chat with a stand-in model (the chat free meanwhile, the report whole at the end, its history after the chat's answer, one quiet retry after a failure or a restart, a paused schedule stopping its run), the run queue (one per schedule, due order, cancelling), "Run without asking" for schedules a person sets up, memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, `stage`, the caller from tailnet-proxy's header only, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text report summaries, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, guards (sleep, date, piped installs, shell scheduling, the egress controls, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words, notifications (the attention budget, the card wording, the APNs provider token and payload, Apple's answers classified, an expired token dropped so the retry re-signs, the collapse id truncated at a char boundary, the `.p8` loaded two ways, an app getting one effect per notice, registration gated on an APNs key) |
 | tailnet-proxy | Who gets in (`admits`: logins and tags), and package `door` with a Tailscale-style caller (`go test`) |
 | The web app | 10 tests (§7.2): the chat rules, card fields, scheduled runs as reports, the access card, Markdown, the key detector (`node --test`) |
 | The apps | 44 tests in DesktopKit (§7.4, `swift test`), two of them live tests skipped unless `AGENTD_URL` or `VNC_ADDR` is set |
@@ -1505,17 +1412,14 @@ About $40/month while the desktop runs. `make stop` brings the desktop's part do
 Found while writing this document. None of them is a known exploit; most are trade-offs this edition makes, or drift between comments and code.
 
 **Security and robustness.**
-- The model key is on the desktop (§2, rule 6). Root can read it, so an approved root command, or any command under Auto approve, could too; Together bills whatever it's used for. Rotating it is `make model-key` and `make agentd-deploy`.
+- The daemon holds the model key on the desktop. Rotate it with `make model-key` and `make agentd-deploy`.
 - Model calls have no spending limit: tasks have no daily budget, only tidy-up has its cap. No cap on a task's steps: the supervisor's checks, the context budget and loop detection limit each task, and a fast loop can run up to 60 turns before the first check.
 - `PUT /api/v1/settings` stores any `model` without checking `KNOWN_MODELS`; the web app offers only the known ones. A task on another model runs (Together decides), with no price, so its cost is null; a card it parks expires when answered, since today's rules refuse that model.
-- Squid has no `Safe_ports` rule, so plain-HTTP requests to allowed hosts aren't port-limited.
-- A schedule that runs without asking (every one a person sets up, §6.14) doesn't ask before data-out after outside content: its commands can send data to any host on the allowlist or that you allowed, with whatever account a command brings.
-- A chat command waits while a scheduled run's command runs (`shell_turn`, §6.6), up to that command's timeout (120 s by default; the model may set more). One command at a time is what keeps a direct command's uid-wide firewall opening (§6.21) to that command.
+- A chat command waits for an ongoing scheduled command to release the shell worker.
 - With no `allowed_logins`, every device your tailnet's rules let through reaches the web app, agentd's API and raw VNC (`-nopw`).
 - The KMS key has the default key policy: the account's IAM decides who can use it.
-- No backups: agentd's state is on the root volume, and Terraform makes no snapshots. The database copies `agentd-deploy` keeps are on the same disk.
 - The single fck-nat instance serves both AZs: a single point of failure.
-- Desktop egress at the security-group level is open (all protocols); only `worker` is restricted, and that's done on the host.
+- Host firewall rules restrict the worker and desktop browsers. The security group allows outbound traffic for the other VM services.
 - The web app has no memory screen (the apps have one) and no "Run without asking" switch (only the API has it). Notifications to the apps are off until you add an APNs key (`make apns-key`), which needs the paid Apple Developer Program; the browsers' Web Push needs no account (§6.17).
 
 **Docs.** `docs/memory-v2.md` is the plan as written; its note at the top says what's different in this edition (notifications by Web Push, the Memory screen only in the apps).
@@ -1536,8 +1440,8 @@ Found while writing this document. None of them is a known exploit; most are tra
 | **Parking** | Saving a task's state while it waits for an answer, freeing the desktop |
 | **Taint** | Marks a task that has read outside content |
 | **Armed send** | After approving text typed into a message field, pressing Enter or Send within 3 calls needs no second approval |
-| **Run without asking** | A schedule's setting: its runs' commands go ahead with what would ask, except root and direct ones (§6.14) |
-| **Auto approve** | The desktop-wide setting under which nothing waits for anyone's OK (§6.11) |
+| **Run without asking** | Allows eligible worker commands in one schedule (§6.14) |
+| **Auto approve** | Allows eligible worker commands and schedule setup on this desktop (§6.11) |
 | **fck-nat** | A NAT instance AMI (a cheap alternative to NAT gateways) |
 | **ZDR** | Zero data retention, a Together AI account setting |
 | **Skill** | A Markdown how-to the agent reads with `read_skill` |

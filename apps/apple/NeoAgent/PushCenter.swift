@@ -1,3 +1,4 @@
+import AgentAPI
 import Observation
 import UserNotifications
 
@@ -7,47 +8,31 @@ import UserNotifications
     import AppKit
 #endif
 
-/// Push notifications: asks permission, gets this device's token (agentd
-/// registers it and sends to it over APNs), and turns Approve/Deny taps on
-/// approval notifications into answers the chat sends once it's connected.
+/// Registers this device for APNs and opens the card mentioned in a notification.
 /// The app delegates (iOS/, macOS/) hand it the token.
 @MainActor
 @Observable
 final class PushCenter: NSObject {
     static let shared = PushCenter()
 
-    struct Answer: Equatable {
-        let approvalID: String
-        let approved: Bool
-    }
-
     /// Hex device token, once the OS hands it over.
     private(set) var deviceToken: String?
-    /// An Approve/Deny tapped on a notification, waiting to be sent.
-    var pendingAnswer: Answer?
+    /// The chat row a notification points to.
+    var pendingCardID: String?
+    @ObservationIgnored private var registrations: [URL: Task<String, Error>] = [:]
+    /// Signing out: no new registrations, and Settings stays open to finish it.
+    @ObservationIgnored private(set) var loggingOut = false
     #if os(macOS)
         /// Brings the chat window back (the Mac app runs on with it closed),
-        /// so a notification's answer gets sent and its card seen.
+        /// so the user can see the card.
         @ObservationIgnored var showChat: (() -> Void)?
     #endif
-
-    nonisolated private static let approve = "APPROVE"
-    nonisolated private static let deny = "DENY"
 
     /// Call at launch so taps that open the app are delivered here.
     func setUp() {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
-        // Approving opens the app (unlocked): the answer goes over the tailnet,
-        // which the app connects to in the foreground.
-        let approval = UNNotificationCategory(
-            identifier: "APPROVAL",
-            actions: [
-                UNNotificationAction(identifier: Self.approve, title: "Approve", options: [.authenticationRequired, .foreground]),
-                UNNotificationAction(identifier: Self.deny, title: "Deny", options: [.destructive, .authenticationRequired, .foreground]),
-            ],
-            intentIdentifiers: [])
-        center.setNotificationCategories([approval])
+        center.setNotificationCategories([])
     }
 
     /// Asks for permission (once) and registers for remote notifications.
@@ -68,6 +53,69 @@ final class PushCenter: NSObject {
 
     func didRegister(token: Data) {
         deviceToken = token.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func registerDevice(on client: AgentClient, topic: String) async throws {
+        try Task.checkCancellation()
+        guard !loggingOut, let token = deviceToken else { return }
+        if let pending = registrations[client.baseURL] {
+            _ = try await pending.value
+            return
+        }
+        let pending = Task {
+            let id = try await client.registerDevice(
+                token: token, name: Device.name, environment: Device.pushEnvironment, topic: topic)
+            UserDefaults.standard.set(id, forKey: registrationKey(client))
+            return id
+        }
+        registrations[client.baseURL] = pending
+        defer { registrations[client.baseURL] = nil }
+        _ = try await pending.value
+    }
+
+    /// Asks the desktop to stop notifying this device, before signing out of
+    /// the tailnet that reaches it. Gives up after `limit`: signing out goes on
+    /// either way. Returns whether the desktop confirmed (or had nothing to forget).
+    func revokeBeforeLogout(on client: AgentClient, within limit: Duration = .seconds(5)) async -> Bool {
+        loggingOut = true
+        let key = registrationKey(client)
+        let pending = registrations[client.baseURL]
+        let revoke = Task { () -> Bool in
+            if let pending {
+                // Cancelling the revoke cancels a registration still under way.
+                _ = try? await withTaskCancellationHandler {
+                    try await pending.value
+                } onCancel: {
+                    pending.cancel()
+                }
+            }
+            if Task.isCancelled { return false }  // out of time: it may have registered
+            guard let id = UserDefaults.standard.string(forKey: key) else { return true }
+            do {
+                try await client.unregisterDevice(id: id)
+            } catch let error as AgentError where error.statusCode == 404 {
+                // The desktop already forgot this registration.
+            } catch {
+                return false  // keep the ID so a later sign-out can try again
+            }
+            UserDefaults.standard.removeObject(forKey: key)
+            return true
+        }
+        let deadline = Task {
+            try await Task.sleep(for: limit)
+            revoke.cancel()
+        }
+        defer { deadline.cancel() }
+        return await revoke.value
+    }
+
+    func finishLogout() {
+        pendingCardID = nil
+        loggingOut = false
+    }
+
+    private func registrationKey(_ client: AgentClient) -> String {
+        "pushRegistrationID.\(client.baseURL.absoluteString)"
     }
 }
 
@@ -95,13 +143,16 @@ extension PushCenter: UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let action = response.actionIdentifier
-        let id = response.notification.request.content.userInfo["approval"] as? String
+        let data = response.notification.request.content.userInfo
+        let approval = data["approval"] as? String
+        let action = data["action"] as? String
         nonisolated(unsafe) let done = completionHandler
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
-                if let id, action == Self.approve || action == Self.deny {
-                    self.pendingAnswer = Answer(approvalID: id, approved: action == Self.approve)
+                if let approval, !approval.isEmpty {
+                    self.pendingCardID = "approval-\(approval)"
+                } else if let action, !action.isEmpty {
+                    self.pendingCardID = "action-\(action)"
                 }
                 #if os(macOS)
                     self.showChat?()

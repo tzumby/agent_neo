@@ -16,7 +16,7 @@ public final class ChatStore {
     }
 
     public private(set) var timeline = ChatTimeline()
-    public private(set) var connection: Connection = .connecting
+    public internal(set) var connection: Connection = .connecting
     public private(set) var status: AgentStatus?
     /// The newest page of the chat is in: the chat can show, at its end.
     public private(set) var loaded = false
@@ -27,7 +27,8 @@ public final class ChatStore {
 
     /// The chat's events loaded so far, oldest first (the timeline is built from them).
     private var history: [AgentEvent] = []
-    private var lastSeq = 0
+    /// The newest event applied: the stream goes on after it.
+    private(set) var lastSeq = 0
     private var olderPage: Task<Bool, Never>?
     /// Cards the desktop no longer knows (answered 404), kept across rebuilds.
     private var expiredApprovals: Set<String> = []
@@ -65,11 +66,7 @@ public final class ChatStore {
                 if !loaded { try await loadNewest(client: client) }
                 for try await event in client.events(after: lastSeq, kinds: Self.streamed) {
                     guard event.seq > lastSeq else { continue }
-                    lastSeq = event.seq
-                    if ChatTimeline.kinds.contains(event.kind) {
-                        history.append(event)
-                        timeline.apply(event)
-                    }
+                    receive(event)
                     if Self.changesStatus.contains(event.kind) {
                         status = try? await client.status()
                     }
@@ -86,15 +83,36 @@ public final class ChatStore {
     /// filling in event by event.
     private func loadNewest(client: AgentClient) async throws {
         do {
-            let page = try await client.eventPage(before: nil, limit: Self.pageSize, kinds: ChatTimeline.kinds)
-            history = page.events
-            hasOlder = page.more
-            lastSeq = page.lastSeq
-            rebuild()
+            show(newest: try await client.eventPage(before: nil, limit: Self.pageSize, kinds: ChatTimeline.kinds))
         } catch let error as AgentError where error.statusCode == 404 {
             // agentd before 0.15.1 has no pages: the stream replays the whole log.
+            loaded = true
         }
+    }
+
+    /// The newest page of the chat, in place of what was loaded.
+    func show(newest page: EventPage) {
+        history = page.events
+        hasOlder = page.more
+        lastSeq = page.lastSeq
+        rebuild()
         loaded = true
+    }
+
+    /// An event from the live stream.
+    func receive(_ event: AgentEvent) {
+        lastSeq = event.seq
+        if ChatTimeline.kinds.contains(event.kind) {
+            history.append(event)
+            timeline.apply(event)
+        }
+    }
+
+    /// An older page, in front of what's loaded.
+    func insert(older page: EventPage) {
+        history.insert(contentsOf: page.events, at: 0)
+        hasOlder = page.more
+        rebuild()
     }
 
     /// The page before the oldest one loaded, put in front of it. Returns
@@ -110,13 +128,75 @@ public final class ChatStore {
                 let page = try? await client.eventPage(
                     before: before, limit: Self.pageSize, kinds: ChatTimeline.kinds)
             else { return false }
-            history.insert(contentsOf: page.events, at: 0)
-            hasOlder = page.more
-            rebuild()
+            insert(older: page)
             return true
         }
         olderPage = load
         return await load.value
+    }
+
+    /// Where the chat row a notification points to (`approval-<id>`,
+    /// `action-<id>`) stands.
+    public enum Lookup: Equatable, Sendable {
+        /// Waiting for the user: scroll to it.
+        case waiting
+        /// In the chat, but answered or expired.
+        case settled
+        /// Nowhere in the chat's history.
+        case missing
+        /// The desktop didn't answer in time, so the chat may not be current.
+        case unreachable
+    }
+
+    /// Finds the row a notification points to. After the app was suspended the
+    /// chat is behind, so it first waits until it's current: the row arrives
+    /// on the stream, or the stream has applied every chat event the desktop
+    /// had when asked. Only then does it page back, since the row is older
+    /// than what's loaded. `connecting` bounds the wait for the connection
+    /// (Tailscale starts after a cold launch), `catchingUp` the wait after it.
+    public func locate(
+        _ itemID: String, client: AgentClient,
+        connecting: Duration = .seconds(45), catchingUp: Duration = .seconds(15)
+    ) async -> Lookup {
+        await locate(
+            itemID, connecting: connecting, catchingUp: catchingUp, poll: .milliseconds(250),
+            newestChatSeq: {
+                try await client.eventPage(before: nil, limit: 1, kinds: ChatTimeline.kinds).events.last?.seq ?? 0
+            },
+            older: { await self.loadOlder(client: client) })
+    }
+
+    func locate(
+        _ itemID: String, connecting: Duration, catchingUp: Duration, poll: Duration,
+        newestChatSeq: () async throws -> Int, older: () async -> Bool
+    ) async -> Lookup {
+        let clock = ContinuousClock()
+        var deadline = clock.now.advanced(by: connecting)
+        var connected = false
+        var newest: Int?
+        while !holds(itemID) {
+            if Task.isCancelled { return .unreachable }
+            if connection == .live, loaded {
+                if !connected {
+                    connected = true
+                    deadline = clock.now.advanced(by: catchingUp)
+                }
+                if newest == nil { newest = try? await newestChatSeq() }
+                if let newest, lastSeq >= newest { break }
+            }
+            if clock.now >= deadline { return .unreachable }
+            try? await Task.sleep(for: poll)
+        }
+        // The chat is current and the row isn't in it: it's older than what's loaded.
+        while !holds(itemID) {
+            if Task.isCancelled { return .unreachable }
+            guard await older() else { return hasOlder ? .unreachable : .missing }
+        }
+        return timeline.visibleItems.contains { $0.id == itemID } ? .waiting : .settled
+    }
+
+    private func holds(_ itemID: String) -> Bool {
+        timeline.items.contains { $0.id == itemID }
     }
 
     /// The timeline again from all the events loaded (an answer in a newer
@@ -178,9 +258,44 @@ public final class ChatStore {
         }
     }
 
-    public func update(settings: AgentSettings, client: AgentClient) async {
-        await attempt { _ = try await client.update(settings: settings) }
-        status = try? await client.status()
+    /// Changes the model or browser actions. Returns what went wrong, for the
+    /// screen that asked to show (nil: saved). The status is read again either
+    /// way, so controls show what the desktop has.
+    @discardableResult
+    public func updateSettings(model: String? = nil, allowActions: Bool? = nil, client: AgentClient) async -> String? {
+        var problem: String?
+        do {
+            _ = try await client.updateSettings(model: model, allowActions: allowActions)
+        } catch {
+            problem = "Couldn't save the setting. \(Self.message(error))"
+        }
+        await refreshStatus(client: client)
+        return problem
+    }
+
+    /// Turns Auto approve on (for the revision the user reviewed) or off.
+    /// Returns what went wrong, as `updateSettings` does.
+    @discardableResult
+    public func setAutoApprove(_ enabled: Bool, expectedVersion: String?, client: AgentClient) async -> String? {
+        var problem: String?
+        do {
+            _ = try await client.setAutoApprove(enabled, expectedVersion: expectedVersion)
+        } catch {
+            problem = "Couldn't turn Auto approve \(enabled ? "on" : "off"). \(Self.message(error))"
+        }
+        await refreshStatus(client: client)
+        return problem
+    }
+
+    /// Keeps the last status when the desktop doesn't answer.
+    private func refreshStatus(client: AgentClient) async {
+        if let fresh = try? await client.status() { status = fresh }
+    }
+
+    /// agentd's own words for an error it answered with.
+    static func message(_ error: Error) -> String {
+        if case .http(_, let message)? = error as? AgentError, !message.isEmpty { return message }
+        return error.localizedDescription
     }
 
     private func attempt(onGone: ((ChatStore) -> Void)? = nil, _ work: () async throws -> Void) async {

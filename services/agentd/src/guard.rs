@@ -125,12 +125,15 @@ pub const EGRESS_REFUSAL: &str = "not run: the shell's internet access (the prox
      OK. If a job needs a host that's blocked, tell the user which one and why.";
 
 /// The desktop's egress controls: Squid (its configuration or its control
-/// commands) and the guard firewall. Refused even with approval: they're
+/// commands), the guard firewall, the direct-egress slice and the privileged
+/// helper that applies the proxy list. Refused even with approval: they're
 /// what stops injected instructions from sending data anywhere.
 pub fn touches_egress_policy(command: &str) -> bool {
     use std::sync::LazyLock;
     static EGRESS: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\bsquid\b|/etc/squid|neo[-_]agent[-_]guard|guard\.nft|/etc/neo-agent\b")
+        regex::Regex::new(
+            r"(?i)\bsquid\b|/etc/squid|neo[-_]agent[-_]guard|guard\.nft|/etc/neo-agent\b|\bneodirect\b|neo[-_]agent[-_]privileged",
+        )
             .expect("valid regex")
     });
     EGRESS.is_match(command)
@@ -367,9 +370,11 @@ mod tests {
             "sudo systemctl restart squid",
             "sudo nft -f /etc/neo-agent/guard.nft",
             "sudo systemctl stop neo-agent-guard",
-            // Holding the firewall open past the one command the user approved.
-            "sudo nft add element inet neo_agent_guard direct_egress '{ 1002 timeout 1d }'",
-            "sudo nft flush set inet neo_agent_guard direct_egress",
+            "sudo nft delete table inet neo_agent_guard",
+            // The direct-egress slice and the helper that applies the proxy list.
+            "sudo systemctl stop neodirect.slice",
+            "systemd-run --user --slice=neodirect.slice curl https://example.com",
+            "echo example.com | sudo /usr/local/libexec/neo-agent-privileged apply-proxy",
         ] {
             assert!(touches_egress_policy(egress), "{egress}");
         }

@@ -21,7 +21,7 @@ SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
 .PHONY: help preflight bootstrap init plan apply destroy fmt lint galaxy inventory deploy desktop screenshot \
-  model-key tailscale-key tailscale-allow apns-key agentd-test agentd-build agentd-deploy agentd-evals agentd-reset agentd-logs \
+  model-key tailscale-key tailscale-allow apns-key agentd-test helper-test agentd-build agentd-deploy agentd-evals agentd-reset agentd-logs \
   tailnet-test tailnet-build tailnet-deploy url web-test web-dev web-smoke \
   app-tailscalekit app-project app-test app-sim app-device app-mac stop start cdp viewer shell
 
@@ -99,6 +99,9 @@ screenshot: inventory ## Download a screenshot of the desktop to screenshots/
 
 agentd-test: ## Format check, clippy and unit tests for agentd
 	cd services/agentd && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+
+helper-test: ## Unit tests for the desktop's privileged worker and proxy helper (python, uv)
+	uv run -q --with jinja2 --with pyyaml python -I -m unittest discover -s ansible/tests
 
 agentd-build: ## Build agentd for the desktop (static linux binary for DESKTOP_ARCH)
 	cd services/agentd && cargo zigbuild --release --target $(DESKTOP_RUST_TARGET)

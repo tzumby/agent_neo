@@ -1,6 +1,6 @@
 # {{ ansible_managed }}
-# agentd starts each shell command as a transient systemd unit (systemd-run,
-# as root): as the shell user with hardening and limits, or as root only after
-# the user approved the command in the app (agentd enforces the approval).
-# Neither the shell user nor the desktop user has sudo.
-agentd ALL=(root) NOPASSWD: ALL
+# Inputs for these fixed operations arrive on stdin and are validated by the helper.
+# No Defaults here: agentd runs sudo without a terminal, so no pty is allocated,
+# and Ubuntu 26.04's sudo-rs reads this file too.
+Cmnd_Alias NEO_AGENT_HELPER = /usr/local/libexec/neo-agent-privileged run-worker, /usr/local/libexec/neo-agent-privileged stop-worker, /usr/local/libexec/neo-agent-privileged apply-proxy
+agentd ALL=(root) NOPASSWD: NEO_AGENT_HELPER

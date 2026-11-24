@@ -39,7 +39,7 @@ chrome=${CHROME:-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
   about:blank >/dev/null 2>&1 &
 pids+=($!)
 env -i PATH="$PATH" HOME="$work/home" LISTEN="unix:$sock" STATE_DIR="$work/state" \
-  CDP_URL=http://127.0.0.1:9333 RUN_AS= SHELL_TOOL=on POLICY=/nonexistent SKILLS_DIR=/nonexistent \
+  CDP_URL=http://127.0.0.1:9333 RUN_AS= WORKDIR="$work" SHELL_TOOL=on POLICY=/nonexistent SKILLS_DIR=/nonexistent \
   EGRESS_USER_HOSTS="$work/state/allowed-hosts.txt" EGRESS_BASE_HOSTS=".github.com pypi.org" \
   MODEL=zai-org/GLM-5.3 LLM_URL=http://127.0.0.1:8091/v1/chat/completions LLM_API_KEY=dev \
   MEMORY_V2=on DESKTOP_NAME=neo-agent RUST_LOG=agentd=info \

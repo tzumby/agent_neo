@@ -4,6 +4,8 @@
 
 *2026-11-01 · Razvan Draghici. Filed from the Claude doc [agentd Memory v2 and Borrowed Patterns](https://claude.ai/artifact/RSHkSqTRP897X5V3YxFQs2); this copy is kept current with decisions as the phases land.*
 
+> **Current implementation.** The trust, retention and consolidation rules in [Architecture §6.13](architecture.md#613-memory) supersede the older design below. Direct user actions establish high trust. Model and imported text stays in the notes until the user confirms or edits it. Use `remember rule: …`, `remember preference: …`, `remember fact: …` or `forget #id` in the authenticated desktop chat for a direct memory action.
+
 > **Changed 2026-11-02 (agentd 0.15.2), the user's decisions: nothing waits for the user's approval, and tidying up is smaller.** The user never approves memories. Tidying up writes no facts and skips scheduled runs, which see their own last reports instead. Where the sections below describe pending memories, proposals, "Review first" (`observe`) or a review stage, [§19 "No approvals, smaller tidying up"](#no-approvals-smaller-tidying-up-2026-11-02) replaces them.
 
 

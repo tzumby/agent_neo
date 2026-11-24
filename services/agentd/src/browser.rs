@@ -3,7 +3,6 @@
 //! are Chrome's backend DOM node IDs.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,53 +12,219 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::cdp::{Cdp, Page};
 use crate::llm::truncate;
-use crate::policy::{Gate, Policy};
 
-/// The element with keyboard focus: its role (explicit, or implied by the
-/// tag) and its label.
-/// The text around an element: the dialog, row or form it's in, else the
-/// nearest parent with more to say than the element itself.
-const AROUND: &str = r#"function() {
-    const clean = (text) => (text || '').replace(/\s+/g, ' ').trim();
-    const own = clean(this.innerText || (this.getAttribute && this.getAttribute('aria-label')));
-    const holder = this.closest && this.closest(
+// The approval scripts below run in an isolated world (`approval_world`), so
+// page JavaScript can't replace the DOM's prototypes there. Named form
+// controls and images still shadow properties of a form or the document
+// (`<input name="action">` makes `form.action` that input), in every world, so
+// these scripts read through the prototypes' own getters and methods.
+
+/// The element a target means: itself, or a text node's parent (across a
+/// shadow root's edge). Null for anything else.
+const TO_ELEMENT: &str = r#"function() {
+    const own = (proto, name) => Object.getOwnPropertyDescriptor(proto, name);
+    const get = (proto, name, object) => Reflect.apply(own(proto, name).get, object, []);
+    if (get(Node.prototype, 'nodeType', this) === 1) return this;
+    const parent = get(Node.prototype, 'parentElement', this);
+    if (parent) return parent;
+    const root = Reflect.apply(own(Node.prototype, 'getRootNode').value, this, []);
+    return root instanceof ShadowRoot ? get(ShadowRoot.prototype, 'host', root) : null;
+}"#;
+
+/// The element with keyboard focus, inside open shadow roots too (else the
+/// body).
+const ACTIVE_ELEMENT: &str = r#"(() => {
+    const get = (proto, name, object) =>
+        Reflect.apply(Object.getOwnPropertyDescriptor(proto, name).get, object, []);
+    let active = get(Document.prototype, 'activeElement', document) || get(Document.prototype, 'body', document);
+    for (let root; active && (root = get(Element.prototype, 'shadowRoot', active)); ) {
+        const inner = get(ShadowRoot.prototype, 'activeElement', root);
+        if (!inner) break;
+        active = inner;
+    }
+    return active;
+})()"#;
+
+/// What an approval card shows and binds, with `this` the target element:
+/// the page; the text around it (the dialog, row or form it's in, else the
+/// nearest parent with more to say than the element itself); where a link or
+/// form would go; whether it touches a password or one-time code; and the
+/// form's current values. Null when it isn't in this document (detached, or
+/// in another frame). Shadow roots count as part of the document.
+const INSPECT: &str = r#"function() {
+    const own = (proto, name) => Object.getOwnPropertyDescriptor(proto, name);
+    const get = (proto, name, object) => Reflect.apply(own(proto, name).get, object, []);
+    const call = (proto, name, object, ...args) => Reflect.apply(own(proto, name).value, object, args);
+    const attr = (node, name) => call(Element.prototype, 'getAttribute', node, name);
+    const rootOf = (node, composed) => call(Node.prototype, 'getRootNode', node, {composed});
+    const hostOf = (node) => {
+        const root = rootOf(node, false);
+        return root instanceof ShadowRoot ? get(ShadowRoot.prototype, 'host', root) : null;
+    };
+    const parentOf = (node) => get(Node.prototype, 'parentElement', node) || hostOf(node);
+    // closest(), continued out through shadow hosts.
+    const closest = (node, selector) => {
+        for (let at = node; at; at = hostOf(at)) {
+            const found = call(Element.prototype, 'closest', at, selector);
+            if (found) return found;
+        }
+        return null;
+    };
+    const textOf = (node) => node instanceof HTMLElement
+        ? get(HTMLElement.prototype, 'innerText', node)
+        : get(Node.prototype, 'textContent', node);
+    const clean = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+    const ofDocument = (name) => get(Document.prototype, name, document);
+    const absolute = (value) => {
+        try { return new URL(value, get(Node.prototype, 'baseURI', document)).href; }
+        catch { return 'about:invalid'; }
+    };
+
+    const el = this;
+    if (!get(Node.prototype, 'isConnected', el) || rootOf(el, true) !== document) return null;
+
+    let form = el instanceof HTMLFormElement ? el : null;
+    if (!form && 'form' in el && el.form instanceof HTMLFormElement) form = el.form;
+    if (!form) form = closest(el, 'form');
+    const ofForm = (name) => form ? get(HTMLFormElement.prototype, name, form) : '';
+
+    const link = closest(el, 'a[href], area[href]');
+    const href = !link ? ''
+        : link instanceof HTMLAnchorElement ? get(HTMLAnchorElement.prototype, 'href', link)
+        : link instanceof HTMLAreaElement ? get(HTMLAreaElement.prototype, 'href', link)
+        : absolute(attr(link, 'href'));
+    const submits = (el instanceof HTMLButtonElement || el instanceof HTMLInputElement)
+        && call(Element.prototype, 'hasAttribute', el, 'formaction');
+    const destination = href || (submits ? el.formAction : ofForm('action')) || '';
+    const target = (link && attr(link, 'target')) || attr(el, 'formtarget') || (form && attr(form, 'target')) || '';
+    const method = attr(el, 'formmethod') || ofForm('method') || '';
+
+    const sensitive = (field) =>
+        (field instanceof HTMLInputElement && get(HTMLInputElement.prototype, 'type', field) === 'password')
+        || /(?:^|\s)(?:current-password|new-password|one-time-code)(?:\s|$)/i.test(attr(field, 'autocomplete') || '');
+    const controls = form ? Array.from(ofForm('elements')) : [];
+    if (el !== form && !controls.includes(el)) controls.push(el);
+    const tag = get(Element.prototype, 'localName', el);
+
+    const ownText = clean(textOf(el) || attr(el, 'aria-label'));
+    const holder = closest(el,
         'dialog,[role=dialog],[role=alertdialog],tr,[role=row],li,[role=listitem],article,[role=article],form');
-    let around = holder ? clean(holder.innerText) : '';
-    if (!around || around === own) {
+    let around = holder ? clean(textOf(holder)) : '';
+    if (!around || around === ownText) {
         around = '';
-        for (let e = this.parentElement, i = 0; e && e !== document.body && i < 6; e = e.parentElement, i++) {
-            const text = clean(e.innerText);
-            if (text && text !== own) { around = text; break; }
+        const body = ofDocument('body');
+        for (let at = parentOf(el), i = 0; at && at !== body && i < 6; at = parentOf(at), i++) {
+            const text = clean(textOf(at));
+            if (text && text !== ownText) { around = text; break; }
         }
     }
-    return around.length > 300 ? around.slice(0, 300) + '…' : around;
-}"#;
-/// Outlines an element and returns its style attribute, to put back.
-const OUTLINE: &str = r#"function() {
-    const before = this.getAttribute('style');
-    this.style.setProperty('outline', '3px solid #FF5A1F', 'important');
-    this.style.setProperty('outline-offset', '2px', 'important');
-    return before;
-}"#;
-const OUTLINE_OFF: &str = r#"function(before) {
-    // Blink writes a changed style attribute lazily. Reading it first writes it:
-    // removing one that isn't written yet would leave style="" behind.
-    this.getAttribute('style');
-    if (before === null) this.removeAttribute('style');
-    else this.setAttribute('style', before);
+    return {
+        title: ofDocument('title'), url: location.href,
+        around: around.length > 300 ? around.slice(0, 300) + '…' : around,
+        label: attr(el, 'aria-label') || attr(el, 'placeholder') || attr(el, 'name') || tag,
+        role: attr(el, 'role'), destination, target, method,
+        protected: controls.some(sensitive) || ['iframe', 'frame', 'object', 'embed'].includes(tag),
+        draft: controls.map((field) => sensitive(field) ? null : [
+            field.name, field.value, field.checked,
+            field.isContentEditable ? get(Node.prototype, 'textContent', field) : null
+        ])
+    };
 }"#;
 
-/// Where an element is, for an approval card (Browser::place_of).
-#[derive(Default)]
+/// Whether a click at (x, y) lands on `this`, the reviewed element: what's
+/// there is it or inside it (shadow roots included). Text or an icon that
+/// takes no pointer events passes the click to the ancestor that does, and a
+/// label clicks its control, as they would for a person. Never into a frame.
+const HIT_TEST: &str = r#"function(x, y) {
+    const own = (proto, name) => Object.getOwnPropertyDescriptor(proto, name);
+    const get = (proto, name, object) => Reflect.apply(own(proto, name).get, object, []);
+    const call = (proto, name, object, ...args) => Reflect.apply(own(proto, name).value, object, args);
+    const hostOf = (node) => {
+        const root = call(Node.prototype, 'getRootNode', node);
+        return root instanceof ShadowRoot ? get(ShadowRoot.prototype, 'host', root) : null;
+    };
+    const parentOf = (node) => get(Node.prototype, 'parentElement', node) || hostOf(node);
+    const within = (node, container) => {
+        for (let at = node; at; at = parentOf(at)) if (at === container) return true;
+        return false;
+    };
+    const el = this;
+    // Hit-test in the element's own tree (a closed shadow root included),
+    // then down through the open shadow roots under what's there.
+    const scope = call(Node.prototype, 'getRootNode', el);
+    const proto = scope instanceof ShadowRoot ? ShadowRoot.prototype : Document.prototype;
+    let hit = call(proto, 'elementFromPoint', scope, x, y);
+    for (let root; hit && (root = get(Element.prototype, 'shadowRoot', hit)); ) {
+        const inner = call(ShadowRoot.prototype, 'elementFromPoint', root, x, y);
+        if (!inner || inner === hit) break;
+        hit = inner;
+    }
+    if (!hit || ['iframe', 'frame', 'object', 'embed'].includes(get(Element.prototype, 'localName', hit))) {
+        return false;
+    }
+    if (within(hit, el)) return true;
+    if (within(el, hit)) {
+        for (let at = el; at && at !== hit; at = parentOf(at)) {
+            if (getComputedStyle(at).pointerEvents !== 'none') return false;
+        }
+        return true;
+    }
+    const labels = 'labels' in el && el.labels instanceof NodeList ? Array.from(el.labels) : [];
+    return labels.some((label) => {
+        if (!within(hit, label)) return false;
+        // Not a link or another control inside the label: those act on their own.
+        const control = call(Element.prototype, 'closest', hit,
+            'a[href],area[href],button,input,select,textarea,summary,[contenteditable]');
+        return !control || control === el || !within(control, label);
+    });
+}"#;
+
+/// Whether the keyboard focus is on `this`, the reviewed field, or inside it
+/// (where a custom element delegates focus), and not in a password or
+/// one-time-code field.
+const FOCUS_WITHIN: &str = r#"function() {
+    const own = (proto, name) => Object.getOwnPropertyDescriptor(proto, name);
+    const get = (proto, name, object) => Reflect.apply(own(proto, name).get, object, []);
+    const call = (proto, name, object, ...args) => Reflect.apply(own(proto, name).value, object, args);
+    const hostOf = (node) => {
+        const root = call(Node.prototype, 'getRootNode', node);
+        return root instanceof ShadowRoot ? get(ShadowRoot.prototype, 'host', root) : null;
+    };
+    const parentOf = (node) => get(Node.prototype, 'parentElement', node) || hostOf(node);
+    const el = this;
+    // The focus as the field's own tree sees it (a closed shadow root
+    // included), then down through open shadow roots.
+    const scope = call(Node.prototype, 'getRootNode', el);
+    let active = get(scope instanceof ShadowRoot ? ShadowRoot.prototype : Document.prototype, 'activeElement', scope);
+    for (let root; active && (root = get(Element.prototype, 'shadowRoot', active)); ) {
+        const inner = get(ShadowRoot.prototype, 'activeElement', root);
+        if (!inner) break;
+        active = inner;
+    }
+    let inside = false;
+    for (let at = active; at && !inside; at = parentOf(at)) inside = at === el;
+    const sensitive = active instanceof HTMLInputElement
+        && get(HTMLInputElement.prototype, 'type', active) === 'password'
+        || /(?:^|\s)(?:current-password|new-password|one-time-code)(?:\s|$)/i.test(
+            (active && call(Element.prototype, 'getAttribute', active, 'autocomplete')) || '');
+    return inside && !sensitive;
+}"#;
+
+/// The page and control that the user reviewed.
+#[derive(Debug, PartialEq)]
 pub struct Place {
     pub title: String,
+    /// The page's address without its query or fragment (`shown_url`).
     pub url: String,
     pub around: String,
-}
-
-pub struct Focused {
-    pub role: Option<String>,
     pub label: String,
+    pub role: Option<String>,
+    /// Where a link or form goes, shown like `url`.
+    pub destination: Option<String>,
+    pub protected: bool,
+    /// What a resumed action must still match: the tab, document, element and
+    /// form state, and digests of the full page and destination addresses.
+    pub binding: Value,
 }
 
 /// An element a tool call refers to, found in the accessibility tree.
@@ -75,8 +240,6 @@ pub struct Browser {
     /// What's happening on the current tab, followed from its events for as
     /// long as agentd is connected to it (across tool calls).
     watch: Mutex<Option<PageWatch>>,
-    allow_actions: bool,
-    policy: Arc<Policy>,
     /// A scheduled run's: it works only in a window it opens itself.
     own_window: bool,
     /// The window it opened, closed when the browser is dropped unless kept.
@@ -97,13 +260,11 @@ impl Drop for Browser {
 }
 
 impl Browser {
-    pub fn new(cdp: Cdp, allow_actions: bool, policy: Arc<Policy>) -> Self {
+    pub fn new(cdp: Cdp) -> Self {
         Self {
             cdp,
             page: None,
             watch: Mutex::new(None),
-            allow_actions,
-            policy,
             own_window: false,
             opened: None,
         }
@@ -174,9 +335,13 @@ impl Browser {
     }
 
     pub async fn where_am_i(&self) -> Result<String> {
+        // `<img name="title">` makes `document.title` that image: read the getter.
         let value = self
             .page()?
-            .eval("JSON.stringify([document.title, location.href])")
+            .eval(
+                "JSON.stringify([String(Object.getOwnPropertyDescriptor(Document.prototype, 'title')\
+                 ?.get?.call(document) ?? ''), location.href])",
+            )
             .await?;
         let pair: (String, String) = serde_json::from_str(value.as_str().unwrap_or("[\"\",\"\"]"))?;
         Ok(format!("{} | {}", pair.0, pair.1))
@@ -390,35 +555,18 @@ impl Browser {
         Ok(Element { node, role, label })
     }
 
-    pub fn click_gate(&self, element: &Element) -> Gate {
-        self.policy
-            .click_gate(self.allow_actions, element.role.as_deref(), &element.label)
-    }
-
-    pub fn type_gate(&self, element: &Element, submit: bool) -> Gate {
-        self.policy.type_gate(
-            self.allow_actions,
-            element.role.as_deref(),
-            &element.label,
-            submit,
-        )
-    }
-
-    pub fn key_gate(&self, key: &str, focused: &Focused) -> Gate {
-        self.policy
-            .key_gate(self.allow_actions, key, focused.role.as_deref(), &focused.label)
-    }
-
-    pub async fn click(&self, element: &Element) -> Result<String> {
+    pub async fn click(&self, element: &Element, approved: &Place) -> Result<String> {
         if let Err(problem) = self.actionable(element, true).await {
             return Ok(format!("not clicked: '{}' {problem}", element.label));
         }
         // A click on "Attach file" would open a system dialog the agent can't see.
         let page = self.page()?;
         page.hold_file_pickers(true).await;
-        let clicked = self.click_node(element.node).await;
+        let clicked = self.click_node(element, approved).await;
         page.hold_file_pickers(false).await;
-        clicked?;
+        if let Some(problem) = clicked? {
+            return Ok(format!("not clicked: '{}': {problem}", element.label));
+        }
         let settled = self.settle(Duration::from_secs(8)).await?;
         Ok(format!(
             "clicked '{}' ({settled}); now at {}{}",
@@ -428,18 +576,31 @@ impl Browser {
         ))
     }
 
-    pub async fn type_text(&self, element: &Element, text: &str, submit: bool) -> Result<String> {
+    pub async fn type_text(&self, element: &Element, text: &str, approved: &Place) -> Result<String> {
         if let Err(problem) = self.actionable(element, false).await {
             return Ok(format!("not typed: '{}' {problem}", element.label));
         }
+        self.verify_place(Some(element), approved).await?;
         let page = self.page()?;
         page.call("DOM.focus", json!({"backendNodeId": element.node}))
             .await?;
-        page.call("Input.insertText", json!({"text": text})).await?;
-        if submit {
-            self.key("Enter").await?;
-            self.settle(Duration::from_secs(8)).await?;
+        // Focusing runs the page's handlers: the field must still be as
+        // reviewed, and the text goes wherever the focus is now.
+        self.verify_place(Some(element), approved)
+            .await
+            .context("the reviewed field changed")?;
+        let (focused, object) = self.run_on_reviewed(approved, FOCUS_WITHIN, json!([])).await?;
+        let typed = async {
+            anyhow::ensure!(
+                focused == true,
+                "the reviewed field doesn't have the focus; not typed"
+            );
+            page.call("Input.insertText", json!({"text": text})).await?;
+            anyhow::Ok(())
         }
+        .await;
+        release(page, &object).await;
+        typed?;
         Ok(format!(
             "typed into '{}'; now at {}",
             element.label,
@@ -447,118 +608,143 @@ impl Browser {
         ))
     }
 
-    pub async fn press_key(&self, key: &str) -> Result<String> {
+    pub async fn press_key(&self, key: &str, approved: &Place) -> Result<String> {
         // Keys can send, open or scroll in more content (Enter or Space on a
         // file input opens a picker).
         let page = self.page()?;
         page.hold_file_pickers(true).await;
-        let pressed = self.key(key).await;
+        let pressed = async {
+            self.verify_place(None, approved).await?;
+            self.key(key).await
+        }
+        .await;
         page.hold_file_pickers(false).await;
         pressed?;
         let settled = self.settle(Duration::from_secs(8)).await?;
         Ok(format!("pressed ({settled})"))
     }
 
-    /// The open page's host, for approval cards (e.g. app.slack.com).
-    pub async fn host(&self) -> String {
-        match self.page() {
-            Ok(page) => page
-                .eval("location.hostname")
-                .await
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_default(),
-            Err(_) => String::new(),
-        }
-    }
-
-    /// What has the keyboard focus (its label), for approving a key press.
-    /// Where an element is, for an approval card: the page, and the text around
-    /// it (the dialog, row or form it's in), which often says more than its
-    /// label. With no element, the focused one. The page writes all of this, so
-    /// it's shown as the page's words. Empty when it can't be read.
-    pub async fn place_of(&self, element: Option<&Element>) -> Place {
-        let Ok(page) = self.page() else {
-            return Place::default();
-        };
-        let here = page
-            .eval("({title: document.title, url: location.host + location.pathname})")
-            .await
-            .unwrap_or(Value::Null);
-        let around = match element {
-            Some(element) => self.call_on(element, AROUND, json!([])).await,
+    /// Bind approval to the target, main document, node, and current form state.
+    /// Evaluate in an isolated world so page JavaScript cannot replace DOM APIs.
+    /// A text node stands for its parent element; with no element, the one
+    /// with keyboard focus.
+    pub async fn place_of(&self, element: Option<&Element>) -> Result<Place> {
+        let page = self.page()?;
+        let tree = page.call("Page.getFrameTree", json!({})).await?;
+        let frame = &tree["frameTree"]["frame"];
+        let frame_id = frame["id"].as_str().context("the page has no main frame")?;
+        let loader = frame["loaderId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("the page has no stable document")?;
+        let context = approval_world(page, frame_id).await?;
+        let object = match element {
+            Some(element) => element_in(page, context, element.node).await?,
             None => {
-                page.eval(&format!(
-                    "({AROUND}).call(document.activeElement || document.body)"
-                ))
-                .await
+                let active = page
+                    .call(
+                        "Runtime.evaluate",
+                        json!({"expression": ACTIVE_ELEMENT, "contextId": context}),
+                    )
+                    .await?;
+                object_of(&active).context("nothing on the page has the focus")?
             }
         };
-        let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
-        Place {
-            title: text(&here["title"]),
-            url: text(&here["url"]),
-            around: around.map(|value| text(&value)).unwrap_or_default(),
+        let inspected = async {
+            let descriptor = page.call("DOM.describeNode", json!({"objectId": object})).await?;
+            let backend = descriptor["node"]["backendNodeId"]
+                .as_i64()
+                .context("the target has no node ID")?;
+            let result = page
+                .call(
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object, "functionDeclaration": INSPECT, "returnByValue": true
+                    }),
+                )
+                .await?;
+            anyhow::Ok((backend, result))
         }
+        .await;
+        release(page, &object).await;
+        let (backend, result) = inspected?;
+        if result.get("exceptionDetails").is_some() {
+            tracing::debug!(details = %result["exceptionDetails"], "couldn't inspect a browser target");
+            bail!("couldn't inspect the target");
+        }
+        let value = &result["result"]["value"];
+        anyhow::ensure!(value.is_object(), "the target isn't in the reviewed document");
+        let field = |name: &str| {
+            value[name]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(String::from)
+        };
+        let url = field("url").context("the page has no URL")?;
+        let destination = field("destination");
+        Ok(Place {
+            title: field("title").unwrap_or_default(),
+            url: shown_url(&url),
+            around: field("around").unwrap_or_default(),
+            label: field("label").unwrap_or_default(),
+            role: field("role"),
+            destination: destination.as_deref().map(shown_url),
+            protected: value["protected"] == true,
+            // Digests, not the addresses: a query or fragment can hold a token.
+            binding: json!({
+                "tab": page.target_id, "frame": frame_id, "document": loader, "node": backend,
+                "url": fingerprint(url.as_bytes()),
+                "destination": destination.as_deref().map(|d| fingerprint(d.as_bytes())),
+                "target": value["target"], "method": value["method"],
+                "draft": fingerprint(value["draft"].to_string().as_bytes()),
+            }),
+        })
     }
 
-    /// The page as it is, with the element outlined for a moment, for an
-    /// approval card.
-    pub async fn picture_of(&self, element: Option<&Element>) -> Result<Vec<u8>> {
-        let Some(element) = element else {
-            return self.screenshot_jpeg().await;
-        };
-        let _ = self
-            .page()?
+    async fn verify_place(&self, element: Option<&Element>, approved: &Place) -> Result<()> {
+        let current = self.place_of(element).await?;
+        anyhow::ensure!(
+            &current == approved && !current.protected,
+            "the reviewed browser target changed"
+        );
+        Ok(())
+    }
+
+    /// Runs `function` (with `arguments`) on the reviewed element, the node
+    /// `approved` binds (a text node's parent), in a world the page can't
+    /// reach. Its value (null if it threw), and the object to release once
+    /// done: after acting, so nothing else waits between the check and the act.
+    async fn run_on_reviewed(
+        &self,
+        approved: &Place,
+        function: &str,
+        arguments: Value,
+    ) -> Result<(Value, String)> {
+        let page = self.page()?;
+        let frame = approved.binding["frame"]
+            .as_str()
+            .context("the reviewed target has no frame")?;
+        let node = approved.binding["node"]
+            .as_i64()
+            .context("the reviewed target has no node ID")?;
+        let context = approval_world(page, frame).await?;
+        let object = element_in(page, context, node).await?;
+        let result = page
             .call(
-                "DOM.scrollIntoViewIfNeeded",
-                json!({"backendNodeId": element.node}),
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object, "functionDeclaration": function,
+                    "arguments": arguments, "returnByValue": true,
+                }),
             )
             .await;
-        let before = self.call_on(element, OUTLINE, json!([])).await;
-        let shot = self.screenshot_jpeg().await;
-        if let Ok(before) = before {
-            let _ = self
-                .call_on(element, OUTLINE_OFF, json!([{"value": before}]))
-                .await;
-        }
-        shot
-    }
-
-    /// Runs a function on an element, with `this` as the element.
-    async fn call_on(&self, element: &Element, function: &str, arguments: Value) -> Result<Value> {
-        let page = self.page()?;
-        let resolved = page
-            .call("DOM.resolveNode", json!({"backendNodeId": element.node}))
-            .await?;
-        let object = resolved["object"]["objectId"]
-            .as_str()
-            .ok_or_else(|| anyhow!("the element isn't on the page"))?;
-        let result = page.call(
-            "Runtime.callFunctionOn",
-            json!({
-                "objectId": object, "functionDeclaration": function,
-                "arguments": arguments, "returnByValue": true,
-            }),
-        );
-        let result = tokio::time::timeout(Duration::from_secs(2), result).await??;
-        Ok(result["result"]["value"].clone())
-    }
-
-    pub async fn focused(&self) -> Focused {
-        const FOCUSED: &str = "(() => { const e = document.activeElement; if (!e || e === document.body) return null; \
-            const label = e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.getAttribute('name') || ''; \
-            let role = e.getAttribute('role'); \
-            if (!role && e.tagName === 'INPUT') role = e.type === 'search' ? 'searchbox' : e.getAttribute('list') ? 'combobox' : 'textbox'; \
-            if (!role && (e.tagName === 'TEXTAREA' || e.isContentEditable)) role = 'textbox'; \
-            return {role: role || '', label}; })()";
-        let found = match self.page() {
-            Ok(page) => page.eval(FOCUSED).await.unwrap_or(Value::Null),
-            Err(_) => Value::Null,
-        };
-        Focused {
-            role: found["role"].as_str().filter(|r| !r.is_empty()).map(String::from),
-            label: found["label"].as_str().unwrap_or_default().to_string(),
+        match result {
+            Ok(result) if result.get("exceptionDetails").is_some() => Ok((Value::Null, object)),
+            Ok(result) => Ok((result["result"]["value"].clone(), object)),
+            Err(err) => {
+                release(page, &object).await;
+                Err(err)
+            }
         }
     }
 
@@ -628,11 +814,11 @@ impl Browser {
         }
     }
 
-    async fn click_node(&self, backend_id: i64) -> Result<()> {
+    /// Clicks the reviewed element at its centre. Some(why not) when something
+    /// else is at that spot by then: nothing is clicked.
+    async fn click_node(&self, element: &Element, approved: &Place) -> Result<Option<String>> {
         let page = self.page()?;
-        let _ = page
-            .call("DOM.scrollIntoViewIfNeeded", json!({"backendNodeId": backend_id}))
-            .await;
+        let backend_id = element.node;
         let quads = page
             .call("DOM.getContentQuads", json!({"backendNodeId": backend_id}))
             .await?;
@@ -647,14 +833,33 @@ impl Browser {
         }
         let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4.0;
         let y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4.0;
-        for (kind, buttons) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 0)] {
-            page.call(
-                "Input.dispatchMouseEvent",
-                json!({"type": kind, "x": x, "y": y, "button": "left", "buttons": buttons, "clickCount": 1}),
-            )
+        self.verify_place(Some(element), approved).await?;
+        // The click goes to whatever is at (x, y), so check that it's the
+        // element the user reviewed, one round trip before the click.
+        let (hit, object) = self
+            .run_on_reviewed(approved, HIT_TEST, json!([{"value": x}, {"value": y}]))
             .await?;
+        let on_target = hit == true;
+        let clicked = async {
+            if on_target {
+                for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {
+                    page.call(
+                        "Input.dispatchMouseEvent",
+                        json!({"type": kind, "x": x, "y": y, "button": "left", "buttons": buttons, "clickCount": 1}),
+                    )
+                    .await?;
+                }
+            }
+            anyhow::Ok(())
         }
-        Ok(())
+        .await;
+        release(page, &object).await;
+        clicked?;
+        Ok((!on_target).then(|| {
+            "the page changed under the target (something else is at that spot now). Take a new \
+             snapshot and ask again."
+                .to_string()
+        }))
     }
 
     async fn key(&self, key: &str) -> Result<()> {
@@ -672,6 +877,81 @@ impl Browser {
         )
         .await?;
         Ok(())
+    }
+}
+
+/// A new isolated world on the frame: its execution context. Page scripts
+/// can't reach it or change the DOM prototypes it sees.
+async fn approval_world(page: &Page, frame: &str) -> Result<i64> {
+    let world = page
+        .call(
+            "Page.createIsolatedWorld",
+            json!({"frameId": frame, "worldName": "agentd-approval"}),
+        )
+        .await?;
+    world["executionContextId"]
+        .as_i64()
+        .context("could not inspect the page")
+}
+
+/// The element `node` means (a text node means its parent), as an object in
+/// `context`. Release it when done.
+async fn element_in(page: &Page, context: i64, node: i64) -> Result<String> {
+    let resolved = page
+        .call(
+            "DOM.resolveNode",
+            json!({"backendNodeId": node, "executionContextId": context}),
+        )
+        .await?;
+    let object = resolved["object"]["objectId"]
+        .as_str()
+        .context("the target is no longer on the page")?
+        .to_string();
+    let element = page
+        .call(
+            "Runtime.callFunctionOn",
+            json!({"objectId": object, "functionDeclaration": TO_ELEMENT}),
+        )
+        .await;
+    release(page, &object).await;
+    object_of(&element?).context("the target isn't an element on the page")
+}
+
+/// The object a script returned; None for a primitive, null, or an error it
+/// threw.
+fn object_of(result: &Value) -> Option<String> {
+    if result.get("exceptionDetails").is_some() {
+        return None;
+    }
+    result["result"]["objectId"].as_str().map(String::from)
+}
+
+async fn release(page: &Page, object: &str) {
+    let _ = page
+        .call("Runtime.releaseObject", json!({"objectId": object}))
+        .await;
+}
+
+/// SHA-256, base64url: what a binding keeps of text it shouldn't hold.
+fn fingerprint(bytes: &[u8]) -> String {
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref())
+}
+
+/// An address as a card shows it: scheme, host, port and path. No user name
+/// or password, query or fragment, which can hold tokens. Only the scheme
+/// for an address without a host (`javascript:`, `data:`, `about:`).
+fn shown_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) if url.cannot_be_a_base() => format!("{}:", url.scheme()),
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => "about:invalid".into(),
     }
 }
 
@@ -1168,7 +1448,7 @@ mod tests {
     async fn live_clicks_wait_for_their_effects_and_check_the_target() {
         let cdp = Cdp::new(&std::env::var("CDP_URL").expect("CDP_URL")).unwrap();
         let target = cdp.new_page().await.unwrap();
-        let mut browser = Browser::new(cdp.clone(), true, Arc::new(Policy::defaults()));
+        let mut browser = Browser::new(cdp.clone());
         browser.switch_to(&target).await.unwrap();
 
         browser
@@ -1177,7 +1457,10 @@ mod tests {
             .unwrap();
         let link = browser.find(None, Some("link"), Some("new"), None).await.unwrap();
         let started = Instant::now();
-        let clicked = browser.click(&link).await.unwrap();
+        let clicked = browser
+            .click(&link, &browser.place_of(Some(&link)).await.unwrap())
+            .await
+            .unwrap();
         println!("{clicked}\n  in {:?}", started.elapsed());
         assert!(clicked.contains("newest"), "{clicked}");
 
@@ -1188,26 +1471,71 @@ mod tests {
             .find(None, Some("button"), Some("Covered"), None)
             .await
             .unwrap();
-        let result = browser.click(&covered).await.unwrap();
+        let result = browser
+            .click(&covered, &browser.place_of(Some(&covered)).await.unwrap())
+            .await
+            .unwrap();
         println!("{result}");
         assert!(result.contains("covered by \"Cookie banner\""), "{result}");
         let off = browser
             .find(None, Some("button"), Some("Off"), None)
             .await
             .unwrap();
-        let result = browser.click(&off).await.unwrap();
+        let result = browser
+            .click(&off, &browser.place_of(Some(&off)).await.unwrap())
+            .await
+            .unwrap();
         println!("{result}");
         assert!(result.contains("disabled"), "{result}");
     }
 
-    /// What a click card shows, against a real Chrome (CDP_URL): the text around
-    /// the element, and a picture that leaves the page exactly as it was.
     #[tokio::test]
-    #[ignore = "needs CDP_URL pointing at a Chrome"]
-    async fn live_a_cards_picture_leaves_the_page_as_it_was() {
+    #[ignore = "needs a local Chrome with remote debugging"]
+    async fn live_browser_approval_follows_the_control_and_form_state() {
         let cdp = Cdp::new(&std::env::var("CDP_URL").expect("CDP_URL")).unwrap();
         let target = cdp.new_page().await.unwrap();
-        let mut browser = Browser::new(cdp.clone(), true, Arc::new(Policy::defaults()));
+        let mut browser = Browser::new(cdp.clone());
+        browser.switch_to(&target).await.unwrap();
+        browser.open_url(
+            "data:text/html,<form><input aria-label='Message' value='original'><button type='button'>Save</button></form>",
+            false,
+        ).await.unwrap();
+
+        let button = browser
+            .find(None, Some("button"), Some("Save"), None)
+            .await
+            .unwrap();
+        let approved = browser.place_of(Some(&button)).await.unwrap();
+        browser
+            .page()
+            .unwrap()
+            .eval("document.querySelector('input').value = 'new draft'")
+            .await
+            .unwrap();
+        assert!(browser.verify_place(Some(&button), &approved).await.is_err());
+        let field = browser
+            .find(None, Some("textbox"), Some("Message"), None)
+            .await
+            .unwrap();
+        let approved = browser.place_of(Some(&field)).await.unwrap();
+        browser.type_text(&field, " typed", &approved).await.unwrap();
+        let value = browser
+            .page()
+            .unwrap()
+            .eval("document.querySelector('input').value")
+            .await
+            .unwrap();
+        assert!(value.as_str().unwrap().contains(" typed"));
+        cdp.close(&target.id).await.unwrap();
+    }
+
+    /// Inspecting an approval target and taking a screenshot leave the DOM intact.
+    #[tokio::test]
+    #[ignore = "needs CDP_URL pointing at a Chrome"]
+    async fn live_approval_inspection_leaves_the_page_as_it_was() {
+        let cdp = Cdp::new(&std::env::var("CDP_URL").expect("CDP_URL")).unwrap();
+        let target = cdp.new_page().await.unwrap();
+        let mut browser = Browser::new(cdp.clone());
         browser.switch_to(&target).await.unwrap();
         let page = "data:text/html,<title>Invoices</title>\
             <table><tr><td>March from Acme, $120</td><td><button>Plain</button></td></tr></table>\
@@ -1222,7 +1550,8 @@ mod tests {
                 .find(None, Some("button"), Some(name), None)
                 .await
                 .unwrap();
-            let picture = browser.picture_of(Some(&element)).await.unwrap();
+            browser.place_of(Some(&element)).await.unwrap();
+            let picture = browser.screenshot_jpeg().await.unwrap();
             assert!(!picture.is_empty());
             let style = browser
                 .page()
@@ -1238,9 +1567,208 @@ mod tests {
             .find(None, Some("button"), Some("Plain"), None)
             .await
             .unwrap();
-        let place = browser.place_of(Some(&plain)).await;
+        let place = browser.place_of(Some(&plain)).await.unwrap();
         assert_eq!(place.title, "Invoices");
         assert!(place.around.contains("March from Acme, $120"), "{}", place.around);
+    }
+
+    /// The page these approval tests run on, served from localhost so it has
+    /// an http address with a query and a fragment.
+    const TARGETS_PAGE: &str = r#"<!doctype html><title>Orders</title><img name="title">
+        <form action="https://collect.example/submit?token=abc" method="post">
+          <input type="hidden" name="action" value="update">
+          <input type="hidden" name="method" value="get">
+          <input name="elements" aria-label="Elements"><input type="password" name="pin">
+          <button type="button">Pay</button>
+        </form>
+        <div onclick="this.dataset.clicked = 1"><span>Archive this</span></div>
+        <div style="position: relative; width: 160px; height: 30px">
+          <input type="checkbox" id="news" aria-label="News"
+            style="position: absolute; left: 0; top: 0; width: 20px; height: 20px; margin: 0">
+          <label for="news" style="position: absolute; inset: 0">Newsletter</label>
+        </div>
+        <my-field></my-field>
+        <ul><li>Shipping label <button id="real" onclick="window.realClicked = 1">Real</button></li></ul>
+        <p><button id="decoy" onclick="window.decoyClicked = 1">Decoy</button></p>
+        <script>
+          customElements.define('my-field', class extends HTMLElement {
+            connectedCallback() {
+              this.attachShadow({mode: 'open'}).innerHTML =
+                '<form action="/save?draft=1"><input aria-label="Nickname"></form>';
+            }
+          });
+        </script>"#;
+
+    async fn serve(html: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                    html.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        address
+    }
+
+    /// Approval targets against a real Chrome (CDP_URL): named controls can't
+    /// hide where a form goes, how, or that it has a password; plain text and a
+    /// shadow root's field are targets; cards and bindings leave out the
+    /// query; a label clicks its control; and a click doesn't land on what the
+    /// page put over the target after the review, even when the page fools
+    /// the main world's own hit test.
+    #[tokio::test]
+    #[ignore = "needs CDP_URL pointing at a Chrome"]
+    async fn live_approval_targets_hold_against_the_page() {
+        let address = serve(TARGETS_PAGE).await;
+        let cdp = Cdp::new(&std::env::var("CDP_URL").expect("CDP_URL")).unwrap();
+        let target = cdp.new_page().await.unwrap();
+        let mut browser = Browser::new(cdp.clone());
+        browser.switch_to(&target).await.unwrap();
+        browser
+            .open_url(&format!("http://{address}/orders?session=s3cret#top"), false)
+            .await
+            .unwrap();
+        let eval = |expression: &'static str| {
+            let page = browser.page().unwrap();
+            async move { page.eval(expression).await.unwrap() }
+        };
+        // The page's own world does see the named controls in place of the properties.
+        assert_eq!(
+            eval("[typeof document.title, typeof document.forms[0].action, typeof document.forms[0].method]")
+                .await,
+            json!(["object", "object", "object"])
+        );
+
+        let pay = browser
+            .find(None, Some("button"), Some("Pay"), None)
+            .await
+            .unwrap();
+        let place = browser.place_of(Some(&pay)).await.unwrap();
+        assert_eq!(place.title, "Orders");
+        assert_eq!(place.url, format!("http://{address}/orders"));
+        assert_eq!(
+            place.destination.as_deref(),
+            Some("https://collect.example/submit")
+        );
+        assert!(place.protected, "the form has a password field");
+        assert_eq!(place.binding["method"], "post");
+        assert_eq!(
+            place.binding["destination"],
+            fingerprint(b"https://collect.example/submit?token=abc")
+        );
+        let binding = place.binding.to_string();
+        assert!(
+            !binding.contains("s3cret") && !binding.contains("token=abc"),
+            "{binding}"
+        );
+
+        // Plain text: its element is the target, and the click reaches the handler.
+        let text = browser
+            .find(None, None, None, Some("Archive this"))
+            .await
+            .unwrap();
+        let place = browser.place_of(Some(&text)).await.unwrap();
+        assert_eq!(place.label, "span");
+        let clicked = browser.click(&text, &place).await.unwrap();
+        assert!(clicked.starts_with("clicked"), "{clicked}");
+        assert_eq!(eval("document.querySelector('div').dataset.clicked").await, "1");
+
+        // A label over its checkbox: the click goes through it.
+        let news = browser
+            .find(None, Some("checkbox"), Some("News"), None)
+            .await
+            .unwrap();
+        let clicked = browser
+            .click(&news, &browser.place_of(Some(&news)).await.unwrap())
+            .await
+            .unwrap();
+        assert!(clicked.starts_with("clicked"), "{clicked}");
+        assert_eq!(eval("document.getElementById('news').checked").await, true);
+
+        // A field in a shadow root: reviewed, typed into, and what has the focus.
+        let field = browser
+            .find(None, Some("textbox"), Some("Nickname"), None)
+            .await
+            .unwrap();
+        let place = browser.place_of(Some(&field)).await.unwrap();
+        assert_eq!(place.label, "Nickname");
+        assert_eq!(place.destination, Some(format!("http://{address}/save")));
+        let typed = browser.type_text(&field, "Neo", &place).await.unwrap();
+        assert!(typed.starts_with("typed"), "{typed}");
+        assert_eq!(
+            eval("document.querySelector('my-field').shadowRoot.querySelector('input').value").await,
+            "Neo"
+        );
+        assert_eq!(browser.place_of(None).await.unwrap().label, "Nickname");
+
+        // After the review, the page puts another button over the reviewed one
+        // and fools the page's own hit test: nothing is clicked.
+        let real = browser
+            .find(None, Some("button"), Some("Real"), None)
+            .await
+            .unwrap();
+        let place = browser.place_of(Some(&real)).await.unwrap();
+        eval(
+            "(() => {
+                const real = document.getElementById('real'), r = real.getBoundingClientRect();
+                Object.assign(document.getElementById('decoy').style, {position: 'fixed', zIndex: 10,
+                    left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px'});
+                document.elementFromPoint = () => real;
+            })()",
+        )
+        .await;
+        let clicked = browser.click(&real, &place).await.unwrap();
+        assert!(clicked.contains("the page changed under the target"), "{clicked}");
+        assert_eq!(
+            eval("[window.realClicked ?? null, window.decoyClicked ?? null]").await,
+            json!([null, null])
+        );
+        cdp.close(&target.id).await.unwrap();
+    }
+
+    #[test]
+    fn cards_show_addresses_without_their_query_and_bindings_keep_digests() {
+        assert_eq!(
+            shown_url("https://me:pw@mail.example.com:8443/inbox/42?token=abc#message"),
+            "https://mail.example.com:8443/inbox/42"
+        );
+        assert_eq!(shown_url("https://example.com"), "https://example.com/");
+        assert_eq!(shown_url("javascript:alert(document.cookie)"), "javascript:");
+        assert_eq!(shown_url("data:text/html,<b>private</b>"), "data:");
+        assert_eq!(shown_url("not an address"), "about:invalid");
+        // What agentd checks on a card works on what the card shows.
+        assert!(crate::guard::check_url(&shown_url("https://example.com/a?b=c")).is_ok());
+        assert!(crate::guard::check_url(&shown_url("http://127.0.0.1:9222/json?x=1")).is_err());
+        assert!(crate::guard::check_url(&shown_url("javascript:void(0)")).is_err());
+        let digest = fingerprint(b"https://example.com/?token=abc");
+        assert_ne!(digest, fingerprint(b"https://example.com/?token=abd"));
+        assert!(!digest.contains("token"));
+    }
+
+    #[test]
+    fn only_an_object_a_script_returned_is_an_element() {
+        assert_eq!(
+            object_of(&json!({"result": {"type": "object", "objectId": "1"}})),
+            Some("1".into())
+        );
+        assert_eq!(
+            object_of(&json!({"result": {"type": "object", "subtype": "null", "value": null}})),
+            None
+        );
+        assert_eq!(
+            object_of(&json!({
+                "result": {"type": "object", "subtype": "error", "objectId": "2"},
+                "exceptionDetails": {"text": "Uncaught"}
+            })),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1249,7 +1777,7 @@ mod tests {
         let cdp = Cdp::new(&std::env::var("CDP_URL").expect("CDP_URL")).unwrap();
         let target = cdp.new_page().await.unwrap();
         println!("tab {}", target.id);
-        let mut browser = Browser::new(cdp.clone(), false, Arc::new(Policy::defaults()));
+        let mut browser = Browser::new(cdp.clone());
         browser.switch_to(&target).await.unwrap();
         let url = std::env::var("SETTLE_URL").unwrap_or_else(|_| "https://example.com".into());
         let expect = std::env::var("SETTLE_TEXT").unwrap_or_else(|_| "documentation".into());

@@ -392,13 +392,12 @@ private struct DraftField: View {
     }
 }
 
-/// A command that needs the user's OK: what it does in plain words and why
-/// it needs the OK; the command itself only when asked for.
+/// A command that needs the user's OK, with its arguments and access visible.
 private struct ApprovalCard: View {
     let approval: Approval
     @Environment(\.chatStore) private var store
     @Environment(\.agentClient) private var client
-    @State private var showCommand = false
+    @State private var showCommand = true
     @State private var draft = CardDraft()
 
     var body: some View {
@@ -418,6 +417,19 @@ private struct ApprovalCard: View {
                 )
                 .font(.app(.caption))
                 .foregroundStyle(.orange)
+            }
+            if approval.directInternet {
+                Label("Direct internet access outside the proxy for this command.", systemImage: "network")
+                    .font(.app(.caption))
+                    .foregroundStyle(.orange)
+            }
+            if !approval.savedKeys.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Saved keys this command can use").font(.app(.caption).weight(.semibold))
+                    Text(approval.savedKeys.joined(separator: ", "))
+                        .font(.app(.footnote).monospaced())
+                        .textSelection(.enabled)
+                }
             }
             HStack {
                 if !draft.editing {
@@ -446,6 +458,7 @@ private struct ApprovalCard: View {
             } else if showCommand {
                 Text(approval.command)
                     .font(.app(.footnote).monospaced())
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -502,9 +515,6 @@ private struct BrowserApprovalCard: View {
                 Image(systemName: icon).foregroundStyle(.orange)
                 Text(title).font(.app(.headline))
                 Spacer()
-                if !action.site.isEmpty {
-                    Label(site, systemImage: "globe").font(.app(.caption)).foregroundStyle(.secondary).lineLimit(1)
-                }
             }
             // A click or key says little by itself. The agent's reason first, then
             // what the page itself shows, which the agent's words can't change.
@@ -517,7 +527,7 @@ private struct BrowserApprovalCard: View {
             switch action.action {
             case "type":
                 if !action.target.isEmpty {
-                    Text("In “\(action.target)”").font(.app(.footnote)).foregroundStyle(.secondary).lineLimit(2)
+                    Text("In “\(action.target)”").font(.app(.footnote)).foregroundStyle(.secondary)
                 }
                 if draft.editing {
                     DraftField(label: "What to write", text: $draft.text)
@@ -537,22 +547,20 @@ private struct BrowserApprovalCard: View {
                 HStack(spacing: 8) {
                     KeyCap(key: action.key ?? "?")
                     if !action.target.isEmpty {
-                        Text("in “\(action.target)”").foregroundStyle(.secondary).lineLimit(2)
+                        Text("in “\(action.target)”").foregroundStyle(.secondary)
                     }
                 }
                 .font(.app(.callout))
             default:
-                Text(clickTarget).font(.app(.callout).weight(.medium)).lineLimit(3)
+                Text(clickTarget).font(.app(.callout).weight(.medium))
             }
-            if action.action != "type" {
-                pageFacts
-            }
-            if action.action == "type", action.submit {
-                Label("Then presses Enter, which may send it", systemImage: "return")
+            pageFacts
+            if legacySend {
+                Label("This older request bundled typing and sending. Deny it and ask again after updating the desktop.", systemImage: "exclamationmark.triangle")
                     .font(.app(.footnote))
                     .foregroundStyle(.orange)
-            } else if action.action == "type", action.sends {
-                Label("Approving also lets it send this", systemImage: "paperplane")
+            } else if action.action == "type", action.submit {
+                Label("Then presses Enter, which may send it", systemImage: "return")
                     .font(.app(.footnote))
                     .foregroundStyle(.orange)
             } else if action.action != "type", !approval.reason.isEmpty {
@@ -566,7 +574,7 @@ private struct BrowserApprovalCard: View {
                     Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
                 }
                 .primaryGlass()
-                .disabled(draft.isBlank)
+                .disabled(draft.isBlank || legacySend)
             }
             .controlSize(.large)
         }
@@ -579,7 +587,6 @@ private struct BrowserApprovalCard: View {
                 Text("Around it on the page").font(.app(.caption).weight(.semibold))
                 Text(action.around)
                     .font(.app(.footnote))
-                    .lineLimit(6)
                     .textSelection(.enabled)
             }
             .foregroundStyle(.secondary)
@@ -587,10 +594,20 @@ private struct BrowserApprovalCard: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Theme.inset, in: .rect(cornerRadius: 14))
         }
-        if !action.page.isEmpty || !action.url.isEmpty {
+        let url = action.url.isEmpty ? action.site : action.url
+        if !action.page.isEmpty || !url.isEmpty || !action.destination.isEmpty {
             VStack(alignment: .leading, spacing: 1) {
-                if !action.page.isEmpty { Text(action.page).lineLimit(1) }
-                if !action.url.isEmpty { Text(action.url).lineLimit(1).truncationMode(.middle) }
+                if !action.page.isEmpty { Text(action.page) }
+                if !url.isEmpty {
+                    Text(url)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                if !action.destination.isEmpty {
+                    Text("Destination: \(action.destination)")
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
             }
             .font(.app(.caption))
             .foregroundStyle(.secondary)
@@ -608,7 +625,7 @@ private struct BrowserApprovalCard: View {
 
     private var title: String {
         switch action.action {
-        case "type": action.submit || action.sends ? "Write and send this?" : "Write this?"
+        case "type": action.submit ? "Write this and press Enter?" : "Write this?"
         case "key": "Press \(action.key ?? "a key")?"
         default: "Click this?"
         }
@@ -622,14 +639,8 @@ private struct BrowserApprovalCard: View {
         }
     }
 
-
-    /// app.slack.com → slack.com
-    private var site: String {
-        var host = action.site
-        for prefix in ["www.", "app.", "mail."] where host.hasPrefix(prefix) {
-            host.removeFirst(prefix.count)
-        }
-        return host
+    private var legacySend: Bool {
+        action.action == "type" && action.sends && !action.submit
     }
 
     private func answer(_ approved: Bool) {

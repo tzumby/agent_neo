@@ -171,7 +171,35 @@
   ansible.builtin.file:
     path: "{{ desktop_config_dir }}"
     state: directory
+    owner: root
+    group: root
     mode: "0755"
+
+- name: Install the browser network rules
+  ansible.builtin.template:
+    src: browser-guard.nft.j2
+    dest: "{{ desktop_config_dir }}/browser-guard.nft"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload the browser network rules
+
+- name: Install the browser network guard unit
+  ansible.builtin.template:
+    src: neo-agent-browser-guard.service.j2
+    dest: /etc/systemd/system/neo-agent-browser-guard.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload the browser network rules
+
+- name: Apply the browser network restrictions before starting Chrome
+  ansible.builtin.systemd_service:
+    name: neo-agent-browser-guard
+    enabled: true
+    state: started
+    daemon_reload: true
+  ignore_errors: "{{ ansible_check_mode }}"
 
 - name: Generate a VNC password
   ansible.builtin.shell: |

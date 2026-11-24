@@ -59,20 +59,20 @@ struct ChatView: View {
                 if store.connection == .live { await push.register() }
             }
             .task(id: "\(push.deviceToken ?? "")|\(connectionKey)") { await registerForPush() }
-            .task(id: push.pendingAnswer) { await sendPendingAnswer() }
+            // A new Tailscale session restarts the search with its client.
+            .task(id: "\(push.pendingCardID ?? "")|\(connectionKey)") { await openNotificationCard() }
     }
 
     /// Hands this device's push token to the desktop, which registers it for
     /// APNs notifications. Retries while the connection comes up. Nothing
     /// happens on a desktop with no APNs key (it answers 400).
     private func registerForPush() async {
-        guard let token = push.deviceToken else { return }
+        guard push.deviceToken != nil else { return }
         let topic = Bundle.main.bundleIdentifier ?? ""
         for _ in 0..<10 {
             if store.connection == .live {
                 do {
-                    try await client.registerDevice(
-                        token: token, name: Device.name, environment: Device.pushEnvironment, topic: topic)
+                    try await push.registerDevice(on: client, topic: topic)
                     return
                 } catch let error as AgentError where error.statusCode == 400 {
                     return  // notifications to the apps aren't set up on this desktop
@@ -83,22 +83,28 @@ struct ChatView: View {
         }
     }
 
-    /// Approve/Deny tapped on a notification: send it once connected.
-    private func sendPendingAnswer() async {
-        guard let answer = push.pendingAnswer else { return }
-        // After a cold launch from the notification, Tailscale needs a few seconds.
-        for _ in 0..<45 where store.connection != .live {
-            try? await Task.sleep(for: .seconds(1))
-            if Task.isCancelled { return }
+    /// A notification was tapped: show its card. After the app was suspended
+    /// the chat catches up first (`ChatStore.locate`), so a card that's still
+    /// on its way isn't reported gone.
+    private func openNotificationCard() async {
+        guard let id = push.pendingCardID, !push.loggingOut else { return }
+        let dismissingSheet = showingSettings || showingMemory
+        showingSettings = false
+        showingMemory = false
+        if dismissingSheet { try? await Task.sleep(for: .milliseconds(450)) }
+        let found = await store.locate(id, client: client)
+        guard !Task.isCancelled, push.pendingCardID == id else { return }
+        switch found {
+        case .waiting:
+            withAnimation(.snappy) { position.scrollTo(id: id, anchor: .center) }
+        case .settled:
+            store.notice = "That request was already answered, or it expired."
+        case .missing:
+            store.notice = "That request isn't in the chat any more."
+        case .unreachable:
+            break  // the chat stays open at its end, where the card shows once the desktop answers
         }
-        do {
-            try await client.answer(approval: answer.approvalID, approved: answer.approved)
-        } catch let error as AgentError where error.statusCode == 404 {
-            store.notice = "That request has expired."
-        } catch {
-            store.notice = "Couldn't send your answer: \(error.localizedDescription)"
-        }
-        push.pendingAnswer = nil
+        push.pendingCardID = nil
     }
 
     /// The conversation with its bars: the stage banner, the composer.
@@ -553,9 +559,9 @@ private struct ModelMenu: View {
         Binding(
             get: { status.settings.model },
             set: { model in
-                var settings = status.settings
-                settings.model = model
-                Task { await store.update(settings: settings, client: client) }
+                Task {
+                    if let problem = await store.updateSettings(model: model, client: client) { store.notice = problem }
+                }
             })
     }
 
@@ -563,9 +569,11 @@ private struct ModelMenu: View {
         Binding(
             get: { status.settings.allowActions },
             set: { allow in
-                var settings = status.settings
-                settings.allowActions = allow
-                Task { await store.update(settings: settings, client: client) }
+                Task {
+                    if let problem = await store.updateSettings(allowActions: allow, client: client) {
+                        store.notice = problem
+                    }
+                }
             })
     }
 }

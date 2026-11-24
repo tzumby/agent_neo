@@ -6,12 +6,11 @@ table inet neo_agent_guard
 delete table inet neo_agent_guard
 
 table inet neo_agent_guard {
-  # The shell user while a command the user approved to connect on its own runs
-  # (agentd adds and removes it; services/agentd/src/agent.rs, open_direct).
-  # Entries expire by themselves, so this closes even if agentd stops.
-  set direct_egress {
-    typeof meta skuid
-    flags timeout
+  chain public_only {
+    oifname "lo" counter reject
+    fib daddr type local counter reject
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 } counter reject
+    ip6 daddr != 2000::/3 counter reject
   }
 
   chain output {
@@ -22,29 +21,21 @@ table inet neo_agent_guard {
     ip daddr 169.254.169.254 meta skuid != 0 counter reject
     ip6 daddr fd00:ec2::254 meta skuid != 0 counter reject
 
-    # The shell user can't reach the desktop's controls on localhost (Chrome
-    # DevTools, VNC, noVNC), so it can't drive the logged-in browser around
-    # the approvals.
-    meta skuid {{ agentd_shell_uid }} ip daddr 127.0.0.0/8 tcp dport { {{ agentd_guarded_ports | join(', ') }} } counter reject
-    meta skuid {{ agentd_shell_uid }} ip6 daddr ::1 tcp dport { {{ agentd_guarded_ports | join(', ') }} } counter reject
+    # Squid may reply to clients and query the local resolver. Check its actual
+    # upstream destination too, so a DNS answer cannot evade the proxy policy.
+    meta skuid {{ agentd_proxy_uid }} ct direction reply ct state established accept
+    meta skuid {{ agentd_proxy_uid }} ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
+    meta skuid {{ agentd_proxy_uid }} jump public_only
 
-    # A command the user approved to connect on its own: the local DNS resolver
-    # and the public internet, each new connection logged since Squid won't see
-    # it (journalctl -k | grep agentd-direct). Never internal addresses (the
-    # same ones Squid refuses): the VPC, Tailscale, link-local, private ranges.
-    meta skuid @direct_egress oifname "lo" meta l4proto { tcp, udp } th dport 53 accept
-    meta skuid @direct_egress oifname != "lo" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } counter reject
-    meta skuid @direct_egress oifname != "lo" ip6 daddr { fc00::/7, fe80::/10 } counter reject
-    meta skuid @direct_egress oifname != "lo" ct state new counter log prefix "agentd-direct: "
-    meta skuid @direct_egress oifname != "lo" accept
+    # A direct unit can resolve names locally and connect to public addresses.
+    # Other processes using the same Unix account do not receive this grant.
+    meta skuid {{ agentd_shell_uid }} socket cgroupv2 level 1 "neodirect.slice" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
+    meta skuid {{ agentd_shell_uid }} socket cgroupv2 level 1 "neodirect.slice" jump public_only
+    meta skuid {{ agentd_shell_uid }} socket cgroupv2 level 1 "neodirect.slice" ct state new limit rate 20/second counter log prefix "agentd-direct: "
+    meta skuid {{ agentd_shell_uid }} socket cgroupv2 level 1 "neodirect.slice" accept
 
-    # No DNS of its own (the proxy resolves names), so no data out through
-    # DNS lookups.
-    meta skuid {{ agentd_shell_uid }} meta l4proto { tcp, udp } th dport 53 counter reject
-
-    # Local services (a dev server it started, the egress proxy) are fine;
-    # everything else goes through the proxy.
-    meta skuid {{ agentd_shell_uid }} oifname "lo" accept
+    # All other worker connections go only to Squid.
+    meta skuid {{ agentd_shell_uid }} ip daddr 127.0.0.1 tcp dport {{ agentd_egress_proxy_port }} accept
     meta skuid {{ agentd_shell_uid }} counter reject
   }
 }

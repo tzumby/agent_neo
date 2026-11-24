@@ -48,6 +48,28 @@ pub struct Notice {
     pub urgency: &'static str,
     /// How long the push service keeps it for an offline browser.
     pub ttl: u32,
+    /// The apps' notification category: "APPROVAL" adds Approve/Deny buttons
+    /// (apps/apple PushCenter); None just opens the app. Web browsers ignore it.
+    pub category: Option<&'static str>,
+    /// Short ids for the apps to act on and deep-link: `{task, approval?, action?}`.
+    pub data: Value,
+}
+
+impl Notice {
+    /// A notification with no category and only its task in `data` (a finished
+    /// task, a test): the common case.
+    pub fn plain(title: String, body: String, tag: String, urgency: &'static str, ttl: u32) -> Self {
+        let data = json!({ "task": tag });
+        Self {
+            title,
+            body,
+            tag,
+            urgency,
+            ttl,
+            category: None,
+            data,
+        }
+    }
 }
 
 fn unix_now() -> i64 {
@@ -129,6 +151,22 @@ fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| webpush::client().unwrap_or_default())
 }
 
+/// An HTTP/2 client for APNs (Apple requires HTTP/2; the Web Push one is HTTP/1).
+fn apns_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+/// A bundle id's bytes (letters, digits, dots and hyphens).
+fn valid_topic_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'.' || b == b'-'
+}
+
 impl Agent {
     /// This desktop's VAPID key, made the first time it's needed and kept in
     /// agentd's settings (a reset makes a new one, with the subscriptions gone).
@@ -144,12 +182,60 @@ impl Agent {
         Ok(vapid)
     }
 
-    /// For the web app: the key browsers subscribe with, and the browsers on.
+    /// For the web app: the key browsers subscribe with, the browsers on, and
+    /// the apps registered for notifications (apns.rs). `apns` says whether an
+    /// APNs key is configured, so the apps can tell "off" from "no device yet".
     pub fn push_info(&self) -> Result<Value> {
         Ok(json!({
             "public_key": self.vapid()?.public_key(),
             "subscriptions": self.store.push_subscriptions()?,
+            "apns": self.apns.is_some(),
+            "devices": self.store.device_tokens()?,
         }))
+    }
+
+    /// An app registers its device token for APNs notifications (its own bundle
+    /// id is the topic). Replaces the entry with the same token.
+    pub fn register_device(
+        &self,
+        token: &str,
+        topic: &str,
+        environment: &str,
+        label: &str,
+    ) -> Result<String, PushError> {
+        if self.apns.is_none() {
+            return Err(PushError::Invalid(
+                "this desktop has no APNs key: notifications to the apps are off".into(),
+            ));
+        }
+        let token = token.trim();
+        if token.is_empty() || token.len() > 200 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(PushError::Invalid("the device token must be hex".into()));
+        }
+        let topic = topic.trim();
+        if topic.is_empty() || topic.len() > 200 || !topic.bytes().all(valid_topic_byte) {
+            return Err(PushError::Invalid(
+                "the app's bundle id (topic) is missing or invalid".into(),
+            ));
+        }
+        let environment = match environment {
+            "sandbox" | "production" => environment,
+            _ => "production",
+        };
+        let id = self
+            .store
+            .save_device_token(token, topic, environment, &clip(label, 60), unix_now())
+            .map_err(PushError::Failed)?;
+        tracing::info!(device = %id, environment, "notifications on in an app");
+        Ok(id)
+    }
+
+    pub fn unregister_device(&self, id: &str) -> Result<bool> {
+        let gone = self.store.delete_device_token(id)?;
+        if gone {
+            tracing::info!(device = %id, "notifications off in an app");
+        }
+        Ok(gone)
     }
 
     pub fn subscribe_push(
@@ -185,21 +271,39 @@ impl Agent {
         Ok(gone)
     }
 
-    /// Queues a notification for every browser with notifications on (or
-    /// only `only`). How many it went to.
+    /// Queues a notification for every browser and app with notifications on
+    /// (or only the one whose id is `only`). How many it went to. Each is a
+    /// `web_push` or `apns` effect (effects.rs): stored first, sent with
+    /// retries, and a newer one for the same task tag replaces one not sent yet.
     pub fn notify(&self, notice: &Notice, only: Option<&str>) -> Result<usize> {
         let now = unix_now();
+        let title = self.secrets.redact(&notice.title);
+        let body = self.secrets.redact(&notice.body);
         let mut queued = 0;
         for sub in self.store.push_subscriptions()? {
             if only.is_some_and(|id| id != sub.id) {
                 continue;
             }
             let payload = json!({
-                "sub": sub.id, "title": self.secrets.redact(&notice.title), "body": self.secrets.redact(&notice.body),
+                "sub": sub.id, "title": title, "body": body,
                 "tag": notice.tag, "url": "/#/chat", "urgency": notice.urgency, "ttl": notice.ttl, "created": now,
             });
             self.enqueue("web_push", &format!("{}:{}", sub.id, notice.tag), &payload, now)?;
             queued += 1;
+        }
+        if self.apns.is_some() {
+            for device in self.store.device_tokens()? {
+                if only.is_some_and(|id| id != device.id) {
+                    continue;
+                }
+                let payload = json!({
+                    "device": device.id, "title": title, "body": body, "tag": notice.tag,
+                    "urgency": notice.urgency, "ttl": notice.ttl, "created": now,
+                    "category": notice.category, "data": notice.data,
+                });
+                self.enqueue("apns", &format!("{}:{}", device.id, notice.tag), &payload, now)?;
+                queued += 1;
+            }
         }
         Ok(queued)
     }
@@ -210,26 +314,38 @@ impl Agent {
         }
     }
 
-    /// A parked task's card: it waits on you.
+    /// A parked task's card: it waits on you. On the apps, a command, a
+    /// browser action or a stuck task shows Approve/Deny on the notification
+    /// itself; a key, a site or a schedule just opens the app (you can't paste
+    /// a key or weigh a schedule from the lock screen).
     pub fn notify_card(&self, task: &str, card: &Value) {
         if let Some((title, body)) = card_notice(card) {
+            let category = match card["kind"].as_str() {
+                Some("shell" | "browser" | "stuck") => Some("APPROVAL"),
+                _ => None,
+            };
+            let id = card["id"].as_str().unwrap_or_default();
             self.notify_quietly(Notice {
                 title,
                 body,
                 tag: task.to_string(),
                 urgency: "high",
                 ttl: 86_400,
+                category,
+                data: json!({"task": task, "approval": id}),
             });
         }
     }
 
-    pub fn notify_action_needed(&self, task: &str, reason: &str) {
+    pub fn notify_action_needed(&self, task: &str, id: &str, reason: &str) {
         self.notify_quietly(Notice {
             title: "Needs you".into(),
             body: clip(reason, BODY_CHARS),
             tag: task.to_string(),
             urgency: "high",
             ttl: 86_400,
+            category: None,
+            data: json!({"task": task, "action": id}),
         });
     }
 
@@ -257,13 +373,7 @@ impl Agent {
             (None, "error") => "Hit a problem".to_string(),
             _ => return,
         };
-        self.notify_quietly(Notice {
-            title,
-            body,
-            tag: task.to_string(),
-            urgency: "normal",
-            ttl: 4 * 3600,
-        });
+        self.notify_quietly(Notice::plain(title, body, task.to_string(), "normal", 4 * 3600));
     }
 }
 
@@ -322,6 +432,82 @@ async fn send(agent: &Agent, sub: &crate::store::PushSubscription, p: &Value, no
     let urgency = if p["urgency"] == "high" { "high" } else { "normal" };
     let ttl = p["ttl"].as_u64().unwrap_or(86_400) as u32;
     Ok(webpush::send(client(), &endpoint, body, &authorization, urgency, ttl).await)
+}
+
+/// Sends one `apns` effect to its iPhone or Mac app, through Apple (apns.rs).
+pub async fn deliver_apns(agent: &Agent, effect: &Effect) -> Outcome {
+    let p = &effect.payload;
+    let now = unix_now();
+    let Some(apns) = agent.apns.as_ref() else {
+        return Outcome::Done; // no APNs key: notifications to the apps are off
+    };
+    let Some(device) = p["device"]
+        .as_str()
+        .and_then(|id| agent.store.device_token(id).ok().flatten())
+    else {
+        return Outcome::Done; // the app turned notifications off
+    };
+    if now - p["created"].as_i64().unwrap_or(0) > STALE_SECS || effect.attempts >= MAX_TRIES {
+        tracing::warn!(device = %device.id, attempts = effect.attempts, "notification dropped: not delivered in time");
+        return Outcome::Done;
+    }
+    let urgency = if p["urgency"] == "high" { "high" } else { "normal" };
+    let priority = if urgency == "high" { "10" } else { "5" };
+    let ttl = p["ttl"].as_i64().unwrap_or(86_400);
+    let message = apns_message(p);
+    let production = device.environment != "sandbox";
+    let delivery = apns
+        .send(
+            apns_client(),
+            &device.token,
+            &device.topic,
+            production,
+            &message,
+            p["tag"].as_str().unwrap_or_default(),
+            priority,
+            now + ttl,
+            now,
+        )
+        .await;
+    match delivery {
+        crate::apns::Delivery::Sent => {
+            let _ = agent.store.device_token_sent(&device.id, now);
+            Outcome::Done
+        }
+        crate::apns::Delivery::Gone => {
+            tracing::info!(device = %device.id, "the app's token is gone: removed");
+            let _ = agent.store.delete_device_token(&device.id);
+            Outcome::Done
+        }
+        crate::apns::Delivery::Refused(why) => {
+            tracing::warn!(device = %device.id, %why, "notification refused by Apple");
+            Outcome::Done
+        }
+        crate::apns::Delivery::Retry(Some(after), _) => {
+            Outcome::Later(after.clamp(Duration::from_secs(2), Duration::from_secs(600)))
+        }
+        crate::apns::Delivery::Retry(None, why) => Outcome::Failed(why),
+    }
+}
+
+/// The APNs payload: the `aps` dictionary (alert, sound, thread, category) and
+/// the app's own keys (task, approval or action) at the top level.
+fn apns_message(p: &Value) -> Value {
+    let mut aps = json!({
+        "alert": {"title": p["title"], "body": p["body"]},
+        "sound": "default",
+        "thread-id": p["tag"],
+    });
+    if let Some(category) = p["category"].as_str() {
+        aps["category"] = json!(category);
+    }
+    let mut message = json!({ "aps": aps });
+    if let Some(data) = p["data"].as_object() {
+        for (key, value) in data {
+            message[key] = value.clone();
+        }
+    }
+    message
 }
 
 #[cfg(test)]
@@ -447,6 +633,7 @@ mod tests {
             .unwrap();
         agent.notify_action_needed(
             "t2",
+            "ac1",
             "Sign in with ghp_abcdefghijklmnopqrstuvwxyz0123456789 please",
         );
         deliver_all(&agent).await;
@@ -577,5 +764,92 @@ mod tests {
             "Three things need you."
         );
         assert_eq!(first_line("```bash\nls\n```\n| a | b |\nDone."), "Done.");
+    }
+
+    #[test]
+    fn the_apns_payload_carries_the_alert_category_and_ids() {
+        // An approval card: Approve/Deny on the notification (category), and
+        // the approval id at the top level for the app to act on.
+        let effect = json!({
+            "title": "Needs your OK", "body": "rm -rf build", "tag": "t1",
+            "category": "APPROVAL", "data": {"task": "t1", "approval": "a9"},
+        });
+        let message = apns_message(&effect);
+        assert_eq!(message["aps"]["alert"]["title"], "Needs your OK");
+        assert_eq!(message["aps"]["alert"]["body"], "rm -rf build");
+        assert_eq!(message["aps"]["thread-id"], "t1");
+        assert_eq!(message["aps"]["category"], "APPROVAL");
+        assert_eq!(message["aps"]["sound"], "default");
+        assert_eq!(message["approval"], "a9");
+        assert_eq!(message["task"], "t1");
+
+        // A finished task: no category, no buttons, just the task.
+        let plain = apns_message(&json!({
+            "title": "Done", "body": "All set.", "tag": "t2", "category": null, "data": {"task": "t2"},
+        }));
+        assert!(plain["aps"].get("category").is_none());
+        assert_eq!(plain["task"], "t2");
+    }
+
+    #[test]
+    fn a_registered_app_gets_an_apns_effect_per_notification() {
+        let (agent, dir) = crate::agent::test_agent_with_apns();
+        assert!(agent.apns.is_some());
+        // A bad token is refused; a good one registers with its bundle id.
+        assert!(matches!(
+            agent.register_device("not-hex!", "dev.neoagent.app.x", "sandbox", "iPhone"),
+            Err(PushError::Invalid(_))
+        ));
+        let id = agent
+            .register_device("a1b2c3d4", "dev.neoagent.app.x", "sandbox", "iPhone 17")
+            .ok()
+            .unwrap();
+        assert_eq!(agent.push_info().unwrap()["devices"][0]["id"], id);
+        assert_eq!(agent.push_info().unwrap()["devices"][0]["label"], "iPhone 17");
+        assert_eq!(agent.push_info().unwrap()["apns"], true);
+        // Keys stay on the desktop: the token and topic aren't listed.
+        assert!(agent.push_info().unwrap()["devices"][0].get("token").is_none());
+
+        // A command card: one apns effect, with Approve/Deny and the ids.
+        agent.notify_card(
+            "t1",
+            &json!({"kind": "shell", "id": "a9", "summary": "Clear the build", "command": "rm -rf build"}),
+        );
+        let effects: Vec<_> = agent
+            .store
+            .due_effects(i64::MAX, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "apns")
+            .collect();
+        assert_eq!(effects.len(), 1);
+        let p = &effects[0].payload;
+        assert_eq!(p["device"], id);
+        assert_eq!(p["title"], "Needs your OK");
+        assert_eq!(p["category"], "APPROVAL");
+        assert_eq!(p["data"]["approval"], "a9");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn with_no_apns_key_the_apps_cant_register_and_nothing_is_sent() {
+        let (agent, dir) = crate::agent::test_agent();
+        // The test agent has no APNs key (APNS_AUTH_KEY empty).
+        assert!(agent.apns.is_none());
+        assert!(matches!(
+            agent.register_device("abc123", "dev.neoagent.app.x", "sandbox", "iPhone"),
+            Err(PushError::Invalid(_))
+        ));
+        // notify() queues web_push only; no apns effects without a key.
+        agent.notify_action_needed("t1", "a1", "Sign in");
+        let apns = agent
+            .store
+            .due_effects(i64::MAX, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "apns")
+            .count();
+        assert_eq!(apns, 0);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

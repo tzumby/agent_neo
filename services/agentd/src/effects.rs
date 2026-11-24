@@ -14,7 +14,7 @@
 //!   `EFFECT_MAX_ATTEMPTS` failures the row stays, given up, and `/status`
 //!   reports it; enqueuing the same key again starts it over.
 //!
-//! Kinds: `purge` (daily), `consolidate` (consolidate.rs) and `web_push`
+//! Kinds: `purge` (daily), `consolidate` (consolidate.rs), `web_push` and `apns`
 //! (notify.rs). `push` rows, from the old push relay, are dropped.
 
 use std::collections::HashSet;
@@ -123,6 +123,7 @@ async fn handle(agent: &Agent, effect: &Effect) -> Outcome {
         "purge" => purge(&agent.store),
         "consolidate" => crate::consolidate::run(agent).await,
         "web_push" => crate::notify::deliver(agent, effect).await,
+        "apns" => crate::notify::deliver_apns(agent, effect).await,
         // A notification queued by an agentd that still had the push relay: nowhere to send it.
         "push" => Outcome::Done,
         // From a newer agentd (after a rollback): keep it for that version.

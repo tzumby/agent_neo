@@ -138,6 +138,26 @@ pub struct PushSubscription {
     pub last_sent: Option<i64>,
 }
 
+/// An iPhone or Mac app registered for APNs notifications (apns.rs). The token
+/// stays on the desktop; the API lists devices by label only.
+#[derive(Clone, Debug, Serialize)]
+pub struct DeviceToken {
+    /// The first 12 hex digits of the token's SHA-256.
+    pub id: String,
+    #[serde(skip)]
+    pub token: String,
+    /// The app's bundle id (the APNs topic).
+    #[serde(skip)]
+    pub topic: String,
+    /// "sandbox" (Xcode builds) or "production" (TestFlight, notarized).
+    pub environment: String,
+    /// "iPhone 17", what the app called it.
+    pub label: String,
+    /// Unix seconds.
+    pub created: i64,
+    pub last_sent: Option<i64>,
+}
+
 /// A saved key, as the apps list it: never its value.
 #[derive(Clone, Debug, Serialize)]
 pub struct SecretInfo {
@@ -309,6 +329,15 @@ impl Store {
                  endpoint TEXT NOT NULL UNIQUE,
                  p256dh TEXT NOT NULL,
                  auth TEXT NOT NULL,
+                 label TEXT NOT NULL DEFAULT '',
+                 created INTEGER NOT NULL,
+                 last_sent INTEGER);
+             -- iPhone and Mac apps to send notifications to (apns.rs).
+             CREATE TABLE IF NOT EXISTS device_tokens (
+                 id TEXT PRIMARY KEY,
+                 token TEXT NOT NULL UNIQUE,
+                 topic TEXT NOT NULL,
+                 environment TEXT NOT NULL DEFAULT 'production',
                  label TEXT NOT NULL DEFAULT '',
                  created INTEGER NOT NULL,
                  last_sent INTEGER);"
@@ -1108,6 +1137,75 @@ impl Store {
         )?;
         Ok(())
     }
+
+    // --- The iPhone and Mac apps' device tokens (apns.rs) --------------------
+
+    /// Adds an app's device token, or updates the one with the same token
+    /// (a renamed device, a new app build). Returns its id.
+    pub fn save_device_token(
+        &self,
+        token: &str,
+        topic: &str,
+        environment: &str,
+        label: &str,
+        now: i64,
+    ) -> Result<String> {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, token.as_bytes());
+        let id: String = digest.as_ref()[..6].iter().map(|b| format!("{b:02x}")).collect();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO device_tokens (id, token, topic, environment, label, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(token) DO UPDATE SET topic = excluded.topic, environment = excluded.environment, label = excluded.label",
+            params![id, token, topic, environment, label, now],
+        )?;
+        Ok(id)
+    }
+
+    pub fn device_tokens(&self) -> Result<Vec<DeviceToken>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, token, topic, environment, label, created, last_sent FROM device_tokens ORDER BY created",
+        )?;
+        let rows = stmt.query_map([], device_token_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn device_token(&self, id: &str) -> Result<Option<DeviceToken>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT id, token, topic, environment, label, created, last_sent FROM device_tokens WHERE id = ?1",
+                params![id],
+                device_token_row,
+            )
+            .optional()?)
+    }
+
+    pub fn delete_device_token(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM device_tokens WHERE id = ?1", params![id])? > 0)
+    }
+
+    pub fn device_token_sent(&self, id: &str, now: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE device_tokens SET last_sent = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+}
+
+fn device_token_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceToken> {
+    Ok(DeviceToken {
+        id: row.get(0)?,
+        token: row.get(1)?,
+        topic: row.get(2)?,
+        environment: row.get(3)?,
+        label: row.get(4)?,
+        created: row.get(5)?,
+        last_sent: row.get(6)?,
+    })
 }
 
 fn push_subscription_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PushSubscription> {
@@ -1208,6 +1306,20 @@ fn migrate(conn: &Connection) -> Result<()> {
                  task TEXT,
                  why TEXT);
              PRAGMA user_version = 6; COMMIT;",
+        )?;
+    }
+    if version < 7 {
+        // The iPhone and Mac apps to notify by APNs (apns.rs).
+        conn.execute_batch(
+            "BEGIN; CREATE TABLE IF NOT EXISTS device_tokens (
+                 id TEXT PRIMARY KEY,
+                 token TEXT NOT NULL UNIQUE,
+                 topic TEXT NOT NULL,
+                 environment TEXT NOT NULL DEFAULT 'production',
+                 label TEXT NOT NULL DEFAULT '',
+                 created INTEGER NOT NULL,
+                 last_sent INTEGER);
+             PRAGMA user_version = 7; COMMIT;",
         )?;
     }
     Ok(())
@@ -1543,7 +1655,12 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(version, 6);
+            assert_eq!(version, 7);
+            // The latest migration added the apps' device-token table.
+            assert!(
+                conn.prepare("SELECT token, topic FROM device_tokens LIMIT 0")
+                    .is_ok()
+            );
             // Older runs: no due time, first try.
             let attempt: Option<i64> = conn
                 .query_row("SELECT attempt FROM runs LIMIT 1", [], |r| r.get(0))

@@ -10,7 +10,7 @@
 4. [AWS infrastructure (Terraform)](#4-aws-infrastructure-terraform)
 5. [The desktop VM](#5-the-desktop-vm)
 6. [agentd: the agent on the desktop](#6-agentd-the-agent-on-the-desktop)
-7. [tailnet-proxy and the web app](#7-tailnet-proxy-and-the-web-app)
+7. [tailnet-proxy, the web app and the apps](#7-tailnet-proxy-the-web-app-and-the-apps)
 8. [End-to-end flows](#8-end-to-end-flows)
 9. [Security model](#9-security-model)
 10. [Operations](#10-operations)
@@ -29,8 +29,9 @@ The pieces:
   - the agent's shell commands as `worker`, in hardened systemd units behind an egress allowlist;
   - **tailnet-proxy**, the desktop's only presence on your tailnet.
 - **agentd** (Rust): the model loop, browser tools over Chrome's DevTools Protocol, a shell tool, approvals that park and resume, memory, scheduled tasks, saved keys, and the HTTP + SSE API the web app uses. All of the agent's state lives on the VM, in `/var/lib/agentd`. It calls the model provider directly, with your key.
-- **tailnet-proxy** (Go, Tailscale's tsnet): a userspace Tailscale node inside one process, at `https://neo-agent.<your tailnet>.ts.net`. It serves the web app, agentd's API and the noVNC viewer, and port 5900 for a native VNC viewer.
+- **tailnet-proxy** (Go, Tailscale's tsnet): a userspace Tailscale node inside one process, at `https://neo-agent.<your tailnet>.ts.net`. It serves the web app, agentd's API and the noVNC viewer, and port 5900 for the apps' take-over view.
 - **The web app** (`apps/web`, static files, no build step): the chat, approval cards, the desktop (take over), schedules, keys and tokens, and settings.
+- **The iPhone and Mac apps** (`apps/apple`, SwiftUI, optional): the same chat against the same API, a native take-over view over port 5900, a Memory screen, and APNs notifications. Each is a Tailscale node of its own (TailscaleKit), signed in as you (§7.4).
 - **The model provider**: Together AI (serverless). The default model is `zai-org/GLM-5.3`, which is text-only. The agent reads pages through the accessibility tree and text, not screenshots. Whether Together keeps prompts is your Together account's setting (zero data retention); agentd doesn't enforce it.
 
 ```
@@ -108,7 +109,8 @@ The rules the code keeps to:
 | `services/agentd/` | The agent (Rust), its skills and its memory evals |
 | `services/tailnet-proxy/` | The tailnet node (Go, tsnet). `door/` is the routes and protections it serves; `devdoor/` is a localhost stand-in for `make web-dev` |
 | `apps/web/` | The web app (`public/`: static HTML, CSS, ES modules), its tests and the local dev stack (`dev/`) |
-| `scripts/` | `put-secret.py` (hidden input → SSM), `agentd-reset.py`, `browser.py` (drive the desktop's Chrome from your machine over `make cdp`) |
+| `apps/apple/` | The iPhone and Mac apps: `project.yml` (XcodeGen), `NeoAgent/` (the screens; `iOS/` and `macOS/` for what only one has), `DesktopKit/` (the shared Swift package), `scripts/` (TailscaleKit, the project, installing) |
+| `scripts/` | `put-secret.py` (hidden input → SSM), `put-apns-key.py` (the apps' APNs key → SSM), `agentd-reset.py`, `browser.py` (drive the desktop's Chrome from your machine over `make cdp`) |
 
 ## 4. AWS infrastructure (Terraform)
 
@@ -191,6 +193,7 @@ Terraform creates no parameters. You create these with `scripts/put-secret.py` (
 | `/neo-agent/<env>/llm/together_api_key` | `make model-key` | Ansible on your machine → `/etc/agentd/secrets.env`; `make agentd-evals` when `TOGETHER_API_KEY` isn't set |
 | `/neo-agent/<env>/tailscale/auth_key` | `make tailscale-key` | Ansible → `/etc/tailnet-proxy.env` |
 | `/neo-agent/<env>/tailscale/allowed_logins` | `make tailscale-allow` (optional) | Ansible → tailnet-proxy's `-allow`. Missing or empty: no login allowlist |
+| `/neo-agent/<env>/apns` | `make apns-key` (optional; `scripts/put-apns-key.py`) | Ansible → `/etc/agentd/secrets.env` (`APNS_AUTH_KEY` base64, `APNS_KEY_ID`, `APNS_TEAM_ID`). One JSON blob. Missing: the apps' notifications are off |
 
 ### 4.8 Compute
 
@@ -466,6 +469,8 @@ Other users have normal egress, apart from rule 1. agentd's Unix socket isn't a 
 | `effects.rs` | The effects queue's runner: side effects stored first, done afterwards (§6.19) |
 | `secrets.rs` | Saved keys: files, names, redaction, the secret filter (§6.15) |
 | `access.rs` | Sites the agent can reach: host checks, Squid's file and reload, spotting the proxy's refusals (§6.20, §6.21) |
+| `notify.rs` | The attention budget: what to notify about, queued as an effect per recipient (§6.17) |
+| `webpush.rs`, `apns.rs` | The two deliveries: Web Push to browsers, APNs to the apps (§6.17) |
 | `skills.rs` | Loads `SKILLS_DIR/*.md` (§6.16) |
 | `clock.rs` | The user's local date and time for the model (§6.18) |
 
@@ -479,6 +484,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
   - version 3 (0.15.2) added `runs.acted`, version 4 (0.15.8) `schedules.auto_approve`;
   - version 5 (0.15.10) added `runs.due` and `runs.attempt`, and an index on `runs.status`: the scheduled runs' queue (§6.14);
   - version 6 (0.15.10) added `egress_hosts`, the sites you allowed (§6.20).
+  - version 7 added `device_tokens`, the iPhone and Mac apps to notify by APNs (§6.17).
 
   Every change is additive, so an older agentd still reads and writes a newer database. 0.14.0 was tested on a v2 database.
 
@@ -494,6 +500,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | `memory_events` | `seq`, `memory_id`, `actor`, `action`, `by_user`, `run`, `before`, `after`, `created` | History of every memory change; `before` and `after` are cleared when a memory is purged |
 | `effects` | `kind`, `key` (primary key together), `payload`, `due`, `attempts`, `last_error`, `created` | Side effects waiting to be done (§6.19) |
 | `push_subscriptions` | `id` (the endpoint's SHA-256, 12 hex), `endpoint`, `p256dh`, `auth`, `label`, `created`, `last_sent` | Browsers with notifications on (§6.17) |
+| `device_tokens` | `id` (the token's SHA-256, 12 hex), `token`, `topic` (bundle id), `environment` (sandbox or production), `label`, `created`, `last_sent` | iPhone and Mac apps with notifications on, by APNs (§6.17) |
 | `egress_hosts` | `host` (primary key), `added` (unix seconds), `by_user`, `task` (the run whose card asked; null from Settings), `why` | The sites you allowed the shell to reach (§6.20); written to Squid's file at every change and at startup |
 | `schedules` | `id`, `agent`, `name`, `prompt`, `cron`, `timezone`, `next_run`, `last_run`, `paused`, `created`; v2: `policy_version`, `created_from`; v4: `auto_approve` (1 for every schedule a person sets up, 0 for one asked for after outside content; the column's default stays 0, §6.14) | Scheduled tasks (§6.14) |
 | `secrets` | `name`, `agent`, `label`, `created`, `updated`, `last_used` | Saved keys' names and labels, never their values (§6.15) |
@@ -520,18 +527,15 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | POST | `/api/v1/actions/{id}` | `{choice: done or skip}` on an Action needed card. Starts a new task with "I've done what you asked… continue" or "I'm skipping that step…" |
 | POST | `/api/v1/stop` | Stops the running task, or gives up on a parked one |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
-| GET | `/api/v1/screenshot` | A live screenshot of the current tab (JPEG). Exists, but the web app doesn't use it |
 | GET, PUT | `/api/v1/settings` | `{model, allow_actions, auto_approve, memory_consolidation, memory_consolidation_model, memory_consolidation_daily_cap_usd}`. `model` is stored as given (§11) |
 | GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active ones by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older clients still read it |
-| GET | `/api/v1/memory/search?q=&kinds=&limit=` | Memory v2: active memories ranked as the agent's notes are, each with its score (what `search_memory` sees) |
 | POST | `/api/v1/memory/consolidate` | Memory v2: consolidate now (`{ok, tasks, mode}`); it still waits for a running task |
 | GET | `/api/v1/memory/consolidation` | Memory v2: consolidation's mode, model, daily cap, this month's cost, last run and how many tasks wait |
 | POST | `/api/v1/memory/{id}/restore` | Memory v2: brings back an expired or replaced memory (a replaced one replaces its successor in turn) |
 | GET | `/api/v1/memory/export?format=json\|markdown` | Memory v2: JSON is `{version: 1, exported_at, agent, memories}` (all but deleted); Markdown is the active ones by kind |
 | POST | `/api/v1/memory/import` | Memory v2: a JSON export (its active memories) or `[{text, kind?}]`, at most 2,000 (and under the 2,000-memory cap). Each goes through the content checks and is in use at once, marked `imported`: nothing waits for approval. Returns `{imported, rejected: [{text, reason}]}` |
 | DELETE | `/api/v1/memory/{id}` | Forget. Memory v2: status `deleted` (purged after 30 days) |
-| POST | `/api/v1/memory/{id}/confirm` | Vouch for an unverified memory. Memory v2: same as `/approve` |
-| POST | `/api/v1/memory/{id}/approve` | Memory v2: an inferred or imported memory (a hint) becomes user-stated |
+| POST | `/api/v1/memory/{id}/confirm` | Vouch for an unverified memory. Memory v2: an inferred or imported memory (a hint) becomes user-stated |
 | PATCH | `/api/v1/memory/{id}` | Memory v2: `{text?, kind?, valid_until?, importance?, expected_version}`. 409 with the current memory if it changed meanwhile. The text goes through the secret filter, and the memory becomes user-stated |
 | GET | `/api/v1/memory/{id}/history` | Memory v2: its `memory_events`, newest first |
 | GET | `/api/v1/schedules` | Schedules, each with its plain-language description |
@@ -545,18 +549,20 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/access` | `{enabled, base, allowed: [{host, added, by, task, why}]}`: whether you can add sites on this desktop (`EGRESS_USER_HOSTS` set), the deployment's list as Squid has it, and yours (§6.20) |
 | POST | `/api/v1/access` | `{host}`: a person allows a site from Settings. 400 for a host that isn't an exact public name; 409 if it's allowed already, if there are 100, or if the deployment sets the list |
 | DELETE | `/api/v1/access/{host}` | The shell can no longer reach it; 404 if it wasn't on the list |
-| GET | `/api/v1/push` | `{public_key, subscriptions: [{id, endpoint, label, created, last_sent}]}`: the VAPID key browsers subscribe with, and the browsers with notifications on (§6.17) |
+| GET | `/api/v1/push` | `{public_key, subscriptions: [...], apns, devices: [{id, environment, label, created, last_sent}]}`: the VAPID key browsers subscribe with, the browsers with notifications on, whether an APNs key is set up, and the apps registered (§6.17) |
 | POST | `/api/v1/push/subscriptions` | `{endpoint, keys: {p256dh, auth}, label}` (`PushSubscription.toJSON()`): adds or updates by endpoint, `{id}`. 400 for an endpoint that isn't a known push service's, bad keys, or a 21st browser |
 | DELETE | `/api/v1/push/subscriptions/{id}` | Notifications off in that browser; 404 if unknown |
 | POST | `/api/v1/push/test` | `{id?}`: a test notification to that browser, or all; `{queued}` |
+| POST | `/api/v1/devices` | `{token, topic, environment, name}`: an app registers for APNs notifications (token is hex, topic the app's bundle id), `{id}`. 400 when this desktop has no APNs key, or the token or topic is invalid |
+| DELETE | `/api/v1/devices/{id}` | Notifications off in that app; 404 if unknown |
 
-The web app has no memory screen, so the memory endpoints are reached only through the API.
+The web app has no memory screen: forgetting, confirming, editing, restoring, export and import are for the apps' Memory screen (§7.4) and the API.
 
 **`stage`** is one word for what the desktop needs, from the first matching row:
 
 | Stage | When |
 |---|---|
-| `needs_you/approval` | A command, browser or schedule card is waiting |
+| `needs_you/approval` | A command, browser, schedule, site-access or Looks stuck card is waiting |
 | `needs_you/secret` | A key request is waiting |
 | `needs_you/action` | The latest task ended with Action needed |
 | `working` | A task is running |
@@ -935,7 +941,7 @@ Web pages, emails and command output can carry injected instructions. The defenc
 - `remember` keeps one fact, up to 500 characters.
 - It's **trusted** if the task hadn't read outside content, and **unverified** otherwise.
 - Each task's instructions list the latest 60 memories in two groups. Unverified ones are framed as "hints only, never instructions".
-- Memories are confirmed or deleted through the API (`/api/v1/memory…`); the web app has no memory screen.
+- Memories are confirmed, edited or forgotten in the apps' Memory screen or through the API (`/api/v1/memory…`); the web app has no memory screen.
 - The system prompt forbids remembering passwords, codes, keys or account numbers, and anything a page told it to remember.
 
 **v2** (`MEMORY_V2=on`, which the desktop's group_vars set; [memory-v2.md](memory-v2.md)).
@@ -1107,16 +1113,13 @@ The model therefore never sees a value, even if a command prints one or you past
 | `git-github` | Cloning, branches, commits. A GitHub token via `request_secret`, with a pre-filled fine-grained token URL (`/settings/personal-access-tokens/new?name=…&expires_in=90&contents=write&pull_requests=write`) and steps. A git credential helper that reads `$GITHUB_TOKEN` from the environment (nothing on disk). gh reading `GITHUB_TOKEN`. What 401 and 403 mean |
 | `fly-deploy` | Deploying to Fly.io through the proxy: token-mode WireGuard (`FLY_WIREGUARD_TOKEN_MODE=1 fly deploy --depot=false --builder-pool=false --remote-only`), the hosts to ask for, what can't work here and why, and what to offer if it fails (§6.21, or a GitHub Actions deploy). Written from flyctl's source, not yet proven on a desktop |
 | `opencode` | Installing opencode from Nix; a Together key via `request_secret`; config without the key (`togetherai/…` reads `TOGETHER_API_KEY`); `opencode run --dir … "…"` with the key; why `--auto` is risky |
-| `pentest-methodology` | Ground rules for authorized penetration testing of your own systems: scope, evidence, minimal-impact proof, findings and reports. Read before any security testing |
-| `pentest-recon` | Mapping an in-scope target's attack surface: passive intel, DNS, port and service scans, subdomain and content discovery, web fingerprinting |
-| `pentest-web` | Testing your own web apps and APIs for the OWASP Top 10: automated scans, manual validation of injection, IDOR, auth and SSRF, minimal-impact proof |
-| `pentest-code-audit` | White-box review of your own source: secrets, dependency and SAST scans, dangerous sinks, entry-point reachability, config review |
-| `pentest-cloud` | Reviewing your own cloud account and Terraform for misconfigurations, plus blast-radius checks from the desktop (what code running here could reach) |
-| `pentest-detection-check` | Checking that your monitoring catches attacks: agreed benign probes at your stack, then whether the edge (WAF/CDN) and the app's logs saw and blocked them |
 
-### 6.17 Notifications (Web Push: `notify.rs`, `webpush.rs`)
+### 6.17 Notifications (`notify.rs`; Web Push `webpush.rs`, APNs `apns.rs`)
 
-agentd sends notifications itself, by Web Push (RFC 8030), to the browsers where you turned them on in the web app (Settings → Notifications, §7.2). There's no relay and no app-store account. The push service in between (Apple's for Safari, Google's FCM for Chrome and Edge on a Mac, Mozilla's, Microsoft's WNS) carries ciphertext only: the payload is encrypted to the browser (RFC 8291, `aes128gcm`, one 4096-byte record). Each request is signed with this desktop's VAPID key (RFC 8292, ES256): made on first use and kept in `settings` (`vapid_pkcs8`), so `agentd-reset` makes a new one. Its token names the push service's origin, expires in 12 h, and carries `VAPID_SUBJECT` as the contact. Browsers subscribe with its public half.
+agentd sends notifications itself, to two kinds of recipient and with no relay or app-store server in between: **browsers** by Web Push (RFC 8030), and the **iPhone and Mac apps** by APNs. `notify.rs` decides what to say and queues one effect per recipient; `webpush.rs` and `apns.rs` are the two deliveries. What notifies you, and when, is the same for both.
+
+- **Web Push to browsers:** to the browsers where you turned notifications on in the web app (Settings → Notifications, §7.2). The push service in between (Apple's for Safari, Google's FCM for Chrome and Edge on a Mac, Mozilla's, Microsoft's WNS) carries ciphertext only: the payload is encrypted to the browser (RFC 8291, `aes128gcm`, one 4096-byte record), and each request is signed with this desktop's VAPID key (RFC 8292, ES256), made on first use and kept in `settings` (`vapid_pkcs8`), so `agentd-reset` makes a new one. Its token names the push service's origin, expires in 12 h, and carries `VAPID_SUBJECT` as the contact. Browsers subscribe with its public half.
+- **APNs to the apps:** off unless an APNs key is configured (`APNS_AUTH_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID` in `secrets.env`, from `make apns-key`; `Apns::from_config`). agentd signs a provider token (a JWT, ES256, with your `.p8` key, cached ~40 min) and POSTs to `api.push.apple.com` or `api.sandbox.push.apple.com` over HTTP/2, TLS the only encryption. The app registers its device token and its own bundle id (the APNs topic) through `POST /api/v1/devices`; the key never leaves the desktop, and needs the paid Apple Developer Program. An approval card's notification carries category `APPROVAL`, so the app shows Approve and Deny on the notification itself (apps/apple `PushCenter`); the answer goes back over the tailnet when the app opens.
 
 - **What notifies you:**
   - a card that waits on you, from `ask` (urgency high, TTL 24 h): "Needs your OK" with the command's summary, "Write this?" / "Write and send this?" / "Click this?" / "Press …?", "Schedule this?", "Needs a key", "Let it reach a site?", "Looks stuck";
@@ -1125,10 +1128,12 @@ agentd sends notifications itself, by Web Push (RFC 8030), to the browsers where
   - a scheduled run with something to report: its name, and `report_outcome`'s summary or the answer's first line. Not a quiet run (`nothing`), a cancelled one, or a failed first try that's being retried.
 
   Not: a quick chat answer, a task you stopped, or Stop on a stuck card.
-- **Payload:** `{title (≤ 80 characters), body (≤ 180), tag, url: "/#/chat"}`, saved keys replaced with `[secret NAME]` first. The tag is the task's id, so a newer notification about a task replaces the older one on the device.
-- **Delivery:** a `web_push` effect per browser and tag (§6.19), so an unsent notification is replaced by a newer one for the same task and device, and a slow service for one device never re-sends to another. 2xx: done, with `last_sent` recorded. 404 or 410: the browser unsubscribed, so its row is deleted. 429 or 5xx: tried again (after `Retry-After` if given). Any other answer is logged and dropped. Not delivered within an hour, or after 5 failures, a notification is dropped rather than left to show as a problem.
-- **Subscriptions** (`push_subscriptions`): at most 20 browsers. An endpoint must be https on a known push service's host (`fcm.googleapis.com`, `*.push.apple.com`, `*.push.services.mozilla.com`, `*.notify.windows.com`, no port), so a subscription can't aim agentd's requests elsewhere; `PUSH_DEV_ENDPOINTS=on` (local development only) also takes `http://127.0.0.1`. Keys are checked: a 65-byte uncompressed P-256 `p256dh` and a 16-byte `auth`. They stay on the desktop: the API lists browsers by label, never their keys.
-- **Tests:** RFC 8291's worked example, byte for byte, with its intermediate values; the VAPID signature verified; the whole path to a stand-in push service, decrypted with the browser's key; saved keys cut out; a 410 forgetting the browser. On 2026-11-11 a test notification also went through Mozilla's real push service to a scripted browser and decrypted correctly.
+- **Payload:** title (≤ 80 characters) and body (≤ 180), saved keys replaced with `[secret NAME]` first. The tag is the task's id, so a newer notification about a task replaces the older one: on the web it's the Web Push `tag` with `url: "/#/chat"`; on the apps the APNs `thread-id` and `apns-collapse-id`, plus the task and card ids as top-level keys the app deep-links and acts on.
+- **Delivery:** a `web_push` effect per browser or an `apns` effect per app, keyed by recipient and tag (§6.19), so an unsent notification is replaced by a newer one for the same task and device, and a slow service for one device never re-sends to another. Web Push: 2xx done (with `last_sent`), 404/410 the browser unsubscribed (row deleted), 429/5xx retried (after `Retry-After`), anything else dropped. APNs: 200 done, 410 or `BadDeviceToken`/`Unregistered` the token is gone (row deleted), 429/5xx retried, anything else dropped. Not delivered within an hour, or after 5 failures, a notification is dropped rather than left to show as a problem.
+- **Recipients:**
+  - **browsers** (`push_subscriptions`): at most 20. An endpoint must be https on a known push service's host (`fcm.googleapis.com`, `*.push.apple.com`, `*.push.services.mozilla.com`, `*.notify.windows.com`, no port), so a subscription can't aim agentd's requests elsewhere; `PUSH_DEV_ENDPOINTS=on` (local development only) also takes `http://127.0.0.1`. Keys are checked: a 65-byte uncompressed P-256 `p256dh` and a 16-byte `auth`.
+  - **apps** (`device_tokens`): a hex device token, the app's bundle id as the topic, and `sandbox` or `production` (which APNs host to use). They stay on the desktop: the API lists browsers and apps by label, never their tokens or keys.
+- **Tests:** RFC 8291's worked example byte for byte with its intermediate values; the VAPID signature verified; the whole Web Push path to a stand-in service, decrypted with the browser's key; the APNs provider token's header, claims and caching; Apple's answers classified (gone, refused, retry); the `.p8` loaded as PEM or base64; the APNs payload's alert, category and ids; a registered app getting one `apns` effect per notification; saved keys cut out; a 410 forgetting the recipient. On 2026-11-11 a test notification went through Mozilla's real push service to a scripted browser and decrypted correctly.
 
 ### 6.18 The user's clock
 
@@ -1155,6 +1160,7 @@ Side effects are stored first and done afterwards. Each is a row in `effects`, w
   - `purge`, daily: hard-deletes memories deleted more than 30 days ago, with their search entries and the text in their history;
   - `consolidate` (key `main`): memory consolidation (§6.13). It's re-enqueued by each finished task, waits while a task runs, and fails over to retries if the model's answer is invalid twice;
   - `web_push` (key `<browser id>:<tag>`): a notification to one browser (§6.17);
+  - `apns` (key `<device id>:<tag>`): a notification to one iPhone or Mac app over APNs (§6.17);
   - `push`: left by an older agentd that sent notifications through the push relay. That relay isn't here, so it's done at once.
 
   Any other kind (from a newer agentd, after a rollback) fails and is kept for that version.
@@ -1194,7 +1200,7 @@ Some tools ignore `HTTPS_PROXY` and connect on their own, often to an address no
 
 **Per user, not per command:** the set matches `worker`'s uid. Only the approved command can use it because commands run one at a time (`shell_turn`) and a unit's processes end with it.
 
-## 7. tailnet-proxy and the web app
+## 7. tailnet-proxy, the web app and the apps
 
 ### 7.1 tailnet-proxy: the desktop on your tailnet
 
@@ -1266,6 +1272,21 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
 - **`devdoor`** (`services/tailnet-proxy/devdoor`) serves package `door` on `127.0.0.1:8088` (`-listen`), with every request signed in as `-login` (`you@example.com`, node `devdoor`). It trusts whoever can reach its port, so it's for local development only and never installed on a desktop.
 - **`make web-dev`** (`apps/web/dev/run.sh`) runs the whole thing on your machine with no AWS, no tailnet and no real model: a debug agentd on a Unix socket in a temporary folder, a headless Chrome of its own (port 9333), `fake_llm.py` as the model (`LLM_URL`, port 8091; it scripts Action needed, a scheduled report, a slow task, a site to allow and editable cards), memory v2 on, the shell as your own user (`RUN_AS` empty), and devdoor serving `apps/web/public` (edits show on reload). The Desktop page stays blank: there's no VNC server. State is thrown away when it stops; `WORK=<dir>` keeps it.
 - **`make web-smoke`**, with web-dev running, clicks through it in headless Chrome: sends a message and waits for the answer, answers a card, saves a key and opens each page. Screenshots go to `OUT` (default `/tmp`).
+
+### 7.4 The iPhone and Mac apps (`apps/apple`)
+
+SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 15.6+, Apple silicon only: TailscaleKit has no Intel slice). XcodeGen makes `NeoAgent.xcodeproj` from `project.yml` (not checked in): targets NeoAgent (iPhone) and NeoAgentMac, one bundle ID for both. Your team and the bundle ID come from `APPLE_TEAM_ID` and `APP_BUNDLE_ID` (default `dev.neoagent.app.<team ID>`); `scripts/project.sh` checks Xcode, XcodeGen and TailscaleKit first, and lists the teams this Mac's Apple Development certificates belong to (their OU).
+
+- **`DesktopKit`** (a Swift package, shared):
+  - `Tailnet`: the app's own Tailscale node (TailscaleKit: libtailscale's tsnet in Go with Swift bindings, built from source by `scripts/build-tailscalekit.sh` at a pinned commit). It signs in through the browser (`AuthURL`), keeps its identity in Application Support, and hands out a `URLSession` and a loopback SOCKS5 proxy into the tailnet. The desktop is the first peer tagged `tag:neo-agent`, online first. iOS takes the proxy away while the app is suspended, so a fresh node (same identity) starts when it comes back; the Mac app does the same after sleep.
+  - `AgentAPI`: the API of §6.4 at `https://<desktop>.<tailnet>.ts.net`, the event stream (SSE) and pages.
+  - `ChatCore`: `ChatTimeline`, the same rules as the web app's `timeline.js` (the same event kinds, cards, reports, folding, plans and Looks stuck), and `ChatStore`, which loads the newest page, streams after it and reloads after a disconnect.
+  - `DesktopViewer`: VNC (swift-rfb) through the SOCKS5 proxy to port 5900 at the desktop's tailnet IP.
+- **Screens** (`NeoAgent/Views`, shared): sign in, the chat with its stage banner, cards and suggestions, Settings (model, browser actions, auto approve, Tailscale log out), Memory (kinds, search, edit, forget, confirm, restore, export and import, tidying up), Schedules and Keys. Take over is full screen on the iPhone (tap, drag, pinch, a keyboard with Esc, Tab, Ctrl, Alt and arrows, clipboard both ways) and its own window on the Mac (⌘ shortcuts act as Ctrl on the desktop).
+- **Identity:** the app signs in as you, so tailnet-proxy passes your login in `X-Tailscale-User` as it does for a browser, and `-allow` (`make tailscale-allow`) applies the same way.
+- **Notifications:** by APNs, direct from agentd with your own key (§6.17), the same events as the browsers' Web Push. The app asks permission on first connect and registers its token and bundle id (`POST /api/v1/devices`); an approval card shows Approve/Deny on the notification (`PushCenter`). Off until `make apns-key` sets up a key, which needs the paid Apple Developer Program.
+- **Not in this edition:** setup links for devices without a Tailscale account, TestFlight and notarized builds. You install with `make app-device` and `make app-mac`; a free Apple Account's builds stop opening after 7 days, and can't create the APNs key notifications need.
+- **Tests:** `make app-test` (`swift test`): the chat timeline (cards, reports, plans, Looks stuck, working time), decoding agentd's and Tailscale's JSON, Markdown, the key detector, Mac shortcuts and copying. `LiveAgentTests` and `LiveVNCTests` run against a real agentd or x11vnc when `AGENTD_URL` or `VNC_ADDR` is set. A Debug build launched with `CHAT_PREVIEW_URL` (and optionally `PREVIEW_SCREEN`) talks to that address directly, without Tailscale: `make web-dev` in the Simulator (README, Developing).
 
 ## 8. End-to-end flows
 
@@ -1415,6 +1436,7 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
 | `galaxy` | Ansible collections (`amazon.aws` 11.x, `community.general` ≥ 12) |
 | `inventory` | Writes `ansible/inventory/aws_ec2.yml` from its template; every playbook target runs it first |
 | `model-key`, `tailscale-key`, `tailscale-allow` | Store your Together key, a Tailscale auth key, and optionally the allowed logins, in SSM from hidden input (`scripts/put-secret.py`). After `tailscale-allow`, `make tailnet-deploy` |
+| `apns-key` | Optional: store your Apple APNs key for the apps' notifications in SSM (`scripts/put-apns-key.py`: the `.p8`, Key ID and Team ID as one JSON blob). Then `make agentd-deploy` (§6.17, §7.4) |
 | `deploy` | `desktop`, `agentd-deploy` and `tailnet-deploy`, in that order |
 | `desktop` | `common` + `desktop` roles (`TAGS=chrome_policy` for only Chrome's policy) |
 | `agentd-test`, `agentd-build`, `agentd-deploy`, `agentd-logs` | agentd: fmt/clippy/tests; static build for `DESKTOP_ARCH`; deploy (copies the database first when the version changes; needs `model-key`); the last 50 lines of `journalctl -u agentd` over SSM |
@@ -1422,6 +1444,7 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
 | `agentd-reset` | A clean slate for testing (`scripts/agentd-reset.py`, over SSM). Stops agentd and Chrome, then deletes `/var/lib/agentd`'s database (chat, tasks, memories, schedules, settings), its upgrade copies, screenshots and saved keys, and Chrome's whole profile (cookies and every sign-in, local storage, IndexedDB, history, tabs, cache), its cache and config folders and the Downloads folder's contents; Chrome's user and profile come from `chrome.service`. Starts Chrome, then agentd, empty. Keeps Chrome's policy and the config. Shows counts first, asks for the desktop's name (its `TailnetName` tag), refuses while a task runs. `FILES=1` also empties `/home/worker/work`; `KEEP_COPY=1` moves it all to `/var/lib/agentd-reset/<time>` (root only, with a manifest of paths and owners) instead, and `RESTORE=1` puts the newest copy back; `DRY_RUN=1` only shows the counts |
 | `tailnet-test`, `tailnet-build`, `tailnet-deploy` | tailnet-proxy: `go vet` and tests (with package `door`); static linux build for `DESKTOP_ARCH`; the `tailnet_proxy` role with the web app (needs `tailscale-key`; deploy agentd first) |
 | `web-test`, `web-dev`, `web-smoke` | The web app (§7.2, §7.3): node unit tests; the whole stack on your machine with a scripted model and devdoor (http://127.0.0.1:8088/); a headless-Chrome click-through against it |
+| `app-tailscalekit`, `app-project`, `app-test`, `app-sim`, `app-device`, `app-mac` | The apps (§7.4): build TailscaleKit once; generate the Xcode project for `APPLE_TEAM_ID` (without it, list the teams this Mac can sign for); DesktopKit's tests; a Simulator build without signing; build, install and open on the iPhone connected by cable; build, install in /Applications and open on this Mac |
 | `stop`, `start` | Stop the desktop to save money (the disk stays; schedules don't run while it's off); start it again (back on your tailnet in a minute or two) |
 | `screenshot`, `viewer`, `cdp`, `shell` | Look at the desktop (screenshot file; noVNC on `localhost:6080`; Chrome DevTools on `localhost:9222`, full control of the logged-in browser while open; a shell), all over SSM |
 
@@ -1472,9 +1495,10 @@ About $40/month while the desktop runs. `make stop` brings the desktop's part do
 
 | Component | Tests |
 |---|---|
-| agentd | 141 unit tests, plus 5 ignored by default that need a real Chrome or run on demand (such as the 5,000-memory speed test): sites the user allows (host checks, a card only for hosts not already reachable, Squid's file, a scheduled run that can't ask, a denied card, the proxy's refusal spotted in output), direct commands (always a card, a yes bound to `direct`, never in a scheduled run, no proxy settings, a tool connecting on its own spotted in output), scheduled runs beside the chat with a stand-in model (the chat free meanwhile, the report whole at the end, its history after the chat's answer, one quiet retry after a failure or a restart, a paused schedule stopping its run), the run queue (one per schedule, due order, cancelling), "Run without asking" for schedules a person sets up, memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, `stage`, the caller from tailnet-proxy's header only, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text report summaries, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, guards (sleep, date, piped installs, shell scheduling, the egress controls, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words |
+| agentd | 171 unit tests, plus 5 ignored by default that need a real Chrome or run on demand (such as the 5,000-memory speed test): sites the user allows (host checks, a card only for hosts not already reachable, Squid's file, a scheduled run that can't ask, a denied card, the proxy's refusal spotted in output), direct commands (always a card, a yes bound to `direct`, never in a scheduled run, no proxy settings, a tool connecting on its own spotted in output), scheduled runs beside the chat with a stand-in model (the chat free meanwhile, the report whole at the end, its history after the chat's answer, one quiet retry after a failure or a restart, a paused schedule stopping its run), the run queue (one per schedule, due order, cancelling), "Run without asking" for schedules a person sets up, memories left pending by an older agentd settled, vouching for a hint, restore, where a memory came from, export and import round trips (imports in use at once), consolidation stats, `stage`, the caller from tailnet-proxy's header only, a parked browser card expiring when Browser actions are turned off, a parked command resuming when the rules still only ask, a quiet scheduled run, plain-text report summaries, a schedule from older rules running with one note, memory consolidation (batches that skip scheduled runs, the reply's format, off and auto (auto unless set, `observe` read as auto), a work log only for tasks that changed something and no facts, no model call for a batch that only read, what the user stated never merged away, rewritten or expired, reruns, decay), memory v2's retrieval (ranking, budgets, what's never shown, recall tracking, a scheduled run's last reports, the filters), write rules (trust from taint, outside-content rules kept as hints, refused corrections and supersedes, nothing saved in a scheduled run, caps), tasks marked when they change something, the secret filter, forget by description, the prompt's notes, edits and history, the schema migration from a real 0.14.0 database (`testdata/agentd-v1.sql`) and `trusted` kept in step, full-text search, the effects queue and purge, the policy version, approvals and card matching, policy patterns, shell argv (hardening, credentials), local shell runs and Stop, store (events, history, memory, schedules, keys, parking, migrations), schedule planning across DST, secret files and redaction, guards (sleep, date, piped installs, shell scheduling, the egress controls, URL checks), skills loading, empty replies, consolidation in batches of 10, dates applied without blocking the store, the chat's pages (`events_page`, the `kinds` list), a command card's plain words, notifications (the attention budget, the card wording, the APNs provider token and payload, Apple's answers classified, an expired token dropped so the retry re-signs, the collapse id truncated at a char boundary, the `.p8` loaded two ways, an app getting one effect per notice, registration gated on an APNs key) |
 | tailnet-proxy | Who gets in (`admits`: logins and tags), and package `door` with a Tailscale-style caller (`go test`) |
 | The web app | 10 tests (§7.2): the chat rules, card fields, scheduled runs as reports, the access card, Markdown, the key detector (`node --test`) |
+| The apps | 44 tests in DesktopKit (§7.4, `swift test`), two of them live tests skipped unless `AGENTD_URL` or `VNC_ADDR` is set |
 
 ## 11. Known gaps and inconsistencies
 
@@ -1492,9 +1516,9 @@ Found while writing this document. None of them is a known exploit; most are tra
 - No backups: agentd's state is on the root volume, and Terraform makes no snapshots. The database copies `agentd-deploy` keeps are on the same disk.
 - The single fck-nat instance serves both AZs: a single point of failure.
 - Desktop egress at the security-group level is open (all protocols); only `worker` is restricted, and that's done on the host.
-- The web app has no memory screen and no "Run without asking" switch: both are reachable only through the API. Nothing notifies you when the web app isn't open (§6.17).
+- The web app has no memory screen (the apps have one) and no "Run without asking" switch (only the API has it). Notifications to the apps are off until you add an APNs key (`make apns-key`), which needs the paid Apple Developer Program; the browsers' Web Push needs no account (§6.17).
 
-**Docs.** `docs/memory-v2.md` is the plan as written; its note at the top says what doesn't apply in this edition (notifications, the attention budget, the apps' Memory screen).
+**Docs.** `docs/memory-v2.md` is the plan as written; its note at the top says what's different in this edition (notifications by Web Push, the Memory screen only in the apps).
 
 ## 12. Glossary
 

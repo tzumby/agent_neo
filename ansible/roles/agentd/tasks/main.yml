@@ -166,13 +166,27 @@
     mode: "0640"
   notify: Restart agentd
 
-# The model key, read on the controller with your AWS credentials, never by
-# the desktop itself. root:agentd 0640: agentd reads it, the shell user can't.
-- name: Write the model key (from SSM)
+# Notifications to the iPhone and Mac apps: your Apple APNs key, if you ran
+# make apns-key. Missing (you didn't) leaves the apps' notifications off; the
+# browsers' Web Push doesn't need it.
+- name: Read the APNs key for the apps (from SSM, if set up)
+  ansible.builtin.set_fact:
+    agentd_apns: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/apns', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
+  no_log: true
+
+# The model key (and the APNs key), read on the controller with your AWS
+# credentials, never by the desktop itself. root:agentd 0640: agentd reads it,
+# the shell user can't.
+- name: Write the keys agentd reads (from SSM)
   ansible.builtin.copy:
     dest: /etc/agentd/secrets.env
     content: |
       TOGETHER_API_KEY={{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/llm/together_api_key', region=agentd_ssm_region) }}
+      {% if agentd_apns | length > 0 %}
+      APNS_AUTH_KEY={{ (agentd_apns | from_json).auth_key }}
+      APNS_KEY_ID={{ (agentd_apns | from_json).key_id }}
+      APNS_TEAM_ID={{ (agentd_apns | from_json).team_id }}
+      {% endif %}
     owner: root
     group: agentd
     mode: "0640"

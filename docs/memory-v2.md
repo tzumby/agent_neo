@@ -1,6 +1,6 @@
 # agentd Memory v2 and Borrowed Patterns — Development Plan
 
-> **Where this stands.** agentd calls Together AI directly (or Bedrock, for the evals). Notifications go from agentd to your browsers by Web Push (`notify.rs`, a `web_push` effect per browser), and §11's attention rules decide which events send one. The web app has no Memory screen: the memory API is the list and tidying up (§13), and you fix or forget a memory by asking the agent. The memory design itself (kinds, trust, retrieval, consolidation, the effects queue) is what agentd runs.
+> **Where this stands.** agentd calls Together AI directly (or Bedrock, for the evals). Notifications go from agentd to your browsers by Web Push and to the iPhone and Mac apps by APNs (`notify.rs`, a `web_push` or `apns` effect per recipient; no relay), and §11's attention rules decide which events send one. The web app has no Memory screen (in it, you fix or forget a memory by asking the agent); the iPhone and Mac apps (`apps/apple`) have the §14 Memory screen, without approvals (§19). The memory design itself (kinds, trust, retrieval, consolidation, the effects queue) is what agentd runs.
 
 *2026-11-01 · Razvan Draghici. Filed from the Claude doc [agentd Memory v2 and Borrowed Patterns](https://claude.ai/artifact/RSHkSqTRP897X5V3YxFQs2); this copy is kept current with decisions as the phases land.*
 
@@ -660,7 +660,7 @@ agentd 0.15.2, the user's decisions: "I should never ever have to approve memori
 | `Makefile` | `agentd-evals` target |
 | `ansible/roles/agentd/` | `MEMORY_V2` in `agentd.env`; DB copy before restart |
 | `apps/apple/DesktopKit/AgentAPI`, `ChatCore` | §14 |
-| `apps/apple/CloudDesktop/Settings`, `ChatView`, `DesktopHome` | §14 |
+| `apps/apple/NeoAgent/Views` (`SettingsView`, `ChatView`, `DesktopHome`) | §14 |
 | `docs/architecture.md` | §6.3, §6.4, §6.5, §6.8, §6.11, §6.13, §6.14, §6.17, §10.6 updated in each phase's PR |
 | `docs/memory-v2.md` | This plan, exported as Markdown, with decisions kept current |
 

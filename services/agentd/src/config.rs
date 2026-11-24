@@ -54,6 +54,14 @@ pub struct Config {
     pub vapid_subject: String,
     /// Local development only: subscriptions may point at http://127.0.0.1.
     pub push_dev_endpoints: bool,
+    /// Notifications to the iPhone and Mac apps (apns.rs): your Apple APNs auth
+    /// key (a `.p8`, as PEM or that PEM base64-encoded) and the ids that name
+    /// it. All three set turns the apps' notifications on; empty leaves them
+    /// off (the apps still work, the browsers still get Web Push). Kept in
+    /// /etc/agentd/secrets.env beside the model key.
+    pub apns_auth_key: String,
+    pub apns_key_id: String,
+    pub apns_team_id: String,
     pub shell_tool: bool,
     pub desktop_name: String,
     /// Memory v2 (docs/memory-v2.md): kinds, trust, retrieval, consolidation.
@@ -131,6 +139,9 @@ impl Config {
                 .context("REVIEW_EVERY_STEPS")?,
             vapid_subject: get("VAPID_SUBJECT", "mailto:neo-agent@example.com"),
             push_dev_endpoints: get("PUSH_DEV_ENDPOINTS", "off") == "on",
+            apns_auth_key: get("APNS_AUTH_KEY", ""),
+            apns_key_id: get("APNS_KEY_ID", ""),
+            apns_team_id: get("APNS_TEAM_ID", ""),
             shell_tool: get("SHELL_TOOL", "on") == "on",
             desktop_name: get("DESKTOP_NAME", "neo-agent"),
             memory_v2: get("MEMORY_V2", "off") == "on",

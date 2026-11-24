@@ -4,6 +4,7 @@
 mod access;
 mod agent;
 mod api;
+mod apns;
 mod browser;
 mod cdp;
 mod clock;

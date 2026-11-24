@@ -380,6 +380,9 @@ pub struct Agent {
     step_seqs: Mutex<HashMap<String, i64>>,
     /// The shell user's uid, for the guard firewall's `direct_egress` set.
     shell_uid: Option<u32>,
+    /// APNs for the iPhone and Mac apps' notifications (apns.rs), when an APNs
+    /// key is configured; None leaves the apps' notifications off.
+    pub apns: Option<crate::apns::Apns>,
 }
 
 /// Adds an entry to one of the guard firewall's sets, or deletes it:
@@ -524,6 +527,7 @@ impl Agent {
             effects_changed: Notify::new(),
             step_seqs: Mutex::default(),
             shell_uid: uid_of(&cfg.run_as),
+            apns: crate::apns::Apns::from_config(&cfg).context("the APNs key (APNS_AUTH_KEY)")?,
             cfg,
         };
         agent.recover();
@@ -1070,15 +1074,6 @@ impl Agent {
             json!({"id": id, "choice": if done { "done" } else { "skip" }, "by": by}),
         );
         Ok(task)
-    }
-
-    /// A screenshot of the current tab, for the app (not part of a task).
-    pub async fn screenshot(&self) -> Result<Vec<u8>> {
-        let mut browser = Browser::new(self.cdp.clone(), false, self.policy.clone());
-        browser
-            .attach(self.store.setting("tab_target")?.as_deref())
-            .await?;
-        browser.screenshot_jpeg().await
     }
 
     fn save_image(&self, jpeg: &[u8]) -> Result<String> {
@@ -3209,7 +3204,7 @@ impl Agent {
             "action_needed",
             json!({"task": task_id, "id": id, "reason": reason, "page": page, "image": image}),
         );
-        self.notify_action_needed(task_id, reason);
+        self.notify_action_needed(task_id, &id, reason);
     }
 
     /// The saved keys, by name, for the system prompt.
@@ -3367,10 +3362,33 @@ pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
         review_every_steps: 5,
         vapid_subject: "mailto:test@example.com".into(),
         push_dev_endpoints: true,
+        apns_auth_key: String::new(),
+        apns_key_id: String::new(),
+        apns_team_id: String::new(),
         shell_tool: true,
         desktop_name: "test-desktop".into(),
         memory_v2: true,
     };
+    (Arc::new(Agent::new(cfg).unwrap()), dir)
+}
+
+/// A test agent with APNs configured (a throwaway key), so the apps' device
+/// tokens and notifications can be exercised.
+#[cfg(test)]
+pub(crate) fn test_agent_with_apns() -> (Arc<Agent>, std::path::PathBuf) {
+    use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+    use base64::Engine;
+    let (agent, dir) = test_agent();
+    let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
+    let pem = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        base64::engine::general_purpose::STANDARD.encode(key.to_pkcs8v1().unwrap().as_ref())
+    );
+    let mut cfg = agent.cfg.clone();
+    cfg.apns_auth_key = pem;
+    cfg.apns_key_id = "ABC123DEFG".into();
+    cfg.apns_team_id = "TEAM123456".into();
+    // Rebuild the agent on the same state directory with APNs on.
     (Arc::new(Agent::new(cfg).unwrap()), dir)
 }
 

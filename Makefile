@@ -21,8 +21,9 @@ SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
 .PHONY: help preflight bootstrap init plan apply destroy fmt lint galaxy inventory deploy desktop screenshot \
-  model-key tailscale-key tailscale-allow agentd-test agentd-build agentd-deploy agentd-evals agentd-reset agentd-logs \
-  tailnet-test tailnet-build tailnet-deploy url web-test web-dev web-smoke stop start cdp viewer shell
+  model-key tailscale-key tailscale-allow apns-key agentd-test agentd-build agentd-deploy agentd-evals agentd-reset agentd-logs \
+  tailnet-test tailnet-build tailnet-deploy url web-test web-dev web-smoke \
+  app-tailscalekit app-project app-test app-sim app-device app-mac stop start cdp viewer shell
 
 help: ## Show targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-15s %s\n", $$1, $$2}'
@@ -68,6 +69,9 @@ tailscale-key: ## Store a Tailscale auth key (tagged tag:neo-agent) in SSM
 
 tailscale-allow: ## Optional: only these Tailscale logins get in (comma-separated), then make tailnet-deploy
 	scripts/put-secret.py $(SSM_PREFIX)/tailscale/allowed_logins
+
+apns-key: ## Optional: store your Apple APNs key for the apps' notifications in SSM, then make agentd-deploy
+	scripts/put-apns-key.py $(SSM_PREFIX)/apns
 
 # --- Ansible -----------------------------------------------------------------
 
@@ -141,6 +145,33 @@ web-dev: ## The web app on this machine, end to end: agentd with a scripted mode
 
 web-smoke: ## Click through the web app in headless Chrome (with make web-dev running)
 	uv run -q --with websockets apps/web/dev/smoke.py $(or $(OUT),/tmp)
+
+# --- The iPhone and Mac apps (apps/apple) ------------------------------------
+
+# Your Apple developer team (10 letters and digits); apps/apple/scripts/project.sh
+# lists the ones this Mac can sign for. APP_BUNDLE_ID is optional.
+export APPLE_TEAM_ID APP_BUNDLE_ID
+
+app-tailscalekit: ## Once: build TailscaleKit, the apps' own Tailscale node (Go + Xcode, a few minutes)
+	apps/apple/scripts/build-tailscalekit.sh
+
+app-project: ## Generate apps/apple/NeoAgent.xcodeproj for Xcode, signed by your team (APPLE_TEAM_ID)
+	apps/apple/scripts/project.sh
+
+app-test: ## Unit tests for the apps' shared code (DesktopKit, on this Mac)
+	cd apps/apple/DesktopKit && swift test
+
+# A compile check: any team ID will do, nothing is signed.
+app-sim: ## Build the iPhone app for the Simulator (no signing)
+	APPLE_TEAM_ID=$(or $(APPLE_TEAM_ID),AAAAAAAAAA) apps/apple/scripts/project.sh
+	cd apps/apple && xcodebuild -project NeoAgent.xcodeproj -scheme NeoAgent \
+	  -destination 'generic/platform=iOS Simulator' -derivedDataPath build/sim CODE_SIGNING_ALLOWED=NO build -quiet
+
+app-device: ## Build, install and open the iPhone app on your iPhone (cable, unlocked; APPLE_TEAM_ID)
+	apps/apple/scripts/run-on-device.sh
+
+app-mac: ## Build the Mac app, install it in /Applications and open it (APPLE_TEAM_ID)
+	apps/apple/scripts/run-on-mac.sh
 
 # --- Power -------------------------------------------------------------------
 

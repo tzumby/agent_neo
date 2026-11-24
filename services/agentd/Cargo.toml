@@ -14,7 +14,7 @@ croner = { version = "4", default-features = false, features = ["jiff"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 jiff = "0.2"
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }

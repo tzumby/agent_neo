@@ -130,10 +130,8 @@ pub const EGRESS_REFUSAL: &str = "not run: the shell's internet access (the prox
 pub fn touches_egress_policy(command: &str) -> bool {
     use std::sync::LazyLock;
     static EGRESS: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(
-            r"(?i)\bsquid\b|/etc/squid|neo[-_]agent[-_]guard|guard\.nft|/etc/neo-agent\b",
-        )
-        .expect("valid regex")
+        regex::Regex::new(r"(?i)\bsquid\b|/etc/squid|neo[-_]agent[-_]guard|guard\.nft|/etc/neo-agent\b")
+            .expect("valid regex")
     });
     EGRESS.is_match(command)
 }

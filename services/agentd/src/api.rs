@@ -40,6 +40,12 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/memory", get(memories))
         .route("/api/v1/memory/consolidate", post(consolidate_now))
         .route("/api/v1/memory/consolidation", get(consolidation))
+        .route("/api/v1/memory/export", get(export_memory))
+        .route("/api/v1/memory/import", post(import_memory))
+        .route("/api/v1/memory/{id}/restore", post(restore_memory))
+        .route("/api/v1/memory/{id}", delete(forget_memory).patch(edit_memory))
+        .route("/api/v1/memory/{id}/confirm", post(confirm_memory))
+        .route("/api/v1/memory/{id}/history", get(memory_history))
         .route("/api/v1/schedules", get(schedules).post(add_schedule))
         .route(
             "/api/v1/schedules/{id}",
@@ -51,6 +57,8 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/push/subscriptions", post(subscribe_push))
         .route("/api/v1/push/subscriptions/{id}", delete(unsubscribe_push))
         .route("/api/v1/push/test", post(test_push))
+        .route("/api/v1/devices", post(register_device))
+        .route("/api/v1/devices/{id}", delete(unregister_device))
         .route("/api/v1/secrets", get(list_secrets))
         .route("/api/v1/secrets/{name}", put(save_secret).delete(delete_secret))
         .route("/api/v1/access", get(access_list).post(allow_host))
@@ -98,7 +106,9 @@ pub fn stage_of(facts: &StageFacts) -> (&'static str, Value) {
             .as_ref()
             .filter(|(_, status)| statuses.contains(&status.as_str()))
     };
-    if let Some((id, kind)) = card(&["shell", "browser", "schedule"]) {
+    // Every card that waits for an OK: a command, the browser, a schedule, a
+    // site to allow, or a task that looks stuck.
+    if let Some((id, kind)) = card(&["shell", "browser", "schedule", "access", "stuck"]) {
         return ("needs_you/approval", json!({"card": id, "kind": kind}));
     }
     if let Some((id, _)) = card(&["secret"]) {
@@ -367,8 +377,8 @@ fn comma_list(text: &Option<String>) -> Vec<&str> {
         .collect()
 }
 
-/// What the agent remembers (the evals read it). Memory v2 lists active
-/// items by default, with all their fields (v1's included).
+/// What the agent remembers: the apps' Memory screen (and the evals). Memory
+/// v2 lists active items by default, with all their fields (v1's included).
 async fn memories(State(agent): App, Query(query): Query<MemoryQuery>) -> Response {
     let limit = query.limit.unwrap_or(500);
     if agent.cfg.memory_v2 {
@@ -425,6 +435,203 @@ fn v2_off() -> Response {
         StatusCode::CONFLICT,
         "memory v2 is off on this desktop (MEMORY_V2)",
     )
+}
+
+// The apps' Memory screen (apps/apple): forget, confirm, edit and restore a
+// memory, export and import. The web app has none of it; there, you ask the
+// agent.
+
+/// Memory v2: brings back an expired or replaced memory.
+async fn restore_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let by = caller(&headers);
+    match memory::restore(&agent.store, memory::Actor::User { login: by.as_deref() }, id) {
+        Ok(Some((item, replaced))) => {
+            agent.emit(
+                "memory.updated",
+                json!({"id": id, "version": item.version, "by": by, "restored": true}),
+            );
+            if let Some(successor) = replaced {
+                agent.emit(
+                    "memory.superseded",
+                    json!({"id": successor, "by_id": id, "by": by}),
+                );
+            }
+            Json(json!({"memory": item})).into_response()
+        }
+        Ok(None) => error(
+            StatusCode::NOT_FOUND,
+            "no expired or replaced memory with that id",
+        ),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+}
+
+/// Memory v2: every memory as JSON (for an import), or the active ones as
+/// Markdown (to read).
+async fn export_memory(State(agent): App, Query(query): Query<ExportQuery>) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    match query.format.as_deref().unwrap_or("json") {
+        "markdown" => match memory::export_markdown(&agent.store) {
+            Ok(text) => ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], text).into_response(),
+            Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        },
+        "json" => match memory::export_json(&agent.store) {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        },
+        _ => error(StatusCode::BAD_REQUEST, "format must be json or markdown"),
+    }
+}
+
+/// Memory v2: imports a JSON export (its active memories) or a list of
+/// `{text, kind?}`.
+async fn import_memory(State(agent): App, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let by = caller(&headers);
+    match memory::import(
+        &agent.store,
+        &agent.secrets,
+        memory::Actor::User { login: by.as_deref() },
+        &body,
+    ) {
+        Ok(done) => {
+            tracing::info!(imported = done.imported, rejected = done.rejected.len(), by = ?by, "memories imported");
+            Json(json!(done)).into_response()
+        }
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+async fn forget_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
+    let by = caller(&headers);
+    let forgotten = if agent.cfg.memory_v2 {
+        memory::forget(&agent.store, memory::Actor::User { login: by.as_deref() }, id).map(|m| m.is_some())
+    } else {
+        agent.store.forget(id)
+    };
+    match forgotten {
+        Ok(true) => {
+            agent.emit("memory.forgotten", json!({"id": id, "by": by}));
+            Json(json!({"ok": true})).into_response()
+        }
+        Ok(false) => error(StatusCode::NOT_FOUND, "no such memory"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// The user vouches for an unverified memory (a hint): it becomes something
+/// they said.
+async fn confirm_memory(State(agent): App, Path(id): Path<i64>, headers: HeaderMap) -> Response {
+    let by = caller(&headers);
+    if !agent.cfg.memory_v2 {
+        return match agent.store.confirm_memory(id) {
+            Ok(true) => {
+                agent.emit("memory.confirmed", json!({"id": id, "by": by}));
+                Json(json!({"ok": true})).into_response()
+            }
+            Ok(false) => error(StatusCode::NOT_FOUND, "no such memory"),
+            Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        };
+    }
+    match memory::approve(&agent.store, memory::Actor::User { login: by.as_deref() }, id) {
+        Ok(Some(item)) => {
+            agent.emit("memory.confirmed", json!({"id": id, "by": by}));
+            Json(json!({"ok": true, "memory": item})).into_response()
+        }
+        Ok(None) => error(StatusCode::NOT_FOUND, "no unverified memory with that id"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct MemoryEdit {
+    text: Option<String>,
+    kind: Option<String>,
+    /// `YYYY-MM-DD` (end of that day, the user's time), or null to clear.
+    #[serde(default, deserialize_with = "double_option")]
+    valid_until: Option<Option<String>>,
+    importance: Option<f64>,
+    expected_version: i64,
+}
+
+/// Tells a missing field (None) from an explicit null (Some(None)).
+fn double_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
+}
+
+/// A user's edit: 409 with the current memory when it changed meanwhile.
+async fn edit_memory(
+    State(agent): App,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(body): Json<MemoryEdit>,
+) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    let valid_until = match body.valid_until {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(date)) => match agent.end_of_day(&date) {
+            Some(until) => Some(Some(until)),
+            None => return error(StatusCode::BAD_REQUEST, "valid_until must be a date, YYYY-MM-DD"),
+        },
+    };
+    let by = caller(&headers);
+    let change = memory::Edit {
+        text: body.text,
+        kind: body.kind,
+        valid_until,
+        importance: body.importance,
+    };
+    let actor = memory::Actor::User { login: by.as_deref() };
+    match memory::edit(
+        &agent.store,
+        &agent.secrets,
+        actor,
+        id,
+        change,
+        body.expected_version,
+    ) {
+        Ok(memory::Edited::Done(item)) => {
+            agent.emit(
+                "memory.updated",
+                json!({"id": id, "version": item.version, "by": by}),
+            );
+            Json(json!({"memory": item})).into_response()
+        }
+        Ok(memory::Edited::Changed(item)) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "it changed meanwhile", "memory": item})),
+        )
+            .into_response(),
+        Ok(memory::Edited::NotFound) => error(StatusCode::NOT_FOUND, "no such memory"),
+        Ok(memory::Edited::Refused(why)) => error(StatusCode::BAD_REQUEST, &why),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
+/// Memory v2: what happened to a memory, newest first.
+async fn memory_history(State(agent): App, Path(id): Path<i64>) -> Response {
+    if !agent.cfg.memory_v2 {
+        return v2_off();
+    }
+    match memory::history(&agent.store, id) {
+        Ok(changes) => Json(json!({"history": changes})).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -654,6 +861,37 @@ async fn unsubscribe_push(State(agent): App, Path(id): Path<String>) -> Response
     }
 }
 
+/// An iPhone or Mac app's APNs registration: its device token, its bundle id
+/// (the topic) and which APNs servers the token is for.
+#[derive(Deserialize)]
+struct NewDevice {
+    token: String,
+    topic: String,
+    #[serde(default)]
+    environment: String,
+    /// What to call the device in the list (the app sends its name).
+    #[serde(default)]
+    name: String,
+}
+
+async fn register_device(State(agent): App, Json(body): Json<NewDevice>) -> Response {
+    match agent.register_device(&body.token, &body.topic, &body.environment, &body.name) {
+        Ok(id) => Json(json!({"id": id})).into_response(),
+        Err(crate::notify::PushError::Invalid(problem)) => error(StatusCode::BAD_REQUEST, &problem),
+        Err(crate::notify::PushError::Failed(err)) => {
+            error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}"))
+        }
+    }
+}
+
+async fn unregister_device(State(agent): App, Path(id): Path<String>) -> Response {
+    match agent.unregister_device(&id) {
+        Ok(true) => Json(json!({"ok": true})).into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "no such device"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct PushTest {
     #[serde(default)]
@@ -663,13 +901,13 @@ struct PushTest {
 /// A test notification, to one browser or all of them.
 async fn test_push(State(agent): App, body: Option<Json<PushTest>>) -> Response {
     let id = body.and_then(|Json(b)| b.id);
-    let notice = crate::notify::Notice {
-        title: "Notifications work".into(),
-        body: "You'll hear from your agent here when it needs you or finishes something.".into(),
-        tag: "test".into(),
-        urgency: "normal",
-        ttl: 600,
-    };
+    let notice = crate::notify::Notice::plain(
+        "Notifications work".into(),
+        "You'll hear from your agent here when it needs you or finishes something.".into(),
+        "test".into(),
+        "normal",
+        600,
+    );
     match agent.notify(&notice, id.as_deref()) {
         Ok(0) if id.is_some() => error(StatusCode::NOT_FOUND, "no such browser"),
         Ok(queued) => Json(json!({"queued": queued})).into_response(),
@@ -833,7 +1071,7 @@ mod tests {
             with(|f| f.cards = vec![("s1".into(), "secret".into())]),
             "needs_you/secret"
         );
-        for kind in ["shell", "browser", "schedule"] {
+        for kind in ["shell", "browser", "schedule", "access", "stuck"] {
             assert_eq!(
                 with(|f| f.cards = vec![("a1".into(), kind.into())]),
                 "needs_you/approval"

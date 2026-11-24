@@ -1,0 +1,116 @@
+import AgentAPI
+import SwiftUI
+
+/// Tasks the agent runs on its own, set up by asking it ("every weekday at 8,
+/// summarize my inbox"). Each can be paused or cancelled here.
+struct SchedulesView: View {
+    let client: AgentClient
+    @State private var schedules: [AgentSchedule] = []
+    @State private var loaded = false
+    @State private var problem: String?
+
+    var body: some View {
+        GroupedList {
+            if loaded, schedules.isEmpty {
+                Section {
+                    Text("Nothing scheduled. Ask the agent, like “Every weekday at 8, summarize my unread email.”")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if !schedules.isEmpty {
+                Section {
+                    ForEach(schedules) { schedule in
+                        ScheduleRow(schedule: schedule)
+                            .swipeActions(edge: .trailing) {
+                                Button("Cancel", role: .destructive) { Task { await cancel(schedule) } }
+                            }
+                            .swipeActions(edge: .leading) {
+                                Button(schedule.paused ? "Resume" : "Pause") {
+                                    Task { await setPaused(!schedule.paused, schedule) }
+                                }
+                                .tint(schedule.paused ? .green : .orange)
+                            }
+                            .macContextMenu {
+                                Button(schedule.paused ? "Resume" : "Pause") {
+                                    Task { await setPaused(!schedule.paused, schedule) }
+                                }
+                                Button("Cancel", role: .destructive) { Task { await cancel(schedule) } }
+                            }
+                    }
+                } footer: {
+                    #if os(macOS)
+                        Text("Each run is a new task with just its prompt. Approvals still apply: you get a notification when one needs you. Right-click a schedule to pause or cancel it.")
+                    #else
+                        Text("Each run is a new task with just its prompt. Approvals still apply: you get a notification when one needs you. Swipe left to cancel, right to pause.")
+                    #endif
+                }
+            }
+            if let problem {
+                Section { Text(problem).foregroundStyle(.red) }
+            }
+        }
+        .navigationTitle("Schedules")
+        .inlineTitle()
+        .overlay { if !loaded { ProgressView() } }
+        .task { await load() }
+        .refreshable { await load() }
+    }
+
+    private func load() async {
+        do {
+            schedules = try await client.schedules()
+            problem = nil
+        } catch {
+            problem = error.localizedDescription
+        }
+        loaded = true
+    }
+
+    private func cancel(_ schedule: AgentSchedule) async {
+        schedules.removeAll { $0.id == schedule.id }
+        do { try await client.cancel(schedule: schedule.id) } catch { await load() }
+    }
+
+    private func setPaused(_ paused: Bool, _ schedule: AgentSchedule) async {
+        do {
+            let updated = try await client.setPaused(paused, schedule: schedule.id)
+            if let index = schedules.firstIndex(where: { $0.id == schedule.id }) { schedules[index] = updated }
+        } catch {
+            problem = error.localizedDescription
+        }
+    }
+}
+
+private struct ScheduleRow: View {
+    let schedule: AgentSchedule
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(schedule.name).font(.app(.headline))
+                if schedule.paused {
+                    Text("Paused").font(.app(.caption).weight(.semibold)).foregroundStyle(.orange)
+                }
+            }
+            Text(schedule.description).font(.app(.subheadline))
+            if !schedule.paused {
+                Text("Next: \(schedule.nextRun.formatted(.dateTime.weekday().month().day().hour().minute()))")
+                    .font(.app(.footnote))
+                    .foregroundStyle(.secondary)
+            }
+            Text(schedule.prompt)
+                .font(.app(.footnote))
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+            if schedule.createdFrom == "agent_tainted" {
+                Label("Set up after the agent read outside content", systemImage: "exclamationmark.triangle")
+                    .font(.app(.caption))
+                    .foregroundStyle(.orange)
+            }
+            if schedule.timezone != TimeZone.current.identifier {
+                Text("Times in \(schedule.timezone)").font(.app(.caption)).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}

@@ -1,17 +1,19 @@
 # Neo Agent, personal edition
 
 An AI agent with its own always-on Linux desktop (XFCE and Google Chrome) in
-**your own AWS account**. You chat with it from a web app on your
-[Tailscale](https://tailscale.com) tailnet, from a laptop or a phone. It
-browses in its own logged-in Chrome, runs shell commands in a sandbox,
+**your own AWS account**. You chat with it on your
+[Tailscale](https://tailscale.com) tailnet, from a web app on a laptop or a
+phone, or from the [iPhone and Mac apps](#the-iphone-and-mac-apps-optional).
+It browses in its own logged-in Chrome, runs shell commands in a sandbox,
 remembers what you tell it, and runs scheduled tasks. Anything risky waits for
 your OK.
 
 This is a trimmed edition of the full project, for one person. It leaves out
-the model gateway, the push relay and the iPhone and Mac apps (notifications
-come to your browsers by Web Push instead), Slack and Teams updates, the Cloudflare and Datadog monitoring with its setup guide, the
-Cloudflare Access front door, and the tooling for running desktops for other
-people.
+the model gateway, the push relay (agentd sends notifications itself — Web Push
+to your browsers, APNs to the apps), Slack and Teams updates, the Cloudflare
+and Datadog monitoring with its setup guide, the Cloudflare Access front door,
+TestFlight and notarized app builds, and the tooling for running desktops for
+other people.
 
 ## What gets deployed
 
@@ -31,7 +33,7 @@ On the desktop:
 | | |
 |---|---|
 | **agentd** | The agent (`services/agentd`, Rust): the model loop, browser control over Chrome's DevTools Protocol, a sandboxed shell, memory, schedules and approvals. It calls Together AI directly with your key. |
-| **tailnet-proxy** | The desktop's only presence on your tailnet (`services/tailnet-proxy`, Go, Tailscale's tsnet), at `https://neo-agent.<your tailnet>.ts.net`. It serves the web app, agentd's API and the desktop viewer, and port 5900 for a native VNC viewer. The rest of the VM, including the agent's commands, can't reach your other tailnet devices. |
+| **tailnet-proxy** | The desktop's only presence on your tailnet (`services/tailnet-proxy`, Go, Tailscale's tsnet), at `https://neo-agent.<your tailnet>.ts.net`. It serves the web app, agentd's API and the desktop viewer, and port 5900 for the apps' take-over view. The rest of the VM, including the agent's commands, can't reach your other tailnet devices. |
 | **The web app** | `apps/web` (static files, no build step): the chat, approval cards, the desktop (take over), schedules, keys and tokens, and settings. |
 | Chrome, Xvfb, XFCE, x11vnc, noVNC | The desktop the agent works in, on localhost only. |
 | Squid, nftables | The agent's shell reaches the internet only through an allowlisting proxy. A firewall keeps the shell away from Chrome's DevTools, VNC and the instance's AWS credentials. |
@@ -51,6 +53,9 @@ On the desktop:
 - Go ≥ 1.27, for tailnet-proxy.
 - A [Together AI](https://api.together.ai) API key.
 - A Tailscale account (the free personal plan is enough).
+- Optional, for the iPhone and Mac apps: a Mac with Xcode 26 or later and an
+  Apple Account (a free one works). See
+  [The iPhone and Mac apps](#the-iphone-and-mac-apps-optional).
 
 ### A new AWS account, once
 
@@ -182,7 +187,8 @@ In the [admin console](https://login.tailscale.com/admin):
 4. **Your devices**: install Tailscale on each laptop and phone you'll use
    the agent from ([tailscale.com/download](https://tailscale.com/download)),
    and sign in with the same account. Only devices on your tailnet can open
-   the web app.
+   the web app. The iPhone and Mac apps join the tailnet by themselves, so a
+   device that only uses an app doesn't need the Tailscale app.
 
 With the default access rules, every device of yours on the tailnet can reach
 the desktop. If you share your tailnet with others, use `make tailscale-allow`
@@ -271,13 +277,16 @@ on every `make` gives a second, separate deployment in the same account.
   account. On iPhone or iPad, add the web app to your Home Screen first (Share
   → Add to Home Screen), open it from there, then turn them on. iOS only
   allows Web Push for Home Screen apps. `agentd_push_contact` sets the contact
-  address the push services see.
+  address the push services see. The iPhone and Mac apps get the same
+  notifications over APNs once you set up a key
+  ([Notifications for the apps](#notifications-for-the-apps-optional)).
 - **Memory**: the agent remembers facts across conversations, and tidies up
-  duplicates and things that are no longer true.
+  duplicates and things that are no longer true. To fix or forget a memory in
+  the web app, ask the agent. The iPhone and Mac apps also have a Memory
+  screen for editing, forgetting, exporting and importing.
 - **Skills** (`services/agentd/skills`) are how-tos the agent reads when it
   needs them. They cover installing software (Nix, no `curl | bash`), Python
-  with uv, Node, git and GitHub, opencode with Together AI, deploying to Fly,
-  and authorized penetration testing of your own systems.
+  with uv, Node, git and GitHub, opencode with Together AI, and deploying to Fly.
 
 From your machine, over SSM:
 
@@ -292,6 +301,97 @@ make stop / start   # stop the desktop when you don't need it (the disk stays)
 make agentd-reset   # wipe the chat, memories, schedules, keys and Chrome's profile (asks first)
 ```
 
+## The iPhone and Mac apps (optional)
+
+Native apps for iPhone (iOS 26 or later) and Mac (macOS 15.6 or later, Apple
+silicon), in `apps/apple`. They have the same chat as the web app: plans,
+approval cards, **Looks stuck**, keys and schedules. Take over shows the desktop
+natively, with the phone's keyboard and gestures or the Mac's keyboard and
+pointer. The apps also have a Memory screen, and push notifications — with
+Approve and Deny right on an approval notification — if you set up an APNs key
+([Notifications for the apps](#notifications-for-the-apps-optional)).
+
+Each app has its own Tailscale node built in. You sign in with your Tailscale
+account inside the app, and it finds your desktop by its tag (`tag:neo-agent`).
+The device doesn't need the Tailscale app.
+
+**What you need**, on a Mac:
+
+- Xcode 26 or later, from the App Store. Open it once to finish installing.
+- XcodeGen: `brew install xcodegen`.
+- Go, as for the deploy (it builds TailscaleKit).
+- Your Apple Account in Xcode: **Xcode → Settings → Accounts → +**. A free
+  account works for building and running. Apps it signs stop opening after 7
+  days, until you run `make app-device` or `make app-mac` again. With the Apple
+  Developer Program ($99 a year), they last a year — and only a paid account
+  can create the APNs key that notifications need (below).
+
+**Build and install:**
+
+```sh
+make app-tailscalekit   # once: builds TailscaleKit from source (a few minutes)
+make app-project        # lists the team IDs this Mac can sign for
+export APPLE_TEAM_ID=<one of them>
+make app-mac            # the Mac app, installed in /Applications and opened
+make app-device         # the iPhone app, on the iPhone connected by cable
+```
+
+Export `APPLE_TEAM_ID` in every new shell, like `AWS_PROFILE`. The apps' bundle
+ID is `dev.neoagent.app.<your team ID>`; set `APP_BUNDLE_ID` to use another.
+
+**The iPhone, the first time:**
+
+1. Connect it to the Mac with a cable, unlock it, and tap **Trust**.
+2. Run `make app-device`. If it says Developer Mode is off, turn it on: on the
+   iPhone, **Settings → Privacy & Security → Developer Mode** (the iPhone
+   restarts). The setting only shows once a Mac with Xcode has seen the phone.
+   Then run `make app-device` again.
+3. With a free account, the iPhone won't open the app until you trust your
+   certificate: **Settings → General → VPN & Device Management →** your Apple
+   ID **→ Trust**. Then open Neo Agent from the Home Screen.
+
+**Signing in:** tap **Log in with Tailscale** and sign in with the account your
+desktop is on. The app joins your tailnet as `neo-agent-iphone` or
+`neo-agent-mac`. If you turned on device approval, approve it in the admin
+console. The app opens on your desktop's chat. "No desktop yet" means no device
+tagged `tag:neo-agent` is online: check that the desktop is running
+(`make start`) and that `make url` prints its address.
+
+### Notifications for the apps (optional)
+
+The apps get a notification when a card needs you (with Approve and Deny on the
+notification itself), when Action needed comes up, when a chat task that ran
+over a minute finishes, and when a scheduled run finds something. agentd sends
+these to Apple directly with your own APNs key — there's no push relay and
+nothing extra in AWS, the same as the browsers' Web Push. It's off until you
+set up a key.
+
+Notifications need the **Apple Developer Program** ($99 a year): a free account
+can't create an APNs key or use the push entitlement. Once, in your
+[Apple developer account](https://developer.apple.com/account):
+
+1. **Certificates, Identifiers & Profiles → Keys → +**. Give it a name, tick
+   **Apple Push Notifications service (APNs)**, and Continue, then Register.
+2. **Download** the `.p8` key file (you can only download it once). Note its
+   **Key ID** (also in the file name, `AuthKey_XXXXXXXXXX.p8`) and your **Team
+   ID** (top right of the portal, under your name).
+
+Then store it and redeploy:
+
+```sh
+make apns-key           # asks for the .p8 path, the Key ID and the Team ID
+make agentd-deploy       # writes the key to the desktop and restarts agentd
+```
+
+Open a signed-in app and allow notifications when it asks (the first time it
+connects); the app registers itself with the desktop from then on. One APNs key
+covers both apps. `make app-device` and `make app-mac` builds use Apple's
+development servers, which the key covers.
+
+To work on the apps in Xcode, run `make app-project` and open
+`apps/apple/NeoAgent.xcodeproj`. Its schemes are NeoAgent (iPhone) and
+NeoAgentMac.
+
 ## Updating
 
 ```sh
@@ -299,6 +399,7 @@ git pull
 make agentd-deploy      # agentd (copies its database first; schema changes are additive)
 make tailnet-deploy     # tailnet-proxy and the web app
 make desktop            # OS hardening, the display stack, Chrome
+make app-mac app-device # the apps, if you use them
 ```
 
 To rotate the model key, run `make model-key` and then `make agentd-deploy`.
@@ -314,7 +415,9 @@ To rotate the model key, run `make model-key` and then `make agentd-deploy`.
   desktop only agentd can read it. The desktop's own IAM role is denied the
   project's SSM parameters. Prompts go straight from agentd to Together AI;
   there is no gateway in between. So anyone with root on the desktop can read
-  the key, and that's you, over SSM.
+  the key, and that's you, over SSM. Your Apple APNs key, if you set up
+  notifications for the apps, is handled the same way (same file, same SSM
+  deny), and agentd signs its notifications to Apple with it.
 - **The agent's shell** runs as `worker`, without sudo, each command in its own
   hardened systemd unit (no privilege escalation, private `/tmp`, memory, CPU,
   process and time limits). It reaches the internet only through Squid's
@@ -348,12 +451,29 @@ make web-dev        # the whole thing on this machine, with a scripted model: ht
 make web-smoke      # with web-dev running: clicks through it in headless Chrome
 make agentd-evals   # memory evals against Together (cents per scenario)
 make lint           # Terraform fmt and validate, playbook syntax
+make app-test       # the apps' shared code (DesktopKit): the chat rules, decoding, Markdown
+make app-sim        # compile the iPhone app for the Simulator (no signing)
 ```
 
 `make web-dev` runs agentd with a fake model (`apps/web/dev/fake_llm.py`) and
 `devdoor`. devdoor is a local stand-in for tailnet-proxy that signs every
 request in as `you@example.com`, so it's for this machine only and never
 deployed.
+
+The apps can use it too, without Tailscale. A Debug build launched with
+`CHAT_PREVIEW_URL` talks to that address directly. In the Simulator, after
+`make app-sim` and with `make web-dev` running:
+
+```sh
+xcrun simctl boot "iPhone 17 Pro"
+xcrun simctl install booted apps/apple/build/sim/Build/Products/Debug-iphonesimulator/NeoAgent.app
+SIMCTL_CHILD_CHAT_PREVIEW_URL=http://127.0.0.1:8088 \
+  xcrun simctl launch booted dev.neoagent.app.aaaaaaaaaa
+```
+
+Add `SIMCTL_CHILD_PREVIEW_SCREEN=memory` (or `settings`, `schedules`, `keys`)
+to open that screen instead. The bundle ID is `make app-sim`'s placeholder;
+it's yours if `APPLE_TEAM_ID` is set.
 
 ## Teardown
 
@@ -363,7 +483,8 @@ make destroy
 
 The state bucket stays (`prevent_destroy`); delete it in the S3 console if you
 want it gone. Then delete the SSM parameters under `/neo-agent/personal/`
-and remove the device in Tailscale's admin console.
+and remove the desktop (and the apps' devices, `neo-agent-iphone` and
+`neo-agent-mac`) in Tailscale's admin console.
 
 ## Notes
 

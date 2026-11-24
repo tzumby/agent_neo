@@ -73,11 +73,9 @@ export APP_BUNDLE_ID="${APP_BUNDLE_ID:-dev.neoagent.app.$team_lower}"
 push=off
 case "${APP_PUSH:-}" in 1 | on | true | yes) push=on ;; esac
 
-xcodegen generate --quiet
-
-# The entitlement files each target points at, written AFTER xcodegen (which
-# would otherwise overwrite a path it's given with an empty file). aps-environment
-# is present only when push is on, so a free account can still build the rest.
+# The entitlement files each target signs with (CODE_SIGN_ENTITLEMENTS in
+# project.yml). aps-environment is present only when push is on, so a free
+# account can still build the rest.
 aps_ios=""
 aps_mac=""
 if [[ "$push" == on ]]; then
@@ -86,7 +84,10 @@ if [[ "$push" == on ]]; then
   aps_mac='  <key>com.apple.developer.aps-environment</key>
   <string>development</string>'
 fi
-cat >NeoAgent/iOS/NeoAgent.entitlements <<EOF
+# Functions rather than heredocs inside $(...), which macOS's bash 3.2 can't
+# parse when the text has an apostrophe.
+ios_plist() {
+  cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -95,7 +96,9 @@ $aps_ios
 </dict>
 </plist>
 EOF
-cat >NeoAgent/macOS/NeoAgent.entitlements <<EOF
+}
+mac_plist() {
+  cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -114,6 +117,27 @@ $aps_mac
 </dict>
 </plist>
 EOF
+}
+ios_entitlements="$(ios_plist)"
+mac_entitlements="$(mac_plist)"
+
+# Xcode records each entitlements file's date when it plans a build, reuses
+# the plan while the project is unchanged, and fails the build when the date
+# has changed by signing time ("was modified during the build"). So a file is
+# written only when its contents change, and the project carries a digest of
+# them (ENTITLEMENTS_DIGEST in project.yml) so that new contents make a new plan.
+ENTITLEMENTS_DIGEST="$(printf '%s\n%s\n' "$ios_entitlements" "$mac_entitlements" | shasum -a 256 | cut -c1-16)"
+export ENTITLEMENTS_DIGEST
+
+xcodegen generate --quiet
+
+write_if_changed() { # path contents
+  if [[ ! -f "$1" || "$(cat "$1")" != "$2" ]]; then
+    printf '%s\n' "$2" >"$1"
+  fi
+}
+write_if_changed NeoAgent/iOS/NeoAgent.entitlements "$ios_entitlements"
+write_if_changed NeoAgent/macOS/NeoAgent.entitlements "$mac_entitlements"
 
 echo "Generated $HERE/NeoAgent.xcodeproj (team $APPLE_TEAM_ID, bundle ID $APP_BUNDLE_ID, push $push)."
 if [[ "$push" == on ]]; then

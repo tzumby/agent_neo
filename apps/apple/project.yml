@@ -21,6 +21,12 @@ settings:
     # Program; a free account builds and runs the app, just without
     # notifications.
     APS_ENVIRONMENT: development
+    # A digest of the entitlement files scripts/project.sh writes. Xcode
+    # reuses a build plan while the project is unchanged, and the plan records
+    # each entitlements file's date: new entitlements with the same project
+    # fail the build ("was modified during the build"). The digest changes
+    # the project with them.
+    ENTITLEMENTS_DIGEST: ${ENTITLEMENTS_DIGEST}
 packages:
   DesktopKit:
     path: DesktopKit
@@ -37,10 +43,6 @@ targets:
     dependencies:
       - package: DesktopKit
         products: [Tailnet, AgentAPI, ChatCore, DesktopViewer]
-    # Written by scripts/project.sh: empty, or with aps-environment when
-    # APP_PUSH is set (notifications; needs the paid Apple Developer Program).
-    entitlements:
-      path: NeoAgent/iOS/NeoAgent.entitlements
     info:
       path: NeoAgent/iOS/Info.plist
       properties:
@@ -56,6 +58,11 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ${APP_BUNDLE_ID}
+        # Written by scripts/project.sh: empty, or with aps-environment when
+        # APP_PUSH is set (notifications; needs the paid Apple Developer
+        # Program). A setting, not XcodeGen's `entitlements:`, which rewrites
+        # the file on every run and so changes its date.
+        CODE_SIGN_ENTITLEMENTS: NeoAgent/iOS/NeoAgent.entitlements
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: false
 
@@ -70,11 +77,6 @@ targets:
     dependencies:
       - package: DesktopKit
         products: [Tailnet, AgentAPI, ChatCore, DesktopViewer]
-    # Written by scripts/project.sh: the sandbox and network entitlements
-    # always, plus aps-environment when APP_PUSH is set (notifications; needs
-    # the paid Apple Developer Program).
-    entitlements:
-      path: NeoAgent/macOS/NeoAgent.entitlements
     info:
       path: NeoAgent/macOS/Info.plist
       properties:
@@ -87,6 +89,10 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ${APP_BUNDLE_ID}
         PRODUCT_NAME: Neo Agent
+        # Written by scripts/project.sh: the sandbox and network entitlements
+        # always, plus aps-environment when APP_PUSH is set (notifications;
+        # needs the paid Apple Developer Program). A setting, as for the iPhone.
+        CODE_SIGN_ENTITLEMENTS: NeoAgent/macOS/NeoAgent.entitlements
         GENERATE_INFOPLIST_FILE: false
         ENABLE_HARDENED_RUNTIME: true
         ARCHS: arm64 # TailscaleKit has no Intel slice

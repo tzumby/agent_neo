@@ -328,16 +328,38 @@ The device doesn't need the Tailscale app.
 
 **Build and install:**
 
-```sh
-make app-tailscalekit   # once: builds TailscaleKit from source (a few minutes)
-make app-project        # lists the team IDs this Mac can sign for
-export APPLE_TEAM_ID=<one of them>
-make app-mac            # the Mac app, installed in /Applications and opened
-make app-device         # the iPhone app, on the iPhone connected by cable
-```
+1. Once, build the Tailscale node the apps embed (needs Go; a few minutes):
 
-Export `APPLE_TEAM_ID` in every new shell, like `AWS_PROFILE`. The apps' bundle
-ID is `dev.neoagent.app.<your team ID>`; set `APP_BUNDLE_ID` to use another.
+   ```sh
+   make app-tailscalekit
+   ```
+
+2. Find your Apple team ID. With no `APPLE_TEAM_ID` set, this lists the teams
+   your Mac can sign for:
+
+   ```sh
+   make app-project
+   ```
+
+   It prints a line like `export APPLE_TEAM_ID=A1B2C3D4E5` for each. Run the one
+   you want (export it in every new shell, like `AWS_PROFILE`):
+
+   ```sh
+   export APPLE_TEAM_ID=<your team ID>
+   ```
+
+3. Build and install:
+
+   ```sh
+   make app-mac            # the Mac app → /Applications, then opens it
+   make app-device         # the iPhone app → your iPhone (connected by cable)
+   ```
+
+These builds have **no notifications** — that keeps them working on a free
+account (a free "Personal Team" can't use the Push Notifications capability, so
+a push build fails to sign). To add notifications, see
+[Notifications for the apps](#notifications-for-the-apps-optional). The apps'
+bundle ID is `dev.neoagent.app.<your team ID>`; set `APP_BUNDLE_ID` to use another.
 
 **The iPhone, the first time:**
 
@@ -367,25 +389,37 @@ nothing extra in AWS, the same as the browsers' Web Push. It's off until you
 set up a key.
 
 Notifications need the **Apple Developer Program** ($99 a year): a free account
-can't create an APNs key or use the push entitlement. Once, in your
-[Apple developer account](https://developer.apple.com/account):
+can't create an APNs key or use the push entitlement. With that:
 
-1. **Certificates, Identifiers & Profiles → Keys → +**. Give it a name, tick
-   **Apple Push Notifications service (APNs)**, and Continue, then Register.
-2. **Download** the `.p8` key file (you can only download it once). Note its
-   **Key ID** (also in the file name, `AuthKey_XXXXXXXXXX.p8`) and your **Team
-   ID** (top right of the portal, under your name).
+1. **Create an APNs key.** In your
+   [Apple developer account](https://developer.apple.com/account) →
+   **Certificates, Identifiers & Profiles → Keys → +**. Give it a name, tick
+   **Apple Push Notifications service (APNs)**, Continue, then Register.
+   **Download** the `.p8` file (you can only download it once). Note its **Key
+   ID** (also in the file name, `AuthKey_XXXXXXXXXX.p8`) and your **Team ID**
+   (top right of the portal, under your name).
 
-Then store it and redeploy:
+2. **Give the key to your desktop:**
 
-```sh
-make apns-key           # asks for the .p8 path, the Key ID and the Team ID
-make agentd-deploy       # writes the key to the desktop and restarts agentd
-```
+   ```sh
+   make apns-key           # asks for the .p8 path, the Key ID and the Team ID
+   make agentd-deploy      # writes the key to the desktop and restarts agentd
+   ```
+
+3. **Rebuild the apps with notifications on** (`APP_PUSH=1`), which adds the
+   Push Notifications capability:
+
+   ```sh
+   APP_PUSH=1 make app-mac
+   APP_PUSH=1 make app-device
+   ```
+
+   Export `APP_PUSH=1` to keep it on for the shell. (On a free Personal Team
+   this step fails to sign — that's the capability the paid program unlocks.)
 
 Open a signed-in app and allow notifications when it asks (the first time it
 connects); the app registers itself with the desktop from then on. One APNs key
-covers both apps. `make app-device` and `make app-mac` builds use Apple's
+covers both apps, and `make app-device` / `make app-mac` build against Apple's
 development servers, which the key covers.
 
 To work on the apps in Xcode, run `make app-project` and open

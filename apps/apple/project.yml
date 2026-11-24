@@ -37,10 +37,10 @@ targets:
     dependencies:
       - package: DesktopKit
         products: [Tailnet, AgentAPI, ChatCore, DesktopViewer]
+    # Written by scripts/project.sh: empty, or with aps-environment when
+    # APP_PUSH is set (notifications; needs the paid Apple Developer Program).
     entitlements:
       path: NeoAgent/iOS/NeoAgent.entitlements
-      properties:
-        aps-environment: $(APS_ENVIRONMENT)
     info:
       path: NeoAgent/iOS/Info.plist
       properties:
@@ -70,16 +70,11 @@ targets:
     dependencies:
       - package: DesktopKit
         products: [Tailnet, AgentAPI, ChatCore, DesktopViewer]
+    # Written by scripts/project.sh: the sandbox and network entitlements
+    # always, plus aps-environment when APP_PUSH is set (notifications; needs
+    # the paid Apple Developer Program).
     entitlements:
       path: NeoAgent/macOS/NeoAgent.entitlements
-      properties:
-        com.apple.security.app-sandbox: true
-        com.apple.security.network.client: true
-        # The app's Tailscale node serves its SOCKS5 proxy on 127.0.0.1.
-        com.apple.security.network.server: true
-        # Memory: import a file, save an export.
-        com.apple.security.files.user-selected.read-write: true
-        com.apple.developer.aps-environment: $(APS_ENVIRONMENT)
     info:
       path: NeoAgent/macOS/Info.plist
       properties:

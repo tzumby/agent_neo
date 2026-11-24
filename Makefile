@@ -149,8 +149,10 @@ web-smoke: ## Click through the web app in headless Chrome (with make web-dev ru
 # --- The iPhone and Mac apps (apps/apple) ------------------------------------
 
 # Your Apple developer team (10 letters and digits); apps/apple/scripts/project.sh
-# lists the ones this Mac can sign for. APP_BUNDLE_ID is optional.
-export APPLE_TEAM_ID APP_BUNDLE_ID
+# lists the ones this Mac can sign for. APP_BUNDLE_ID is optional. APP_PUSH=1
+# turns on notifications (needs the paid Apple Developer Program; off by default
+# so the apps build on a free account).
+export APPLE_TEAM_ID APP_BUNDLE_ID APP_PUSH
 
 app-tailscalekit: ## Once: build TailscaleKit, the apps' own Tailscale node (Go + Xcode, a few minutes)
 	apps/apple/scripts/build-tailscalekit.sh

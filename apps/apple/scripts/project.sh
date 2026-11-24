@@ -65,5 +65,57 @@ export APP_BUNDLE_ID="${APP_BUNDLE_ID:-dev.neoagent.app.$team_lower}"
 [[ "$APP_BUNDLE_ID" =~ ^[A-Za-z0-9.-]+$ ]] ||
   die "APP_BUNDLE_ID has letters, digits, dots and dashes only; not '$APP_BUNDLE_ID'."
 
+# Notifications are opt-in: APP_PUSH=1 adds the Push Notifications capability
+# (aps-environment). It needs the paid Apple Developer Program — a free
+# Personal Team can't provision it, and the build fails. Off by default, so the
+# apps build and run on any account; the agent still reaches browsers by Web
+# Push either way.
+push=off
+case "${APP_PUSH:-}" in 1 | on | true | yes) push=on ;; esac
+
 xcodegen generate --quiet
-echo "Generated $HERE/NeoAgent.xcodeproj (team $APPLE_TEAM_ID, bundle ID $APP_BUNDLE_ID)."
+
+# The entitlement files each target points at, written AFTER xcodegen (which
+# would otherwise overwrite a path it's given with an empty file). aps-environment
+# is present only when push is on, so a free account can still build the rest.
+aps_ios=""
+aps_mac=""
+if [[ "$push" == on ]]; then
+  aps_ios='  <key>aps-environment</key>
+  <string>development</string>'
+  aps_mac='  <key>com.apple.developer.aps-environment</key>
+  <string>development</string>'
+fi
+cat >NeoAgent/iOS/NeoAgent.entitlements <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+$aps_ios
+</dict>
+</plist>
+EOF
+cat >NeoAgent/macOS/NeoAgent.entitlements <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.app-sandbox</key>
+  <true/>
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <!-- The app's Tailscale node serves its SOCKS5 proxy on 127.0.0.1. -->
+  <key>com.apple.security.network.server</key>
+  <true/>
+  <!-- Memory: import a file, save an export. -->
+  <key>com.apple.security.files.user-selected.read-write</key>
+  <true/>
+$aps_mac
+</dict>
+</plist>
+EOF
+
+echo "Generated $HERE/NeoAgent.xcodeproj (team $APPLE_TEAM_ID, bundle ID $APP_BUNDLE_ID, push $push)."
+if [[ "$push" == on ]]; then
+  echo "Push Notifications are on: this needs the paid Apple Developer Program."
+fi

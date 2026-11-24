@@ -16,7 +16,7 @@ struct SplashView: View {
                 .glass(.circle)
                 .scaleEffect(breathing ? 1.04 : 0.97)
                 .animation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true), value: breathing)
-            Text("Neo Agent")
+            Text("Agent Neo")
                 .font(.app(.title3).weight(.semibold))
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)

@@ -1,4 +1,4 @@
-# Neo Agent, personal edition
+# Agent Neo, personal edition
 
 An AI agent with its own always-on Linux desktop (XFCE and Google Chrome) in
 **your own AWS account**. You chat with it on your
@@ -380,7 +380,7 @@ bundle ID is `dev.neoagent.app.<your team ID>`; set `APP_BUNDLE_ID` to use anoth
    Then run `make app-device` again.
 3. With a free account, the iPhone won't open the app until you trust your
    certificate: **Settings → General → VPN & Device Management →** your Apple
-   ID **→ Trust**. Then open Neo Agent from the Home Screen.
+   ID **→ Trust**. Then open Agent Neo from the Home Screen.
 
 **Signing in:** tap **Log in with Tailscale** and sign in with the account your
 desktop is on. The app joins your tailnet as `neo-agent-iphone` or

@@ -35,6 +35,6 @@ if ! xcrun devicectl device process launch --device "$IDENTIFIER" "$BUNDLE_ID"; 
   echo >&2
   echo "Installed, but the iPhone wouldn't open it. With a free Apple account, trust" >&2
   echo "your certificate first: Settings → General → VPN & Device Management → your" >&2
-  echo "Apple ID → Trust. Then open Neo Agent from the Home Screen." >&2
+  echo "Apple ID → Trust. Then open Agent Neo from the Home Screen." >&2
   exit 1
 fi

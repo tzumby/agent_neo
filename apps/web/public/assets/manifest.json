@@ -1,6 +1,6 @@
 {
-  "name": "Neo Agent",
-  "short_name": "Neo Agent",
+  "name": "Agent Neo",
+  "short_name": "Agent Neo",
   "description": "Your AI agent and its desktop.",
   "start_url": "/",
   "scope": "/",

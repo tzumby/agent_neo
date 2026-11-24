@@ -13,7 +13,7 @@ struct NeoAgentMacApp: App {
 
     var body: some Scene {
         // One chat window: two would each stream the same chat.
-        Window("Neo Agent", id: "chat") {
+        Window("Agent Neo", id: "chat") {
             Group {
                 #if DEBUG
                     if let preview = ChatPreview.fromEnvironment() {

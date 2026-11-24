@@ -18,7 +18,7 @@ self.addEventListener("push", (event) => {
   } catch {
     data = {};
   }
-  const title = typeof data.title === "string" && data.title.trim() ? data.title : "Neo Agent";
+  const title = typeof data.title === "string" && data.title.trim() ? data.title : "Agent Neo";
   const tag = typeof data.tag === "string" && data.tag ? data.tag : undefined;
   // Always a notification: browsers penalize pushes that show nothing.
   event.waitUntil(self.registration.showNotification(title, {

@@ -46,7 +46,7 @@ targets:
     info:
       path: NeoAgent/iOS/Info.plist
       properties:
-        CFBundleDisplayName: Neo Agent
+        CFBundleDisplayName: Agent Neo
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         APSEnvironment: $(APS_ENVIRONMENT)
@@ -80,7 +80,7 @@ targets:
     info:
       path: NeoAgent/macOS/Info.plist
       properties:
-        CFBundleDisplayName: Neo Agent
+        CFBundleDisplayName: Agent Neo
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         APSEnvironment: $(APS_ENVIRONMENT)
@@ -88,7 +88,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ${APP_BUNDLE_ID}
-        PRODUCT_NAME: Neo Agent
+        PRODUCT_NAME: Agent Neo
         # Written by scripts/project.sh: the sandbox and network entitlements
         # always, plus aps-environment when APP_PUSH is set (notifications;
         # needs the paid Apple Developer Program). A setting, as for the iPhone.

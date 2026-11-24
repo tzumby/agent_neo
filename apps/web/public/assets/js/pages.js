@@ -376,7 +376,7 @@ function pushSection(store) {
 
   function thisDevice(state, own, info, mine) {
     if (state === "ios-home-screen") {
-      return h("p", null, "On iPhone or iPad: tap Share → Add to Home Screen, open Neo Agent from there, then turn notifications on here.");
+      return h("p", null, "On iPhone or iPad: tap Share → Add to Home Screen, open Agent Neo from there, then turn notifications on here.");
     }
     if (state === "unsupported") return h("p", null, "This browser can't get notifications from the web app.");
     if (state === "denied") {

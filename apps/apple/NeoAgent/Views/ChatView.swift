@@ -202,7 +202,7 @@ struct ChatView: View {
                 .macSheetSize(height: 420)
             }
             .alert(
-                "Neo Agent",
+                "Agent Neo",
                 isPresented: Binding(get: { store.notice != nil }, set: { if !$0 { store.notice = nil } })
             ) {
                 Button("OK") {}

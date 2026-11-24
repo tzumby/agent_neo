@@ -19,7 +19,7 @@ struct LoginView: View {
                 .font(.system(size: 40, weight: .light))
                 .frame(width: 96, height: 96)
                 .glass(.circle)
-            Text("Neo Agent")
+            Text("Agent Neo")
                 .font(.app(.largeTitle).bold())
             Text("Sign in with the Tailscale account your desktop is on.")
                 .multilineTextAlignment(.center)

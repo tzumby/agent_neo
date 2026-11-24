@@ -135,7 +135,7 @@ def runner_args(request, credential_dir):
     sensitive = bool(keys) or route == "direct"
     args = [
         "/usr/bin/systemd-run", "--quiet", "--pipe", "--wait", "--collect",
-        "--service-type=exec", "--expand-environment=no", "--description=Neo Agent worker command",
+        "--service-type=exec", "--expand-environment=no", "--description=Agent Neo worker command",
         f'--unit={request["unit"]}.service', f"--uid={WORKER}", f"--property=RuntimeMaxSec={seconds}s",
     ]
     args.extend(f"--property={prop}" for prop in SAFE_WORKER_PROPERTIES)
@@ -265,5 +265,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except (KeyError, OSError, ValueError, subprocess.SubprocessError):
-        print("Neo Agent: privileged operation failed or received invalid input", file=sys.stderr)
+        print("Agent Neo: privileged operation failed or received invalid input", file=sys.stderr)
         sys.exit(1)

@@ -30,6 +30,11 @@ http_access allow all
 
 # A pass-through, not a cache; don't tell sites about the desktop.
 cache deny all
+# No ICMP pinger (only round-trip times for choosing peers, which this proxy
+# has none of). It talks to Squid over UDP on localhost, which the guard
+# firewall refuses for the proxy account, and Squid then waits for its hello
+# forever: systemd timed out starting it (found deploying 2026-11-23).
+pinger_enable off
 shutdown_lifetime 0 seconds
 forwarded_for delete
 via off

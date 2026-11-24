@@ -358,6 +358,7 @@ The desktop has a separate browser network table (§5.3). File permissions prote
   - `api.together.ai`, `api.together.xyz` (for tools you give a key, such as opencode; agentd's own model calls don't go through Squid);
   - `.nixos.org`.
 - **No cache, no `X-Forwarded-For`, no `Via`.**
+- **No ICMP pinger** (`pinger_enable off`). It talks to Squid over UDP on localhost, which the guard firewall refuses for `proxy`, and Squid then waits for its hello until systemd's start timeout.
 - **Every request** is logged in `/var/log/squid/access.log`, rotated by logrotate only (`/etc/logrotate.d/squid`: daily, `agentd_squid_log_days` = 14 kept, compressed, also at 200 MB). Squid's own rotation is off (`logfile_rotate 0`), so it's not rotated twice.
 
 ### 5.7 Nix for the shell user

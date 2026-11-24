@@ -1,4 +1,4 @@
-# Agent Neo, personal edition
+# Agent Neo
 
 An AI agent with its own always-on Linux desktop (XFCE and Google Chrome) in
 **your own AWS account**. You chat with it on your

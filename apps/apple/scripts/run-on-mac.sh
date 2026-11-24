@@ -14,5 +14,11 @@ osascript -e "if application \"$APP_NAME\" is running then tell application \"$A
 sleep 1
 rm -rf "/Applications/$APP_NAME.app"
 ditto "build/mac/Build/Products/Release/$APP_NAME.app" "/Applications/$APP_NAME.app"
+# macOS caches app icons by bundle path and date, and an incremental build
+# keeps the bundle's date (ditto copies it), so the Dock kept showing the old
+# icon after the icon changed. A new date and registering again refresh it.
+touch "/Applications/$APP_NAME.app"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+  -f "/Applications/$APP_NAME.app"
 open "/Applications/$APP_NAME.app"
 echo "Installed /Applications/$APP_NAME.app"

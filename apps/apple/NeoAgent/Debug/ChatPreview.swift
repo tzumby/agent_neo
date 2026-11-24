@@ -7,9 +7,10 @@ import SwiftUI
 /// Tailscale (e.g. the Simulator and a local stand-in). Launch with
 /// CHAT_PREVIEW_URL=http://127.0.0.1:8899 (through simctl: SIMCTL_CHILD_CHAT_PREVIEW_URL),
 /// PREVIEW_SESSION=<id> to open that conversation, and PREVIEW_SCREEN=
-/// conversations, archived, usage (usage-end: its lower half), memory,
-/// settings, schedules or keys for that screen, PREVIEW_DRAFT=<text> to type
-/// in the composer (screenshots).
+/// conversations, archived, usage (usage-end: its lower half; usage-budget:
+/// its budget section, PREVIEW_WIDTH points wide), memory, settings,
+/// schedules or keys for that screen, PREVIEW_DRAFT=<text> to type in the
+/// composer (screenshots).
 struct ChatPreview: View {
     let url: URL
     @State private var store = ChatStore(remembering: ChatPreview.remembered)
@@ -26,6 +27,11 @@ struct ChatPreview: View {
     }
 
     private var client: AgentClient { AgentClient(baseURL: url, session: .shared) }
+
+    /// A size in points from the environment, if set.
+    private static func size(_ name: String) -> CGFloat? {
+        ProcessInfo.processInfo.environment[name].flatMap(Double.init).map { CGFloat($0) }
+    }
 
     private var home: DesktopHomeContent {
         DesktopHomeContent(
@@ -53,13 +59,19 @@ struct ChatPreview: View {
             NavigationStack { UsageView(store: store, client: client) }
                 .task { await store.run(client: client) }
         case "usage-end":
-            // Its lower sections: laid out tall, seen from the bottom.
+            // Its lower sections: laid out tall, seen from the bottom (the
+            // iPhone's; the Mac's grouped form doesn't draw in a scroll view).
             ScrollView {
                 NavigationStack { UsageView(store: store, client: client).scrollDisabled(true) }
                     .frame(height: 2300)
             }
             .defaultScrollAnchor(.bottom)
             .task { await store.run(client: client) }
+        case "usage-budget":
+            // The budget section alone, PREVIEW_WIDTH points wide (a Mac
+            // sheet's width: where its row has to fit).
+            NavigationStack { UsageBudgetPreview(store: store, client: client) }
+                .frame(width: Self.size("PREVIEW_WIDTH"))
         case let screen:
             #if os(iOS)
                 PhoneHome(

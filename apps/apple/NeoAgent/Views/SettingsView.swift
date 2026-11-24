@@ -69,7 +69,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Agent")
                 } footer: {
-                    Text(autoApproveDescription)
+                    Text(autoApproveDescription).sectionFooter()
                 }
             }
             if store.conversationsAvailable == true {
@@ -84,7 +84,7 @@ struct SettingsView: View {
                         }
                     }
                 } footer: {
-                    Text("What the model calls cost, and a monthly budget.")
+                    Text("What the model calls cost, and a monthly budget.").sectionFooter()
                 }
             }
             Section {
@@ -92,7 +92,7 @@ struct SettingsView: View {
                 NavigationLink("Schedules") { SchedulesView(client: client) }
                 NavigationLink("Keys & tokens") { SecretsView(client: client) }
             } footer: {
-                Text("What the agent remembers between conversations, the tasks it runs on its own, and the keys it can use without seeing them.")
+                Text("What the agent remembers between conversations, the tasks it runs on its own, and the keys it can use without seeing them.").sectionFooter()
             }
             Section("Desktop") {
                 LabeledContent("Name", value: store.status?.desktop ?? "…")

@@ -231,6 +231,25 @@ struct GroupedForm<Content: View>: View {
     }
 }
 
+extension View {
+    /// A section's footer: a note under its group. The Mac's grouped form
+    /// sets a footer in body text against the trailing edge, where it reads
+    /// like a stray caption; there it's smaller and secondary, from the
+    /// leading edge, lined up with the section headers (as System Settings
+    /// sets its notes). The iPhone's list already does that.
+    func sectionFooter() -> some View {
+        #if os(macOS)
+            font(.app(.subheadline))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+        #else
+            self
+        #endif
+    }
+}
+
 extension Font {
     /// A text style at the app's size. The iPhone's are the system's (Dynamic
     /// Type). The Mac's styles are fixed and small (body text is 13 points)

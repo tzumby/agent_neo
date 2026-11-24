@@ -222,7 +222,7 @@ struct ArchivedConversations: View {
                             delete: { deleting = session })
                     }
                 } footer: {
-                    Text("Swipe left to bring one back or delete it.")
+                    Text("Swipe left to bring one back or delete it.").sectionFooter()
                 }
             }
         }

@@ -77,12 +77,12 @@ struct UsageView: View {
             } header: {
                 Text("By schedule")
             } footer: {
-                Text(estimateNote(usage))
+                Text(estimateNote(usage)).sectionFooter()
             }
         } else {
             Section {
             } footer: {
-                Text(estimateNote(usage))
+                Text(estimateNote(usage)).sectionFooter()
             }
         }
     }
@@ -378,6 +378,27 @@ private struct CostRow: View {
 
 // MARK: - Budget
 
+#if DEBUG
+    /// Debug builds only (ChatPreview's PREVIEW_SCREEN=usage-budget): the
+    /// budget section alone, to see its row at a sheet's width.
+    struct UsageBudgetPreview: View {
+        let store: ChatStore
+        let client: AgentClient
+        @State private var usage: AgentUsage?
+
+        var body: some View {
+            GroupedList {
+                if let usage {
+                    BudgetSection(store: store, client: client, budget: usage.budget) { await load() }
+                }
+            }
+            .task { await load() }
+        }
+
+        private func load() async { usage = try? await client.usage(days: 30) }
+    }
+#endif
+
 /// The monthly budget: a field to set it, and a way to remove it.
 private struct BudgetSection: View {
     let store: ChatStore
@@ -405,10 +426,14 @@ private struct BudgetSection: View {
                 Text("Monthly budget")
                 Spacer()
                 // As wide as what's typed (the placeholder only when empty),
-                // so the dollar sign stays against the number.
+                // so the dollar sign stays against the number. "None" is a
+                // prompt and the title is hidden: the Mac's grouped form
+                // shows a text field's title as a label of its own, at the
+                // row's leading edge, on top of "Monthly budget".
                 HStack(spacing: 1) {
                     if !text.isEmpty { Text("$").foregroundStyle(.secondary) }
-                    TextField(text.isEmpty ? "None" : "", text: $text)
+                    TextField("Monthly budget", text: $text, prompt: text.isEmpty ? Text("None") : nil)
+                        .labelsHidden()
                         .multilineTextAlignment(.trailing)
                         .monospacedDigit()
                         .focused($editing)
@@ -448,7 +473,7 @@ private struct BudgetSection: View {
         } header: {
             Text("Budget")
         } footer: {
-            Text("You get a notification at 80% and at 100%. Once it's used up, new messages wait until you raise it or the month turns over; tasks already running finish.")
+            Text("You get a notification at 80% and at 100%. Once it's used up, new messages wait until you raise it or the month turns over; tasks already running finish.").sectionFooter()
         }
         .onAppear { show(current) }
         .onChange(of: current) { _, value in if !editing { show(value) } }

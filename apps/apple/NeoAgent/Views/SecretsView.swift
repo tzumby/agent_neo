@@ -35,9 +35,9 @@ struct SecretsView: View {
                     }
                 } footer: {
                     #if os(macOS)
-                        Text("Keys stay on your desktop and never come back to this Mac. The agent gives one to a command by name and never sees its value; it's hidden from the chat and notifications. Click a key to replace it, right-click to delete it. Deleting doesn't revoke it: do that where you created it.")
+                        Text("Keys stay on your desktop and never come back to this Mac. The agent gives one to a command by name and never sees its value; it's hidden from the chat and notifications. Click a key to replace it, right-click to delete it. Deleting doesn't revoke it: do that where you created it.").sectionFooter()
                     #else
-                        Text("Keys stay on your desktop and never come back to this phone. The agent gives one to a command by name and never sees its value; it's hidden from the chat and notifications. Tap a key to replace it, swipe to delete it. Deleting doesn't revoke it: do that where you created it.")
+                        Text("Keys stay on your desktop and never come back to this phone. The agent gives one to a command by name and never sees its value; it's hidden from the chat and notifications. Tap a key to replace it, swipe to delete it. Deleting doesn't revoke it: do that where you created it.").sectionFooter()
                     #endif
                 }
             }
@@ -158,7 +158,7 @@ struct SecretEditor: View {
                         }
                     TextField("What it is, like GitHub token", text: $label)
                 } footer: {
-                    Text("Commands get it as $\(name.isEmpty ? "NAME" : name). Keys only: never a password.")
+                    Text("Commands get it as $\(name.isEmpty ? "NAME" : name). Keys only: never a password.").sectionFooter()
                 }
             } else {
                 Section {
@@ -168,7 +168,7 @@ struct SecretEditor: View {
             Section {
                 KeyField(prompt: "Key or token", value: $value, pasted: $pasted)
             } footer: {
-                Text("Saved only on your desktop, over your tailnet. This \(Device.noun) can't read it back.")
+                Text("Saved only on your desktop, over your tailnet. This \(Device.noun) can't read it back.").sectionFooter()
             }
             if let problem {
                 Section { Text(problem).foregroundStyle(.red) }

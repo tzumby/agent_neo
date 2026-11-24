@@ -39,9 +39,9 @@ struct SchedulesView: View {
                     }
                 } footer: {
                     #if os(macOS)
-                        Text("Each run is a new task with just its prompt. Approvals still apply: you get a notification when one needs you. Right-click a schedule to pause or cancel it.")
+                        Text("Each run is a new task with just its prompt. Approvals still apply: you get a notification when one needs you. Right-click a schedule to pause or cancel it.").sectionFooter()
                     #else
-                        Text("Each run is a new task with just its prompt. Approvals still apply: you get a notification when one needs you. Swipe left to cancel, right to pause.")
+                        Text("Each run is a new task with just its prompt. Approvals still apply: you get a notification when one needs you. Swipe left to cancel, right to pause.").sectionFooter()
                     #endif
                 }
             }

@@ -123,9 +123,9 @@ struct MemoryView: View {
         } footer: {
             if query.isEmpty {
                 #if os(macOS)
-                    Text("Click one to edit it. Right-click to forget it, to confirm a hint, or to restore an expired one.")
+                    Text("Click one to edit it. Right-click to forget it, to confirm a hint, or to restore an expired one.").sectionFooter()
                 #else
-                    Text("Tap one to edit it. Swipe left to forget it; right to confirm a hint, or to restore an expired one.")
+                    Text("Tap one to edit it. Swipe left to forget it; right to confirm a hint, or to restore an expired one.").sectionFooter()
                 #endif
             }
         }
@@ -173,9 +173,9 @@ struct MemoryView: View {
                 Text("To confirm")
             } footer: {
                 #if os(macOS)
-                    Text("The agent uses these as hints. Right-click to confirm or forget an entry.")
+                    Text("The agent uses these as hints. Right-click to confirm or forget an entry.").sectionFooter()
                 #else
-                    Text("The agent uses these as hints. Swipe right to confirm an entry, or left to forget it.")
+                    Text("The agent uses these as hints. Swipe right to confirm an entry, or left to forget it.").sectionFooter()
                 #endif
             }
         }
@@ -350,7 +350,7 @@ private struct ConsolidationSection: View {
         } header: {
             Text("Tidying up")
         } footer: {
-            Text(footer)
+            Text(footer).sectionFooter()
         }
     }
 
@@ -405,7 +405,7 @@ private struct MemoryEditor: View {
             Section {
                 TextField("What to remember", text: $text, axis: .vertical).lineLimit(2...8)
             } footer: {
-                Text("\(text.count)/500")
+                Text("\(text.count)/500").sectionFooter()
             }
             Section {
                 Picker("Kind", selection: $kind) {
@@ -419,7 +419,7 @@ private struct MemoryEditor: View {
                     DatePicker("Until", selection: $endDate, in: Date.now..., displayedComponents: .date)
                 }
             } footer: {
-                Text("Rules apply to every task; preferences say how you like things done; facts and the work log are hints. Editing it makes it something you said.")
+                Text("Rules apply to every task; preferences say how you like things done; facts and the work log are hints. Editing it makes it something you said.").sectionFooter()
             }
             Section("Why do you know this?") {
                 Text(origin)

@@ -13,6 +13,7 @@
 pub mod broker;
 pub mod client;
 pub mod hcu;
+pub mod steps;
 
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
@@ -46,23 +47,38 @@ pub enum Request {
         window: String,
         query: Query,
     },
-    /// What an approval card shows and binds: the element as the app has it now.
-    Describe {
+    /// What an approval card shows and binds for a batch: per step, the
+    /// element (or window) as the app has it now.
+    Prepare {
         task: String,
         window: String,
-        element: String,
+        steps: Vec<steps::Step>,
     },
-    /// One semantic click (no pointer or keyboard input), if the element is
-    /// still what `expect` describes.
-    Click {
+    /// The batch, if every step's target is still what `expect` describes.
+    Act {
         task: String,
         window: String,
-        element: String,
-        expect: Binding,
+        steps: Vec<steps::Step>,
+        expect: Vec<Binding>,
     },
-    /// The whole desktop, for the user to see.
+    /// The whole desktop: for the user, and the model's frame for pixel input.
     Screenshot {
         task: String,
+    },
+    /// A closer look at a region of the task's latest screenshot.
+    Zoom {
+        task: String,
+        region: [f64; 4],
+    },
+    /// What a pixel batch's card binds: the window under each point.
+    PrepareGui {
+        task: String,
+        actions: Vec<steps::GuiAction>,
+    },
+    Gui {
+        task: String,
+        actions: Vec<steps::GuiAction>,
+        expect: GuiBinding,
     },
 }
 
@@ -131,6 +147,29 @@ pub struct Binding {
     pub path: String,
 }
 
+/// Where a pixel batch lands: the screenshot it was planned on (the broker's
+/// count of frames), and the window under each of its points and the one
+/// that takes its keys. It goes ahead only on this same layout.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct GuiBinding {
+    pub epoch: String,
+    pub frame: u64,
+    pub size: (u32, u32),
+    pub targets: Vec<GuiTarget>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct GuiTarget {
+    /// Which action (from 0), and where in the screenshot (none for keys and text).
+    pub action: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<(f64, f64)>,
+    pub app: String,
+    pub title: String,
+    pub pid: u32,
+    pub exe: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct Image {
     pub mime: String,
@@ -155,7 +194,12 @@ pub struct Response {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<Image>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding: Option<Binding>,
+    pub bindings: Option<Vec<Binding>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui: Option<GuiBinding>,
+    /// A screenshot's size, in the pixels GUI actions use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<(u32, u32)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<Value>,
 }

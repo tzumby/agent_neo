@@ -42,6 +42,14 @@ pub const KNOWN_MODELS: [&str; 5] = [
     "deepseek-ai/DeepSeek-V4.1-Flash-1017",
 ];
 
+/// Whether the model takes images (screenshots for app_gui; vision.rs).
+/// Checked against Together's API with an image, 2026-11-25: Kimi-K3 reads
+/// one; GLM-5.3 refuses image input (`multimodal_not_supported`), and the
+/// others weren't tried.
+pub fn sees_images(model: &str) -> bool {
+    model == "moonshotai/Kimi-K3"
+}
+
 /// Whether the model wants its `reasoning_content` sent back on later turns.
 /// GLM and Kimi do (they reason worse without it); others, such as DeepSeek,
 /// reject it in requests, so it's dropped for anything not known to want it.

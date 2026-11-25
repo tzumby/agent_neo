@@ -133,12 +133,30 @@ pub fn card_notice(card: &Value) -> Option<(String, String)> {
                 text("summary").or(text("target"))?.to_string(),
             ),
         },
-        "app" => (
-            match text("app") {
-                Some(app) => format!("Click this in {app}?"),
-                None => "Click this in the app?".into(),
+        "app" => {
+            let app = text("app").unwrap_or("the app");
+            match text("action")? {
+                "type" => (format!("Write this in {app}?"), text("text")?.to_string()),
+                "key" => (
+                    format!("Press {} in {app}?", text("key").unwrap_or("a key")),
+                    text("summary").or(text("window")).unwrap_or_default().to_string(),
+                ),
+                "click" => (
+                    format!("Click this in {app}?"),
+                    text("summary").or(text("target"))?.to_string(),
+                ),
+                _ => (
+                    format!("Do this in {app}?"),
+                    text("summary").or(text("window"))?.to_string(),
+                ),
+            }
+        }
+        "install" => (
+            format!("Install {}?", text("app").or(text("name"))?),
+            match (text("version"), text("publisher")) {
+                (Some(version), Some(publisher)) => format!("{version} from {publisher}, the Snap Store"),
+                _ => "From the Snap Store".to_string(),
             },
-            text("summary").or(text("target"))?.to_string(),
         ),
         "schedule" => (
             "Schedule this?".into(),

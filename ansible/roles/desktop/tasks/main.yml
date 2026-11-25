@@ -95,8 +95,16 @@
 - name: Install the Chrome policy
   ansible.builtin.copy:
     dest: /etc/opt/chrome/policies/managed/neo-agent.json
-    content: "{{ desktop_chrome_policy | to_nice_json }}\n"
+    content: "{{ desktop_chrome_policy | combine(desktop_chrome_link_policy) | to_nice_json }}\n"
     mode: "0644"
+  vars:
+    # An app's links are taken off the blocklist and launched from its sites.
+    desktop_chrome_link_schemes: "{{ desktop_chrome_app_links | map(attribute='protocol') | map('regex_replace', '$', ':*') | list }}"
+    desktop_chrome_link_policy: >-
+      {{ {} if not desktop_chrome_app_links else {
+           'URLBlocklist': desktop_chrome_policy.URLBlocklist | reject('in', desktop_chrome_link_schemes) | list,
+           'AutoLaunchProtocolsFromOrigins': desktop_chrome_app_links,
+         } }}
   tags: [chrome_policy]
 
 # --- The agent user ----------------------------------------------------------

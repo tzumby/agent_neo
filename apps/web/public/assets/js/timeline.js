@@ -32,6 +32,83 @@ export function workingFor(since, now = Date.now()) {
   return Number.isFinite(start) ? duration((now - start) / 60000) : "";
 }
 
+/** A download size: "233 MB", with one decimal under 10 MB ("4.2 MB"). */
+export function megabytes(bytes) {
+  const mb = bytes / 1e6;
+  return mb >= 10 ? `${Math.round(mb)} MB` : `${Math.max(1, Math.round(mb * 10)) / 10} MB`;
+}
+
+/** Button “Confirm”; “without a name” when it has none. */
+export function clickTarget(role, target) {
+  const name = target ? `“${target}”` : "without a name";
+  return role ? `${capitalised(role)} ${name}` : name;
+}
+
+/** Textbox “Notes”, or just Textbox when it has no name ("" when it has neither). */
+function element(role, target) {
+  return [role ? capitalised(role) : "", target ? `“${target}”` : ""].filter(Boolean).join(" ");
+}
+
+/**
+ * One step of an app card in plain words: `text`, then a keycap for `key`;
+ * the full `quote` it writes; muted, where it is in the app (`note`) and a
+ * window other than the card's (`window`). A wait sends nothing: `quiet`.
+ * `pixels`: a step of a "gui" card, at a point of the card's picture.
+ */
+export function appStepWords(step, { pixels = false, window = "" } = {}) {
+  const s = step;
+  const words = { text: "", key: null, quote: null, note: null, window: null, quiet: false };
+  if (s.window && s.window !== window && s.action !== "activate" && s.action !== "close") {
+    words.window = `In “${s.window}”`;
+  }
+  const what = element(s.role, s.target);
+  if (pixels) {
+    const at = (p) => (p ? ` at ${Math.round(p.x)}, ${Math.round(p.y)}` : "");
+    const [first, last] = [s.points[0], s.points[s.points.length - 1]];
+    switch (s.action) {
+      case "click":
+        words.text = `Click${at(first)}${s.button && s.button !== "left" ? ` (${s.button} button)` : ""}${s.key ? `, holding ${s.key}` : ""}`;
+        break;
+      case "double_click": words.text = `Double-click${at(first)}`; break;
+      case "move": words.text = `Point${at(first)}`; break;
+      case "drag":
+        words.text = s.points.length > 1
+          ? `Drag from ${Math.round(first.x)}, ${Math.round(first.y)} to ${Math.round(last.x)}, ${Math.round(last.y)}` : "Drag";
+        break;
+      case "scroll": words.text = `Scroll${at(first)}`; break;
+      case "type": words.text = "Write:"; words.quote = s.text ?? ""; break;
+      case "keypress": words.text = "Press"; words.key = s.key || "?"; break;
+      case "wait": words.text = "Wait a second"; words.quiet = true; break;
+      default: words.text = capitalised(s.action || "a step");
+    }
+    return words;
+  }
+  words.note = s.around || null;
+  switch (s.action) {
+    case "click": words.text = `Click ${clickTarget(s.role, s.target)}${s.pointer ? " with the mouse" : ""}`; break;
+    case "type": words.text = what ? `Write in ${what}:` : "Write:"; words.quote = s.text ?? ""; break;
+    case "key": words.text = "Press"; words.key = s.key || "?"; break;
+    case "set_value": words.text = what ? `Set ${what} to:` : "Set it to:"; words.quote = s.text ?? ""; break;
+    case "select":
+      words.text = s.range ? `Select from ${what || "here"}…`
+        : s.text ? `Select “${s.text}”${what ? ` in ${what}` : ""}` : `Select ${clickTarget(s.role, s.target)}`;
+      break;
+    case "scroll": {
+      const pages = s.pages ? `${s.pages} ${s.pages === 1 ? "page" : "pages"}` : "";
+      words.text = ["Scroll", s.direction, pages, what ? `in ${what}` : ""].filter(Boolean).join(" ");
+      break;
+    }
+    case "activate": words.text = s.window ? `Switch to the window “${s.window}”` : "Switch windows"; break;
+    case "close": words.text = s.window ? `Close the window “${s.window}”` : "Close the window"; break;
+    case "wait":
+      words.text = `Wait${s.for ? ` for ${s.for}` : ""}${s.gone ? " to go away" : ""}`;
+      words.quiet = true;
+      break;
+    default: words.text = [capitalised(s.action || "a step"), what].filter(Boolean).join(" ");
+  }
+  return words;
+}
+
 /** A scheduled run's answer that found nothing new, in a line. */
 export function isOneLine(text) {
   const t = text.trim();
@@ -131,7 +208,7 @@ export class Timeline {
         const id = str(d.id);
         const card = {
           type: "approval", id, seq: event.seq, state: "pending",
-          kind: ["secret", "schedule", "browser", "app", "access", "stuck"].includes(d.kind) ? d.kind : "shell",
+          kind: ["secret", "schedule", "browser", "app", "install", "access", "stuck"].includes(d.kind) ? d.kind : "shell",
           command: str(d.command), reason: str(d.reason), summary: d.summary || null, tainted: d.tainted === true,
           editable: d.editable === true,
         };
@@ -160,10 +237,26 @@ export class Timeline {
             around: str(d.around), image: d.image || null,
           };
         } else if (card.kind === "app") {
-          // A native app on the desktop, through its accessibility tree.
+          // A native app on the desktop, through its accessibility tree, or
+          // (action "gui") by pixels of the picture, whose size is `frame`.
+          // A batch has all its steps; a lone input's are on the card too.
+          const frame = d.frame && num(d.frame.width) > 0 && num(d.frame.height) > 0
+            ? { width: d.frame.width, height: d.frame.height } : null;
           card.app = {
             action: str(d.action), app: str(d.app), window: str(d.window), target: str(d.target),
             role: str(d.role), text: d.text ?? null, key: d.key ?? null, around: str(d.around), image: d.image || null,
+            steps: Array.isArray(d.steps) ? d.steps.filter((s) => s && typeof s === "object").map(appStep) : [],
+            frame,
+          };
+        } else if (card.kind === "install") {
+          // An app from a store (the Snap Store), installed on the desktop as
+          // root. All but `why` is the store's, its summary included.
+          card.summary = null;
+          card.install = {
+            source: str(d.source), name: str(d.name), app: str(d.app), publisher: str(d.publisher),
+            verified: d.verified === true, version: str(d.version), channel: str(d.channel),
+            confinement: str(d.confinement), summary: str(d.summary),
+            size: Number.isFinite(d.size) && d.size > 0 ? d.size : null, why: str(d.why),
           };
         }
         this.approvalIndex.set(id, this.items.length);
@@ -308,4 +401,23 @@ function str(value) {
 
 function num(value) {
   return Number.isFinite(value) ? value : 0;
+}
+
+function capitalised(text) {
+  return text ? `${text[0].toUpperCase()}${text.slice(1)}` : "";
+}
+
+// One step of an app card, with what's missing or odd left empty. A pixel
+// step's point (or a drag's path) is in `points`.
+function appStep(s) {
+  const point = (p) => (p && Number.isFinite(p.x) && Number.isFinite(p.y) ? { x: p.x, y: p.y } : null);
+  const keys = Array.isArray(s.keys) ? s.keys.filter((k) => typeof k === "string" && k).join("+") : "";
+  return {
+    action: str(s.action), target: str(s.target), role: str(s.role), around: str(s.around),
+    text: typeof s.text === "string" ? s.text : null, key: str(s.key) || keys || null, window: str(s.window),
+    pointer: s.pointer === true, range: s.range === true, direction: str(s.direction),
+    pages: Number.isFinite(s.pages) && s.pages > 0 ? s.pages : null, for: str(s.for), gone: s.gone === true,
+    button: str(s.button),
+    points: Array.isArray(s.path) ? s.path.map(point).filter(Boolean) : [point(s)].filter(Boolean),
+  };
 }

@@ -1,6 +1,6 @@
 ---
 name: install-software
-description: Installing command-line tools, language runtimes, libraries and desktop apps (Nix first; never curl | bash).
+description: Installing command-line tools, language runtimes and libraries (Nix first), and desktop apps (install_app, never Nix); never curl | bash.
 ---
 # Installing software
 
@@ -28,11 +28,28 @@ current.
 - Python: uv (read the python skill). Never `sudo pip` or `pip install --user`.
 - JavaScript: npm in the project (read the node skill).
 
-## Desktop apps and system packages
+## Desktop apps: install_app, never Nix
 
-The owner installs desktop apps, system libraries, and drivers through SSM.
-Explain what package is needed and why. Use Nix for worker tools you can
-install without administrator access.
+Programs with windows the user opens on the desktop (Slack, Zoom, Spotify,
+Obsidian, an editor) come from the Snap Store through install_app: the user
+approves a card, and the app gets a launcher on the desktop and in the
+Applications menu. Use the store's name (`slack`, `zoom-client`,
+`spotify`); a wrong one gets suggestions. Only strictly confined snaps from
+verified publishers can be installed this way.
+
+Never install a desktop app with Nix, pip, npm or a downloaded archive. What
+the shell installs belongs to the shell's user: the desktop can't run it
+(Electron apps abort on their sandbox), and it mustn't, since the shell could
+change it.
+
+If install_app isn't available, or the app isn't in the store, the owner
+installs it through SSM: say which app and why.
+
+## System packages
+
+The owner installs system libraries and drivers through SSM. Explain what
+package is needed and why. Use Nix for worker tools you can install without
+administrator access.
 
 ## Never
 

@@ -27,13 +27,13 @@ The pieces:
   - the display stack (Xvfb, XFCE, x11vnc, noVNC) and Chrome as the user `agent`;
   - **agentd**, the agent, as `agentd`;
   - the agent's shell commands as `worker`, in hardened systemd units behind an egress allowlist;
-  - with native apps on, the desktop broker as `agent`: Hybrid Computer Use's `computer-use` on the session's accessibility tree, for agentd alone ([desktop-apps.md](desktop-apps.md));
+  - with native apps on, the desktop broker as `agent`: Hybrid Computer Use's `computer-use` on the session's accessibility tree and screen, for agentd alone ([desktop-apps.md](desktop-apps.md));
   - **tailnet-proxy**, the desktop's only presence on your tailnet.
 - **agentd** (Rust): the model loop, browser tools over Chrome's DevTools Protocol, a shell tool, approvals that park and resume, memory, scheduled tasks, saved keys, and the HTTP + SSE API the web app uses. All of the agent's state lives on the VM, in `/var/lib/agentd`. It calls the model provider directly, with your key.
 - **tailnet-proxy** (Go, Tailscale's tsnet): a userspace Tailscale node inside one process, at `https://neo-agent.<your tailnet>.ts.net`. It serves the web app, agentd's API and the noVNC viewer, and port 5900 for the apps' take-over view.
 - **The web app** (`apps/web`, static files, no build step): the chat, approval cards, the desktop (take over), schedules, keys and tokens, and settings.
 - **The iPhone and Mac apps** (`apps/apple`, SwiftUI, optional): the same chat against the same API, a native take-over view over port 5900, a Memory screen, and APNs notifications. Each is a Tailscale node of its own (TailscaleKit), signed in as you (§7.4).
-- **The model provider**: Together AI (serverless). The default model is `zai-org/GLM-5.3`, which is text-only. The agent reads pages through the accessibility tree and text, not screenshots. Whether Together keeps prompts is your Together account's setting (zero data retention); agentd doesn't enforce it.
+- **The model provider**: Together AI (serverless). The default model is `zai-org/GLM-5.3`, which is text-only. The agent reads pages through the accessibility tree and text, not screenshots. A model checked to see images (`moonshotai/Kimi-K3`) also gets the desktop's screenshots for native apps ([desktop-apps.md](desktop-apps.md) §5). Whether Together keeps prompts is your Together account's setting (zero data retention); agentd doesn't enforce it.
 
 ```
  Browser on a laptop  ┌──────────────────────── your tailnet (WireGuard, end to end) ─────────────────────────┐
@@ -278,7 +278,7 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
     - `URLBlocklist` of desktop-app link schemes (`slack:*`, Zoom's, Teams', `discord:*`, `figma:*`, `notion:*`, `vscode:*` and others, 28 in all). Web apps try to open their desktop apps, as Slack's web client does with `slack://`. Chrome then asks "Open xdg-open?" in its own UI, which the agent can't see or answer over DevTools, so tasks hung there (2026-11-02). Blocked, the launch fails quietly and the web app stays in the browser.
     - `ExternalProtocolDialogShowAlwaysOpenCheckbox: false`: any other scheme's prompt has no "Always allow…", so it can't be made permanent from Take over.
     - `PrintingEnabled: false`: no print dialog from a page's `window.print()` or Ctrl+P. It's Chrome's own UI too, and there's no printer.
-- **Native apps** (`desktop_apps`, off by default; on for the personal desktop). XFCE runs on the desktop user's own session bus (`/run/user/<uid>/bus`, lingering's user manager; `dbus-user-session`) instead of `dbus-launch`'s, so its apps, the accessibility bus and the desktop broker share it. Chrome gets the same bus and `AT_SPI_BUS_ADDRESS` pointed nowhere: it stays off the accessibility bus (it ignores `NO_AT_BRIDGE`). The rest is the agentd role's (§5.4, [desktop-apps.md](desktop-apps.md) §3).
+- **Native apps** (`desktop_apps`, off by default; on for the personal desktop). XFCE runs on the desktop user's own session bus (`/run/user/<uid>/bus`, lingering's user manager; `dbus-user-session`) instead of `dbus-launch`'s, so its apps, the accessibility bus and the desktop broker share it. The unit passes `DISPLAY` and `XAUTHORITY` to the services that bus starts, which XFCE's `xinitrc` doesn't: AT-SPI's registry needs them to synthesize keys. Chrome gets the same bus and `AT_SPI_BUS_ADDRESS` pointed nowhere: it stays off the accessibility bus (it ignores `NO_AT_BRIDGE`). The rest is the agentd role's (§5.4, [desktop-apps.md](desktop-apps.md) §3).
 - **Units** (`Restart=always`, `RestartSec=2`, no start-rate limit; started in this order):
 
 | Unit | Runs as | Command |
@@ -319,7 +319,7 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
 | `/etc/agentd/secrets.env` | root:agentd 0640 | `TOGETHER_API_KEY`, read from SSM `<prefix>/llm/together_api_key` on your machine at each deploy (`no_log`). agentd reads it; the shell user can't |
 | `/etc/agentd/policy.toml` | root:agentd 0640 | Only when `agentd_dangerous` overrides the built-in approval rules |
 | `/etc/agentd/skills/*.md` | root:agentd 0640 | Skills |
-| `/usr/local/libexec/neo-agent-privileged` | root 0755 | Fixed worker launch and stop operations, plus Squid policy reconciliation. The launcher sets the worker identity, sandbox configuration, and shell limits from Ansible |
+| `/usr/local/libexec/neo-agent-privileged` | root 0755 | Fixed worker launch and stop operations, Squid policy reconciliation, and (with app installs on) `install-snap`. The launcher sets the worker identity, sandbox configuration, and shell limits from Ansible |
 | `/etc/sudoers.d/agentd` | root 0440 (validated by `visudo`) | Grants agentd the helper's three fixed operations. No `Defaults`: agentd runs sudo without a terminal, and Ubuntu 26.04's `sudo-rs` reads the file too |
 | `/var/lib/agentd/` | agentd 0700 | SQLite, images, saved keys (§6.3) |
 | `/run/agentd/agentd.sock` | agentd:agentd 0660 in a 0750 directory | The API. Reachable by agentd and tailnet-proxy only |
@@ -464,8 +464,10 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 | `tools.rs` | The system prompt and the tool schemas the model sees |
 | `llm.rs` | The chat-completions client (Together, or `LLM_URL`), `KNOWN_MODELS`, prices, reasoning handling, usage and cost, retries, `truncate` |
 | `browser.rs`, `cdp.rs` | Browser tools over the Chrome DevTools Protocol (§6.9) |
-| `desktop/` | Native apps: the broker's protocol and HCU's text (`mod.rs`), the MCP client (`hcu.rs`), the broker itself (`broker.rs`, `agentd desktop-broker`), agentd's client (`client.rs`) ([desktop-apps.md](desktop-apps.md)) |
+| `desktop/` | Native apps: the broker's protocol and HCU's text (`mod.rs`), steps and pixel actions (`steps.rs`), the MCP client (`hcu.rs`), the broker itself (`broker.rs`, `agentd desktop-broker`), agentd's client (`client.rs`) ([desktop-apps.md](desktop-apps.md)) |
 | `agent/apps.rs` | The app_* tools and their `app` cards |
+| `vision.rs` | Screenshots for a model that sees images: references in the history, attached only to outgoing requests |
+| `snaps.rs`, `agent/installs.rs` | `install_app`: the Snap Store through snapd, and its `install` cards |
 | `shell.rs` | Running commands in hardened transient systemd units (§6.10) |
 | `policy.rs` | Approval rules for commands, clicks, typing and keys, and the policy version (§6.11) |
 | `guard.rs` | Untrusted-content labels, the context budget, loop detection, refusals (sleep, `curl \| sh`, shell scheduling, `date`, the egress controls), plain summaries, URL checks |
@@ -517,7 +519,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | `secrets` | `name`, `agent`, `label`, `created`, `updated`, `last_used` | Saved keys' names and labels, never their values (§6.15) |
 | `destinations`, `posts` | (the full edition's Slack and Teams updates) | Unused here. The base schema still creates them, so a database moves between versions with and without them |
 
-- **`images/<32 hex>.jpg`**: screenshots shown in the chat (`show_screenshot`, Action needed cards), served at `/api/v1/images/{id}`.
+- **`images/<32 hex>.jpg`**: screenshots shown in the chat (`show_screenshot`, Action needed cards, `app` cards) and the desktop screenshots a seeing model was given, served at `/api/v1/images/{id}`.
 - **`secrets/<NAME>`**: one file per saved key (mode 0600), written atomically through `.<NAME>.new` and a rename.
 - **`agentd.db.pre-<version>-<time>`**: a copy of the database made by the Ansible role before a new agentd version starts (SQLite online backup, as `agentd`). The last 3 are kept, for a rollback.
 - **The `agent` column** on history, runs, memory, schedules, conversations and key metadata is `main` everywhere, and every event carries `"agent": "main"`. It's there for more than one agent (the code calls them bots), which this edition doesn't have. It isn't the conversation: that's `session`, and the first conversation's id happens to be `main` too.
@@ -768,8 +770,11 @@ For each tool call:
 | `request_access` | `hosts` (at most 5), `why` | Asks you to let the shell reach sites the proxy refuses (§6.20) | Always: it's an `access` card |
 | `report_outcome` (memory v2, scheduled runs only) | `outcome` (result, nothing, blocked), `summary` (≤ 180 characters) | Ends a scheduled run. `nothing` leaves a quiet row in the chat; `result` and `blocked` show the report in full. The outcome goes on `run.finished` and in the journal | No |
 | `app_windows`, `app_observe`, `app_find` | `window`, `root`, `read_text`, filters | A listed native app's windows and controls, through the desktop broker ([desktop-apps.md](desktop-apps.md) §5) | No |
-| `app_click` | `window`, `ref`, `summary` | One semantic click (the app's accessibility action, no mouse) on a control | Always: an `app` card. Refused in scheduled runs and with Browser actions off |
-| `app_screenshot` | `caption` | A screenshot of the desktop in the chat | No |
+| `app_act` | `window`, `steps` (click, type, keypress, set_value, select, scroll, activate, close, wait; up to 64), `summary` | A batch of input in an app through its accessibility tree: typed text arrives whole, Unicode and newlines included | Always: one `app` card for the batch. Refused in scheduled runs and with Browser actions off |
+| `app_screenshot` | `caption`, `show` | The whole desktop: to a model that sees images, else to the chat | No |
+| `app_zoom` (models that see images) | `region` | Enlarges part of the model's latest screenshot | No |
+| `app_gui` (models that see images) | `actions` (click, double_click, move, drag, scroll, type, keypress, wait at the screenshot's pixels), `summary` | Pixel input, for what the tree doesn't expose | Always: one `app` card, its points numbered on the screenshot. Same refusals as `app_act` |
+| `install_app` | `name`, `why` | Installs a desktop app from the Snap Store (strictly confined, verified publisher), with launchers on the desktop and in the menu ([desktop-apps.md](desktop-apps.md) §10) | Always: an `install` card. Refused in scheduled runs |
 
 The shell tools (`run_shell`, `request_secret`, `request_access`) exist only when `SHELL_TOOL=on`; `read_skill` only when there are skills; the app tools only when `DESKTOP_APPS=on`.
 
@@ -786,7 +791,7 @@ The shell tools (`run_shell`, `request_secret`, `request_access`) exist only whe
 - Windows are opened (`Target.createTarget`) and found (`Browser.getWindowForTarget`) on the browser's own DevTools session (`/json/version`'s WebSocket), and closed tab by tab (`/json/close`).
 
 **Reading pages.**
-- The model never gets screenshots: the default models are text-only.
+- The model never gets screenshots of pages: the default models are text-only. (Native apps' screenshots go to a model that sees images, [desktop-apps.md](desktop-apps.md) §5.)
 - `read_text` returns the page text.
 - `snapshot` returns `Accessibility.getFullAXTree`, flattened, without ignored and presentational nodes.
 - `ref`s are backend DOM node ids. `find` resolves an element by ref, or by role and name, or by visible text.
@@ -882,7 +887,7 @@ for sensitive fields or a target the tool cannot verify. A generic website contr
 after input or navigation. Its interface cannot establish all server-side
 effects.
 
-**Native apps.** Every click in an app is an `app` card: the app, the window's title, the element's role, name and place, the model's summary and a screenshot. The binding the broker read (its epoch, the window and element, the app's id, process and executable, the title, role, name and path) stays server-side. A changed binding on resume, or in the broker's own check under its lock just before the click, means nothing is clicked. Browser actions off and scheduled runs block app clicks too ([desktop-apps.md](desktop-apps.md) §5).
+**Native apps.** Every batch of input in an app is one `app` card: the app, the window's title, the model's summary, each step in words (typed text in full, keys, each element's role, name and place), and a screenshot, with pixel steps numbered on it. The bindings the broker read (its epoch, each window and element, the app's id, process and executable, the title, role, name and path; for pixels, the window under each point and the frame) stay server-side. A changed binding on resume, or in the broker's own check under its lock just before input, means nothing is sent. Browser actions off and scheduled runs block app input too, and a saved key's value is never typed ([desktop-apps.md](desktop-apps.md) §5).
 
 **Editing.** The web and Apple apps can edit cards that carry
 `editable: true`. Shell, typing, and schedule edits re-enter the same
@@ -1366,7 +1371,7 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 | Your devices ↔ the desktop | Devices on your tailnet; the desktop | Tailscale (WireGuard end to end), your tailnet's access rules, tailnet-proxy's optional login allowlist (WhoIs), and `door`'s same-site checks against other sites' pages |
 | agentd ↔ the agent's commands | `agentd` vs `worker` | Unix users and file modes (`/var/lib/agentd` 0700, `/etc/agentd` 0750, socket 0660 in a 0750 directory); hardened systemd units; the guard firewall (no DevTools, VNC, noVNC, IMDS or DNS for `worker`); the Squid allowlist; no sudo for `worker` |
 | agentd ↔ the browser | `agentd` and `agent` | CDP is on localhost. Chrome's socket traffic is filtered independently of browser URL validation. |
-| agentd ↔ the desktop broker (native apps) | `agentd` and `agent` | A socket only agentd can open, and the broker's peer check; typed operations on listed apps only, semantic clicks only, each bound to what its card showed ([desktop-apps.md](desktop-apps.md) §7) |
+| agentd ↔ the desktop broker (native apps) | `agentd` and `agent` | A socket only agentd can open, and the broker's peer check; typed steps and pixel actions on listed apps' windows only, each bound to what its card showed ([desktop-apps.md](desktop-apps.md) §7) |
 | The model ↔ the desktop | The model's tool calls | agentd's tool layer: approvals, gates, refusals, the step budget, redaction. The model never sees secrets |
 | The desktop ↔ the model provider | agentd; Together | TLS with the system's CAs and your key as a bearer token. What Together keeps is your account's setting |
 | The desktop ↔ your AWS account | The instance role | SSM's managed policy only, denied the project's parameters; the metadata service is root-only on the desktop |
@@ -1395,6 +1400,7 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 | The agent sends data to an attacker | Browser input requires approval. The shell's proxy filters destinations and recognized data-out after outside content requires review. Approved programs can send data to allowed destinations. |
 | The agent approves its own actions | The API is on a socket the shell user can't open. Approvals come only from the web app, through tailnet-proxy |
 | You turned on Auto approve | Eligible worker and schedule actions can proceed. Browser input, saved-key use, new proxy sites, and direct internet require explicit approval. |
+| The agent installs software as root | Only `install_app`: a strictly confined app from a verified Snap Store publisher, on a card you approve; the helper checks the store and the approved publisher again. Nothing from the shell or Nix runs on the desktop |
 | The agent drives a terminal or Chrome through the accessibility tree | The broker answers only for the listed apps (by AT-SPI id and executable), never Chrome, a terminal or the file manager. Chrome stays off the accessibility bus. Clicks only, each approved |
 | The agent drives the logged-in browser from the shell | The guard firewall lets `worker` reach only Squid on localhost (so not 9222, 5900 or 6080); the X cookie and profile are private |
 | The agent steals AWS credentials | The guard firewall blocks the metadata service for everyone but root. The desktop's role can't read the project's SSM parameters anyway, and has only SSM's managed policy |
@@ -1497,7 +1503,7 @@ Found while writing this document. None of them is a known exploit; most are tra
 - Host firewall rules restrict the worker and desktop browsers. The security group allows outbound traffic for the other VM services.
 - The web app has no memory screen (the apps have one) and no "Run without asking" switch (only the API has it). Notifications to the apps are off until you add an APNs key (`make apns-key`), which needs the paid Apple Developer Program; the browsers' Web Push needs no account (§6.17).
 
-- Native apps are a pilot: clicks only, the listed apps only, no screenshots for the model, and you and the agent can act on the screen at the same time ([desktop-apps.md](desktop-apps.md) §9).
+- Native apps: the listed apps only, screenshots only for a model checked to see images (Kimi-K3), one HCU process shared by every task, and you and the agent can act on the screen at the same time ([desktop-apps.md](desktop-apps.md) §9).
 
 **Docs.** `docs/memory-v2.md` is the plan as written; its note at the top says what's different in this edition (notifications by Web Push, the Memory screen only in the apps).
 

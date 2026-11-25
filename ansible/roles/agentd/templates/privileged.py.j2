@@ -5,16 +5,19 @@ from contextlib import contextmanager
 import fcntl
 import grp
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import pwd
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 
 WORKER = {{ agentd_shell_user | to_json }}
@@ -34,6 +37,15 @@ UNIT = re.compile(r"agentd-cmd-[0-9a-f]{12}")
 KEY = re.compile(r"[A-Z][A-Z0-9_]{1,63}")
 LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 TRUSTED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+# Desktop apps the user approved (agentd's install_app): snaps only, strictly
+# confined, from publishers the store verified.
+SNAP = "/usr/bin/snap"
+SNAPD_SOCKET = "/run/snapd.socket"
+SNAP_LAUNCHERS = Path("/var/lib/snapd/desktop/applications")
+SNAP_NAME = re.compile(r"(?=[a-z0-9-]*[a-z])[a-z0-9](?:-?[a-z0-9]){0,39}")
+PUBLISHER_ID = re.compile(r"[A-Za-z0-9]{32}")
+VALIDATED = ("verified", "starred")
+SYSTEMD_RUN = "/usr/bin/systemd-run"
 SAFE_WORKER_PROPERTIES = (
     "NoNewPrivileges=yes",
     "CapabilityBoundingSet=",
@@ -247,6 +259,111 @@ def apply_proxy():
         return 0
 
 
+class SnapdConnection(http.client.HTTPConnection):
+    """snapd's REST API, on its Unix socket."""
+
+    def __init__(self):
+        super().__init__("localhost", timeout=60)
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(SNAPD_SOCKET)
+
+
+def snapd_get(path):
+    connection = SnapdConnection()
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        return response.status, json.loads(response.read(8_000_000))
+    finally:
+        connection.close()
+
+
+def validate_install(request):
+    if not isinstance(request, dict) or set(request) != {"name", "publisher"}:
+        raise ValueError("invalid install request")
+    name, publisher = request["name"], request["publisher"]
+    if not isinstance(name, str) or not SNAP_NAME.fullmatch(name):
+        raise ValueError("invalid snap name")
+    if not isinstance(publisher, str) or not PUBLISHER_ID.fullmatch(publisher):
+        raise ValueError("invalid publisher")
+    return name, publisher
+
+
+def store_snap(name):
+    """The store's entry for a snap the agent may ask for: an app, strictly
+    confined, from a publisher the store verified. Checked here again: agentd
+    doesn't decide what root installs."""
+    status, body = snapd_get("/v2/find?" + urllib.parse.urlencode({"name": name}))
+    found = [
+        snap for snap in (body.get("result") or [] if status == 200 else [])
+        if isinstance(snap, dict) and snap.get("name") == name
+    ]
+    if not found:
+        raise ValueError("no such snap")
+    snap = found[0]
+    publisher = snap.get("publisher") or {}
+    if snap.get("type") != "app" or snap.get("confinement") != "strict" or publisher.get("validation") not in VALIDATED:
+        raise ValueError("only strictly confined apps from verified publishers")
+    return snap
+
+
+def desktop_launchers(name):
+    """The snap's launchers that show in a menu."""
+    hidden = re.compile(r"^NoDisplay\s*=\s*true\s*$", re.MULTILINE | re.IGNORECASE)
+    return [
+        path for path in sorted(SNAP_LAUNCHERS.glob(f"{name}_*.desktop"))
+        if not hidden.search(path.read_text(encoding="utf-8", errors="replace"))
+    ]
+
+
+def place_launchers(launchers):
+    """Puts the launchers on the desktop and in the user's own applications
+    folder, which XFCE's menu and xdg-open read without a session restart (so
+    a link like slack:// finds its app), as the desktop user: nothing in its
+    home is written by root. Through systemd-run: agentd's own sandbox
+    (ProtectHome), which this helper runs in, hides the home directories.
+    Executable launchers on the desktop are trusted: Thunar also wants a
+    checksum only where gvfs is installed, and it isn't."""
+    home = Path(pwd.getpwnam(DESKTOP_USER).pw_dir)
+    folders = [home / "Desktop", home / ".local" / "share" / "applications"]
+    steps = [["/usr/bin/mkdir", "-p", *map(str, folders)]] + [
+        ["/usr/bin/install", "-m", "0755", "-T", str(launcher), str(folder / launcher.name)]
+        for launcher in launchers
+        for folder in folders
+    ]
+    # The folder's index of who opens what (slack:// → the Slack app); GIO
+    # doesn't look past it for link handlers.
+    steps.append(["/usr/bin/update-desktop-database", str(folders[1])])
+    for step in steps:
+        subprocess.run(
+            [SYSTEMD_RUN, "--quiet", "--wait", "--collect", f"--uid={DESKTOP_USER}", "--service-type=exec",
+             "--property=NoNewPrivileges=yes", *step],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True,
+        )
+    return [launcher.name for launcher in launchers]
+
+
+def install_snap():
+    name, publisher = validate_install(json.loads(read_input(256)))
+    snap = store_snap(name)
+    # The publisher on the card the user approved.
+    if (snap.get("publisher") or {}).get("id") != publisher:
+        raise ValueError("the snap's publisher changed")
+    result = subprocess.run(
+        [SNAP, "install", name], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=1800,
+    )
+    if result.returncode:
+        return 1
+    status, info = snapd_get(f"/v2/snaps/{urllib.parse.quote(name)}")
+    version = info.get("result", {}).get("version", "") if status == 200 else ""
+    print(json.dumps({"name": name, "version": version, "launchers": place_launchers(desktop_launchers(name))}))
+    return 0
+
+
 def main():
     if os.geteuid() != 0 or len(sys.argv) != 2:
         return 1
@@ -257,6 +374,8 @@ def main():
             return stop_worker(check_unit(read_input(23)))
         case "apply-proxy":
             return apply_proxy()
+        case "install-snap":
+            return install_snap()
         case _:
             return 1
 

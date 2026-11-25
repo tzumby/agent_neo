@@ -67,6 +67,7 @@
           <li><a href="#apps"><span class="n"></span>iPhone and Mac apps</a></li>
           <li><a href="#commands"><span class="n"></span>Everyday commands</a></li>
           <li><a href="#settings"><span class="n"></span>Settings</a></li>
+          <li><a href="#desktop-apps"><span class="n"></span>Desktop apps</a></li>
           <li><a href="#updating"><span class="n"></span>Updating</a></li>
           <li><a href="#backups"><span class="n"></span>Backups</a></li>
           <li><a href="#cost"><span class="n"></span>Cost</a></li>
@@ -336,14 +337,15 @@ make preflight</code></pre>
         <p>Ask for something in the chat. The agent works in its own browser and shell; three dots mean it’s working, with how long it’s been at it, and Stop cancels the task.</p>
         <ul class="tools">
           <li><span class="t">Plans</span><span class="d">Anything with three or more steps gets a checklist that ticks off as the agent goes.</span></li>
-          <li><span class="t">Approval cards</span><span class="d">Show the exact command or browser input the agent wants. Every click, bit of typing and key press needs your OK, and typing and submitting are separate cards.</span></li>
+          <li><span class="t">Approval cards</span><span class="d">Show the exact command, browser input or app input the agent wants. Every click, bit of typing and key press needs your OK, and typing and submitting are separate cards.</span></li>
           <li><span class="t">Signing in to sites</span><span class="d">When a site needs you (a login, 2FA, a CAPTCHA), an Action needed card offers <strong>Take over</strong>. The desktop opens in the page, and the agent carries on when you’re done. Chrome stays signed in.</span></li>
           <li><span class="t">Keys and tokens</span><span class="d">Give them through the secure card or the Keys and tokens screen, never in the chat. Review the exact command before granting a key, and prefer narrowly scoped tokens: the command runs in the agent’s workspace, so anything there it uses (a tool the agent installed, a repository’s git hooks, package scripts) runs with the key too.</span></li>
+          <li><span class="t">Desktop apps</span><span class="d">Beyond Chrome, the agent uses the desktop’s own apps: it clicks, types, presses shortcuts and fills dialogs, each batch on one card. It can also install apps from the Snap Store, with your OK. See <a href="#desktop-apps">Desktop apps</a>.</span></li>
           <li><span class="t">Schedules</span><span class="d">“Every weekday at 8, summarize my inbox” or “tomorrow at 9, check PR 12”. Each run’s answer lands in the chat; the Schedules screen pauses and cancels them.</span></li>
           <li><span class="t">Memory</span><span class="d">Send <code>remember rule: …</code>, <code>remember preference: …</code> or <code>remember fact: …</code> for standing instructions, and <code>forget #ID</code> to remove one. The Apple apps add a Memory screen to confirm, edit, import and export.</span></li>
           <li><span class="t">Long tasks</span><span class="d">There’s no step cap. A supervisor checks in every 30 minutes of work or 60 model turns; if a task looks stuck, you get a <strong>Looks stuck</strong> card with the reason, and choose Keep going or Stop.</span></li>
           <li><span class="t">Local servers</span><span class="d">The agent’s commands reach the internet only through the proxy, and nothing on the desktop itself, not even a dev server the same command started. Run those checks on your own computer.</span></li>
-          <li><span class="t">Auto approve</span><span class="d">Off by default, in Settings. When on, ordinary shell commands and schedule setup run without a card. Browser input, saved keys, new sites, direct internet and data going out after reading outside content still ask.</span></li>
+          <li><span class="t">Auto approve</span><span class="d">Off by default, in Settings. When on, ordinary shell commands and schedule setup run without a card. Browser and app input, saved keys, new sites, direct internet and data going out after reading outside content still ask.</span></li>
         </ul>
         <p>The agent also reads short how-tos (“skills”) when it needs them: installing software with Nix (never <code>curl | bash</code>), Python with uv, Node, git and GitHub, opencode with Together AI, and deploying to Fly. They live in <code>services/agentd/skills</code>.</p>
       </section>
@@ -475,6 +477,37 @@ APP_PUSH=1 make app-device</code></pre>
         <p>The region comes from <code>AWS_REGION</code>. Adding <code>ENV=&lt;name&gt;</code> to every <code>make</code> command gives you a second, separate deployment in the same account.</p>
       </section>
 
+      <!-- Reference: desktop apps -->
+      <section id="desktop-apps" aria-labelledby="desktop-apps-h">
+        <h2 id="desktop-apps-h">Desktop apps</h2>
+        <p>Beyond Chrome, the agent uses the desktop’s own Linux apps the way you would. It reads their controls through the accessibility tree that screen readers use, with Microsoft Research’s open-source <a href="https://github.com/microsoft/Hybrid-Computer-Use">Hybrid Computer Use</a>, and then clicks, types (any language, newlines included), presses shortcuts, picks from menus, fills dialogs, scrolls, and switches or closes windows.</p>
+        <p>Each batch of input is one card. It lists every step: the full text to type, each key, each control and where it sits. You also get the agent’s reason and a screenshot. Everything is checked again just before it happens: if anything changed while you decided, nothing is sent. It never types into password fields, and scheduled runs can’t use apps.</p>
+        <p>The apps it may use are listed: Mousepad and Slack to start. Chrome stays with the browser tools, and terminals and the file manager are out of reach.</p>
+
+        <h3>On and off</h3>
+        <p>It’s on for x86 desktops (<code>desktop_apps</code> in <code>ansible/inventory/group_vars/desktop.yml</code>): <code>make deploy</code> installs the pinned Hybrid Computer Use release (its checksum checked), Mousepad, and a small broker that only agentd can talk to. It stays off on arm64, which Hybrid Computer Use doesn’t ship for yet. To turn it off, set <code>desktop_apps: false</code> and run <code>make deploy</code>.</p>
+        <div class="callout">
+          <p>Turning it on or off restarts XFCE and Chrome once: the desktop’s session moves to a different message bus. Chrome’s open tabs close; your sign-ins stay.</p>
+        </div>
+
+        <h3>Try it</h3>
+        <ol class="steps">
+          <li><p>Take over the desktop and open Mousepad (Applications → Accessories → Mousepad). The agent doesn’t start apps itself.</p></li>
+          <li><p>In the chat, ask: “In Mousepad, write a shopping list with three items and save it as list.txt in my home folder.”</p></li>
+          <li><p>Approve the cards. Expect two or three: the typing and Ctrl+S, then the file name in the Save As dialog. Each shows the desktop as it was when the agent asked. Mousepad’s title changes to <code>list.txt</code>.</p></li>
+        </ol>
+        <p>Reading needs no card: “What does the file open in Mousepad say?”</p>
+
+        <h3>Screenshots</h3>
+        <p>With a model that sees images, set in Settings (Kimi-K3 today), the agent also looks at screenshots of the desktop, zooms into them, and can click, drag or type at a spot on the screen, for anything the accessibility tree leaves out. Those cards number each spot on the screenshot. The default model, GLM-5.3, doesn’t take images, so the agent works from the tree alone.</p>
+
+        <h3>Installing apps</h3>
+        <p>Ask the agent to install a desktop app, like Spotify or Zoom. It looks the app up in the Snap Store and asks on a card that shows the app, its publisher, version and size. Only sandboxed apps from verified publishers qualify. Once you approve, it’s installed with launchers on the desktop and in the Applications menu. Installing an app doesn’t let the agent use it: add the app to the list below first.</p>
+
+        <h3>Adding an app</h3>
+        <p>Apps are listed in <code>agentd_desktop_apps_allowed</code> (the agentd role’s defaults): the app’s accessibility name, its executable, the name you know it by and, for one that isn’t from the store, its package. Never list an app with a shell in it, like a terminal, an editor with a terminal panel or a file manager that opens one: typing there would run commands as the desktop user, outside the agent’s sandbox. The <a href="https://github.com/tzumby/agent_neo/blob/main/docs/desktop-apps.md">design notes</a> show how to find an app’s names.</p>
+      </section>
+
       <!-- Reference: updating -->
       <section id="updating" aria-labelledby="updating-h">
         <h2 id="updating-h">Updating</h2>
@@ -547,6 +580,10 @@ make desktop          <span class="c"># OS hardening, the display stack, Chrome<
         <h2 id="troubleshooting-h">Troubleshooting</h2>
         <ul class="fix">
           <li>
+            <p class="sym">The agent says no window of an app it may use is open</p>
+            <p>Open the app from the desktop (through Take over) after the desktop has started: apps that were already open when its accessibility switched on may need closing and opening again, and the agent says which. If it still can’t see them, <code>make shell</code> and check <code>systemctl status neo-desktop-broker</code>.</p>
+          </li>
+          <li>
             <p class="sym"><code>make preflight</code> says the region is blocked by an SCP</p>
             <p>It lists the regions the SCPs allow. Change <code>AWS_REGION</code> to one of them and run <code>make preflight</code> again. Anything else an SCP blocks needs the organization’s administrator.</p>
           </li>
@@ -617,6 +654,7 @@ make desktop          <span class="c"># OS hardening, the display stack, Chrome<
         <li><a href="./">Overview</a></li>
         <li><a href="https://github.com/tzumby/agent_neo/blob/main/docs/architecture.md">Architecture</a></li>
         <li><a href="https://github.com/tzumby/agent_neo/blob/main/docs/memory-v2.md">Memory design</a></li>
+        <li><a href="https://github.com/tzumby/agent_neo/blob/main/docs/desktop-apps.md">Desktop apps</a></li>
         <li><a href="https://github.com/tzumby/agent_neo">GitHub</a></li>
       </ul>
     </div>

@@ -23,10 +23,12 @@ mod secrets;
 mod sessions;
 mod shell;
 mod skills;
+mod snaps;
 mod store;
 mod supervise;
 mod tools;
 mod usage;
+mod vision;
 mod webpush;
 
 use std::io::IsTerminal;

@@ -39,6 +39,8 @@ use crate::tools;
 
 /// The native app tools (app_*), through the desktop broker.
 mod apps;
+/// install_app: desktop apps from the Snap Store, on a card.
+mod installs;
 
 const HISTORY_LIMIT: i64 = 20;
 /// Memories shown to the model at the start of each task (the latest ones).
@@ -572,6 +574,11 @@ pub struct Agent {
     pub secrets: Secrets,
     /// The event seq of the tool call each task is running (a memory's source).
     step_seqs: Mutex<HashMap<String, i64>>,
+    /// Screenshots waiting to reach each task's model (vision.rs), the frame
+    /// its pixel cards show, and the tasks whose model sees images.
+    model_images: Mutex<HashMap<String, Vec<String>>>,
+    model_frames: Mutex<HashMap<String, String>>,
+    vision_tasks: Mutex<HashSet<String>>,
     /// APNs for the iPhone and Mac apps' notifications (apns.rs), when an APNs
     /// key is configured; None leaves the apps' notifications off.
     pub apns: Option<crate::apns::Apns>,
@@ -653,6 +660,8 @@ fn same_request(approved: &Value, now: &Value) -> bool {
         "manual",
         "app",
         "window",
+        "publisher_id",
+        "version",
     ]
     .iter()
     .all(|key| approved[key] == now[key])
@@ -687,6 +696,9 @@ impl Agent {
             schedules_changed: Notify::new(),
             effects_changed: Notify::new(),
             step_seqs: Mutex::default(),
+            model_images: Mutex::default(),
+            model_frames: Mutex::default(),
+            vision_tasks: Mutex::default(),
             apns: crate::apns::Apns::from_config(&cfg).context("the APNs key (APNS_AUTH_KEY)")?,
             desktop: cfg
                 .desktop_apps
@@ -1377,6 +1389,7 @@ impl Agent {
         match card["kind"].as_str() {
             Some("browser" | "app") if !self.settings().allow_actions => Some("browser actions are off"),
             Some("app") if self.desktop.is_none() => Some("native apps are off on this desktop"),
+            Some("install") if !self.cfg.app_installs => Some("app installs are off on this desktop"),
             Some("shell")
                 if card["command"]
                     .as_str()
@@ -1832,6 +1845,14 @@ impl Agent {
             tracing::info!(task = %task_id, "report_outcome_missing");
         }
         self.task_sessions.lock().unwrap().remove(task_id);
+        self.model_images.lock().unwrap().remove(task_id);
+        self.model_frames.lock().unwrap().remove(task_id);
+        self.vision_tasks.lock().unwrap().remove(task_id);
+    }
+
+    /// Whether this task's model sees images (as of its latest turn).
+    pub(super) fn sees_images(&self, task_id: &str) -> bool {
+        self.vision_tasks.lock().unwrap().contains(task_id)
     }
 
     /// What a task has cost so far, on its run's row after each model call
@@ -1867,7 +1888,11 @@ impl Agent {
             &self.skills.listing(),
             &self.keys_prompt(),
             self.cfg.memory_v2,
-            self.desktop.is_some(),
+            tools::Desktop {
+                apps: self.desktop.is_some(),
+                installs: self.cfg.app_installs,
+                vision: llm::sees_images(&state.model),
+            },
         );
         state.messages[0] = json!({"role": "system", "content": prompt});
         let schemas = tools::schemas(
@@ -1875,7 +1900,11 @@ impl Agent {
             !self.skills.is_empty(),
             self.cfg.memory_v2,
             self.cfg.memory_v2 && state.scheduled.is_some(),
-            self.desktop.is_some(),
+            tools::Desktop {
+                apps: self.desktop.is_some(),
+                installs: self.cfg.app_installs,
+                vision: llm::sees_images(&state.model),
+            },
         );
         // The user answered a stuck card (review): keep going with the
         // supervisor's advice, or stop with a summary of where it got to
@@ -2170,7 +2199,25 @@ impl Agent {
                 tracing::info!(task = %task_id, step, cut, "trimmed old tool output from the context");
             }
             let max_tokens = turn_max_tokens(state.empty_retries);
+            // A model that sees images gets the screenshots its tools took.
+            let sees = self.desktop.is_some() && llm::sees_images(&state.model);
+            if sees {
+                self.vision_tasks.lock().unwrap().insert(task_id.clone());
+            } else {
+                self.vision_tasks.lock().unwrap().remove(&task_id);
+            }
+            let images = self
+                .model_images
+                .lock()
+                .unwrap()
+                .remove(&task_id)
+                .unwrap_or_default();
+            if !images.is_empty() {
+                state.messages.push(crate::vision::message(&images));
+                state.tainted = true;
+            }
             let mut messages = state.messages.clone();
+            crate::vision::resolve(&mut messages, sees, &self.cfg.state_dir.join("images"));
             if !hints.is_empty() {
                 messages.insert(
                     1,
@@ -2358,8 +2405,11 @@ impl Agent {
             .messages
             .push(json!({"role": "user", "content": tools::wrap_up(why)}));
         guard::enforce_budget(&mut state.messages, guard::TOOL_OUTPUT_BUDGET);
+        let mut messages = state.messages.clone();
+        let sees = self.desktop.is_some() && llm::sees_images(&state.model);
+        crate::vision::resolve(&mut messages, sees, &self.cfg.state_dir.join("images"));
         let request = json!({
-            "model": state.model, "messages": state.messages, "tools": schemas,
+            "model": state.model, "messages": messages, "tools": schemas,
             "tool_choice": "none", "max_tokens": TURN_MAX_TOKENS,
         });
         let answer = match self.llm.chat(&request).await {
@@ -2652,10 +2702,14 @@ impl Agent {
                     _ => unreachable!("browser action arguments checked above"),
                 }
             }
-            "app_windows" | "app_observe" | "app_find" | "app_click" | "app_screenshot"
+            "app_windows" | "app_observe" | "app_find" | "app_act" | "app_screenshot" | "app_gui"
+            | "app_zoom"
                 if self.desktop.is_some() =>
             {
                 self.app_tool(task_id, name, args, schedule, resumed).await
+            }
+            "install_app" if self.cfg.app_installs => {
+                self.install_app(task_id, args, schedule, tainted, resumed).await
             }
             "remember" | "forget" => self.memory_tool(task_id, name, args, schedule),
             "search_memory" if self.cfg.memory_v2 => self.memory_tool(task_id, name, args, schedule),
@@ -3628,7 +3682,7 @@ impl Agent {
         // These actions always require a person's decision.
         let manual = matches!(
             card["kind"].as_str(),
-            Some("secret" | "browser" | "app" | "access")
+            Some("secret" | "browser" | "app" | "install" | "access")
         ) || card["manual"] == true;
         if resumed.is_none() && !manual && self.settings().auto_approve {
             self.auto_approved(task_id, card);
@@ -3828,6 +3882,8 @@ pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
         max_parallel_tasks: 3,
         desktop_apps: false,
         desktop_broker: dir.join("no-broker.sock"),
+        app_installs: false,
+        snapd_socket: dir.join("no-snapd.sock").display().to_string(),
     };
     (Arc::new(Agent::new(cfg).unwrap()), dir)
 }

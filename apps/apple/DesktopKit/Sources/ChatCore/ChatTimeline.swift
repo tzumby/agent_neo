@@ -251,11 +251,30 @@ public struct ChatTimeline: Sendable, Equatable {
                 action.imagePath = data["image"]?.string
                 approval.browser = action
             } else if data["kind"]?.string == "app" {
-                approval.app = AppAction(
+                // A batch has all its steps; a lone input's are on the card too.
+                var action = AppAction(
                     action: data["action"]?.string ?? "", app: data["app"]?.string ?? "",
                     window: data["window"]?.string ?? "", target: data["target"]?.string ?? "",
                     role: data["role"]?.string ?? "", text: data["text"]?.string, key: data["key"]?.string,
                     around: data["around"]?.string ?? "", imagePath: data["image"]?.string)
+                action.steps = data["steps"]?.array?.compactMap(AppStep.init) ?? []
+                if let width = data["frame"]?["width"]?.double, let height = data["frame"]?["height"]?.double,
+                    width > 0, height > 0
+                {
+                    action.frame = AppAction.Frame(width: width, height: height)
+                }
+                approval.app = action
+            } else if data["kind"]?.string == "install" {
+                // Its summary is the store's description, kept with the store's facts.
+                approval.summary = nil
+                approval.install = AppInstall(
+                    source: data["source"]?.string ?? "", name: data["name"]?.string ?? "",
+                    app: data["app"]?.string ?? "", publisher: data["publisher"]?.string ?? "",
+                    verified: data["verified"]?.bool ?? false, version: data["version"]?.string ?? "",
+                    channel: data["channel"]?.string ?? "", confinement: data["confinement"]?.string ?? "",
+                    summary: data["summary"]?.string ?? "",
+                    size: data["size"]?.double.flatMap { $0 > 0 ? Int(exactly: $0.rounded()) : nil },
+                    why: data["why"]?.string ?? "")
             }
             approvalIndex[id] = items.count
             items.append(.approval(approval))
@@ -449,6 +468,8 @@ public struct Approval: Sendable, Equatable {
     public var browser: BrowserAction?
     /// Set when it's a click (or typing, or a key) in one of the desktop's own apps.
     public var app: AppAction?
+    /// Set when the agent asks to install an app on the desktop, from a store.
+    public var install: AppInstall?
     /// Set when it's a schedule the agent wants to set up.
     public var schedule: ScheduleProposal?
     /// Set when the agent asks for a key or token.
@@ -593,10 +614,12 @@ public struct BrowserAction: Sendable, Equatable {
 }
 
 /// A change the agent wants to make in one of the desktop's own apps, which
-/// it drives through their accessibility tree. What it says about where comes
-/// from the app, not the agent.
+/// it drives through their accessibility tree, or (action "gui", with a model
+/// that sees the screen) by pixels of a screenshot. What it says about where
+/// comes from the app, not the agent.
 public struct AppAction: Sendable, Equatable {
-    /// "click"; "type" or "key" may follow.
+    /// "click", "type", "key", "set_value", "select", "scroll", "activate" or
+    /// "close" for one input; "act" for a batch; "gui" for pixel input.
     public let action: String
     /// The app's name, e.g. Mousepad.
     public let app: String
@@ -613,6 +636,248 @@ public struct AppAction: Sendable, Equatable {
     public let around: String
     /// The desktop when the agent asked.
     public let imagePath: String?
+    /// Every step, in order. Empty on an older card: one click, type or key.
+    public var steps: [AppStep] = []
+    /// For "gui": the pixel size of the picture, which the steps' points are in.
+    public var frame: Frame?
+
+    public struct Frame: Sendable, Equatable {
+        public let width: Double
+        public let height: Double
+    }
+
+    /// The card lists its steps: a batch, or any pixel input.
+    public var listsSteps: Bool { steps.count > 1 || action == "act" || action == "gui" }
+
+    /// Where each pixel step acts on the picture, in fractions of its size, by
+    /// the step's number. None but on a "gui" card with its picture and size.
+    public var marks: [Mark] {
+        guard action == "gui", imagePath != nil, let frame else { return [] }
+        return steps.enumerated().compactMap { index, step in
+            step.points.isEmpty
+                ? nil
+                : Mark(
+                    step: index + 1,
+                    points: step.points.map {
+                        AppStep.Point(
+                            x: min(max($0.x / frame.width, 0), 1), y: min(max($0.y / frame.height, 0), 1))
+                    })
+        }
+    }
+
+    /// A step's place on the picture: one point, or a drag's path.
+    public struct Mark: Sendable, Equatable {
+        public let step: Int
+        public let points: [AppStep.Point]
+    }
+}
+
+/// One step of an app card, with what's missing or odd left empty.
+public struct AppStep: Sendable, Equatable {
+    public var action: String
+    /// The element: its accessible name and what it is ("menuitem").
+    public var target = ""
+    public var role = ""
+    /// Where it sits in the app.
+    public var around = ""
+    /// What it writes, sets or selects, in full.
+    public var text: String?
+    /// The key, or keys, pressed ("CTRL+S"); for a pixel click, the keys held.
+    public var key: String?
+    /// The window it acts in (or switches to, or closes).
+    public var window = ""
+    /// A click with the mouse rather than through the app.
+    public var pointer = false
+    /// A selection from the element to another.
+    public var range = false
+    /// A scroll's direction and pages.
+    public var direction = ""
+    public var pages: Int?
+    /// What a wait waits for ("a window “Save As”"), and whether for it to go.
+    public var waitFor = ""
+    public var gone = false
+    /// A pixel click's mouse button ("right").
+    public var button = ""
+    /// A pixel step's point, or a drag's path, in the picture's pixels.
+    public var points: [Point] = []
+
+    public struct Point: Sendable, Equatable {
+        public let x: Double
+        public let y: Double
+    }
+
+    public init(action: String) { self.action = action }
+
+    init?(_ json: JSONValue) {
+        guard case .object = json else { return nil }
+        action = json["action"]?.string ?? ""
+        target = json["target"]?.string ?? ""
+        role = json["role"]?.string ?? ""
+        around = json["around"]?.string ?? ""
+        text = json["text"]?.string
+        let keys = json["keys"]?.array?.compactMap(\.string).filter { !$0.isEmpty }.joined(separator: "+") ?? ""
+        key = json["key"]?.string.flatMap { $0.isEmpty ? nil : $0 } ?? (keys.isEmpty ? nil : keys)
+        window = json["window"]?.string ?? ""
+        pointer = json["pointer"]?.bool ?? false
+        range = json["range"]?.bool ?? false
+        direction = json["direction"]?.string ?? ""
+        pages = json["pages"]?.double.flatMap { $0 > 0 ? Int(exactly: $0.rounded()) : nil }
+        waitFor = json["for"]?.string ?? ""
+        gone = json["gone"]?.bool ?? false
+        button = json["button"]?.string ?? ""
+        let point = { (p: JSONValue) -> Point? in
+            guard let x = p["x"]?.double, let y = p["y"]?.double, x.isFinite, y.isFinite else { return nil }
+            return Point(x: x, y: y)
+        }
+        points = json["path"]?.array.map { $0.compactMap(point) } ?? point(json).map { [$0] } ?? []
+    }
+
+    /// A step in plain words: `text`, then a keycap for `key`; the full
+    /// `quote` it writes; muted, where it is in the app (`note`) and a window
+    /// other than the card's (`window`). A wait sends nothing: `quiet`.
+    public struct Words: Sendable, Equatable {
+        public var text = ""
+        public var key: String?
+        public var quote: String?
+        public var note: String?
+        public var window: String?
+        public var quiet = false
+    }
+
+    /// `pixels`: a step of a "gui" card, at a point of the card's picture.
+    public func words(pixels: Bool = false, window cardWindow: String = "") -> Words {
+        var words = Words()
+        if !window.isEmpty, window != cardWindow, action != "activate", action != "close" {
+            words.window = "In “\(window)”"
+        }
+        let what = Self.element(role: role, name: target)
+        if pixels {
+            let spot = { (p: Point) in "\(Self.pixel(p.x)), \(Self.pixel(p.y))" }
+            let at = { (p: Point?) in p.map { " at \(spot($0))" } ?? "" }
+            switch action {
+            case "click":
+                words.text =
+                    "Click\(at(points.first))\(button.isEmpty || button == "left" ? "" : " (\(button) button)")"
+                    + (key.map { ", holding \($0)" } ?? "")
+            case "double_click": words.text = "Double-click\(at(points.first))"
+            case "move": words.text = "Point\(at(points.first))"
+            case "drag":
+                if let first = points.first, let last = points.last, points.count > 1 {
+                    words.text = "Drag from \(spot(first)) to \(spot(last))"
+                } else {
+                    words.text = "Drag"
+                }
+            case "scroll": words.text = "Scroll\(at(points.first))"
+            case "type":
+                words.text = "Write:"
+                words.quote = text ?? ""
+            case "keypress":
+                words.text = "Press"
+                words.key = key ?? "?"
+            case "wait":
+                words.text = "Wait a second"
+                words.quiet = true
+            default: words.text = Self.capitalised(action.isEmpty ? "a step" : action)
+            }
+            return words
+        }
+        words.note = around.isEmpty ? nil : around
+        switch action {
+        case "click":
+            words.text = "Click \(Self.clickTarget(role: role, name: target))\(pointer ? " with the mouse" : "")"
+        case "type":
+            words.text = what.isEmpty ? "Write:" : "Write in \(what):"
+            words.quote = text ?? ""
+        case "key":
+            words.text = "Press"
+            words.key = key ?? "?"
+        case "set_value":
+            words.text = what.isEmpty ? "Set it to:" : "Set \(what) to:"
+            words.quote = text ?? ""
+        case "select":
+            words.text =
+                if range {
+                    "Select from \(what.isEmpty ? "here" : what)…"
+                } else if let text, !text.isEmpty {
+                    "Select “\(text)”\(what.isEmpty ? "" : " in \(what)")"
+                } else {
+                    "Select \(Self.clickTarget(role: role, name: target))"
+                }
+        case "scroll":
+            let count = pages.map { $0 == 1 ? "1 page" : "\($0) pages" } ?? ""
+            words.text = ["Scroll", direction, count, what.isEmpty ? "" : "in \(what)"]
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+        case "activate": words.text = window.isEmpty ? "Switch windows" : "Switch to the window “\(window)”"
+        case "close": words.text = window.isEmpty ? "Close the window" : "Close the window “\(window)”"
+        case "wait":
+            words.text = "Wait\(waitFor.isEmpty ? "" : " for \(waitFor)")\(gone ? " to go away" : "")"
+            words.quiet = true
+        default:
+            words.text = [Self.capitalised(action.isEmpty ? "a step" : action), what]
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+        }
+        return words
+    }
+
+    /// Button “Confirm”; “without a name” when it has none.
+    public static func clickTarget(role: String, name: String) -> String {
+        let name = name.isEmpty ? "without a name" : "“\(name)”"
+        return role.isEmpty ? name : "\(capitalised(role)) \(name)"
+    }
+
+    /// Textbox “Notes”, or just Textbox when it has no name ("" when it has neither).
+    static func element(role: String, name: String) -> String {
+        [capitalised(role), name.isEmpty ? "" : "“\(name)”"].filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    static func capitalised(_ text: String) -> String { text.prefix(1).uppercased() + text.dropFirst() }
+
+    /// A pixel, rounded (0 for one no Int holds).
+    static func pixel(_ value: Double) -> Int { Int(exactly: value.rounded()) ?? 0 }
+}
+
+/// An app the agent wants to install on the desktop, as root, from a store
+/// (the Snap Store). All but `why` is the store's, which the agent's words
+/// can't change.
+public struct AppInstall: Sendable, Equatable {
+    /// Where it comes from, e.g. Snap Store.
+    public let source: String
+    /// The snap's name, which is what gets installed, e.g. slack.
+    public let name: String
+    /// Its title, e.g. Slack.
+    public let app: String
+    /// The publisher's display name.
+    public let publisher: String
+    /// The store verified the publisher.
+    public let verified: Bool
+    public let version: String
+    /// The store channel, e.g. stable.
+    public let channel: String
+    /// "strict": it runs in the Snap sandbox.
+    public let confinement: String
+    /// The store's one-line description (empty when it has none).
+    public let summary: String
+    /// The download size in bytes, when the store gave one.
+    public let size: Int?
+    /// The agent's reason (empty when it gave none).
+    public let why: String
+
+    /// "Version 4.53.292 · stable · 233 MB", leaving out what's missing.
+    public var details: String {
+        [version.isEmpty ? "" : "Version \(version)", channel, size.map(Self.megabytes) ?? ""]
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+    }
+
+    /// A download size: "233 MB", with one decimal under 10 MB ("4.2 MB").
+    public static func megabytes(_ bytes: Int) -> String {
+        let mb = Double(bytes) / 1_000_000
+        if mb >= 10 { return "\(Int(mb.rounded())) MB" }
+        let tenths = max(1, Int((mb * 10).rounded()))
+        return tenths % 10 == 0 ? "\(tenths / 10) MB" : "\(tenths / 10).\(tenths % 10) MB"
+    }
 }
 
 /// "Action needed": the agent stopped for something only the user can do.

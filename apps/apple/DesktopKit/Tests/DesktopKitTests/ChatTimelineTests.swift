@@ -151,6 +151,8 @@ private func aTask() throws -> [AgentEvent] {
                 imagePath: "/api/v1/images/ab12"))
     #expect(card.summary == "Save the shopping list" && card.reason == "may change or send something in the app")
     #expect(card.tainted && !card.editable && card.command.isEmpty && card.browser == nil)
+    // An older card has no steps.
+    #expect(action.steps.isEmpty && action.frame == nil && !action.listsSteps && action.marks.isEmpty)
     timeline.apply(
         try event(2, "approval.requested", #"{"id":"c10","kind":"app","action":"click","target":null,"around":null,"summary":null,"image":null}"#))
     guard case .approval(let bare) = timeline.visibleItems.last, let nameless = bare.app else {
@@ -158,7 +160,140 @@ private func aTask() throws -> [AgentEvent] {
         return
     }
     #expect(nameless.target.isEmpty && nameless.around.isEmpty && nameless.imagePath == nil && bare.summary == nil)
+    #expect(
+        [AppStep.clickTarget(role: "menuitem", name: "Save"), AppStep.clickTarget(role: "push button", name: ""),
+         AppStep.clickTarget(role: "", name: "OK")] == ["Menuitem “Save”", "Push button without a name", "“OK”"])
     timeline.apply(try event(3, "approval.resolved", #"{"task":"t1","id":"c9","approved":true}"#))
+    #expect(timeline.visibleItems.count == 1)
+}
+
+@Test func aBatchInANativeAppListsEveryStepWithAllItsText() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(
+        try event(
+            1, "approval.requested",
+            #"{"task":"t1","id":"c11","kind":"app","action":"act","app":"Mousepad","window":"*notes.txt - Mousepad","summary":"Add milk and save","reason":"may change or send something in the app","image":"/api/v1/images/ab12","steps":[{"action":"type","target":"","role":"textbox","around":"tablist › textbox","text":"- milk\n- eggs ✓"},{"action":"key","key":"CTRL+S","window":"*notes.txt - Mousepad"},{"action":"click","target":"Save","role":"menuitem","around":"menu “File” › menuitem “Save”","pointer":true},{"action":"wait","for":"a window “Save As”","gone":true},"odd",null]}"#
+        ))
+    guard case .approval(let card) = timeline.visibleItems.last, let action = card.app else {
+        Issue.record("no app card")
+        return
+    }
+    #expect(action.action == "act" && action.window == "*notes.txt - Mousepad" && card.summary == "Add milk and save")
+    // A batch's fields stay on its steps, and what isn't a step is left out.
+    #expect(action.target.isEmpty && action.text == nil && action.frame == nil && action.steps.count == 4)
+    #expect(action.listsSteps && action.marks.isEmpty)
+    var typed = AppStep(action: "type")
+    typed.role = "textbox"
+    typed.around = "tablist › textbox"
+    typed.text = "- milk\n- eggs ✓"
+    #expect(action.steps[0] == typed)
+    #expect(action.steps[1].key == "CTRL+S" && action.steps[1].window == "*notes.txt - Mousepad")
+    #expect(action.steps[2].pointer && action.steps[3].waitFor == "a window “Save As”" && action.steps[3].gone)
+    let words = action.steps.map { $0.words(window: action.window) }
+    // The full text, its lines kept.
+    #expect(
+        words[0]
+            == AppStep.Words(text: "Write in Textbox:", quote: "- milk\n- eggs ✓", note: "tablist › textbox"))
+    // The card's own window isn't repeated.
+    #expect(words[1] == AppStep.Words(text: "Press", key: "CTRL+S"))
+    #expect(words[2].text == "Click Menuitem “Save” with the mouse" && words[2].note == "menu “File” › menuitem “Save”")
+    #expect(words[3] == AppStep.Words(text: "Wait for a window “Save As” to go away", quiet: true))
+    func say(_ action: String, _ set: (inout AppStep) -> Void) -> String {
+        var step = AppStep(action: action)
+        set(&step)
+        return step.words().text
+    }
+    #expect(
+        [
+            say("set_value") { $0.role = "spinbutton"; $0.target = "Size"; $0.text = "42" },
+            say("select") { $0.role = "textbox"; $0.text = "Line one" },
+            say("select") { $0.role = "listitem"; $0.target = "Blue" },
+            say("select") { $0.role = "cell"; $0.target = "A1"; $0.range = true },
+            say("scroll") { $0.role = "list"; $0.target = "Files"; $0.direction = "down"; $0.pages = 2 },
+            say("activate") { $0.window = "Save As" },
+            say("close") { $0.window = "Untitled 1 - Mousepad" },
+        ] == [
+            "Set Spinbutton “Size” to:", "Select “Line one” in Textbox", "Select Listitem “Blue”",
+            "Select from Cell “A1”…", "Scroll down 2 pages in List “Files”", "Switch to the window “Save As”",
+            "Close the window “Untitled 1 - Mousepad”",
+        ])
+}
+
+@Test func aPixelBatchKeepsItsPointsAndThePicturesSizeForTheMarks() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(
+        try event(
+            1, "approval.requested",
+            #"{"task":"t1","id":"c12","kind":"app","action":"gui","app":"Mousepad","window":"notes.txt - Mousepad","summary":"Open the File menu and drag the file","image":"/api/v1/images/cd34","frame":{"width":1229,"height":768},"steps":[{"action":"click","x":100,"y":120.4,"button":"right","keys":["CTRL"],"key":"CTRL","window":"notes.txt - Mousepad","app":"Mousepad"},{"action":"drag","path":[{"x":10,"y":10},{"x":"far","y":5},{"x":200,"y":300}],"window":"Files","app":"Thunar"},{"action":"keypress","keys":["CTRL","S"]},{"action":"scroll","x":"400","y":300,"scroll_y":3},{"action":"wait"}]}"#
+        ))
+    guard case .approval(let card) = timeline.visibleItems.last, let action = card.app else {
+        Issue.record("no gui card")
+        return
+    }
+    #expect(action.action == "gui" && action.frame == AppAction.Frame(width: 1229, height: 768))
+    #expect(action.imagePath == "/api/v1/images/cd34" && action.listsSteps)
+    // A point that isn't a number is dropped.
+    #expect(
+        action.steps.map(\.points) == [
+            [AppStep.Point(x: 100, y: 120.4)], [AppStep.Point(x: 10, y: 10), AppStep.Point(x: 200, y: 300)], [], [],
+            [],
+        ])
+    #expect(action.steps[0].button == "right" && action.steps[0].key == "CTRL" && action.steps[2].key == "CTRL+S")
+    let words = action.steps.map { $0.words(pixels: true, window: action.window) }
+    #expect(
+        words.map(\.text) == [
+            "Click at 100, 120 (right button), holding CTRL", "Drag from 10, 10 to 200, 300", "Press", "Scroll",
+            "Wait a second",
+        ])
+    #expect(words[0].window == nil && words[1].window == "In “Files”" && words[2].key == "CTRL+S" && words[4].quiet)
+    // The marks: in fractions of the picture, numbered as the steps are.
+    #expect(action.marks.map(\.step) == [1, 2])
+    #expect(action.marks[1].points == [AppStep.Point(x: 10 / 1229, y: 10 / 768), AppStep.Point(x: 200 / 1229, y: 300 / 768)])
+    timeline.apply(
+        try event(
+            2, "approval.requested",
+            #"{"id":"c13","kind":"app","action":"gui","image":"/api/v1/images/cd34","frame":{"width":0,"height":"768"},"steps":{"action":"click"}}"#
+        ))
+    guard case .approval(let odd) = timeline.visibleItems.last, let oddAction = odd.app else {
+        Issue.record("no odd gui card")
+        return
+    }
+    #expect(oddAction.frame == nil && oddAction.steps.isEmpty && oddAction.marks.isEmpty)
+}
+
+@Test func anAppInstallKeepsWhatTheStoreSays() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(
+        try event(
+            1, "approval.requested",
+            #"{"task":"t1","id":"c7","kind":"install","source":"Snap Store","name":"slack","app":"Slack","publisher":"Slack","verified":true,"version":"4.53.292","channel":"stable","confinement":"strict","summary":"Team communication for the 21st century.","size":233066496,"why":"So you can use Slack as a desktop app","reason":"installs an app on your desktop, as root","tainted":true}"#
+        ))
+    guard case .approval(let card) = timeline.visibleItems.last, let install = card.install else {
+        Issue.record("no install card")
+        return
+    }
+    #expect(
+        install
+            == AppInstall(
+                source: "Snap Store", name: "slack", app: "Slack", publisher: "Slack", verified: true,
+                version: "4.53.292", channel: "stable", confinement: "strict",
+                summary: "Team communication for the 21st century.", size: 233_066_496,
+                why: "So you can use Slack as a desktop app"))
+    #expect(install.details == "Version 4.53.292 · stable · 233 MB")
+    // The summary is the store's, not the agent's.
+    #expect(card.summary == nil && card.reason == "installs an app on your desktop, as root")
+    #expect(card.tainted && !card.editable && card.command.isEmpty && card.app == nil && card.browser == nil)
+    timeline.apply(
+        try event(2, "approval.requested", #"{"id":"c8","kind":"install","name":"slack","channel":"stable","summary":"","size":null,"why":null}"#))
+    guard case .approval(let bare) = timeline.visibleItems.last, let plain = bare.install else {
+        Issue.record("no bare install card")
+        return
+    }
+    #expect(plain.app.isEmpty && !plain.verified && plain.summary.isEmpty && plain.size == nil && plain.why.isEmpty)
+    #expect(plain.details == "stable" && !bare.tainted)
+    #expect(
+        [233_066_496, 4_240_000, 4_000_000, 1200].map(AppInstall.megabytes) == ["233 MB", "4.2 MB", "4 MB", "0.1 MB"])
+    timeline.apply(try event(3, "approval.resolved", #"{"task":"t1","id":"c7","approved":true}"#))
     #expect(timeline.visibleItems.count == 1)
 }
 

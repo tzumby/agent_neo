@@ -8,7 +8,7 @@
 import { findKey } from "./keys.js";
 import { parse, render, safeHref } from "./markdown.js";
 import { busyButton, h, icon, time, when } from "./dom.js";
-import { duration, rowKey, workingFor } from "./timeline.js";
+import { appStepWords, clickTarget, duration, megabytes, rowKey, workingFor } from "./timeline.js";
 
 export function mountChat(store, view, { openDesktop, openKeys }) {
   const scroll = view.querySelector(".chat-scroll");
@@ -329,6 +329,7 @@ function warning(text) {
 function approvalCard(card, ctx) {
   if (card.kind === "browser") return browserCard(card, ctx);
   if (card.kind === "app") return appCard(card, ctx);
+  if (card.kind === "install") return installCard(card, ctx);
   if (card.kind === "schedule") return scheduleCard(card, ctx);
   if (card.kind === "secret") return secretCard(card, ctx);
   if (card.kind === "access") return accessCard(card, ctx);
@@ -384,43 +385,139 @@ function browserCard(card, ctx) {
     said, what, facts, note, answerButtons(card, ctx, edit, legacySend));
 }
 
+// What an app card asks, by its action ("key" names its key).
+const APP_ASKS = {
+  type: "Write this", set_value: "Set this", select: "Select this", scroll: "Scroll",
+  activate: "Switch windows", close: "Close this window", act: "Do this", gui: "Do this",
+};
+
 // The browser card's counterpart for the desktop's own apps, which the agent
-// drives through their accessibility tree. Never editable.
+// drives through their accessibility tree, or (with a model that sees the
+// screen) by pixels of a screenshot. A batch lists every step, in order.
+// Never editable.
 function appCard(card, ctx) {
   const a = card.app;
   const where = a.app ? `in ${a.app}` : "in the app";
-  const title = a.action === "type" ? `Write this ${where}?`
-    : a.action === "key" ? `Press ${a.key || "a key"} ${where}?` : `Click this ${where}?`;
+  const title = a.action === "key" ? `Press ${a.key || "a key"} ${where}?` : `${APP_ASKS[a.action] || "Click this"} ${where}?`;
+  const listed = a.steps.length > 1 || a.action === "act" || a.action === "gui";
+  const only = a.steps.length === 1 ? a.steps[0] : null;
+  const marked = a.action === "gui" && a.frame !== null && typeof a.image === "string" && a.image.startsWith("/api/v1/images/");
   let what;
-  if (a.action === "type") {
+  if (listed) {
+    what = appSteps(a, marked);
+  } else if (a.action === "type") {
     what = [a.target ? h("p", { class: "card-text muted" }, `In “${a.target}”`) : null,
       h("blockquote", { class: "card-quote" }, a.text || "")];
   } else if (a.action === "key") {
     what = h("p", { class: "card-text" }, h("kbd", null, a.key || "?"), a.target ? ` in “${a.target}”` : "");
+  } else if (["set_value", "select", "scroll", "activate", "close"].includes(a.action)) {
+    // Its one step in words; where it is in the app follows, as for a click.
+    what = stepLines({ ...appStepWords(only || a, { window: a.window }), note: null }, "card-target");
   } else {
-    what = h("p", { class: "card-text card-target" }, clickTarget(a.role, a.target));
+    what = h("p", { class: "card-text card-target" }, clickTarget(a.role, a.target), only?.pointer ? " with the mouse" : "");
   }
   // The agent's reason first, then what the app itself shows, which the
   // agent's words can't change.
-  const said = a.action !== "type" && card.summary ? h("p", { class: "card-text strong" }, `The agent says: ${card.summary}`) : null;
+  const said = (listed || a.action !== "type") && card.summary
+    ? h("p", { class: "card-text strong" }, `The agent says: ${card.summary}`) : null;
   const facts = [
-    a.around ? h("div", { class: "card-inset" }, h("p", { class: "strong" }, "Where it is in the app"), h("p", { class: "muted" }, a.around)) : null,
+    !listed && a.around ? h("div", { class: "card-inset" }, h("p", { class: "strong" }, "Where it is in the app"), h("p", { class: "muted" }, a.around)) : null,
     a.window ? h("p", { class: "card-text muted card-value" }, a.window) : null,
-    a.image ? picture(a.image, "The desktop when the agent asked") : null,
+    a.image ? (marked ? markedPicture(a) : picture(a.image, "The desktop when the agent asked")) : null,
   ];
   return h("section", { class: "card card-needs", "aria-label": title },
     h("div", { class: "card-head" },
-      h("h3", { class: "card-title" }, icon(a.action === "type" || a.action === "key" ? "keyboard" : "click"), title),
+      h("h3", { class: "card-title" }, icon(["type", "key", "set_value"].includes(a.action) ? "keyboard" : "click"), title),
       a.app ? h("span", { class: "card-site" }, icon("desktop"), a.app) : null),
     said, what, facts,
     card.reason ? h("p", { class: "card-text muted" }, `It ${card.reason}.`) : null,
     answerButtons(card, ctx));
 }
 
-/** Button “Confirm”; “without a name” when it has none. */
-function clickTarget(role, target) {
-  const name = target ? `“${target}”` : "without a name";
-  return role ? `${role[0].toUpperCase()}${role.slice(1)} ${name}` : name;
+// A batch's steps, numbered. A pixel step's number is also on the picture.
+function appSteps(a, marked) {
+  const pixels = a.action === "gui";
+  return h("ol", { class: "app-steps" }, a.steps.map((s, i) => {
+    const words = appStepWords(s, { pixels, window: a.window });
+    return h("li", { class: words.quiet ? "app-step is-quiet" : "app-step" },
+      h("span", { class: marked && s.points.length ? "app-step-n is-marked" : "app-step-n" }, String(i + 1)),
+      h("div", { class: "app-step-body" }, stepLines(words)));
+  }));
+}
+
+function stepLines(words, className = "") {
+  return [
+    h("p", { class: `card-text ${className}`.trim() }, words.text, words.key ? [" ", h("kbd", null, words.key)] : null),
+    words.note ? h("p", { class: "app-step-note muted" }, words.note) : null,
+    words.quote !== null ? h("blockquote", { class: "card-quote" }, words.quote) : null,
+    words.window ? h("p", { class: "app-step-note muted card-value" }, words.window) : null,
+  ];
+}
+
+// The screenshot a pixel batch was planned on: a ring where each step acts,
+// which leaves what it acts on in sight, with the step's number beside it,
+// and a drag's path drawn. The marks are placed in percent of the frame, so
+// they stay put as the picture scales.
+function markedPicture(a) {
+  const { width, height } = a.frame;
+  const percent = (value) => `${Math.min(100, Math.max(0, value * 100))}%`;
+  const mark = (p, label, className = "shot-mark") => {
+    const el = h("span", { class: className, "aria-hidden": "true" }, label ? h("span", { class: "shot-mark-n" }, label) : null);
+    // CSSOM: the page's policy allows no style attributes.
+    el.style.left = percent(p.x / width);
+    el.style.top = percent(p.y / height);
+    return el;
+  };
+  const paths = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  paths.setAttribute("class", "shot-paths");
+  paths.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  paths.setAttribute("preserveAspectRatio", "none");
+  paths.setAttribute("aria-hidden", "true");
+  const marks = [];
+  a.steps.forEach((s, i) => {
+    if (!s.points.length) return;
+    if (s.points.length > 1) {
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+      line.setAttribute("points", s.points.map((p) => `${p.x},${p.y}`).join(" "));
+      line.setAttribute("vector-effect", "non-scaling-stroke");
+      paths.append(line);
+      marks.push(mark(s.points[s.points.length - 1], "", "shot-mark is-end"));
+    }
+    marks.push(mark(s.points[0], String(i + 1)));
+  });
+  const img = h("img", { src: a.image, alt: "A screenshot from your desktop, numbered where each step acts", loading: "lazy" });
+  return h("figure", { class: "shot" },
+    h("div", { class: "shot-marks" }, img, paths.childNodes.length ? paths : null, marks),
+    h("figcaption", null, "The desktop when the agent asked, numbered by step"));
+}
+
+// An app from a store (the Snap Store), installed on the desktop as root. The
+// agent's reason first, then what the store says about it, which the agent's
+// words can't change. Never editable.
+function installCard(card, ctx) {
+  const i = card.install;
+  const title = `Install ${i.app || i.name || "this app"}?`;
+  const details = [i.version ? `Version ${i.version}` : "", i.channel, i.size ? megabytes(i.size) : ""]
+    .filter(Boolean).join(" · ");
+  const facts = [
+    i.publisher ? h("p", { class: "strong" }, i.publisher,
+      i.verified ? h("span", { class: "card-verified" }, "✓ Verified publisher") : null) : null,
+    details ? h("p", null, details) : null,
+    i.summary ? h("p", { class: "muted" }, i.summary) : null,
+    i.name ? h("p", { class: "muted mono card-value" }, i.name) : null,
+  ];
+  return h("section", { class: "card card-needs", "aria-label": title },
+    h("div", { class: "card-head" },
+      h("h3", { class: "card-title" }, icon("plus"), title),
+      i.source ? h("span", { class: "card-site" }, icon("desktop"), i.source) : null),
+    i.why ? h("p", { class: "card-text strong" }, `The agent says: ${i.why}`) : null,
+    facts.some(Boolean) ? h("div", { class: "card-inset" }, facts) : null,
+    i.confinement === "strict"
+      ? h("p", { class: "card-text muted" }, "Strictly confined: it runs in the Snap sandbox with a snap's usual access, which includes your desktop user's files.")
+      : null,
+    card.tainted ? warning("The agent read web pages or other outside content before asking. Check this is an app you asked for.") : null,
+    card.reason ? h("p", { class: "card-text muted" }, `It ${card.reason}.`) : null,
+    answerButtons(card, ctx));
 }
 
 function scheduleCard(card, ctx) {

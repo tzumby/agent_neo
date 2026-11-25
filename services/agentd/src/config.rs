@@ -72,6 +72,11 @@ pub struct Config {
     pub desktop_apps: bool,
     /// The broker's socket, which only agentd may open.
     pub desktop_broker: PathBuf,
+    /// install_app: desktop apps from the Snap Store, each on a card the user
+    /// approves, installed as root by the privileged helper (APP_INSTALLS=on).
+    pub app_installs: bool,
+    /// snapd's socket (local runs and tests can point elsewhere).
+    pub snapd_socket: String,
 }
 
 fn read_kv(path: &Path, into: &mut HashMap<String, String>) -> Result<()> {
@@ -153,6 +158,8 @@ impl Config {
                 .max(1),
             desktop_apps: get("DESKTOP_APPS", "off") == "on",
             desktop_broker: get("DESKTOP_BROKER", "/run/neo-desktop/broker.sock").into(),
+            app_installs: get("APP_INSTALLS", "off") == "on",
+            snapd_socket: get("SNAPD_SOCKET", crate::snaps::SNAPD_SOCKET),
         })
     }
 }

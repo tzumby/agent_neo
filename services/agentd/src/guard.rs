@@ -42,7 +42,9 @@ pub fn carries_outside_content(tool: &str) -> bool {
             | "app_windows"
             | "app_observe"
             | "app_find"
-            | "app_click"
+            | "app_act"
+            | "app_gui"
+            | "app_zoom"
     )
 }
 

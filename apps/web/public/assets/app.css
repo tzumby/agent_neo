@@ -260,6 +260,30 @@ h4.md-h, h5.md-h, h6.md-h { font-size: 1rem; font-weight: 650; }
 .card-edit-code { margin-top: 0.5rem; font-family: var(--mono); font-size: 0.85rem; }
 .card-target { font-weight: 600; }
 .card-quote { margin: 0; padding: 0.1rem 0 0.1rem 0.8rem; border-left: 3px solid var(--signal); white-space: pre-wrap; overflow-wrap: anywhere; }
+/* An app card's steps, numbered. A pixel step's number is orange, as its
+   mark on the picture is. */
+.app-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }
+.app-step { display: grid; grid-template-columns: 1.4rem minmax(0, 1fr); gap: 0.55rem; align-items: start; }
+.app-step-n { display: grid; place-items: center; width: 1.4rem; height: 1.4rem; margin-top: 0.08rem; border-radius: 50%; border: 1px solid var(--rule); color: var(--slate); font-size: 0.74rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.app-step-n.is-marked { border-color: var(--signal); background: var(--signal); color: var(--side); }
+.app-step-body { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; }
+.app-step-note { margin: 0; font-size: 0.84rem; overflow-wrap: anywhere; }
+.app-step.is-quiet .card-text { color: var(--slate); }
+.shot-marks { position: relative; width: fit-content; max-width: 100%; }
+.shot-paths { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.shot-paths polyline { fill: none; stroke: var(--signal); stroke-width: 2.5; stroke-dasharray: 6 4; stroke-linecap: round; }
+/* A ring around the point, its middle clear, and the step's number beside it. */
+.shot-mark {
+  position: absolute; width: 1.3rem; height: 1.3rem; transform: translate(-50%, -50%); border-radius: 50%;
+  border: 2px solid var(--signal); box-shadow: 0 0 0 1.5px #fff, inset 0 0 0 1.5px #fff; pointer-events: none;
+}
+.shot-mark.is-end { width: 0.8rem; height: 0.8rem; }
+.shot-mark-n {
+  position: absolute; left: 75%; bottom: 75%; display: grid; place-items: center;
+  min-width: 1.15rem; height: 1.15rem; padding: 0 0.25rem; border-radius: 999px;
+  background: var(--signal); color: var(--side); font-size: 0.7rem; font-weight: 700; line-height: 1;
+  box-shadow: 0 0 0 1.5px #fff, 0 1px 3px rgba(8, 23, 32, 0.45);
+}
 .card-inset { background: var(--inset); border-radius: 0.6rem; padding: 0.7rem 0.85rem; }
 .card-inset p { margin: 0.15rem 0; }
 .card-warning { margin: 0; display: flex; gap: 0.45rem; color: var(--signal-text); font-size: 0.88rem; }
@@ -269,6 +293,7 @@ h4.md-h, h5.md-h, h6.md-h { font-size: 1rem; font-weight: 650; }
 ul.card-inset.card-hosts { padding: 0.7rem 0.85rem; }
 .card-hosts code { font-family: var(--mono); font-size: 0.9rem; overflow-wrap: anywhere; }
 .card-ok { margin: 0; display: flex; gap: 0.4rem; align-items: center; color: var(--ok); font-weight: 600; }
+.card-verified { margin-left: 0.45rem; color: var(--ok); font-size: 0.84rem; font-weight: 600; white-space: nowrap; }
 .card-how { font-size: 0.93rem; }
 .card-link { display: inline-flex; align-items: center; gap: 0.3rem; width: fit-content; font-weight: 600; }
 .command summary { cursor: pointer; color: var(--slate); font-size: 0.88rem; width: fit-content; }

@@ -110,3 +110,10 @@ desktop_chrome_policy:
   # No print dialog (a page's window.print(), Ctrl+P): it's Chrome's own UI,
   # which the agent can't see either, and there's no printer here.
   PrintingEnabled: false
+
+# Links from web pages that open an installed desktop app: Chrome hands these
+# schemes to the app, from these sites only, without asking (so no prompt the
+# agent can't see), instead of blocking them. A Slack app signs in through the
+# browser and comes back by a slack:// link from slack.com. Chrome policy's
+# own form: {protocol, allowed_origins}, origins as in URLBlocklist.
+desktop_chrome_app_links: []

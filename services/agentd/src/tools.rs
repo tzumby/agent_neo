@@ -47,7 +47,7 @@ pub fn system_prompt(
     skills: &str,
     keys: &str,
     memory_v2: bool,
-    apps: bool,
+    desktop: Desktop,
 ) -> String {
     let shell_rule = if shell {
         let saved = if keys.is_empty() {
@@ -88,6 +88,16 @@ name ($NAME) or list it in secrets. Never print keys or write them into files. {
     } else {
         format!("\n{memories}")
     };
+    let desktop_rules = [
+        if desktop.apps { APPS_RULE } else { "" },
+        if desktop.apps && desktop.vision {
+            VISION_RULE
+        } else {
+            ""
+        },
+        if desktop.installs { INSTALLS_RULE } else { "" },
+    ]
+    .concat();
     let prompt = format!(
         "You are an assistant with control of the user's own cloud desktop: a Linux VM with a Google \
 Chrome that is logged in to the user's accounts{and_shell}. The user talks to you from the web app, on their phone or computer.
@@ -128,7 +138,7 @@ requests of one or two steps.
     security phrases, one-time codes, booking codes or full account numbers.",
         and_shell = if shell { ", and a bash shell" } else { "" },
         memory_rule = if memory_v2 { "" } else { MEMORY_V1_RULE },
-        apps_rule = if apps { APPS_RULE } else { "" },
+        apps_rule = desktop_rules,
     );
     if memory_v2 {
         // At the end, after the skills: the stable part in front stays cacheable.
@@ -143,14 +153,42 @@ requests of one or two steps.
     }
 }
 
+/// The desktop's own apps, as the deployment has them: the app_* tools
+/// (native apps through the broker) and install_app (snaps, on a card).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Desktop {
+    pub apps: bool,
+    pub installs: bool,
+    /// The model sees images: screenshots come to it, and app_gui and app_zoom exist.
+    pub vision: bool,
+}
+
+/// Desktop apps the agent may ask to install (docs/desktop-apps.md §10).
+const INSTALLS_RULE: &str = "- Desktop apps (programs with windows, like Slack, Zoom or Spotify): install them with \
+install_app, which asks the user on a card and installs the Snap Store's app with a launcher on the desktop and in \
+the menu. Never install desktop apps with Nix, pip, npm or the shell: what your shell installs runs as your shell's \
+user and can't run on the user's desktop.
+";
+
 /// Native apps (docs/desktop-apps.md), when the deployment has them.
-const APPS_RULE: &str = "- Native apps: some desktop apps other than Chrome can be used through their accessibility \
-tree. app_windows lists the windows you may use (wN); app_observe and app_find read a window's controls, each with a \
-ref (rN). app_click asks the user to approve one click on a control; you can't type or press keys in apps, so ask \
-the user to Take over for that (needs_user). Use only refs from your latest app results. A result's first line is \
-evidence of what was sent, not proof of the outcome: check the app afterwards. After a stale ref, or a result that \
-isn't plainly ok (effect_unknown, wait_timeout, window_changed), observe the window again before anything else. \
-Web pages are always the browser tools' (Chrome), never the app tools'.
+const APPS_RULE: &str = "- Native apps: desktop apps other than Chrome are used through their accessibility tree. \
+app_windows lists the windows you may use (wN); app_observe and app_find read a window's controls, each with a ref \
+(rN). app_act does things in a window: click, type text into a field, press a key chord, set a value, select, \
+scroll, switch or close windows, and wait. One call is one batch the user approves on a card, so put the steps of \
+one job together (type the message, then press ENTER), and use wait steps between steps that depend on what the one \
+before opens. Refs come from your latest app results only; elements a step opens (a menu's items, a dialog's \
+fields) get refs after it, so look again before acting on them. A result's first line is evidence of what was sent, \
+not proof of the outcome: check the app afterwards. After a stale ref, or a result that isn't plainly ok \
+(effect_unknown, wait_timeout, window_changed), look again before anything else. Never type passwords or codes: \
+ask the user to Take over. Web pages are always the browser tools' (Chrome), never the app tools'.
+";
+
+/// Pixel input, for a model that sees images.
+const VISION_RULE: &str = "- Screenshots: app_screenshot shows you the whole desktop, and app_zoom enlarges part of \
+it. Prefer app_act (named controls): use app_gui (click, drag, scroll, type and keys at pixels of your latest \
+screenshot) only for what the tree doesn't expose, like canvases or custom widgets. Take a new screenshot before \
+app_gui whenever anything was read or done since: points are checked against the window under them, and input to \
+any other window is refused.
 ";
 
 const MEMORY_V1_RULE: &str = "- Memory: use remember to keep inferred facts for the user. Treat recalled hints as \
@@ -175,7 +213,7 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     })
 }
 
-pub fn schemas(shell: bool, skills: bool, memory_v2: bool, scheduled: bool, apps: bool) -> Value {
+pub fn schemas(shell: bool, skills: bool, memory_v2: bool, scheduled: bool, desktop: Desktop) -> Value {
     let max_chars = json!({"type": "integer", "description": "truncate after N characters (12000)"});
     let target = json!({
         "ref": {"type": "integer", "description": "ref from snapshot"},
@@ -422,18 +460,65 @@ pub fn schemas(shell: bool, skills: bool, memory_v2: bool, scheduled: bool, apps
             &["hosts", "why"],
         ));
     }
-    if apps {
-        tools.extend(app_tools());
+    if desktop.apps {
+        tools.extend(app_tools(desktop.vision));
+    }
+    if desktop.installs {
+        tools.push(tool(
+            "install_app",
+            "Ask the user to install a desktop app (a program with windows) from the Snap Store, such as slack, \
+             zoom-client or spotify: only strictly confined apps from verified publishers. They approve it on a card; \
+             it then has a launcher on the desktop and in the Applications menu. Not for command-line tools (Nix).",
+            json!({
+                "name": {"type": "string", "description": "the app's Snap Store name, e.g. slack; a wrong one gets suggestions"},
+                "why": {"type": "string", "description": "what the user wants it for, in a few words (shown on the card)"},
+            }),
+            &["name"],
+        ));
     }
     Value::Array(tools)
 }
 
-/// The native app tools (docs/desktop-apps.md §4).
-fn app_tools() -> Vec<Value> {
+/// The native app tools (docs/desktop-apps.md §5); the pixel ones only for a
+/// model that sees images.
+fn app_tools(vision: bool) -> Vec<Value> {
     let window =
         json!({"type": "string", "description": "a window ref (wN) from app_windows or a later app result"});
     let max_chars = json!({"type": "integer", "description": "truncate after N characters (12000)"});
-    vec![
+    let says_why = json!({
+        "type": "string",
+        "description": "What this does and why, in a few plain words for someone who can't see the app, like \
+                        \"Send Ana the agenda in Slack\" (shown when the user is asked to approve it)",
+    });
+    let step = json!({
+        "type": "object",
+        "description": "One step. click {ref} (pointer: true lets the mouse do it when the control has no action of \
+                        its own, as with a text area or a canvas); type {ref, text} (into that field, at its cursor; \
+                        it focuses the field itself, so no click first; newlines and any language are fine); \
+                        keypress {keys: one chord, e.g. [\"CTRL\",\"S\"] or [\"ENTER\"]}; set_value {ref, value}; \
+                        select {ref, text?, to_ref?}; scroll {ref, direction, pages}; activate {window: wN}; \
+                        close {window: wN} (only waits may follow it); wait {window: title text (gone: true for it to close) | query | ref (rN) with state/value/text | text | \
+                        settle: true, gone?, timeout_ms?} (waits send nothing; at most 60 s in all).",
+        "properties": {
+            "type": {"type": "string", "enum": ["click", "type", "keypress", "set_value", "select", "scroll", "activate", "close", "wait"]},
+            "ref": {"type": "string"},
+            "text": {"type": "string"},
+            "keys": {"type": "array", "items": {"type": "string"}},
+            "value": {"type": "string"},
+            "to_ref": {"type": "string"},
+            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+            "pages": {"type": "number"},
+            "pointer": {"type": "boolean"},
+            "window": {"type": "string"},
+            "query": {"type": "object"},
+            "state": {"type": "string"},
+            "settle": {"type": "boolean"},
+            "gone": {"type": "boolean"},
+            "timeout_ms": {"type": "integer"},
+        },
+        "required": ["type"],
+    });
+    let mut tools = vec![
         tool(
             "app_windows",
             "List the windows of the desktop's native apps you may use (not Chrome): their refs (wN), titles and \
@@ -444,11 +529,11 @@ fn app_tools() -> Vec<Value> {
         tool(
             "app_observe",
             "Read a native app window's controls: one line per element with its role, name, value, states and \
-             ref (rN). With root, only that element's subtree; with root and read_text, that element's whole \
-             text, a page at a time.",
+             ref (rN). With root, only that element's subtree (root: \"focused\" for the focused one); with root \
+             and read_text, that element's whole text, a page at a time.",
             json!({
                 "window": window,
-                "root": {"type": "string", "description": "an element ref (rN) to read only its subtree"},
+                "root": {"type": "string", "description": "an element ref (rN), or \"focused\", to read only its subtree"},
                 "read_text": {
                     "type": "object",
                     "description": "read root's text instead of a tree; follow next_read for the next page",
@@ -481,29 +566,60 @@ fn app_tools() -> Vec<Value> {
             &["window"],
         ),
         tool(
-            "app_click",
-            "Request approval to click one control of a native app window, by its ref from your latest app \
-             result. The click goes through the app's accessibility action, not the mouse, and the result says \
-             what changed. A menu's items appear once the menu is open.",
+            "app_act",
+            "Request approval to do steps in a native app window, in order: click, type, keypress, set_value, \
+             select, scroll, activate, close, wait (up to 64). The user approves the whole batch on one card \
+             showing every step and all the text; the first step that fails stops it. Refs come from your latest \
+             app results; the result says what changed.",
             json!({
                 "window": window,
-                "ref": {"type": "string", "description": "the control's ref (rN)"},
-                "summary": {
-                    "type": "string",
-                    "description": "What this does and why, in a few plain words for someone who can't see the \
-                                    app, like \"Save the shopping list in Mousepad\" (shown when the user is \
-                                    asked to approve it)",
-                },
+                "steps": {"type": "array", "items": step, "minItems": 1, "maxItems": 64},
+                "summary": says_why,
             }),
-            &["window", "ref", "summary"],
+            &["window", "steps", "summary"],
         ),
         tool(
             "app_screenshot",
-            "Show the user a screenshot of the desktop (you don't see it yourself).",
-            json!({"caption": {"type": "string"}}),
+            if vision {
+                "Take a screenshot of the whole desktop: you see it (attached after the results), and app_gui's \
+                 x/y are its pixels. show: true also shows it to the user in the chat."
+            } else {
+                "Show the user a screenshot of the desktop (you don't see it yourself)."
+            },
+            json!({"caption": {"type": "string"}, "show": {"type": "boolean"}}),
             &[],
         ),
-    ]
+    ];
+    if vision {
+        tools.push(tool(
+            "app_zoom",
+            "Enlarge a region of your latest screenshot to read small text or icons: [x0, y0, x1, y1] in its \
+             pixels (each side at least 8). Only looks.",
+            json!({"region": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}}),
+            &["region"],
+        ));
+        tools.push(tool(
+            "app_gui",
+            "Request approval to act at pixels of your latest app_screenshot, in a native app's window: click \
+             (button, keys for held modifiers), double_click, move, drag (path of points), scroll (scroll_x/scroll_y), \
+             type (text to the window you clicked, or the focused one), keypress (keys), wait (one second). Every \
+             point must be on a window of an app you may use. For what the tree doesn't expose; prefer app_act.",
+            json!({
+                "actions": {"type": "array", "items": {"type": "object", "properties": {
+                    "type": {"type": "string", "enum": ["click", "double_click", "move", "drag", "scroll", "type", "keypress", "wait"]},
+                    "x": {"type": "number"}, "y": {"type": "number"},
+                    "button": {"type": "string", "enum": ["left", "right", "wheel", "back", "forward"]},
+                    "path": {"type": "array", "items": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}}},
+                    "scroll_x": {"type": "integer"}, "scroll_y": {"type": "integer"},
+                    "text": {"type": "string"},
+                    "keys": {"type": "array", "items": {"type": "string"}},
+                }, "required": ["type"]}, "minItems": 1, "maxItems": 64},
+                "summary": says_why,
+            }),
+            &["actions", "summary"],
+        ));
+    }
+    tools
 }
 
 #[cfg(test)]
@@ -522,7 +638,7 @@ mod tests {
     #[test]
     fn memory_v2_puts_its_rules_and_notes_at_the_end() {
         let block = "## Your rules and the user's preferences\n- #1 [rule · 2026-10-03 · user said] Reply in English\n";
-        let v2 = system_prompt(true, "now", block, "- python: uv\n", "", true, false);
+        let v2 = system_prompt(true, "now", block, "- python: uv\n", "", true, Desktop::default());
         assert!(!v2.contains("- Memory: use remember"));
         let skills = v2.find("- python: uv").unwrap();
         let rules = v2.find("## Memory\nUser-stated rules and preferences").unwrap();
@@ -536,7 +652,7 @@ mod tests {
             "- python: uv\n",
             "",
             false,
-            false,
+            Desktop::default(),
         );
         assert!(v1.contains("- Memory: use remember") && !v1.contains("## Memory"));
         assert!(v1.find("What you remember").unwrap() < v1.find("- python: uv").unwrap());
@@ -544,13 +660,13 @@ mod tests {
 
     #[test]
     fn memory_v2_offers_three_memory_tools() {
-        let v2 = names(&schemas(true, true, true, false, false));
+        let v2 = names(&schemas(true, true, true, false, Desktop::default()));
         assert!(
             ["remember", "forget", "search_memory"]
                 .iter()
                 .all(|t| v2.contains(&t.to_string()))
         );
-        let v1 = names(&schemas(true, true, false, false, false));
+        let v1 = names(&schemas(true, true, false, false, Desktop::default()));
         assert!(v1.contains(&"remember".to_string()) && !v1.contains(&"search_memory".to_string()));
         assert_eq!(v2.len(), v1.len() + 1);
         assert!(v1.contains(&"update_plan".to_string()) && v2.contains(&"update_plan".to_string()));
@@ -558,27 +674,72 @@ mod tests {
 
     #[test]
     fn native_apps_come_with_their_tools_and_rule_only_when_on() {
-        let off = names(&schemas(true, true, true, false, false));
+        let off = names(&schemas(true, true, true, false, Desktop::default()));
         assert!(!off.iter().any(|n| n.starts_with("app_")));
-        let on = names(&schemas(true, true, true, false, true));
+        let on = names(&schemas(
+            true,
+            true,
+            true,
+            false,
+            Desktop {
+                apps: true,
+                installs: false,
+                vision: false,
+            },
+        ));
         for tool in [
             "app_windows",
             "app_observe",
             "app_find",
-            "app_click",
+            "app_act",
             "app_screenshot",
         ] {
             assert!(on.contains(&tool.to_string()), "{tool}");
         }
-        assert!(!system_prompt(true, "now", "", "", "", true, false).contains("app_windows"));
-        let prompt = system_prompt(true, "now", "", "", "", true, true);
-        assert!(prompt.contains("app_click asks the user to approve one click"));
+        assert!(!system_prompt(true, "now", "", "", "", true, Desktop::default()).contains("app_windows"));
+        let prompt = system_prompt(
+            true,
+            "now",
+            "",
+            "",
+            "",
+            true,
+            Desktop {
+                apps: true,
+                installs: false,
+                vision: false,
+            },
+        );
+        assert!(prompt.contains("app_act does things in a window"));
+        assert!(!on.contains(&"app_gui".to_string()) && !prompt.contains("app_gui"));
+        let vision = Desktop {
+            apps: true,
+            installs: false,
+            vision: true,
+        };
+        let seeing = names(&schemas(true, true, true, false, vision));
+        assert!(seeing.contains(&"app_gui".to_string()) && seeing.contains(&"app_zoom".to_string()));
+        assert!(system_prompt(true, "now", "", "", "", true, vision).contains("Prefer app_act"));
         assert!(prompt.contains("never the app tools'"));
+        assert!(!prompt.contains("install_app"));
+        let installs = Desktop {
+            apps: false,
+            installs: true,
+            vision: false,
+        };
+        assert!(names(&schemas(true, true, true, false, installs)).contains(&"install_app".to_string()));
+        assert!(
+            system_prompt(true, "now", "", "", "", true, installs)
+                .contains("Never install desktop apps with Nix")
+        );
     }
 
     #[test]
     fn the_prompt_asks_for_a_plan_on_longer_tasks() {
-        assert!(system_prompt(true, "now", "", "", "", true, false).contains("call update_plan first"));
+        assert!(
+            system_prompt(true, "now", "", "", "", true, Desktop::default())
+                .contains("call update_plan first")
+        );
         assert!(
             wrap_up("A check found you stuck.")
                 .starts_with("(agentd) A check found you stuck. You can't use tools")

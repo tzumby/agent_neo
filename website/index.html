@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Agent Neo: an AI agent with its own Linux desktop, in your AWS account</title>
-  <meta name="description" content="Agent Neo is an open-source AI agent with its own Linux desktop in your AWS account. It browses, runs sandboxed commands, remembers and runs schedules. Anything risky waits for your OK.">
+  <meta name="description" content="Agent Neo is an open-source AI agent with its own Linux desktop in your AWS account. It browses, uses desktop apps, runs sandboxed commands, remembers and runs schedules. Anything risky waits for your OK.">
   <meta name="theme-color" content="#edf0ee">
   <link rel="canonical" href="https://agentneo.dev/">
   <meta property="og:site_name" content="Agent Neo">
@@ -35,6 +35,7 @@
         Agent Neo
       </a>
       <nav class="nav" aria-label="Main">
+        <a class="nav-hide-sm" href="#desktop-apps">Apps</a>
         <a class="nav-hide-sm" href="#harness">Security</a>
         <a class="nav-hide-sm" href="#memory">Memory</a>
         <a href="getting-started.html">Getting started</a>
@@ -190,12 +191,74 @@
       </div>
     </section>
 
+    <!-- Desktop apps -->
+    <section class="section flush-top" id="desktop-apps">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="kicker">New</p>
+          <h2 class="display-2">Beyond the browser</h2>
+          <p class="lede">Not everything lives in a web page. Agent Neo also uses the desktop’s own apps the way you would: it reads them, then clicks, types, presses shortcuts, picks from menus, fills dialogs and scrolls. It reads freely. Every batch of input waits for your OK.</p>
+        </div>
+
+        <div class="apps-top">
+          <figure class="apps-figure">
+            <figcaption class="visually-hidden">Illustration: the text editor Mousepad as the agent reads it, an accessibility tree in which each control has a short reference, and the approval card you get when the agent asks to add two lines to a list and save it: three numbered steps, with the full text it will type.</figcaption>
+            <div class="prompt" aria-hidden="true">
+              <p class="tree-head">What the agent reads: Mousepad’s accessibility tree</p>
+<pre class="tree-body">window "~/notes.txt - Mousepad"
+  menu "File" <span class="ref">r1</span>
+  menu "Edit" <span class="ref">r2</span>
+  menu "Search" <span class="ref">r3</span>
+  tablist
+    textbox <span class="ref">r7</span>  <span class="m">focused</span>
+      <span class="m">Shopping list - apples - bread</span></pre>
+            </div>
+            <div class="app-card" aria-hidden="true">
+              <div class="app-card-head">
+                <p class="app-card-title">Do this in Mousepad?</p>
+                <span class="app-chip"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 9h18" stroke="currentColor" stroke-width="2"/></svg>Mousepad</span>
+              </div>
+              <p class="app-card-said">The agent says: Add olive oil and crème fraîche to the list, then save it</p>
+              <ol class="app-card-steps">
+                <li><span class="n">1</span><span>Press <kbd>CTRL+END</kbd></span></li>
+                <li><span class="n">2</span><span>Write in the text area:<span class="app-card-quote">- olive oil<br>- Crème fraîche</span></span></li>
+                <li><span class="n">3</span><span>Press <kbd>CTRL+S</kbd></span></li>
+              </ol>
+              <p class="app-card-window">~/notes.txt - Mousepad</p>
+              <div class="app-card-btns"><span>Deny</span><span class="pri">Approve</span></div>
+            </div>
+          </figure>
+
+          <ul class="apps-points">
+            <li>
+              <h3>Named controls first, pixels when needed</h3>
+              <p>Linux apps describe their controls to screen readers. The agent reads that tree through Microsoft Research’s open-source <a href="https://github.com/microsoft/Hybrid-Computer-Use">Hybrid Computer Use</a>, so it works with what a control is called, not where it seems to be. With a model that sees images, it also works from screenshots, for canvases and anything else the tree leaves out.</p>
+            </li>
+            <li>
+              <h3>One card per batch, every step on it</h3>
+              <p>You see each step in words: the full text it will type, any language, newlines included; every shortcut; each control and where it sits. You also get the agent’s reason and a screenshot. Clicks at pixels are numbered on the screenshot.</p>
+            </li>
+            <li>
+              <h3>Checked again before it happens</h3>
+              <p>If a control changed or a window moved while you decided, nothing is sent and the agent looks again. If an outcome is unclear, it has to look before it can do anything else. It never types into password fields, and scheduled runs can’t use apps at all.</p>
+            </li>
+            <li>
+              <h3>Only the apps you list, installed from the store</h3>
+              <p>Each app is matched by its name and the program running it; Chrome stays with the browser tools, and terminals and the file manager are out of reach. Ask for a new app and the agent finds it in the Snap Store. You approve an install card, and the app gets launchers on the desktop and in the menu. Only sandboxed apps from verified publishers qualify.</p>
+            </li>
+          </ul>
+        </div>
+
+        <p class="apps-note"><strong>On x86 desktops,</strong> with the Mousepad text editor and Slack to start. Screenshots go to the model only if it’s one checked to see images (Kimi-K3 today); with the default model, the agent works from the accessibility tree alone. <a href="https://github.com/tzumby/agent_neo/blob/main/docs/desktop-apps.md">How it works</a></p>
+      </div>
+    </section>
+
     <!-- The harness -->
     <section class="section deep" id="harness">
       <div class="wrap">
         <div class="section-head">
           <h2 class="display-2">The model proposes. The harness decides.</h2>
-          <p class="lede">A prompt can be talked out of its rules; code can’t. Every rule that matters is a check in agentd, the Rust daemon between the model and your desktop. Web pages and command output can carry injected instructions, so the harness assumes they will.</p>
+          <p class="lede">A prompt can be talked out of its rules; code can’t. Every rule that matters is a check in agentd, the Rust daemon between the model and your desktop. Web pages, apps and command output can carry injected instructions, so the harness assumes they will.</p>
         </div>
         <p class="legend">Lime marks where the agent stops and waits for you.</p>
 
@@ -218,7 +281,7 @@ vi /etc/squid/squid.conf      <span class="x">refused</span></pre>
           <li class="stage">
             <div class="stage-text">
               <h4>Outside content is marked as data</h4>
-              <p>Anything from a web page or command output reaches the model wrapped as untrusted, and the task stays tainted for the rest of its life. From then on, commands that could send data out and new schedules need your OK, and anything it remembers is saved as an unconfirmed hint.</p>
+              <p>Anything from a web page, a desktop app or command output reaches the model wrapped as untrusted, and the task stays tainted for the rest of its life. From then on, commands that could send data out and new schedules need your OK, and anything it remembers is saved as an unconfirmed hint.</p>
             </div>
             <div class="stage-eg">
 <pre class="eg"><span class="m">&lt;untrusted source="web page"&gt;</span>
@@ -232,11 +295,12 @@ task <span class="x">tainted</span></pre>
           <li class="stage gate">
             <div class="stage-text">
               <h4>Anything with real authority waits for you</h4>
-              <p>You get a card with the exact command, or the page and the full text to type. Browser input is bound to the tab, the document, the element and the form’s state, and checked again just before it happens. If the page changed, nothing is clicked. Typing never lands in a password or one-time-code field.</p>
+              <p>You get a card with the exact command, or the page and the full text to type. Browser input is bound to the tab, the document, the element and the form’s state, and checked again just before it happens. If the page changed, nothing is clicked. Typing never lands in a password or one-time-code field. Input in a desktop app is bound the same way: to the app, its window and each control, or, for a click at pixels, to the window under the pointer.</p>
             </div>
             <div class="stage-eg">
               <ul class="eg-list">
                 <li>Every click, every bit of typing, every key press</li>
+                <li>Every batch of clicks, typing and keys in a desktop app</li>
                 <li>Submitting, separately from typing</li>
                 <li>Using a saved API key or token</li>
                 <li>Reaching a site the proxy doesn’t allow yet</li>
@@ -289,7 +353,7 @@ paste.example.net:443      <span class="x">denied</span>
               <ul>
                 <li>The model key</li>
                 <li>Chat, memory, schedules and saved keys, in a private directory</li>
-                <li>The only connection to Chrome’s DevTools</li>
+                <li>The only connections to Chrome’s DevTools and to the desktop’s apps</li>
               </ul>
               <h5>Can’t</h5>
               <ul class="cant">
@@ -306,17 +370,18 @@ paste.example.net:443      <span class="x">denied</span>
               <h5>Can’t</h5>
               <ul class="cant">
                 <li>Use sudo</li>
-                <li>Reach Chrome’s DevTools, the screen or the browser profile</li>
+                <li>Reach Chrome’s DevTools, the screen, the desktop’s apps or the browser profile</li>
                 <li>Read the model key, agentd’s data or the API socket</li>
                 <li>Reach AWS credentials or your other tailnet devices</li>
               </ul>
             </div>
             <div class="acct">
               <p class="acct-name">agent</p>
-              <p class="acct-role">Chrome</p>
+              <p class="acct-role">Chrome and the desktop</p>
               <h5>Holds</h5>
               <ul>
                 <li>Your signed-in sessions</li>
+                <li>A broker for the desktop’s apps, which answers only agentd, and only for the apps you list</li>
               </ul>
               <h5>Can’t</h5>
               <ul class="cant">
@@ -349,7 +414,7 @@ paste.example.net:443      <span class="x">denied</span>
         </ul>
 
         <div class="note-auto">
-          <p><strong>Auto approve is off by default.</strong> Turn it on and ordinary shell commands and schedule setup go ahead without a card. Browser input, saved keys, new sites, direct internet and data going out after outside content still wait for you.</p>
+          <p><strong>Auto approve is off by default.</strong> Turn it on and ordinary shell commands and schedule setup go ahead without a card. Browser and app input, saved keys, new sites, direct internet and data going out after outside content still wait for you.</p>
           <p>Long tasks have no step cap. A supervisor, a separate model call, reviews progress every 30 minutes of work or 60 turns, and if a task looks stuck it asks you whether to keep going.</p>
         </div>
       </div>
@@ -496,6 +561,7 @@ make url            <span class="c"># open this on your tailnet</span></code></p
         <li><a href="getting-started.html">Getting started</a></li>
         <li><a href="https://github.com/tzumby/agent_neo/blob/main/docs/architecture.md">Architecture</a></li>
         <li><a href="https://github.com/tzumby/agent_neo/blob/main/docs/memory-v2.md">Memory design</a></li>
+        <li><a href="https://github.com/tzumby/agent_neo/blob/main/docs/desktop-apps.md">Desktop apps</a></li>
         <li><a href="https://github.com/tzumby/agent_neo">GitHub</a></li>
       </ul>
     </div>

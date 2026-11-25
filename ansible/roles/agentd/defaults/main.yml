@@ -116,14 +116,29 @@ agentd_hcu_packages:
   - libxres1
   - xdotool
   - x11-utils
+  # update-desktop-database, for install_app's launchers.
+  - desktop-file-utils
 # The apps the agent may use: AT-SPI's id for the app, its executable (both
-# must match), the name you know it by, and its package. Every other window
-# (Chrome, a terminal, the file manager) is out of the tools' reach.
+# must match; * stands for one path segment, as in a snap's revision), the
+# name you know it by, and its apt package if Ansible installs it (snaps come
+# through install_app). Every other window (Chrome, a terminal, the file
+# manager) is out of the tools' reach.
 agentd_desktop_apps_allowed:
   - id: org.xfce.mousepad
     exe: /usr/bin/mousepad
     name: Mousepad
     package: mousepad
+  # The Snap Store's (install_app). Electron: started after the broker, its
+  # tree is there; the snap answers accessibility calls from the broker
+  # (unconfined), not from other snaps.
+  - id: slack
+    exe: /snap/slack/*/usr/lib/slack/slack
+    name: Slack
 agentd_desktop_broker_socket: /run/neo-desktop/broker.sock
+# Desktop apps the agent may ask to install (install_app): snaps, strictly
+# confined, from verified publishers, each on a card you approve. Root installs
+# them through the privileged helper (install-snap), which checks the store
+# again, and puts their launchers on the desktop and in the menu.
+agentd_app_installs: "{{ agentd_desktop_apps }}"
 # The desktop session's display (the desktop role's desktop_display).
 agentd_desktop_display: ":1"

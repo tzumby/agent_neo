@@ -499,6 +499,105 @@ strong { font-weight: 700; }
 .abilities h3 { font-size: 1.15rem; font-stretch: 106%; margin-bottom: 0.45rem; }
 .abilities p { margin: 0; color: var(--slate); }
 
+/* ---------- Desktop apps ---------- */
+
+.kicker {
+  display: inline-block;
+  font-size: 0.85rem; font-weight: 700; letter-spacing: 0.01em;
+  color: var(--signal-text);
+  margin-bottom: 0.9rem;
+}
+.apps-top {
+  display: grid; gap: clamp(2rem, 4vw, 3.5rem);
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+}
+@media (min-width: 980px) {
+  .apps-top { grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr); }
+}
+/* What the agent reads, and what you're asked: the tree, then the card over it. */
+.apps-figure { margin: 0; display: grid; gap: 0; }
+.tree-head {
+  padding: 0.75rem 1.1rem; margin: 0;
+  font-size: 0.85rem; color: var(--deep-muted);
+  border-bottom: 1px solid var(--deep-line);
+}
+.tree-body {
+  margin: 0; padding: 0.9rem 1.1rem 4.5rem;
+  font: 400 0.76rem/1.8 var(--mono);
+  white-space: pre; overflow-x: auto;
+}
+.tree-body .ref {
+  padding: 0 0.35em; border-radius: 4px;
+  background: var(--deep-2); color: #bef264; border: 1px solid var(--deep-line);
+}
+.tree-body .m { color: var(--deep-muted); }
+.app-card {
+  position: relative;
+  margin: -3.25rem 0 0 clamp(1rem, 8%, 3.5rem);
+  padding: 1rem 1.1rem 1.1rem;
+  background: var(--surface);
+  border: 1px solid var(--signal-line); border-left-width: 0.4rem; border-radius: 14px;
+  box-shadow: 0 1.5rem 3rem -1.5rem rgba(15, 38, 51, 0.45);
+}
+.app-card p { margin: 0; }
+.app-card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1rem; margin-bottom: 0.6rem; }
+.app-card-title { font-weight: 750; font-size: 1.08rem; }
+.app-chip {
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  padding: 0.2rem 0.6rem; border-radius: 999px;
+  border: 1px solid var(--rule); color: var(--slate);
+  font-size: 0.82rem; font-weight: 600;
+}
+.app-chip svg { width: 0.95rem; height: 0.95rem; }
+.app-card-said { font-weight: 650; margin-bottom: 0.35rem !important; }
+.app-card-target { color: var(--ink-2); margin-bottom: 0.75rem !important; }
+.app-card-inset {
+  padding: 0.6rem 0.8rem; margin-bottom: 0.6rem;
+  border-radius: 10px; background: var(--inset);
+  font-size: 0.9rem;
+}
+.app-card-inset .strong { font-weight: 650; margin-bottom: 0.15rem; }
+.app-card-inset p:not(.strong) { color: var(--slate); }
+.app-card-steps { list-style: none; margin: 0.2rem 0 0.8rem; padding: 0; display: grid; gap: 0.55rem; }
+.app-card-steps li { display: flex; gap: 0.6rem; align-items: flex-start; font-size: 0.95rem; }
+.app-card-steps .n {
+  flex: none; display: inline-grid; place-items: center;
+  width: 1.35rem; height: 1.35rem; margin-top: 0.05rem; border-radius: 999px;
+  border: 1px solid var(--rule); color: var(--slate);
+  font-size: 0.75rem; font-weight: 700;
+}
+.app-card-steps kbd {
+  padding: 0.05rem 0.4rem; border-radius: 0.35rem;
+  border: 1px solid var(--rule); border-bottom-width: 2px;
+  font: 600 0.8rem/1.4 var(--mono);
+}
+.app-card-quote {
+  display: block; margin-top: 0.35rem; padding: 0.15rem 0 0.15rem 0.7rem;
+  border-left: 3px solid var(--signal-line);
+  font: 400 0.85rem/1.6 var(--mono); color: var(--ink-2);
+}
+.app-card-window { color: var(--slate); font: 400 0.78rem/1.5 var(--mono); margin-bottom: 0.9rem !important; }
+.app-card-btns { display: flex; justify-content: flex-end; gap: 0.5rem; }
+.app-card-btns span {
+  padding: 0.45rem 0.9rem; border-radius: 0.6rem;
+  border: 1px solid var(--rule); font-size: 0.9rem; font-weight: 650;
+}
+.app-card-btns .pri { background: var(--signal); border-color: var(--signal); color: #0f2633; }
+
+.apps-points { list-style: none; display: grid; gap: 1.6rem; }
+.apps-points li { border-top: 2px solid var(--ink); padding-top: 0.9rem; }
+.apps-points h3 { font-size: 1.12rem; font-stretch: 106%; margin-bottom: 0.4rem; }
+.apps-points p { margin: 0; color: var(--slate); }
+.apps-note {
+  margin: clamp(2.5rem, 5vw, 3.5rem) 0 0;
+  max-width: 46rem;
+  border-left: 4px solid var(--signal-line);
+  padding: 0.2rem 0 0.2rem 1.1rem;
+  color: var(--slate);
+}
+.apps-note strong { color: var(--ink); }
+
 /* ---------- The harness (deep) ---------- */
 
 .deep {

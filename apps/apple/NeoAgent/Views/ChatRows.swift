@@ -27,6 +27,8 @@ struct ChatRow: View, Equatable {
                 BrowserApprovalCard(approval: approval, action: action)
             } else if let action = approval.app {
                 AppApprovalCard(approval: approval, action: action)
+            } else if let install = approval.install {
+                InstallApprovalCard(approval: approval, install: install)
             } else {
                 ApprovalCard(approval: approval)
             }
@@ -647,8 +649,9 @@ private struct BrowserApprovalCard: View {
 }
 
 /// "Click this in Mousepad?": the browser card's counterpart for the desktop's
-/// own apps, which the agent drives through their accessibility tree. Never
-/// editable.
+/// own apps, which the agent drives through their accessibility tree, or
+/// (with a model that sees the screen) by pixels of a screenshot. A batch
+/// lists every step, in order. Never editable.
 private struct AppApprovalCard: View {
     let approval: Approval
     let action: AppAction
@@ -670,31 +673,13 @@ private struct AppApprovalCard: View {
             }
             // The agent's reason first, then what the app itself shows, which the
             // agent's words can't change.
-            if action.action != "type", let summary = approval.summary {
+            if action.listsSteps || action.action != "type", let summary = approval.summary {
                 Text("The agent says: \(summary)").font(.app(.subheadline).weight(.medium))
             }
-            switch action.action {
-            case "type":
-                if !action.target.isEmpty {
-                    Text("In “\(action.target)”").font(.app(.footnote)).foregroundStyle(.secondary)
-                }
-                HStack(alignment: .top, spacing: 10) {
-                    Capsule().fill(.orange.opacity(0.6)).frame(width: 3)
-                    Text(action.text ?? "")
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .fixedSize(horizontal: false, vertical: true)
-            case "key":
-                HStack(spacing: 8) {
-                    KeyCap(key: action.key ?? "?")
-                    if !action.target.isEmpty {
-                        Text("in “\(action.target)”").foregroundStyle(.secondary)
-                    }
-                }
-                .font(.app(.callout))
-            default:
-                Text(clickTarget(role: action.role, name: action.target)).font(.app(.callout).weight(.medium))
+            if action.listsSteps {
+                AppStepList(action: action)
+            } else {
+                what
             }
             appFacts
             if !approval.reason.isEmpty {
@@ -714,8 +699,52 @@ private struct AppApprovalCard: View {
         .card()
     }
 
+    /// One input: what it does to what.
+    @ViewBuilder private var what: some View {
+        switch action.action {
+        case "type":
+            if !action.target.isEmpty {
+                Text("In “\(action.target)”").font(.app(.footnote)).foregroundStyle(.secondary)
+            }
+            AppQuote(text: action.text ?? "")
+        case "key":
+            HStack(spacing: 8) {
+                KeyCap(key: action.key ?? "?")
+                if !action.target.isEmpty {
+                    Text("in “\(action.target)”").foregroundStyle(.secondary)
+                }
+            }
+            .font(.app(.callout))
+        case "set_value", "select", "scroll", "activate", "close":
+            AppStepLines(words: oneStep, emphasized: true)
+        default:
+            let pointer = action.steps.first?.pointer == true
+            Text(clickTarget(role: action.role, name: action.target) + (pointer ? " with the mouse" : ""))
+                .font(.app(.callout).weight(.medium))
+        }
+    }
+
+    /// Its one step in words. Where it is in the app follows, as for a click.
+    private var oneStep: AppStep.Words {
+        var words = (action.steps.first ?? cardStep).words(window: action.window)
+        words.note = nil
+        return words
+    }
+
+    /// The card's own fields as a step, for a card without steps.
+    private var cardStep: AppStep {
+        var step = AppStep(action: action.action)
+        step.target = action.target
+        step.role = action.role
+        step.around = action.around
+        step.text = action.text
+        step.key = action.key
+        step.window = action.window
+        return step
+    }
+
     @ViewBuilder private var appFacts: some View {
-        if !action.around.isEmpty {
+        if !action.listsSteps, !action.around.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Where it is in the app").font(.app(.caption).weight(.semibold))
                 Text(action.around)
@@ -736,8 +765,15 @@ private struct AppApprovalCard: View {
         }
         if let path = action.imagePath {
             VStack(alignment: .leading, spacing: 6) {
-                RemoteImage(path: path)
-                Text("The desktop when the agent asked").font(.app(.caption)).foregroundStyle(.secondary)
+                if let frame = action.frame, !action.marks.isEmpty {
+                    MarkedScreenshot(path: path, frame: frame, marks: action.marks)
+                    Text("The desktop when the agent asked, numbered by step")
+                        .font(.app(.caption))
+                        .foregroundStyle(.secondary)
+                } else {
+                    RemoteImage(path: path)
+                    Text("The desktop when the agent asked").font(.app(.caption)).foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -747,16 +783,256 @@ private struct AppApprovalCard: View {
         return switch action.action {
         case "type": "Write this in \(app)?"
         case "key": "Press \(action.key ?? "a key") in \(app)?"
+        case "set_value": "Set this in \(app)?"
+        case "select": "Select this in \(app)?"
+        case "scroll": "Scroll in \(app)?"
+        case "activate": "Switch windows in \(app)?"
+        case "close": "Close this window in \(app)?"
+        case "act", "gui": "Do this in \(app)?"
         default: "Click this in \(app)?"
         }
     }
 
     private var icon: String {
         switch action.action {
-        case "type": "keyboard"
+        case "type", "set_value": "keyboard"
         case "key": action.key == "Enter" ? "return" : "keyboard"
+        case "activate", "close": "macwindow"
+        case "act": "list.number"
         default: "cursorarrow.click.2"
         }
+    }
+
+    private func answer(_ approved: Bool) {
+        guard let store, let client else { return }
+        Task { await store.answer(approval, approved: approved, text: nil, client: client) }
+    }
+}
+
+/// An app card's steps, numbered. A pixel step's number is orange, as its
+/// mark on the picture is.
+private struct AppStepList: View {
+    let action: AppAction
+
+    var body: some View {
+        let marked = Set(action.marks.map(\.step))
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(action.steps.enumerated()), id: \.offset) { index, step in
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    StepNumber(number: index + 1, marked: marked.contains(index + 1))
+                    AppStepLines(words: step.words(pixels: action.action == "gui", window: action.window))
+                }
+            }
+        }
+    }
+}
+
+private struct StepNumber: View {
+    let number: Int
+    let marked: Bool
+
+    var body: some View {
+        Text("\(number)")
+            .font(.app(.caption2).weight(.bold).monospacedDigit())
+            .foregroundStyle(marked ? AnyShapeStyle(.black) : AnyShapeStyle(.secondary))
+            .frame(minWidth: 20, minHeight: 20)
+            .background {
+                if marked {
+                    Capsule().fill(.orange)
+                } else {
+                    Capsule().strokeBorder(.secondary.opacity(0.5), lineWidth: 1)
+                }
+            }
+    }
+}
+
+/// A step in plain words: what it does, a keycap, the full text it writes,
+/// and, muted, where it is in the app and a window other than the card's.
+private struct AppStepLines: View {
+    let words: AppStep.Words
+    var emphasized = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(words.text)
+                if let key = words.key {
+                    KeyCap(key: key)
+                }
+            }
+            .font(emphasized ? .app(.callout).weight(.medium) : .app(.callout))
+            .foregroundStyle(words.quiet ? HierarchicalShapeStyle.secondary : .primary)
+            .fixedSize(horizontal: false, vertical: true)
+            if let note = words.note {
+                Text(note).font(.app(.caption)).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            if let quote = words.quote {
+                AppQuote(text: quote)
+            }
+            if let window = words.window {
+                Text(window).font(.app(.caption)).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+        }
+    }
+}
+
+/// What it writes, in full, its lines kept.
+private struct AppQuote: View {
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Capsule().fill(.orange.opacity(0.6)).frame(width: 3)
+            Text(text)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// The screenshot a pixel batch was planned on: a ring where each step acts,
+/// which leaves what it acts on in sight, with the step's number beside it,
+/// and a drag's path drawn. The marks are placed in fractions of the picture,
+/// so they stay put as it scales.
+private struct MarkedScreenshot: View {
+    let path: String
+    let frame: AppAction.Frame
+    let marks: [AppAction.Mark]
+
+    var body: some View {
+        RemoteImage(path: path, aspectRatio: frame.width / frame.height)
+            .overlay {
+                GeometryReader { geometry in
+                    let size = geometry.size
+                    ZStack(alignment: .topLeading) {
+                        ForEach(marks, id: \.step) { mark in
+                            let points = mark.points.map { CGPoint(x: $0.x * size.width, y: $0.y * size.height) }
+                            if points.count > 1, let end = points.last {
+                                Path { $0.addLines(points) }
+                                    .stroke(.orange, style: StrokeStyle(lineWidth: 2.5, lineCap: .round, dash: [6, 4]))
+                                ring(12).position(end)
+                            }
+                            if let start = points.first {
+                                ring(20).position(start)
+                                badge(mark.step).position(x: start.x + 14, y: start.y - 14)
+                            }
+                        }
+                    }
+                }
+                .accessibilityHidden(true)
+            }
+    }
+
+    private func ring(_ size: CGFloat) -> some View {
+        ZStack {
+            Circle().stroke(.white, lineWidth: 5)
+            Circle().stroke(.orange, lineWidth: 2)
+        }
+        .frame(width: size, height: size)
+    }
+
+    private func badge(_ number: Int) -> some View {
+        Text("\(number)")
+            .font(.system(size: 11, weight: .bold).monospacedDigit())
+            .foregroundStyle(.black)
+            .padding(.horizontal, 4)
+            .frame(minWidth: 18, minHeight: 18)
+            .background(.orange, in: .capsule)
+            .overlay(Capsule().stroke(.white, lineWidth: 1.5))
+            .shadow(color: .black.opacity(0.4), radius: 2, y: 1)
+    }
+}
+
+/// "Install Slack?": an app from a store (the Snap Store), installed on the
+/// desktop as root. The agent's reason first, then what the store says about
+/// it, which the agent's words can't change. Never editable.
+private struct InstallApprovalCard: View {
+    let approval: Approval
+    let install: AppInstall
+    @Environment(\.chatStore) private var store
+    @Environment(\.agentClient) private var client
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.down.app").foregroundStyle(.orange)
+                Text(title).font(.app(.headline))
+                Spacer()
+                if !install.source.isEmpty {
+                    Label(install.source, systemImage: "shippingbox")
+                        .font(.app(.footnote))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            if !install.why.isEmpty {
+                Text("The agent says: \(install.why)").font(.app(.subheadline).weight(.medium))
+            }
+            storeFacts
+            if install.confinement == "strict" {
+                Text("Strictly confined: it runs in the Snap sandbox with a snap's usual access, which includes your desktop user's files.")
+                    .font(.app(.footnote))
+                    .foregroundStyle(.secondary)
+            }
+            if approval.tainted {
+                Label(
+                    "The agent read web pages or other outside content before asking. Check this is an app you asked for.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.app(.footnote))
+                .foregroundStyle(.orange)
+            }
+            if !approval.reason.isEmpty {
+                Text("It \(approval.reason).").font(.app(.footnote)).foregroundStyle(.secondary)
+            }
+            // Shown only while it waits: answered, it leaves the chat.
+            HStack(spacing: 10) {
+                Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
+                    .glassButton()
+                Button { answer(true) } label: {
+                    Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
+                }
+                .primaryGlass()
+            }
+            .controlSize(.large)
+        }
+        .card()
+    }
+
+    private var storeFacts: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if !install.publisher.isEmpty {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(install.publisher).font(.app(.subheadline).weight(.semibold))
+                    if install.verified {
+                        Label("Verified publisher", systemImage: "checkmark.seal.fill")
+                            .font(.app(.caption).weight(.medium))
+                            .foregroundStyle(.green)
+                    }
+                }
+            }
+            if !install.details.isEmpty {
+                Text(install.details).font(.app(.subheadline))
+            }
+            if !install.summary.isEmpty {
+                Text(install.summary).font(.app(.footnote)).foregroundStyle(.secondary)
+            }
+            if !install.name.isEmpty {
+                Text(install.name)
+                    .font(.app(.footnote).monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.inset, in: .rect(cornerRadius: 14))
+    }
+
+    private var title: String {
+        let app = !install.app.isEmpty ? install.app : !install.name.isEmpty ? install.name : "this app"
+        return "Install \(app)?"
     }
 
     private func answer(_ approved: Bool) {
@@ -768,8 +1044,7 @@ private struct AppApprovalCard: View {
 /// What a click card calls its element: Button “Confirm”; “without a name”
 /// when it has none.
 private func clickTarget(role: String, name: String) -> String {
-    let name = name.isEmpty ? "without a name" : "“\(name)”"
-    return role.isEmpty ? name : "\(role.prefix(1).uppercased())\(role.dropFirst()) \(name)"
+    AppStep.clickTarget(role: role, name: name)
 }
 
 private struct Outcome: View {

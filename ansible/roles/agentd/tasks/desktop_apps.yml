@@ -14,7 +14,7 @@
 
 - name: Install what HCU's Linux provider needs, and the apps
   ansible.builtin.apt:
-    name: "{{ agentd_hcu_packages + (agentd_desktop_apps_allowed | map(attribute='package') | list) }}"
+    name: "{{ agentd_hcu_packages + (agentd_desktop_apps_allowed | selectattr('package', 'defined') | map(attribute='package') | list) }}"
     state: present
     install_recommends: false
 

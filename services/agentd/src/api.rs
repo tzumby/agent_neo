@@ -127,7 +127,9 @@ pub fn stage_of(facts: &StageFacts) -> (&'static str, Value) {
     };
     // Every card that waits for an OK: a command, the browser, a native app,
     // a schedule, a site to allow, or a task that looks stuck.
-    if let Some((id, kind, session)) = card(&["shell", "browser", "app", "schedule", "access", "stuck"]) {
+    if let Some((id, kind, session)) = card(&[
+        "shell", "browser", "app", "install", "schedule", "access", "stuck",
+    ]) {
         return (
             "needs_you/approval",
             json!({"card": id, "kind": kind, "session": session}),
@@ -1705,7 +1707,9 @@ mod tests {
             with(|f| f.cards = vec![("s1".into(), "secret".into(), "main".into())]),
             "needs_you/secret"
         );
-        for kind in ["shell", "browser", "app", "schedule", "access", "stuck"] {
+        for kind in [
+            "shell", "browser", "app", "install", "schedule", "access", "stuck",
+        ] {
             assert_eq!(
                 with(|f| f.cards = vec![("a1".into(), kind.into(), "main".into())]),
                 "needs_you/approval"

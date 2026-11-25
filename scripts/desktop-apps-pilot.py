@@ -2,15 +2,17 @@
 as root (copy it over `make shell`): a fixture in Mousepad, a chat request to
 agentd over its socket, and its approval cards answered by a rule.
 
-    python3 -I desktop-apps-pilot.py setup      # notes.txt open in Mousepad, unsaved
-    python3 -I desktop-apps-pilot.py chat "<request>" [approve|deny|off|tamper|kill]
+    python3 -I desktop-apps-pilot.py setup [clean]  # notes.txt open in Mousepad, unsaved (clean: saved)
+    python3 -I desktop-apps-pilot.py chat "<request>" [approve|deny|off|tamper|kill] [model]
     python3 -I desktop-apps-pilot.py schedule "<request>"   # as a scheduled run
     python3 -I desktop-apps-pilot.py check      # the file and the window title
+    python3 -I desktop-apps-pilot.py cleanup    # the pilot's conversations, memories and files
 
-approve: OKs only Mousepad's File and Save clicks, denies the rest. deny:
+approve: OKs Mousepad's cards (any input), denies the rest. deny:
 denies all. off: turns Browser actions off first (and on after). tamper: the
 app saves itself while the first card waits. kill: computer-use is killed
-0.6 s after the first OK. Each chat starts a conversation called "HCU pilot".
+0.6 s after the first OK. Each chat starts a conversation called "HCU pilot",
+and the agent may remember what it did there; cleanup removes both.
 """
 
 import http.client
@@ -58,7 +60,7 @@ def as_agent(*args, background=False):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-def setup():
+def setup(dirty=True):
     # A test reset: unsaved changes go (SIGTERM would ask about them).
     subprocess.run(["pkill", "-KILL", "-u", "agent", "-x", "mousepad"])
     time.sleep(1)
@@ -74,6 +76,9 @@ def setup():
     else:
         sys.exit("Mousepad didn't open")
     win = found[0]
+    if not dirty:
+        check()
+        return
     # Real (XTEST) input to the active window: GTK ignores synthetic events.
     # ("- milk" as text would read as an option: the dash is a key.)
     as_agent("xdotool", "windowactivate", "--sync", win, "mousemove", "--window", win, "300", "200", "click", "1",
@@ -94,7 +99,11 @@ def compact(kind, data):
     return text if len(text) < 600 else text[:600] + "…"
 
 
-def chat(request, policy):
+def chat(request, policy, model=None):
+    previous = None
+    if model:
+        previous = api("GET", "/api/v1/settings")[1]["model"]
+        api("PUT", "/api/v1/settings", {"model": model})
     if policy == "off":
         api("PUT", "/api/v1/settings", {"allow_actions": False})
     status, session = api("POST", "/api/v1/sessions", {"title": "HCU pilot"})
@@ -122,8 +131,7 @@ def chat(request, policy):
             if kind == "approval.requested":
                 cards += 1
                 card = data
-                ok = (policy != "deny" and card.get("kind") == "app" and card.get("app") == "Mousepad"
-                      and card.get("target") in ("File", "Save"))
+                ok = policy != "deny" and card.get("kind") == "app" and card.get("app") == "Mousepad"
                 if ok and policy == "tamper" and cards == 1:
                     # While the user decides, the app changes: it saves on its
                     # own (the title loses its "*"), so the card is out of date.
@@ -131,9 +139,8 @@ def chat(request, policy):
                     as_agent("xdotool", "windowactivate", "--sync", win, "key", "Escape", "ctrl+s")
                     time.sleep(1)
                     print("          (tampered: the app saved, and its menu closed, before the OK)")
-                print(f"          card: {card.get('kind')} {card.get('action')} {card.get('role')} “{card.get('target')}” in "
-                      f"{card.get('app')} / {card.get('window')!r}; around: {card.get('around')!r}; "
-                      f"image: {bool(card.get('image'))}; binding: {json.dumps(card.get('binding'))[:300]}")
+                print(f"          card: {card.get('kind')} {card.get('action')} in {card.get('app')} / {card.get('window')!r}; "
+                      f"image: {bool(card.get('image'))}; steps: {json.dumps(card.get('steps'), ensure_ascii=False)[:600]}")
                 print(f"          -> {'approve' if ok else 'deny'}")
                 api("POST", f"/api/v1/approvals/{card['id']}", {"approved": ok})
                 if ok and policy == "kill" and cards == 1:
@@ -162,6 +169,8 @@ def chat(request, policy):
                                     "status": done.get("status")}))
     if policy == "off":
         api("PUT", "/api/v1/settings", {"allow_actions": True})
+    if previous:
+        api("PUT", "/api/v1/settings", {"model": previous})
     check()
 
 
@@ -205,13 +214,34 @@ def scheduled(request):
     check()
 
 
+def cleanup():
+    """Deletes the "HCU pilot" conversations and forgets what the agent
+    remembered about the fixture (its folder, hcu-pilot, is only the pilot's).
+    Closes Mousepad and removes the fixture."""
+    for archived in ("0", "1"):
+        _, listed = api("GET", f"/api/v1/sessions?archived={archived}")
+        for session in listed["sessions"]:
+            if session.get("title") == "HCU pilot":
+                print("conversation", session["id"], api("DELETE", f"/api/v1/sessions/{session['id']}")[0])
+    _, listed = api("GET", "/api/v1/memory?status=active,superseded,expired&limit=500")
+    for memory in listed["memories"]:
+        item = memory.get("item", memory)
+        if "hcu-pilot" in item.get("text", ""):
+            print("memory", item["id"], api("DELETE", f"/api/v1/memory/{item['id']}")[0], item["text"][:70])
+    as_agent("pkill", "-x", "mousepad")
+    subprocess.run(["rm", "-rf", "/home/agent/hcu-pilot"], check=True)
+    print("fixture removed")
+
+
 if __name__ == "__main__":
     what = sys.argv[1]
     if what == "setup":
-        setup()
+        setup(dirty=sys.argv[2:] != ["clean"])
     elif what == "check":
         check()
     elif what == "schedule":
         scheduled(sys.argv[2])
+    elif what == "cleanup":
+        cleanup()
     elif what == "chat":
-        chat(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "approve")
+        chat(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "approve", sys.argv[4] if len(sys.argv) > 4 else None)

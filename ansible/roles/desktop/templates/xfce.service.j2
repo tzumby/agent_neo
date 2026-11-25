@@ -17,9 +17,14 @@ WorkingDirectory={{ desktop_home }}
 Environment=DISPLAY={{ desktop_display }} XAUTHORITY={{ desktop_xauthority }} HOME={{ desktop_home }} XDG_RUNTIME_DIR=/run/user/{{ desktop_user_info.uid }}
 ExecStartPre={{ desktop_libexec_dir }}/wait-for-display
 {% if desktop_apps | bool %}
-# startxfce4 keeps a bus it's given; its xinitrc passes DISPLAY and the rest
-# to services the bus starts (the accessibility bus, xfconfd).
+# startxfce4 keeps a bus it's given. Services the bus starts (the
+# accessibility bus and its registry, xfconfd) need the display too, which
+# XFCE's xinitrc doesn't pass on (a display manager would): without it, the
+# registry can't synthesize keys, and every key chord HCU sends goes nowhere.
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ desktop_user_info.uid }}/bus
+ExecStartPre=/usr/bin/dbus-update-activation-environment --systemd DISPLAY XAUTHORITY
+# An accessibility bus already running from before starts again with them.
+ExecStartPre=-/usr/bin/systemctl --user try-restart at-spi-dbus-bus.service
 ExecStart=/usr/bin/startxfce4
 {% else %}
 ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/startxfce4

@@ -9,7 +9,7 @@ import { inline, parse, safeHref } from "../public/assets/js/markdown.js";
 import { deviceLabel, fromBase64Url, iosOutsideHomeScreen, isIOS, ownSubscription, pushState, pushSupported } from "../public/assets/js/push.js";
 import { ApiError } from "../public/assets/js/api.js";
 import { Store } from "../public/assets/js/store.js";
-import { Timeline, duration, rowKey, workingFor } from "../public/assets/js/timeline.js";
+import { Timeline, appStepWords, clickTarget, duration, megabytes, rowKey, workingFor } from "../public/assets/js/timeline.js";
 
 let seq = 0;
 const ev = (kind, data = {}) => ({ seq: ++seq, ts: "2026-11-03T08:00:00Z", kind, data });
@@ -78,9 +78,108 @@ test("a click in a native app is a card of its own, with what the app shows", ()
   assert.deepEqual(card.app, {
     action: "click", app: "Mousepad", window: "~/notes.txt - Mousepad", target: "Save", role: "menuitem",
     text: null, key: null, around: "menu “File” › menuitem “Save” — Save the current document", image: "/api/v1/images/ab12",
-  });
+    steps: [], frame: null,
+  }, "an older card has no steps");
   const bare = new Timeline([ev("approval.requested", { id: "c10", kind: "app", action: "click", target: null, around: null, summary: null, image: null })]).visible()[0];
   assert.deepEqual([bare.app.target, bare.app.around, bare.app.image, bare.summary], ["", "", null, null]);
+  assert.deepEqual([clickTarget("menuitem", "Save"), clickTarget("push button", ""), clickTarget("", "OK")],
+    ["Menuitem “Save”", "Push button without a name", "“OK”"]);
+});
+
+test("a batch in a native app lists every step, with all the text it writes", () => {
+  const card = new Timeline([ev("approval.requested", {
+    task: "t1", id: "c11", kind: "app", action: "act", app: "Mousepad", window: "*notes.txt - Mousepad",
+    summary: "Add milk and save", reason: "may change or send something in the app", image: "/api/v1/images/ab12",
+    steps: [
+      { action: "type", target: "", role: "textbox", around: "tablist › textbox", text: "- milk\n- eggs ✓" },
+      { action: "key", key: "CTRL+S", window: "*notes.txt - Mousepad" },
+      { action: "click", target: "Save", role: "menuitem", around: "menu “File” › menuitem “Save”", pointer: true },
+      { action: "wait", for: "a window “Save As”", gone: true },
+      "odd", null,
+    ],
+  })]).visible()[0];
+  const a = card.app;
+  assert.deepEqual([a.action, a.app, a.window, a.target, a.text, a.frame, card.summary],
+    ["act", "Mousepad", "*notes.txt - Mousepad", "", null, null, "Add milk and save"], "a batch's fields stay on its steps");
+  assert.equal(a.steps.length, 4, "what isn't a step is left out");
+  assert.deepEqual(a.steps[0], {
+    action: "type", target: "", role: "textbox", around: "tablist › textbox", text: "- milk\n- eggs ✓", key: null,
+    window: "", pointer: false, range: false, direction: "", pages: null, for: "", gone: false, button: "", points: [],
+  });
+  assert.deepEqual([a.steps[1].action, a.steps[1].key, a.steps[1].window], ["key", "CTRL+S", "*notes.txt - Mousepad"]);
+  assert.deepEqual([a.steps[2].pointer, a.steps[3].for, a.steps[3].gone], [true, "a window “Save As”", true]);
+  const words = a.steps.map((s) => appStepWords(s, { window: a.window }));
+  assert.deepEqual(words[0], {
+    text: "Write in Textbox:", key: null, quote: "- milk\n- eggs ✓", note: "tablist › textbox", window: null, quiet: false,
+  }, "the full text, its lines kept");
+  assert.deepEqual([words[1].text, words[1].key, words[1].window], ["Press", "CTRL+S", null], "the card's own window isn't repeated");
+  assert.deepEqual([words[2].text, words[2].note], ["Click Menuitem “Save” with the mouse", "menu “File” › menuitem “Save”"]);
+  assert.deepEqual([words[3].text, words[3].quiet], ["Wait for a window “Save As” to go away", true]);
+  const say = (step) => appStepWords({ action: "", target: "", role: "", around: "", text: null, points: [], ...step }).text;
+  assert.deepEqual([
+    say({ action: "set_value", role: "spinbutton", target: "Size", text: "42" }),
+    say({ action: "select", role: "textbox", text: "Line one" }),
+    say({ action: "select", role: "listitem", target: "Blue" }),
+    say({ action: "select", role: "cell", target: "A1", range: true }),
+    say({ action: "scroll", role: "list", target: "Files", direction: "down", pages: 2 }),
+    say({ action: "activate", window: "Save As" }),
+    say({ action: "close", window: "Untitled 1 - Mousepad" }),
+  ], [
+    "Set Spinbutton “Size” to:", "Select “Line one” in Textbox", "Select Listitem “Blue”", "Select from Cell “A1”…",
+    "Scroll down 2 pages in List “Files”", "Switch to the window “Save As”", "Close the window “Untitled 1 - Mousepad”",
+  ]);
+});
+
+test("a pixel batch keeps its points and the picture's size, for the marks", () => {
+  const card = new Timeline([ev("approval.requested", {
+    task: "t1", id: "c12", kind: "app", action: "gui", app: "Mousepad", window: "notes.txt - Mousepad",
+    summary: "Open the File menu and drag the file", image: "/api/v1/images/cd34", frame: { width: 1229, height: 768 },
+    steps: [
+      { action: "click", x: 100, y: 120.4, button: "right", keys: ["CTRL"], key: "CTRL", window: "notes.txt - Mousepad", app: "Mousepad" },
+      { action: "drag", path: [{ x: 10, y: 10 }, { x: "far", y: 5 }, { x: 200, y: 300 }], window: "Files", app: "Thunar" },
+      { action: "keypress", keys: ["CTRL", "S"] },
+      { action: "scroll", x: "400", y: 300, scroll_y: 3 },
+      { action: "wait" },
+    ],
+  })]).visible()[0];
+  const a = card.app;
+  assert.deepEqual([a.action, a.frame, a.image], ["gui", { width: 1229, height: 768 }, "/api/v1/images/cd34"]);
+  assert.deepEqual(a.steps.map((s) => s.points), [
+    [{ x: 100, y: 120.4 }], [{ x: 10, y: 10 }, { x: 200, y: 300 }], [], [], [],
+  ], "a point that isn't a number is dropped");
+  assert.deepEqual([a.steps[0].button, a.steps[0].key, a.steps[2].key], ["right", "CTRL", "CTRL+S"]);
+  const words = a.steps.map((s) => appStepWords(s, { pixels: true, window: a.window }));
+  assert.deepEqual(words.map((w) => w.text), [
+    "Click at 100, 120 (right button), holding CTRL", "Drag from 10, 10 to 200, 300", "Press", "Scroll", "Wait a second",
+  ]);
+  assert.deepEqual([words[0].window, words[1].window, words[2].key, words[4].quiet], [null, "In “Files”", "CTRL+S", true]);
+  const odd = new Timeline([ev("approval.requested", {
+    id: "c13", kind: "app", action: "gui", frame: { width: 0, height: "768" }, steps: { action: "click" },
+  })]).visible()[0];
+  assert.deepEqual([odd.app.frame, odd.app.steps], [null, []]);
+});
+
+test("an app install is a card of its own, with what the store says", () => {
+  const card = new Timeline([ev("approval.requested", {
+    task: "t1", id: "c7", kind: "install", source: "Snap Store", name: "slack", app: "Slack", publisher: "Slack",
+    verified: true, version: "4.53.292", channel: "stable", confinement: "strict",
+    summary: "Team communication for the 21st century.", size: 233066496,
+    why: "So you can use Slack as a desktop app", reason: "installs an app on your desktop, as root", tainted: true,
+  })]).visible()[0];
+  assert.equal(card.kind, "install", "not the shell card");
+  assert.deepEqual(
+    [card.summary, card.reason, card.tainted, card.editable, card.app],
+    [null, "installs an app on your desktop, as root", true, false, undefined], "the summary is the store's, not the agent's");
+  assert.deepEqual(card.install, {
+    source: "Snap Store", name: "slack", app: "Slack", publisher: "Slack", verified: true, version: "4.53.292",
+    channel: "stable", confinement: "strict", summary: "Team communication for the 21st century.", size: 233066496,
+    why: "So you can use Slack as a desktop app",
+  });
+  const bare = new Timeline([ev("approval.requested", { id: "c8", kind: "install", name: "slack", summary: "", size: null, why: null })]).visible()[0];
+  assert.deepEqual(
+    [bare.install.app, bare.install.verified, bare.install.summary, bare.install.size, bare.install.why, bare.tainted],
+    ["", false, "", null, "", false]);
+  assert.deepEqual([megabytes(233066496), megabytes(4_240_000), megabytes(4_000_000), megabytes(1200)], ["233 MB", "4.2 MB", "4 MB", "0.1 MB"]);
 });
 
 test("shell approval cards preserve the full command and its access details", () => {

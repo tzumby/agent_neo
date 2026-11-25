@@ -1015,6 +1015,7 @@ private struct StageBanner: View {
             let what = switch detail?["kind"]?.string {
             case "browser": "approve a change in the browser"
             case "app": "approve a change in an app"
+            case "install": "approve an app install"
             case "schedule": "approve a schedule"
             case "access": "allow a site"
             case "stuck": "your task looks stuck"

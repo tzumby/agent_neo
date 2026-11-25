@@ -25,6 +25,8 @@ struct ChatRow: View, Equatable {
                 StuckCard(approval: approval, check: check)
             } else if let action = approval.browser {
                 BrowserApprovalCard(approval: approval, action: action)
+            } else if let action = approval.app {
+                AppApprovalCard(approval: approval, action: action)
             } else {
                 ApprovalCard(approval: approval)
             }
@@ -552,7 +554,7 @@ private struct BrowserApprovalCard: View {
                 }
                 .font(.app(.callout))
             default:
-                Text(clickTarget).font(.app(.callout).weight(.medium))
+                Text(clickTarget(role: action.role, name: action.target)).font(.app(.callout).weight(.medium))
             }
             pageFacts
             if legacySend {
@@ -617,12 +619,6 @@ private struct BrowserApprovalCard: View {
         }
     }
 
-    /// Button “Confirm”
-    private var clickTarget: String {
-        let name = action.target.isEmpty ? "without a name" : "“\(action.target)”"
-        return action.role.isEmpty ? name : "\(action.role.prefix(1).uppercased())\(action.role.dropFirst()) \(name)"
-    }
-
     private var title: String {
         switch action.action {
         case "type": action.submit ? "Write this and press Enter?" : "Write this?"
@@ -648,6 +644,132 @@ private struct BrowserApprovalCard: View {
         let text = approved ? draft.changed(from: action.text ?? "") : nil
         Task { await store.answer(approval, approved: approved, text: text, client: client) }
     }
+}
+
+/// "Click this in Mousepad?": the browser card's counterpart for the desktop's
+/// own apps, which the agent drives through their accessibility tree. Never
+/// editable.
+private struct AppApprovalCard: View {
+    let approval: Approval
+    let action: AppAction
+    @Environment(\.chatStore) private var store
+    @Environment(\.agentClient) private var client
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: icon).foregroundStyle(.orange)
+                Text(title).font(.app(.headline))
+                Spacer()
+                if !action.app.isEmpty {
+                    Label(action.app, systemImage: "macwindow")
+                        .font(.app(.footnote))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            // The agent's reason first, then what the app itself shows, which the
+            // agent's words can't change.
+            if action.action != "type", let summary = approval.summary {
+                Text("The agent says: \(summary)").font(.app(.subheadline).weight(.medium))
+            }
+            switch action.action {
+            case "type":
+                if !action.target.isEmpty {
+                    Text("In “\(action.target)”").font(.app(.footnote)).foregroundStyle(.secondary)
+                }
+                HStack(alignment: .top, spacing: 10) {
+                    Capsule().fill(.orange.opacity(0.6)).frame(width: 3)
+                    Text(action.text ?? "")
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .fixedSize(horizontal: false, vertical: true)
+            case "key":
+                HStack(spacing: 8) {
+                    KeyCap(key: action.key ?? "?")
+                    if !action.target.isEmpty {
+                        Text("in “\(action.target)”").foregroundStyle(.secondary)
+                    }
+                }
+                .font(.app(.callout))
+            default:
+                Text(clickTarget(role: action.role, name: action.target)).font(.app(.callout).weight(.medium))
+            }
+            appFacts
+            if !approval.reason.isEmpty {
+                Text("It \(approval.reason).").font(.app(.footnote)).foregroundStyle(.secondary)
+            }
+            // Shown only while it waits: answered, it leaves the chat.
+            HStack(spacing: 10) {
+                Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
+                    .glassButton()
+                Button { answer(true) } label: {
+                    Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
+                }
+                .primaryGlass()
+            }
+            .controlSize(.large)
+        }
+        .card()
+    }
+
+    @ViewBuilder private var appFacts: some View {
+        if !action.around.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Where it is in the app").font(.app(.caption).weight(.semibold))
+                Text(action.around)
+                    .font(.app(.footnote))
+                    .textSelection(.enabled)
+            }
+            .foregroundStyle(.secondary)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.inset, in: .rect(cornerRadius: 14))
+        }
+        if !action.window.isEmpty {
+            Text(action.window)
+                .font(.app(.caption))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+        if let path = action.imagePath {
+            VStack(alignment: .leading, spacing: 6) {
+                RemoteImage(path: path)
+                Text("The desktop when the agent asked").font(.app(.caption)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var title: String {
+        let app = action.app.isEmpty ? "the app" : action.app
+        return switch action.action {
+        case "type": "Write this in \(app)?"
+        case "key": "Press \(action.key ?? "a key") in \(app)?"
+        default: "Click this in \(app)?"
+        }
+    }
+
+    private var icon: String {
+        switch action.action {
+        case "type": "keyboard"
+        case "key": action.key == "Enter" ? "return" : "keyboard"
+        default: "cursorarrow.click.2"
+        }
+    }
+
+    private func answer(_ approved: Bool) {
+        guard let store, let client else { return }
+        Task { await store.answer(approval, approved: approved, text: nil, client: client) }
+    }
+}
+
+/// What a click card calls its element: Button “Confirm”; “without a name”
+/// when it has none.
+private func clickTarget(role: String, name: String) -> String {
+    let name = name.isEmpty ? "without a name" : "“\(name)”"
+    return role.isEmpty ? name : "\(role.prefix(1).uppercased())\(role.dropFirst()) \(name)"
 }
 
 private struct Outcome: View {

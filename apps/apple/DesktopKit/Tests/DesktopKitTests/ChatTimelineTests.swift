@@ -132,6 +132,36 @@ private func aTask() throws -> [AgentEvent] {
     #expect(action.around == "March, $120 Confirm" && action.imagePath == "/api/v1/images/ab")
 }
 
+@Test func aClickInANativeAppKeepsWhatTheAppShows() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(
+        try event(
+            1, "approval.requested",
+            #"{"task":"t1","id":"c9","kind":"app","action":"click","app":"Mousepad","window":"~/notes.txt - Mousepad","target":"Save","role":"menuitem","around":"menu “File” › menuitem “Save” — Save the current document","summary":"Save the shopping list","reason":"may change or send something in the app","image":"/api/v1/images/ab12","binding":{"pid":4242},"tainted":true}"#
+        ))
+    guard case .approval(let card) = timeline.visibleItems.last, let action = card.app else {
+        Issue.record("no app card")
+        return
+    }
+    #expect(
+        action
+            == AppAction(
+                action: "click", app: "Mousepad", window: "~/notes.txt - Mousepad", target: "Save", role: "menuitem",
+                text: nil, key: nil, around: "menu “File” › menuitem “Save” — Save the current document",
+                imagePath: "/api/v1/images/ab12"))
+    #expect(card.summary == "Save the shopping list" && card.reason == "may change or send something in the app")
+    #expect(card.tainted && !card.editable && card.command.isEmpty && card.browser == nil)
+    timeline.apply(
+        try event(2, "approval.requested", #"{"id":"c10","kind":"app","action":"click","target":null,"around":null,"summary":null,"image":null}"#))
+    guard case .approval(let bare) = timeline.visibleItems.last, let nameless = bare.app else {
+        Issue.record("no nameless app card")
+        return
+    }
+    #expect(nameless.target.isEmpty && nameless.around.isEmpty && nameless.imagePath == nil && bare.summary == nil)
+    timeline.apply(try event(3, "approval.resolved", #"{"task":"t1","id":"c9","approved":true}"#))
+    #expect(timeline.visibleItems.count == 1)
+}
+
 @Test func aCardSaysWhetherItTakesAnEdit() throws {
     var timeline = ChatTimeline()
     timeline.apply(

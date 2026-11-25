@@ -66,6 +66,12 @@ pub struct Config {
     /// How many conversations may work at the same moment (sessions.rs);
     /// more messages wait in the queue. At least 1.
     pub max_parallel_tasks: usize,
+    /// Native apps on the desktop through the desktop broker and HCU
+    /// (docs/desktop-apps.md): the app_* tools. Off unless the deployment
+    /// opts in (DESKTOP_APPS=on).
+    pub desktop_apps: bool,
+    /// The broker's socket, which only agentd may open.
+    pub desktop_broker: PathBuf,
 }
 
 fn read_kv(path: &Path, into: &mut HashMap<String, String>) -> Result<()> {
@@ -145,6 +151,8 @@ impl Config {
                 .parse::<usize>()
                 .context("MAX_PARALLEL_TASKS")?
                 .max(1),
+            desktop_apps: get("DESKTOP_APPS", "off") == "on",
+            desktop_broker: get("DESKTOP_BROKER", "/run/neo-desktop/broker.sock").into(),
         })
     }
 }

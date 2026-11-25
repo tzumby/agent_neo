@@ -10,6 +10,7 @@ mod cdp;
 mod clock;
 mod config;
 mod consolidate;
+mod desktop;
 mod effects;
 mod guard;
 mod llm;
@@ -41,6 +42,18 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).is_some_and(|arg| arg == "--version") {
         println!("agentd {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    // The desktop broker (desktop/broker.rs): the same binary, run by systemd
+    // as the desktop user, for native apps.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "desktop-broker") {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("agentd=info")),
+            )
+            .with_ansi(false)
+            .init();
+        return desktop::broker::main(&args[1..]).await;
     }
     // agentd runs as its own user; as root it would leave root-owned state.
     // /proc/self belongs to the process's effective user.

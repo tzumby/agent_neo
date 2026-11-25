@@ -81,3 +81,49 @@ agentd_dangerous: []
 
 agentd_ssm_prefix: "/neo-agent/{{ desktop_env | default('personal') }}"
 agentd_ssm_region: "{{ lookup('ansible.builtin.env', 'AWS_REGION', default='ca-central-1') }}"
+
+# --- Native apps (docs/desktop-apps.md) ------------------------------------------
+# Native apps on the desktop through Microsoft Research's Hybrid Computer Use
+# (HCU): the agent reads their accessibility trees and, with your OK, clicks
+# their controls. Off unless the deployment opts in (desktop_apps in
+# group_vars, which also moves XFCE to the user's bus: the desktop role).
+agentd_desktop_apps: "{{ desktop_apps | default(false) | bool }}"
+# The pinned release (tag v1.0.1, commit 00eaeebe8ac0d275e46f875bdb5347e5f326faa1):
+# its archive's and binary's SHA-256, per architecture. arm64 has no release
+# archive: build the pinned source for linux/arm64 (docs/desktop-apps.md §7)
+# and verify it on an arm64 desktop before adding it here.
+agentd_hcu_version: "1.0.1"
+agentd_hcu_sha256:
+  amd64:
+    archive: f078cb073b8284e158b91dcc202d47e38acf5f1ecd99245328f9b15f0a48c2fc
+    binary: 3a4243b3801b4e49c3fb50d0191e31be5bcc590cc700d2c921c3ff864a7f3923
+agentd_hcu_dir: /usr/local/lib/hcu/{{ agentd_hcu_version }}
+# Its MCP tools' input schemas (SHA-256 of their canonical JSON): the broker
+# refuses a computer-use whose tools differ.
+agentd_hcu_schema_sha256:
+  AX: 4f741356f65d63a840a9b36a07073a07c8cd1524a96b3e79e529b31025dea97f
+  GUI: c18483aa4c28eba5680f552ac52489385c48280c8f47692287d39ed706016475
+# What HCU's Linux provider needs (python3-gi and the typelibs, wmctrl,
+# libxres1; xdotool and x11-utils come with the desktop).
+agentd_hcu_packages:
+  - python3
+  - python3-gi
+  - at-spi2-core
+  - gir1.2-atspi-2.0
+  - gir1.2-gtk-3.0
+  - gir1.2-gdkpixbuf-2.0
+  - wmctrl
+  - libxres1
+  - xdotool
+  - x11-utils
+# The apps the agent may use: AT-SPI's id for the app, its executable (both
+# must match), the name you know it by, and its package. Every other window
+# (Chrome, a terminal, the file manager) is out of the tools' reach.
+agentd_desktop_apps_allowed:
+  - id: org.xfce.mousepad
+    exe: /usr/bin/mousepad
+    name: Mousepad
+    package: mousepad
+agentd_desktop_broker_socket: /run/neo-desktop/broker.sock
+# The desktop session's display (the desktop role's desktop_display).
+agentd_desktop_display: ":1"

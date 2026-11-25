@@ -9,6 +9,12 @@ desktop_width: 1280
 desktop_height: 800
 desktop_depth: 24
 
+# Native apps through Hybrid Computer Use (docs/desktop-apps.md), when a
+# deployment opts in (group_vars): XFCE then runs on the user's own bus, which
+# the desktop broker shares, and Chrome stays off the accessibility bus. The
+# rest (HCU, the apps, the broker) is the agentd role's.
+desktop_apps: false
+
 desktop_config_dir: /etc/neo-agent
 desktop_libexec_dir: /usr/local/lib/neo-agent
 
@@ -34,6 +40,8 @@ desktop_packages:
   - scrot
   - x11-utils
   - xauth
+  # The user's own session bus (systemd --user), which XFCE uses with native apps on.
+  - dbus-user-session
   - x11-xserver-utils
   - adwaita-icon-theme
   - fonts-noto-core

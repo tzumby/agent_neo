@@ -133,6 +133,13 @@ pub fn card_notice(card: &Value) -> Option<(String, String)> {
                 text("summary").or(text("target"))?.to_string(),
             ),
         },
+        "app" => (
+            match text("app") {
+                Some(app) => format!("Click this in {app}?"),
+                None => "Click this in the app?".into(),
+            },
+            text("summary").or(text("target"))?.to_string(),
+        ),
         "schedule" => (
             "Schedule this?".into(),
             text("name").or(text("text"))?.to_string(),

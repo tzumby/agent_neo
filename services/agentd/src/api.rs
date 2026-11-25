@@ -125,9 +125,9 @@ pub fn stage_of(facts: &StageFacts) -> (&'static str, Value) {
             .as_ref()
             .filter(|(_, status, _)| statuses.contains(&status.as_str()))
     };
-    // Every card that waits for an OK: a command, the browser, a schedule, a
-    // site to allow, or a task that looks stuck.
-    if let Some((id, kind, session)) = card(&["shell", "browser", "schedule", "access", "stuck"]) {
+    // Every card that waits for an OK: a command, the browser, a native app,
+    // a schedule, a site to allow, or a task that looks stuck.
+    if let Some((id, kind, session)) = card(&["shell", "browser", "app", "schedule", "access", "stuck"]) {
         return (
             "needs_you/approval",
             json!({"card": id, "kind": kind, "session": session}),
@@ -1208,7 +1208,13 @@ async fn image(State(agent): App, Path(id): Path<String>) -> Response {
         return error(StatusCode::BAD_REQUEST, "bad image id");
     }
     match tokio::fs::read(agent.cfg.state_dir.join("images").join(format!("{id}.jpg"))).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
+        // Chrome's screenshots are JPEGs; the desktop's (HCU's) are PNGs, saved
+        // under the same name, so the bytes say which.
+        Ok(bytes) => {
+            let png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+            let kind = if png { "image/png" } else { "image/jpeg" };
+            ([(header::CONTENT_TYPE, kind)], bytes).into_response()
+        }
         Err(_) => error(StatusCode::NOT_FOUND, "no such image"),
     }
 }
@@ -1699,7 +1705,7 @@ mod tests {
             with(|f| f.cards = vec![("s1".into(), "secret".into(), "main".into())]),
             "needs_you/secret"
         );
-        for kind in ["shell", "browser", "schedule", "access", "stuck"] {
+        for kind in ["shell", "browser", "app", "schedule", "access", "stuck"] {
             assert_eq!(
                 with(|f| f.cards = vec![("a1".into(), kind.into(), "main".into())]),
                 "needs_you/approval"

@@ -1,0 +1,34 @@
+# {{ ansible_managed }}
+# The desktop broker: agentd's binary as the desktop user, holding one
+# computer-use (HCU) process on the XFCE session. It goes with the session:
+# stopped when XFCE stops, started again (with new refs) when it's back.
+[Unit]
+Description=Desktop broker: native apps through Hybrid Computer Use, for agentd
+Requires=neo-desktop-broker.socket
+BindsTo=xfce.service
+PartOf=xfce.service
+After=neo-desktop-broker.socket xfce.service
+StartLimitIntervalSec=0
+
+[Service]
+User={{ agentd_desktop_user }}
+Group={{ agentd_desktop_user }}
+ExecStart=/usr/local/bin/agentd desktop-broker --config /etc/neo-desktop/broker.toml
+Environment=RUST_LOG=agentd=info
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# X and D-Bus are Unix sockets; it has no use for the network.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+MemoryMax=768M
+TasksMax=256
+
+[Install]
+WantedBy=xfce.service

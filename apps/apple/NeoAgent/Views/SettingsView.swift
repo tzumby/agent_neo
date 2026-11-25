@@ -15,7 +15,7 @@ struct SettingsView: View {
     @State private var stillRegistered = false
     /// A setting that didn't save (the chat's own alert can't show over this sheet).
     @State private var problem: String?
-    private let autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content."
+    private let autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser and app changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content."
 
     var body: some View {
         GroupedList {

@@ -37,6 +37,9 @@ use crate::store::{Event, MAIN, Pending, QueuedRun, Schedule, SecretInfo, Store}
 use crate::supervise::{self, Verdict};
 use crate::tools;
 
+/// The native app tools (app_*), through the desktop broker.
+mod apps;
+
 const HISTORY_LIMIT: i64 = 20;
 /// Memories shown to the model at the start of each task (the latest ones).
 const MEMORY_LIMIT: i64 = 60;
@@ -572,6 +575,8 @@ pub struct Agent {
     /// APNs for the iPhone and Mac apps' notifications (apns.rs), when an APNs
     /// key is configured; None leaves the apps' notifications off.
     pub apns: Option<crate::apns::Apns>,
+    /// The desktop broker, for native apps (apps.rs), when the deployment has them.
+    desktop: Option<crate::desktop::client::Desktop>,
 }
 
 pub(crate) fn short_id() -> String {
@@ -646,6 +651,8 @@ fn same_request(approved: &Value, now: &Value) -> bool {
         "destination",
         "timeout",
         "manual",
+        "app",
+        "window",
     ]
     .iter()
     .all(|key| approved[key] == now[key])
@@ -681,6 +688,9 @@ impl Agent {
             effects_changed: Notify::new(),
             step_seqs: Mutex::default(),
             apns: crate::apns::Apns::from_config(&cfg).context("the APNs key (APNS_AUTH_KEY)")?,
+            desktop: cfg
+                .desktop_apps
+                .then(|| crate::desktop::client::Desktop::new(&cfg.desktop_broker)),
             cfg,
         };
         agent.recover();
@@ -1199,7 +1209,8 @@ impl Agent {
         // behind it starts (pump).
         if approved
             && ((parked.card["kind"] == "shell" && parked.card["timeout"].is_null())
-                || (parked.card["kind"] == "browser" && parked.card["binding"].is_null()))
+                || (matches!(parked.card["kind"].as_str(), Some("browser" | "app"))
+                    && parked.card["binding"].is_null()))
         {
             self.abandon_because(parked, POLICY_CHANGED, Some("policy_changed"));
             self.pump();
@@ -1364,7 +1375,8 @@ impl Agent {
     /// tool off, or a task on a model that's no longer allowed.
     fn refused_now(&self, card: &Value, model: Option<&str>) -> Option<&'static str> {
         match card["kind"].as_str() {
-            Some("browser") if !self.settings().allow_actions => Some("browser actions are off"),
+            Some("browser" | "app") if !self.settings().allow_actions => Some("browser actions are off"),
+            Some("app") if self.desktop.is_none() => Some("native apps are off on this desktop"),
             Some("shell")
                 if card["command"]
                     .as_str()
@@ -1855,6 +1867,7 @@ impl Agent {
             &self.skills.listing(),
             &self.keys_prompt(),
             self.cfg.memory_v2,
+            self.desktop.is_some(),
         );
         state.messages[0] = json!({"role": "system", "content": prompt});
         let schemas = tools::schemas(
@@ -1862,6 +1875,7 @@ impl Agent {
             !self.skills.is_empty(),
             self.cfg.memory_v2,
             self.cfg.memory_v2 && state.scheduled.is_some(),
+            self.desktop.is_some(),
         );
         // The user answered a stuck card (review): keep going with the
         // supervisor's advice, or stop with a summary of where it got to
@@ -2637,6 +2651,11 @@ impl Agent {
                     (_, Some(element), _) => browser.click(element, &place).await,
                     _ => unreachable!("browser action arguments checked above"),
                 }
+            }
+            "app_windows" | "app_observe" | "app_find" | "app_click" | "app_screenshot"
+                if self.desktop.is_some() =>
+            {
+                self.app_tool(task_id, name, args, schedule, resumed).await
             }
             "remember" | "forget" => self.memory_tool(task_id, name, args, schedule),
             "search_memory" if self.cfg.memory_v2 => self.memory_tool(task_id, name, args, schedule),
@@ -3607,8 +3626,10 @@ impl Agent {
     ) -> Result<Decision> {
         card["task"] = json!(task_id);
         // These actions always require a person's decision.
-        let manual =
-            matches!(card["kind"].as_str(), Some("secret" | "browser" | "access")) || card["manual"] == true;
+        let manual = matches!(
+            card["kind"].as_str(),
+            Some("secret" | "browser" | "app" | "access")
+        ) || card["manual"] == true;
         if resumed.is_none() && !manual && self.settings().auto_approve {
             self.auto_approved(task_id, card);
             return Ok(Decision::Approved);
@@ -3805,6 +3826,8 @@ pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
         desktop_name: "test-desktop".into(),
         memory_v2: true,
         max_parallel_tasks: 3,
+        desktop_apps: false,
+        desktop_broker: dir.join("no-broker.sock"),
     };
     (Arc::new(Agent::new(cfg).unwrap()), dir)
 }

@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+# The desktop broker's socket: agentd's alone (its group also has
+# tailnet-proxy in it, so 0600; the broker checks each peer too).
+[Unit]
+Description=Desktop broker socket (native apps, for agentd)
+
+[Socket]
+ListenStream={{ agentd_desktop_broker_socket }}
+SocketUser=agentd
+SocketGroup=agentd
+SocketMode=0600
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

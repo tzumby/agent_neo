@@ -25,7 +25,8 @@ fn from_agentd(result: &str) -> bool {
 }
 
 /// Tools whose results carry outside content: web pages (text, titles,
-/// snapshots, tab lists) and command output.
+/// snapshots, tab lists), command output, and native apps' windows and
+/// controls (desktop/).
 pub fn carries_outside_content(tool: &str) -> bool {
     matches!(
         tool,
@@ -38,6 +39,10 @@ pub fn carries_outside_content(tool: &str) -> bool {
             | "type_text"
             | "wait_for"
             | "run_shell"
+            | "app_windows"
+            | "app_observe"
+            | "app_find"
+            | "app_click"
     )
 }
 
@@ -49,6 +54,8 @@ pub fn label_untrusted(tool: &str, result: String) -> String {
     }
     let source = if tool == "run_shell" {
         "command output"
+    } else if tool.starts_with("app_") {
+        "desktop app"
     } else {
         "web page"
     };
@@ -472,6 +479,14 @@ mod tests {
         assert!(label_untrusted("run_shell", "exit code 0\nhi".into()).contains("command output"));
         assert_eq!(label_untrusted("press_key", "pressed".into()), "pressed");
         assert_eq!(label_untrusted("click", "blocked: nope".into()), "blocked: nope");
+        assert!(
+            label_untrusted("app_observe", "{\"ok\":true}\nax:".into())
+                .starts_with("<untrusted source=\"desktop app\">")
+        );
+        assert_eq!(
+            label_untrusted("app_screenshot", "shown to the user".into()),
+            "shown to the user"
+        );
     }
 
     #[test]

@@ -131,7 +131,7 @@ export class Timeline {
         const id = str(d.id);
         const card = {
           type: "approval", id, seq: event.seq, state: "pending",
-          kind: ["secret", "schedule", "browser", "access", "stuck"].includes(d.kind) ? d.kind : "shell",
+          kind: ["secret", "schedule", "browser", "app", "access", "stuck"].includes(d.kind) ? d.kind : "shell",
           command: str(d.command), reason: str(d.reason), summary: d.summary || null, tainted: d.tainted === true,
           editable: d.editable === true,
         };
@@ -158,6 +158,12 @@ export class Timeline {
             submit: d.submit === true, sends: d.sends === true, site: str(d.site),
             role: str(d.role), page: str(d.page), url: str(d.url), destination: str(d.destination),
             around: str(d.around), image: d.image || null,
+          };
+        } else if (card.kind === "app") {
+          // A native app on the desktop, through its accessibility tree.
+          card.app = {
+            action: str(d.action), app: str(d.app), window: str(d.window), target: str(d.target),
+            role: str(d.role), text: d.text ?? null, key: d.key ?? null, around: str(d.around), image: d.image || null,
           };
         }
         this.approvalIndex.set(id, this.items.length);

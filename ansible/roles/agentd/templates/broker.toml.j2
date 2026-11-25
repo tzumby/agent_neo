@@ -1,0 +1,28 @@
+# {{ ansible_managed }}
+# The desktop broker (agentd desktop-broker; docs/desktop-apps.md): who may
+# ask, which computer-use, the session it works on, and the apps it may use.
+client_user = "agentd"
+computer_use = "{{ agentd_hcu_dir }}/computer-use"
+
+# The XFCE session's environment, nothing else: HCU runs as the desktop user
+# on its display and bus.
+[env]
+DISPLAY = "{{ agentd_desktop_display }}"
+XAUTHORITY = "{{ agentd_desktop_home }}/.Xauthority"
+HOME = "{{ agentd_desktop_home }}"
+XDG_RUNTIME_DIR = "/run/user/{{ agentd_desktop_uid }}"
+DBUS_SESSION_BUS_ADDRESS = "unix:path=/run/user/{{ agentd_desktop_uid }}/bus"
+PATH = "/usr/bin:/bin"
+LANG = "C.UTF-8"
+
+[schema_sha256]
+{% for tool, digest in agentd_hcu_schema_sha256.items() %}
+{{ tool }} = "{{ digest }}"
+{% endfor %}
+{% for app in agentd_desktop_apps_allowed %}
+
+[[apps]]
+id = "{{ app.id }}"
+exe = "{{ app.exe }}"
+name = "{{ app.name }}"
+{% endfor %}

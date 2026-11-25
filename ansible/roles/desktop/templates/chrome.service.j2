@@ -12,6 +12,14 @@ StartLimitIntervalSec=0
 User={{ desktop_user }}
 WorkingDirectory={{ desktop_home }}
 Environment=DISPLAY={{ desktop_display }} XAUTHORITY={{ desktop_xauthority }} HOME={{ desktop_home }} XDG_RUNTIME_DIR=/run/user/{{ desktop_user_info.uid }}
+{% if desktop_apps | bool %}
+# The session's bus. Chrome stays off the accessibility bus: its pages are the
+# browser tools' (DevTools), never the native app tools', and an accessibility
+# tree for every page would cost memory. Chrome ignores NO_AT_BRIDGE, but its
+# bridge connects where AT_SPI_BUS_ADDRESS says, before it asks the bus: here,
+# nowhere. DevTools' own accessibility tree (snapshot) doesn't need it.
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ desktop_user_info.uid }}/bus AT_SPI_BUS_ADDRESS=unix:path=/nonexistent/at-spi-bus
+{% endif %}
 ExecStartPre={{ desktop_libexec_dir }}/wait-for-display
 ExecStart=/usr/bin/google-chrome \
   --user-data-dir={{ desktop_home }}/chrome-profile \

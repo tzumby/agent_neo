@@ -328,6 +328,7 @@ function warning(text) {
 
 function approvalCard(card, ctx) {
   if (card.kind === "browser") return browserCard(card, ctx);
+  if (card.kind === "app") return appCard(card, ctx);
   if (card.kind === "schedule") return scheduleCard(card, ctx);
   if (card.kind === "secret") return secretCard(card, ctx);
   if (card.kind === "access") return accessCard(card, ctx);
@@ -361,9 +362,7 @@ function browserCard(card, ctx) {
   } else if (b.action === "key") {
     what = h("p", { class: "card-text" }, h("kbd", null, b.key || "?"), b.target ? ` in “${b.target}”` : "");
   } else {
-    const name = b.target ? `“${b.target}”` : "without a name";
-    const role = b.role ? `${b.role[0].toUpperCase()}${b.role.slice(1)} ` : "";
-    what = h("p", { class: "card-text card-target" }, `${role}${name}`);
+    what = h("p", { class: "card-text card-target" }, clickTarget(b.role, b.target));
   }
   // A click or key says little by itself: the agent's reason first, then what the
   // page itself shows, which the agent's words can't change.
@@ -383,6 +382,45 @@ function browserCard(card, ctx) {
       h("h3", { class: "card-title" }, icon(b.action === "click" ? "click" : "keyboard"), title),
       b.site ? h("span", { class: "card-site" }, icon("globe"), b.site) : null),
     said, what, facts, note, answerButtons(card, ctx, edit, legacySend));
+}
+
+// The browser card's counterpart for the desktop's own apps, which the agent
+// drives through their accessibility tree. Never editable.
+function appCard(card, ctx) {
+  const a = card.app;
+  const where = a.app ? `in ${a.app}` : "in the app";
+  const title = a.action === "type" ? `Write this ${where}?`
+    : a.action === "key" ? `Press ${a.key || "a key"} ${where}?` : `Click this ${where}?`;
+  let what;
+  if (a.action === "type") {
+    what = [a.target ? h("p", { class: "card-text muted" }, `In “${a.target}”`) : null,
+      h("blockquote", { class: "card-quote" }, a.text || "")];
+  } else if (a.action === "key") {
+    what = h("p", { class: "card-text" }, h("kbd", null, a.key || "?"), a.target ? ` in “${a.target}”` : "");
+  } else {
+    what = h("p", { class: "card-text card-target" }, clickTarget(a.role, a.target));
+  }
+  // The agent's reason first, then what the app itself shows, which the
+  // agent's words can't change.
+  const said = a.action !== "type" && card.summary ? h("p", { class: "card-text strong" }, `The agent says: ${card.summary}`) : null;
+  const facts = [
+    a.around ? h("div", { class: "card-inset" }, h("p", { class: "strong" }, "Where it is in the app"), h("p", { class: "muted" }, a.around)) : null,
+    a.window ? h("p", { class: "card-text muted card-value" }, a.window) : null,
+    a.image ? picture(a.image, "The desktop when the agent asked") : null,
+  ];
+  return h("section", { class: "card card-needs", "aria-label": title },
+    h("div", { class: "card-head" },
+      h("h3", { class: "card-title" }, icon(a.action === "type" || a.action === "key" ? "keyboard" : "click"), title),
+      a.app ? h("span", { class: "card-site" }, icon("desktop"), a.app) : null),
+    said, what, facts,
+    card.reason ? h("p", { class: "card-text muted" }, `It ${card.reason}.`) : null,
+    answerButtons(card, ctx));
+}
+
+/** Button “Confirm”; “without a name” when it has none. */
+function clickTarget(role, target) {
+  const name = target ? `“${target}”` : "without a name";
+  return role ? `${role[0].toUpperCase()}${role.slice(1)} ${name}` : name;
 }
 
 function scheduleCard(card, ctx) {

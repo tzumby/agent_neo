@@ -381,7 +381,7 @@ export function mountSettings(store, view, session) {
       return;
     }
     const settings = status.settings || {};
-    const autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content.";
+    const autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser and app changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content.";
     const models = [...new Set([settings.model, ...(status.known_models || [])])].filter(Boolean);
     const model = h("select", { class: "field" }, models.map((m) => h("option", { value: m, selected: m === settings.model }, m)));
     const actions = h("input", { type: "checkbox", checked: settings.allow_actions === true });
@@ -435,7 +435,7 @@ export function mountSettings(store, view, session) {
         h("label", { class: "label" }, "Model", model),
         h("label", { class: "toggle" }, actions,
           h("span", null, h("span", { class: "strong" }, "Browser actions"),
-            h("span", { class: "muted block" }, "Lets the agent ask before typing, clicking, or pressing a key in your desktop's browser."))),
+            h("span", { class: "muted block" }, "Lets the agent ask before typing, clicking, or pressing a key in your desktop's browser and apps."))),
         h("label", { class: "toggle" }, autoApprove,
           h("span", null, h("span", { class: "strong" }, "Auto approve"),
             h("span", { class: "muted block" }, autoApproveDescription)))),

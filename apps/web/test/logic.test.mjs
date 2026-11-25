@@ -64,6 +64,25 @@ test("card kinds keep their fields", () => {
   assert.deepEqual(t.visible().map((i) => i.id), ["s", "k"]);
 });
 
+test("a click in a native app is a card of its own, with what the app shows", () => {
+  const card = new Timeline([ev("approval.requested", {
+    task: "t1", id: "c9", kind: "app", action: "click", app: "Mousepad", window: "~/notes.txt - Mousepad",
+    target: "Save", role: "menuitem", around: "menu “File” › menuitem “Save” — Save the current document",
+    summary: "Save the shopping list", reason: "may change or send something in the app", image: "/api/v1/images/ab12",
+    binding: { pid: 4242 }, tainted: true,
+  })]).visible()[0];
+  assert.equal(card.kind, "app", "not the shell card");
+  assert.deepEqual(
+    [card.summary, card.reason, card.tainted, card.editable, card.browser],
+    ["Save the shopping list", "may change or send something in the app", true, false, undefined]);
+  assert.deepEqual(card.app, {
+    action: "click", app: "Mousepad", window: "~/notes.txt - Mousepad", target: "Save", role: "menuitem",
+    text: null, key: null, around: "menu “File” › menuitem “Save” — Save the current document", image: "/api/v1/images/ab12",
+  });
+  const bare = new Timeline([ev("approval.requested", { id: "c10", kind: "app", action: "click", target: null, around: null, summary: null, image: null })]).visible()[0];
+  assert.deepEqual([bare.app.target, bare.app.around, bare.app.image, bare.summary], ["", "", null, null]);
+});
+
 test("shell approval cards preserve the full command and its access details", () => {
   const command = "gh pr list\ngh issue list";
   const t = new Timeline([

@@ -3,6 +3,12 @@
 Description=XFCE session on {{ desktop_display }}
 Wants=xvfb.service
 After=xvfb.service user@{{ desktop_user_info.uid }}.service
+{% if desktop_apps | bool %}
+# Native apps (docs/desktop-apps.md): the session, its apps and the desktop
+# broker share the user's own bus (lingering keeps it up), where the
+# accessibility bus is found. dbus-launch would give XFCE a bus of its own.
+Requires=user@{{ desktop_user_info.uid }}.service
+{% endif %}
 StartLimitIntervalSec=0
 
 [Service]
@@ -10,7 +16,14 @@ User={{ desktop_user }}
 WorkingDirectory={{ desktop_home }}
 Environment=DISPLAY={{ desktop_display }} XAUTHORITY={{ desktop_xauthority }} HOME={{ desktop_home }} XDG_RUNTIME_DIR=/run/user/{{ desktop_user_info.uid }}
 ExecStartPre={{ desktop_libexec_dir }}/wait-for-display
+{% if desktop_apps | bool %}
+# startxfce4 keeps a bus it's given; its xinitrc passes DISPLAY and the rest
+# to services the bus starts (the accessibility bus, xfconfd).
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ desktop_user_info.uid }}/bus
+ExecStart=/usr/bin/startxfce4
+{% else %}
 ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/startxfce4
+{% endif %}
 Restart=always
 RestartSec=2
 

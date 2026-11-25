@@ -250,6 +250,12 @@ public struct ChatTimeline: Sendable, Equatable {
                 action.around = data["around"]?.string ?? ""
                 action.imagePath = data["image"]?.string
                 approval.browser = action
+            } else if data["kind"]?.string == "app" {
+                approval.app = AppAction(
+                    action: data["action"]?.string ?? "", app: data["app"]?.string ?? "",
+                    window: data["window"]?.string ?? "", target: data["target"]?.string ?? "",
+                    role: data["role"]?.string ?? "", text: data["text"]?.string, key: data["key"]?.string,
+                    around: data["around"]?.string ?? "", imagePath: data["image"]?.string)
             }
             approvalIndex[id] = items.count
             items.append(.approval(approval))
@@ -441,6 +447,8 @@ public struct Approval: Sendable, Equatable {
     public var editable = false
     /// Set when it's a browser action (typing, a key, a click) rather than a command.
     public var browser: BrowserAction?
+    /// Set when it's a click (or typing, or a key) in one of the desktop's own apps.
+    public var app: AppAction?
     /// Set when it's a schedule the agent wants to set up.
     public var schedule: ScheduleProposal?
     /// Set when the agent asks for a key or token.
@@ -582,6 +590,29 @@ public struct BrowserAction: Sendable, Equatable {
     public var around = ""
     /// The page, with what it would click outlined.
     public var imagePath: String?
+}
+
+/// A change the agent wants to make in one of the desktop's own apps, which
+/// it drives through their accessibility tree. What it says about where comes
+/// from the app, not the agent.
+public struct AppAction: Sendable, Equatable {
+    /// "click"; "type" or "key" may follow.
+    public let action: String
+    /// The app's name, e.g. Mousepad.
+    public let app: String
+    /// The window's title.
+    public let window: String
+    /// The element's accessible name (empty when it has none).
+    public let target: String
+    /// What it is ("menuitem", "push button").
+    public let role: String
+    /// What it will type.
+    public let text: String?
+    public let key: String?
+    /// Where it sits in the app: its menus or panels, and its description.
+    public let around: String
+    /// The desktop when the agent asked.
+    public let imagePath: String?
 }
 
 /// "Action needed": the agent stopped for something only the user can do.

@@ -10,3 +10,9 @@ agentd_memory_v2: "on"
 # (agentd_shell_allowed_domains). A leading dot also allows subdomains. Sites
 # you allow from the web app's Settings don't need to be here.
 agentd_shell_extra_domains: []
+
+# Native apps through Hybrid Computer Use (docs/desktop-apps.md): the agent
+# reads the listed apps' windows (agentd_desktop_apps_allowed: Mousepad for
+# the pilot) and clicks their controls with your OK. XFCE moves to the user's
+# own bus; Chrome stays the browser tools'. Both roles read this.
+desktop_apps: true

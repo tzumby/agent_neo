@@ -147,7 +147,10 @@
     group: root
     mode: "0755"
   register: agentd_binary_install
-  notify: Restart agentd
+  notify:
+    - Restart agentd
+    # The same binary, as the desktop user.
+    - Restart the desktop broker
 
 # A new version may migrate the database when it starts: keep a copy of it as
 # it was (the last 3), for a rollback. SQLite's online backup, as the agentd
@@ -279,6 +282,14 @@
     group: root
     mode: "0440"
     validate: visudo -cf %s
+
+- name: Set up native apps (desktop broker and HCU)
+  ansible.builtin.import_tasks: desktop_apps.yml
+  when: agentd_desktop_apps | bool
+
+- name: Turn native apps off
+  ansible.builtin.import_tasks: desktop_apps_off.yml
+  when: not (agentd_desktop_apps | bool)
 
 - name: Install the systemd unit
   ansible.builtin.template:

@@ -1,0 +1,16 @@
+# Native apps turned off (or never on): no broker. HCU and the apps stay
+# installed; nothing runs them.
+- name: Find the broker's units
+  ansible.builtin.stat:
+    path: /etc/systemd/system/neo-desktop-broker.socket
+  register: agentd_broker_socket_unit
+
+- name: Stop the broker and its socket
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+  loop:
+    - neo-desktop-broker.service
+    - neo-desktop-broker.socket
+  when: agentd_broker_socket_unit.stat.exists

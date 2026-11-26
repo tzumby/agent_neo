@@ -12,7 +12,7 @@ import { keyLabel, modelKeyForm, savedWords } from "./modelkeys.js";
 import { parse, render, safeHref } from "./markdown.js";
 import { busyButton, fill, h, icon, time, when } from "./dom.js";
 import {
-  PLAN_MAX_STEPS, PLAN_STEP_LENGTH, andList, appStepWords, clickTarget, coveredWords, duration, megabytes,
+  PLAN_MAX_STEPS, PLAN_NOTE_LENGTH, PLAN_STEP_LENGTH, andList, appStepWords, clickTarget, coveredWords, duration, megabytes,
   planAnswer, planCovers, planPhrases, planProblem, rowKey, stepNeeds, withoutNeed, workingFor,
 } from "./timeline.js";
 
@@ -92,7 +92,10 @@ export function mountChat(store, view, { openDesktop, openKeys }) {
       if (!seen.has(key)) {
         entry.node.remove();
         rows.delete(key);
-        if (key.startsWith("approval-")) planDrafts.delete(key.slice("approval-".length)); // answered
+        if (key.startsWith("approval-")) { // answered
+          planDrafts.delete(key.slice("approval-".length));
+          planNotes.delete(key.slice("approval-".length));
+        }
       }
     }
 
@@ -309,14 +312,18 @@ function needChips(step, onRemove) {
 
 // --- A plan to approve ---------------------------------------------------------------
 
-// The person's version of each plan card's steps, by card, until it's
-// answered: a row drawn again (or another conversation and back) keeps it.
+// The person's version of each plan card's steps, and what they're adding to
+// it, by card, until it's answered: a row drawn again (or another
+// conversation and back) keeps them.
 const planDrafts = new Map();
+const planNotes = new Map();
 
 // The task's plan, approved as a whole: what its steps need then goes ahead
 // without cards of its own, for the rest of the task. The person can reword,
 // delete, add and reorder steps, and take needs off, but not add one (agentd
-// refuses that), so a new step has none.
+// refuses that), so a new step has none. They can also add more details in
+// their own words (a card with `notes`), sent with either answer: the agent
+// follows them, and they approve nothing the steps don't.
 function planCard(card, ctx) {
   const p = card.plan;
   const editable = card.editable;
@@ -333,6 +340,18 @@ function planCard(card, ctx) {
   const refusal = h("p", { class: "card-warning", role: "alert", hidden: true });
   const deny = h("button", { class: "button", type: "button" }, "Deny");
   const approve = h("button", { class: "button button-primary", type: "button" }, "Approve plan");
+  const note = p.notes ? h("textarea", {
+    class: "field card-edit plan-note", rows: 2, maxlength: PLAN_NOTE_LENGTH, spellcheck: "true",
+    placeholder: "Anything the agent should know or do differently", "aria-describedby": `plan-note-${card.id}`,
+  }) : null;
+  if (note) {
+    note.value = planNotes.get(card.id) || "";
+    note.addEventListener("input", () => planNotes.set(card.id, note.value));
+  }
+  const details = note ? h("label", { class: "label plan-note-label" },
+    h("span", null, "More details ", h("span", { class: "plan-note-optional" }, "(optional)")), note,
+    h("span", { class: "plan-note-hint", id: `plan-note-${card.id}` },
+      "Goes to the agent with your answer. It doesn't approve anything the steps don't.")) : null;
 
   /** The steps again, after a change to the list; `focus` picks what has focus after. */
   function draw(focus) {
@@ -412,17 +431,23 @@ function planCard(card, ctx) {
     change([...steps, { step: "", status: "pending" }]);
     draw(focusIn(steps.length - 1, "input"));
   });
-  deny.addEventListener("click", () => busyButton(deny, () => ctx.store.answer(card, false)));
+  const refused = (words) => {
+    if (words) fill(refusal, icon("warning"), h("span", null, words));
+    refusal.hidden = !words;
+  };
+  deny.addEventListener("click", () => busyButton(deny, async () => {
+    const why = await ctx.store.answerPlan(card, false, undefined, note?.value);
+    refused(why && `Not sent: ${why}`);
+  }));
   approve.addEventListener("click", () => busyButton(approve, async () => {
-    const refused = await ctx.store.answerPlan(card, true, planAnswer(p.steps, steps));
-    if (refused) fill(refusal, icon("warning"), h("span", null, `Not approved: ${refused}`));
-    refusal.hidden = !refused;
+    const why = await ctx.store.answerPlan(card, true, planAnswer(p.steps, steps), note?.value);
+    refused(why && `Not approved: ${why}`);
   }));
   draw();
   return h("section", { class: "card card-needs", "aria-label": "Approve this plan?" },
     h("h3", { class: "card-title" }, icon("list"), "Approve this plan?"),
     card.tainted ? warning("The agent wrote this plan after reading web pages or other outside content. Check each step is something you asked for.") : null,
-    list, add, summary, problem, refusal, buttons(deny, approve));
+    list, add, details, summary, problem, refusal, buttons(deny, approve));
 }
 
 // --- What a plan covered -----------------------------------------------------------

@@ -534,16 +534,16 @@ export class Store {
 
   /**
    * A plan card's answer, with the person's version of its steps when they
-   * changed it. Resolves to agentd's reason when it refused that version (a
-   * 400: an empty step, too many, a need the card didn't have), for the card
-   * to show; else null.
+   * changed it, and what they added (`note`, approved or denied). Resolves to
+   * agentd's reason when it refused that version (a 400: an empty step, too
+   * many, a need the card didn't have), for the card to show; else null.
    */
-  async answerPlan(card, approved, plan) {
+  async answerPlan(card, approved, plan, note) {
     const conversation = this.conversation;
     let refused = null;
     await this.attempt(async () => {
       try {
-        await this.api.answer(card.id, approved, undefined, plan);
+        await this.api.answer(card.id, approved, undefined, plan, false, note?.trim() || undefined);
       } catch (error) {
         if (!(error instanceof ApiError && error.status === 400)) throw error;
         refused = error.message;

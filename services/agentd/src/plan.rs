@@ -15,6 +15,8 @@ use crate::{access, snaps};
 
 pub const MAX_ITEMS: usize = 20;
 pub const MAX_STEP_CHARS: usize = 120;
+/// What the user can add to a plan card in their own words (0.21.0).
+pub const MAX_NOTE_CHARS: usize = 2000;
 const MAX_APP_CHARS: usize = 60;
 const MAX_KEYS: usize = 10;
 
@@ -110,6 +112,19 @@ pub fn edited(card: &Value, plan: &Value) -> Result<Vec<Item>, String> {
         ));
     }
     Ok(items)
+}
+
+/// What the user added to a plan card, trimmed: None when they added nothing.
+/// It goes to the agent with their answer and grants nothing. Errors are for
+/// the user.
+pub fn note(text: &str) -> Result<Option<String>, String> {
+    let text = text.trim();
+    if text.chars().count() > MAX_NOTE_CHARS {
+        return Err(format!(
+            "what you added is too long: at most {MAX_NOTE_CHARS} characters"
+        ));
+    }
+    Ok((!text.is_empty()).then(|| text.to_string()))
 }
 
 fn items_of(items: &[Value], status_required: bool) -> Result<Vec<Item>, String> {

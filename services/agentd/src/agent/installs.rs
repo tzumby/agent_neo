@@ -238,6 +238,7 @@ mod tests {
             by: None,
             edited: None,
             plan: None,
+            note: None,
             for_task: false,
         };
         let denied = agent

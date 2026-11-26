@@ -244,7 +244,8 @@ public struct ChatTimeline: Sendable, Equatable {
                 approval.app = AppAction(data)
             } else if data["kind"]?.string == "plan" {
                 approval.plan = PlanApproval(
-                    steps: data["steps"]?.array?.compactMap { PlanStep($0) } ?? [], covers: PlanCovers(data["covers"]))
+                    steps: data["steps"]?.array?.compactMap { PlanStep($0) } ?? [], covers: PlanCovers(data["covers"]),
+                    notes: data["notes"]?.bool ?? false)
             } else if data["kind"]?.string == "install" {
                 // Its summary is the store's description, kept with the store's facts.
                 approval.summary = nil
@@ -615,6 +616,9 @@ public struct PlanApproval: Sendable, Equatable {
     public let steps: [PlanStep]
     /// What approving adds for the task (a later card's: only what's new).
     public let covers: PlanCovers
+    /// The user can add more details in their own words, sent with either
+    /// answer (agentd 0.21.0; an older one would drop them).
+    public var notes = false
 }
 
 /// What a plan covers, each list without repeats.

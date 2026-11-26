@@ -515,6 +515,8 @@ struct Answer {
     edited: Option<String>,
     /// A plan card's steps as they edited them, if they did.
     plan: Option<Vec<plan::Item>>,
+    /// What they added to a plan card in their own words, if anything.
+    note: Option<String>,
     /// "Allow for this task": what the card asks, granted for the rest of it.
     for_task: bool,
 }
@@ -1399,17 +1401,19 @@ impl Agent {
         edit: Option<Edit>,
         by: Option<String>,
     ) -> Result<(), StartError> {
-        self.answer_approval_for(id, approved, edit, false, by)
+        self.answer_approval_for(id, approved, edit, None, false, by)
     }
 
-    /// `answer_approval`, and with `for_task`, "Allow for this task": the
-    /// card's kind of action goes ahead without asking for the rest of the
-    /// task (a card that offers it, `for_task` on it).
+    /// `answer_approval`, with what the user added to a plan card (`note`,
+    /// checked by `plan_note`), and with `for_task`, "Allow for this
+    /// task": the card's kind of action goes ahead without asking for the
+    /// rest of the task (a card that offers it, `for_task` on it).
     pub fn answer_approval_for(
         self: &Arc<Self>,
         id: &str,
         approved: bool,
         edit: Option<Edit>,
+        note: Option<String>,
         for_task: bool,
         by: Option<String>,
     ) -> Result<(), StartError> {
@@ -1500,6 +1504,11 @@ impl Agent {
             resolved["edited"] = json!(true);
             resolved["plan"] = json!(items);
         }
+        // Only a plan card's: another card's answer can't carry words for the agent.
+        let note = note.filter(|_| card["kind"] == "plan");
+        if let Some(note) = &note {
+            resolved["note"] = json!(note);
+        }
         let for_task = for_task && approved && card["for_task"].is_string();
         if for_task {
             resolved["for_task"] = json!(true);
@@ -1518,6 +1527,7 @@ impl Agent {
             by: by.clone(),
             edited,
             plan,
+            note,
             for_task,
         };
         let task = state.task.clone();
@@ -1564,6 +1574,22 @@ impl Agent {
             return Some("this card has no plan to edit".into());
         }
         plan::edited(&parked.card, steps).err()
+    }
+
+    /// What the user added to this card, trimmed (None: nothing), or why it
+    /// can't be sent (for the user). Only a plan card takes it. A card
+    /// that's gone isn't a problem here: answering it says so.
+    pub fn plan_note(&self, id: &str, text: &str) -> Result<Option<String>, String> {
+        let note = plan::note(text)?;
+        if note.is_none() {
+            return Ok(None);
+        }
+        match self.store.parked(id).ok().flatten() {
+            Some(parked) if parked.card["kind"] != "plan" => {
+                Err("only a plan card takes what you add".into())
+            }
+            _ => Ok(note),
+        }
     }
 
     /// Puts what the user wrote into the tool call the task parked on, and into
@@ -2650,8 +2676,9 @@ impl Agent {
         }
         // `summary`, `reason` and `command`: what an app from before 0.18.0
         // shows on a card it doesn't know (a command's card).
+        // `notes`: the user can add to their answer in their own words (0.21.0).
         let card = json!({
-            "kind": "plan", "steps": items, "covers": new, "editable": true, "tainted": state.tainted,
+            "kind": "plan", "steps": items, "covers": new, "editable": true, "notes": true, "tainted": state.tainted,
             "summary": format!("Approve a plan of {} step{}", items.len(), if items.len() == 1 { "" } else { "s" }),
             "reason": format!("lets the agent go ahead without asking again, for this task: {}", new.describe()),
             "command": plan::numbered(&items),
@@ -2661,6 +2688,11 @@ impl Agent {
             .and_then(|a| a.card["id"].as_str().map(String::from));
         let by = resumed.as_ref().and_then(|a| a.by.clone());
         let edited = resumed.as_ref().and_then(|a| a.plan.clone());
+        // What the user added, as their words for the agent: it grants nothing.
+        let note = resumed
+            .as_ref()
+            .and_then(|a| a.note.as_deref())
+            .map(|note| self.secrets.redact(note).into_owned());
         match self.approve(&state.task, card, resumed, false)? {
             Decision::Approved => {
                 let asked = plan::Needs::of(&items);
@@ -2680,7 +2712,7 @@ impl Agent {
                     .insert(state.task.clone(), state.grant.clone());
                 state.plan_asked = true;
                 self.unplanned.lock().unwrap().remove(&state.task);
-                tracing::info!(task = %state.task, edited = edited.is_some(), "plan approved");
+                tracing::info!(task = %state.task, edited = edited.is_some(), noted = note.is_some(), "plan approved");
                 self.save_plan(state, approved);
                 let covered = if state.grant.needs.is_empty() {
                     "The user took off everything that needed their OK, so each of those actions still asks."
@@ -2699,15 +2731,28 @@ impl Agent {
                 } else {
                     String::new()
                 };
+                let added = note
+                    .map(|note| {
+                        format!(
+                            "\n\nThey also wrote this with their answer. Follow it as you work; it approves nothing \
+                             the plan doesn't cover, which still asks:\n{note}"
+                        )
+                    })
+                    .unwrap_or_default();
                 Ok(format!(
-                    "approved: the user approved your plan. {covered}{changed}"
+                    "approved: the user approved your plan. {covered}{changed}{added}"
                 ))
             }
-            Decision::Denied | Decision::Changed => Ok(
-                "denied: the user didn't approve this plan, so don't start on it. Ask them what they'd like \
-                 instead; don't try another way."
+            Decision::Denied | Decision::Changed => Ok(match note {
+                Some(note) => format!(
+                    "denied: the user didn't approve this plan, so don't start on it. They wrote:\n{note}\n\nIf \
+                     that says what they'd like instead, make a new plan that follows it (update_plan); otherwise \
+                     ask them. Don't try another way on your own."
+                ),
+                None => "denied: the user didn't approve this plan, so don't start on it. Ask them what they'd like \
+                         instead; don't try another way."
                     .into(),
-            ),
+            }),
             Decision::Unattended => Ok("not approved: a scheduled run can't ask.".into()),
         }
     }
@@ -4671,6 +4716,7 @@ mod tests {
             by: None,
             edited: None,
             plan: None,
+            note: None,
             for_task: false,
         };
         let started = Instant::now();
@@ -4720,6 +4766,7 @@ mod tests {
                 by: None,
                 edited: None,
                 plan: None,
+                note: None,
                 for_task: false,
             })
         };
@@ -5027,6 +5074,7 @@ mod tests {
                     by: None,
                     edited: Some(edited.into()),
                     plan: None,
+                    note: None,
                     for_task: false,
                 }),
                 &mut cancel,
@@ -5084,6 +5132,7 @@ mod tests {
                     by: None,
                     edited: None,
                     plan: None,
+                    note: None,
                     for_task: false,
                 }),
                 &mut cancel,
@@ -5147,6 +5196,7 @@ mod tests {
                     by: None,
                     edited: Some("Check only the build".into()),
                     plan: None,
+                    note: None,
                     for_task: false,
                 }),
             )
@@ -6036,6 +6086,7 @@ mod user_schedule_tests {
             by: None,
             edited: None,
             plan: None,
+            note: None,
             for_task: false,
         };
         let made = agent.schedule_task("t2", &after, true, Some(approved)).unwrap();
@@ -6994,6 +7045,7 @@ mod access_tests {
             by: Some("me@acme.com".into()),
             edited: None,
             plan: None,
+            note: None,
             for_task: false,
         };
         let reply = agent
@@ -7076,6 +7128,7 @@ mod access_tests {
             by: None,
             edited: None,
             plan: None,
+            note: None,
             for_task: false,
         };
         let reply = agent
@@ -7216,6 +7269,7 @@ mod plan_tests {
             by: Some("me".into()),
             edited: None,
             plan,
+            note: None,
             for_task: false,
         })
     }
@@ -7570,6 +7624,94 @@ mod plan_tests {
             )
             .unwrap();
         assert!(agent.plan_problem("other", &json!([{"step": "x"}])).is_some());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn what_the_user_adds_to_a_plan_goes_to_the_agent_and_grants_nothing() {
+        let (agent, dir) = test_agent();
+        agent
+            .secrets
+            .put("GITHUB_TOKEN", "ghp_test_value_123456")
+            .unwrap();
+        let mut state = a_task(&agent);
+        let park = parks(agent.update_plan(&mut state, &plan_args(), None));
+        assert_eq!(park.card["notes"], true, "the card says it takes them");
+        agent
+            .store
+            .park(&park.id, "t1", &park.card, "{}", &agent.policy_version())
+            .unwrap();
+
+        // Checked: trimmed, nothing is None, too long is refused, a plan card's only.
+        assert_eq!(
+            agent.plan_note(&park.id, "  Use the work account \n"),
+            Ok(Some("Use the work account".into()))
+        );
+        assert_eq!(agent.plan_note(&park.id, " \n "), Ok(None));
+        assert!(
+            agent
+                .plan_note(&park.id, &"a".repeat(plan::MAX_NOTE_CHARS + 1))
+                .unwrap_err()
+                .contains("too long")
+        );
+        agent
+            .store
+            .park(
+                "other",
+                "t1",
+                &json!({"kind": "shell", "command": "rm -rf x"}),
+                "{}",
+                &agent.policy_version(),
+            )
+            .unwrap();
+        assert!(agent.plan_note("other", "do it anyway").is_err());
+
+        let with = |approved, note: &str| {
+            let mut answer = answer(&park.card, approved, None).unwrap();
+            answer.note = Some(note.into());
+            Some(answer)
+        };
+        // Denied with it: the agent may plan again from what they said.
+        let said = agent
+            .update_plan(
+                &mut state,
+                &plan_args(),
+                with(false, "Skip Slack, just write the list"),
+            )
+            .unwrap();
+        assert!(
+            said.starts_with("denied:")
+                && said.contains("They wrote:\nSkip Slack, just write the list")
+                && said.contains("make a new plan that follows it"),
+            "{said}"
+        );
+        assert!(state.grant.needs.is_empty());
+
+        // Approved with it: the agent reads it, a saved key's value redacted,
+        // and the grant is the plan's alone.
+        let said = agent
+            .update_plan(
+                &mut state,
+                &plan_args(),
+                with(
+                    true,
+                    "Post it after 5pm, and also email it to Sam with ghp_test_value_123456",
+                ),
+            )
+            .unwrap();
+        assert!(said.starts_with("approved:"), "{said}");
+        assert!(
+            said.contains("They also wrote this with their answer")
+                && said.contains("Post it after 5pm, and also email it to Sam")
+                && said.contains("[secret GITHUB_TOKEN]")
+                && !said.contains("ghp_test"),
+            "{said}"
+        );
+        let mail = json!({"kind": "browser", "action": "type", "site": "mail.google.com", "text": "hi"});
+        assert!(
+            agent.approve("t1", mail, None, false).unwrap_err().is::<Park>(),
+            "what the note asks for still asks"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 }

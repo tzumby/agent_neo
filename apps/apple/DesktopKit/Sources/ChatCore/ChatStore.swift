@@ -592,18 +592,20 @@ public final class ChatStore {
     }
 
     /// `plan`: the user's version of a plan card's steps, when they changed
-    /// it. Returns agentd's reason when it refused a plan card's answer (a
-    /// 400: an empty step, too many, a need the card didn't have), for the
-    /// card to show rather than a notice.
+    /// it; `note`: what they added to a plan card, with either answer.
+    /// Returns agentd's reason when it refused a plan card's answer (a 400:
+    /// an empty step, too many, a need the card didn't have), for the card to
+    /// show rather than a notice.
     @discardableResult
     public func answer(
         _ approval: Approval, approved: Bool, text: String? = nil, plan: [PlanEdit]? = nil, forTask: Bool = false,
-        client: AgentClient
+        note: String? = nil, client: AgentClient
     ) async -> String? {
         var refused: String?
         await attempt(onGone: { $0.conversations.values.forEach { $0.expire(approval: approval.id) } }) {
             do {
-                try await client.answer(approval: approval.id, approved: approved, text: text, plan: plan, forTask: forTask)
+                try await client.answer(
+                    approval: approval.id, approved: approved, text: text, plan: plan, forTask: forTask, note: note)
             } catch let error as AgentError where error.statusCode == 400 && approval.plan != nil {
                 refused = Self.message(error)
             }

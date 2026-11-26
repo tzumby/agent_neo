@@ -292,9 +292,12 @@ struct ApprovalAnswer: Encodable, Equatable {
     var plan: [PlanEdit]? = nil
     /// "Allow for this task"; left out when not.
     var forTask: Bool? = nil
+    /// What the user added to a plan card in their own words (agentd
+    /// 0.21.0); left out when they added nothing.
+    var note: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case approved, text, plan
+        case approved, text, plan, note
         case forTask = "for_task"
     }
 }
@@ -457,13 +460,19 @@ public struct AgentClient: Sendable {
     /// an edit; `plan`: their version of a plan card's steps. Each only when
     /// they changed it.
     /// `forTask`: "Allow for this task", the card's kind of action without
-    /// asking until the task ends.
+    /// asking until the task ends. `note`: what the user added to a plan card
+    /// (one with `notes`), sent with either answer; trimmed, and left out
+    /// when empty.
     public func answer(
-        approval id: String, approved: Bool, text: String? = nil, plan: [PlanEdit]? = nil, forTask: Bool = false
+        approval id: String, approved: Bool, text: String? = nil, plan: [PlanEdit]? = nil, forTask: Bool = false,
+        note: String? = nil
     ) async throws {
+        let note = note?.trimmingCharacters(in: .whitespacesAndNewlines)
         let _: [String: Bool] = try await post(
             "/api/v1/approvals/\(id)",
-            body: ApprovalAnswer(approved: approved, text: text, plan: plan, forTask: forTask ? true : nil))
+            body: ApprovalAnswer(
+                approved: approved, text: text, plan: plan, forTask: forTask ? true : nil,
+                note: note?.isEmpty == false ? note : nil))
     }
 
     /// "I'm done" (true) or "Skip" (false) on an action-needed card; starts a

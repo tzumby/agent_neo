@@ -625,6 +625,9 @@ private func said(_ covers: PlanCovers) -> String {
     #expect(oddPlan.steps == [PlanStep(step: "Go", status: .pending, commands: ["ls"])])
     #expect(oddPlan.covers == PlanCovers(sites: ["a.com"]))
     #expect(!odd.editable, "only a card that says it takes an edit offers one")
+    #expect(!plan.notes && !oddPlan.notes, "only a card that says it reads them offers more details")
+    let (_, noted) = try planApproval(planCard.replacingOccurrences(of: #""editable":true,"#, with: #""editable":true,"notes":true,"#))
+    #expect(noted.notes)
 
     var timeline = ChatTimeline(replaying: [try event(1, "approval.requested", planCard)])
     timeline.apply(

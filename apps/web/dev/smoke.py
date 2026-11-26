@@ -247,6 +247,11 @@ async def main(out):
             p.check("form.test" in words and "Commands that would ask" in words, "…naming the page it types on and that it runs commands")
             await p.js(f"""(() => {{ const t = {card}.querySelector('.plan-edit-text');
                 t.value = 'Open the page with the message box'; t.dispatchEvent(new Event('input')); }})()""")
+            # More details, in the person's words: optional, and sent with the answer.
+            p.check(await p.js(f"!!{card}.querySelector('textarea.plan-note') && {card}.textContent.includes('More details (optional)')"),
+                    "…with an optional field for more details")
+            await p.js(f"""(() => {{ const t = {card}.querySelector('textarea.plan-note');
+                t.value = 'Sign it from Sam'; t.dispatchEvent(new Event('input')); }})()""")
             await p.js(f"{card}.scrollIntoView({{block: 'center'}})")
             await p.shot(f"{out}/smoke-plan-card.png")
             answered = await p.js(answers)
@@ -255,6 +260,8 @@ async def main(out):
             p.check(await p.until(f"{answers} > {answered}", 15), "…and the task ends")
             p.check(await p.js("[...document.querySelectorAll('.row-agent')].pop().textContent.includes('Hello under the plan')"),
                     "…the page has the text")
+            p.check(await p.js("[...document.querySelectorAll('.row-agent')].pop().textContent.includes('Your note: Sign it from Sam')"),
+                    "…and the agent got the details added")
             p.check(await p.js("!document.querySelector('.card-needs')"), "…with no more cards")
             last = "[...document.querySelectorAll('.row-plan')].pop()"
             p.check(await p.js(f"{last}?.textContent.includes('Open the page with the message box')"), "…and the plan is the person's version")

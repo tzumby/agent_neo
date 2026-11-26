@@ -226,6 +226,14 @@ import Testing
     #expect(steps[1].keys.sorted() == ["status", "step"])
 }
 
+@Test func whatTheUserAddsToAPlanGoesWithTheAnswerOnlyWhenThereIsSomething() throws {
+    let noted = try JSONSerialization.jsonObject(
+        with: JSONEncoder().encode(ApprovalAnswer(approved: false, text: nil, note: "Skip Slack"))) as? [String: Any]
+    #expect(noted?.keys.sorted() == ["approved", "note"] && noted?["note"] as? String == "Skip Slack")
+    let plain = try JSONEncoder().encode(ApprovalAnswer(approved: true, text: nil, note: nil))
+    #expect(String(decoding: plain, as: UTF8.self) == #"{"approved":true}"#)
+}
+
 // MARK: Model keys (agentd 0.20.0)
 
 @Test func decodesTheProvidersAndTheKeyTheDesktopNeeds() throws {

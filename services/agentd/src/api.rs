@@ -449,6 +449,9 @@ struct Approval {
     text: Option<String>,
     /// A plan card's steps as the user edited them: they replace the agent's.
     plan: Option<Value>,
+    /// What the user added to a plan card in their own words (a card with
+    /// `notes`), approved or denied: the agent reads it with their answer.
+    note: Option<String>,
     /// "Allow for this task": the card's kind of action goes ahead without
     /// asking for the rest of the task.
     #[serde(default)]
@@ -463,7 +466,16 @@ async fn answer_approval(
 ) -> Response {
     let edited = body.text.as_deref().filter(|_| body.approved);
     let plan = body.plan.as_ref().filter(|_| body.approved);
-    tracing::info!(id, approved = body.approved, edited = edited.is_some() || plan.is_some(), by = ?caller(&headers), "approval answered");
+    let note = match body
+        .note
+        .as_deref()
+        .map(|text| agent.plan_note(&id, text))
+        .transpose()
+    {
+        Ok(note) => note.flatten(),
+        Err(problem) => return error(StatusCode::BAD_REQUEST, &problem),
+    };
+    tracing::info!(id, approved = body.approved, edited = edited.is_some() || plan.is_some(), noted = note.is_some(), by = ?caller(&headers), "approval answered");
     if edited.is_some() && plan.is_some() {
         return error(StatusCode::BAD_REQUEST, "send text or plan, not both");
     }
@@ -474,7 +486,7 @@ async fn answer_approval(
         return error(StatusCode::BAD_REQUEST, &problem);
     }
     let edit = edited.map(Edit::Text).or(plan.map(Edit::Plan));
-    match agent.answer_approval_for(&id, body.approved, edit, body.for_task, caller(&headers)) {
+    match agent.answer_approval_for(&id, body.approved, edit, note, body.for_task, caller(&headers)) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(StartError::NotFound) => error(
             StatusCode::NOT_FOUND,

@@ -215,6 +215,11 @@ a.icon-button { color: inherit; }
 .plan-tool:disabled { opacity: 0.35; cursor: default; }
 .plan-add { align-self: flex-start; padding-left: 0.6rem; }
 .plan-summary code { font: 0.85em var(--mono); overflow-wrap: anywhere; }
+/* More details, in the person's words, under a plan's steps. */
+.plan-note-label { gap: 0.35rem; }
+.plan-note-optional, .plan-note-hint { font-weight: 400; color: var(--slate); }
+.plan-note-hint { font-size: 0.82rem; }
+.plan-note { min-height: 3.4rem; font-weight: 400; }
 /* An action an approved plan let go ahead: a quiet line, what it did folded under it. */
 .row-covered + .row-covered { margin-top: -0.9rem; }
 .covered { margin: 0; color: var(--slate); font-size: 0.88rem; }

@@ -487,6 +487,33 @@ test("answering a plan card sends the plan only when edited, and a refused edit 
   assert.ok(store.conversation.expiredApprovals.has(card.id));
 });
 
+test("what the person adds to a plan card goes with either answer, trimmed, and only when there's something", async (t) => {
+  const bodies = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  });
+  const store = new Store(api);
+  const card = { id: "a1b2c3d4e5f6" };
+  await store.answerPlan(card, true, undefined, "  Use the work account\n");
+  await store.answerPlan(card, false, undefined, "Skip Slack");
+  await store.answerPlan(card, true, undefined, "   ");
+  await store.answerPlan(card, true);
+  assert.deepEqual(bodies, [
+    { approved: true, note: "Use the work account" },
+    { approved: false, note: "Skip Slack" },
+    { approved: true },
+    { approved: true },
+  ]);
+
+  // Only a card from an agentd that reads it offers the field.
+  const cards = (data) => new Timeline([
+    ev("approval.requested", { kind: "plan", id: "p1", task: "t1", steps: [{ step: "Read", status: "pending" }], ...data }),
+  ]).visible().filter((i) => i.type === "approval");
+  assert.equal(cards({ notes: true })[0].plan.notes, true);
+  assert.equal(cards({})[0].plan.notes, false);
+});
+
 test("a plan whose message is on an older page still shows", () => {
   const t = new Timeline([
     ev("task.resumed", { task: "t9" }),

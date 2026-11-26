@@ -53,9 +53,10 @@ export const api = {
   send: (text) => request("POST", "/api/v1/messages", withTime(text)),
   stop: () => request("POST", "/api/v1/stop", {}),
   // `text`, `plan`: the person's version of the card's text, or of a plan
-  // card's steps; each left out (undefined) unless they changed it.
-  answer: (id, approved, text, plan, forTask) =>
-    request("POST", `/api/v1/approvals/${enc(id)}`, { approved, text, plan, for_task: forTask || undefined }),
+  // card's steps; each left out (undefined) unless they changed it. `note`:
+  // what they added to a plan card in their own words (agentd 0.21.0).
+  answer: (id, approved, text, plan, forTask, note) =>
+    request("POST", `/api/v1/approvals/${enc(id)}`, { approved, text, plan, for_task: forTask || undefined, note: note || undefined }),
   resolve: (id, done) => request("POST", `/api/v1/actions/${enc(id)}`, { choice: done ? "done" : "skip" }),
   // Conversations (agentd 0.16): 404 on an older desktop.
   sessions: (archived) => request("GET", `/api/v1/sessions${archived ? "?archived=1" : ""}`),

@@ -21,6 +21,7 @@ const PLAN_STATUSES = ["pending", "in_progress", "done"];
 /** agentd's limits on a plan the person edits. */
 export const PLAN_MAX_STEPS = 20;
 export const PLAN_STEP_LENGTH = 120;
+export const PLAN_NOTE_LENGTH = 2000;
 
 /** "1 min", "24 min", "1 h 5 min" for whole minutes; "" under one. */
 export function duration(minutes) {
@@ -365,6 +366,8 @@ export class Timeline {
           // `covers` is what approving adds (a later card's: only what's new).
           const list = (key) => [...new Set(Array.isArray(d.covers?.[key]) ? d.covers[key].filter((v) => typeof v === "string" && v) : [])];
           card.plan = {
+            // The person can add to their answer in their own words (agentd 0.21.0).
+            notes: d.notes === true,
             steps: Array.isArray(d.steps) ? planSteps(d.steps) : [],
             covers: {
               sites: list("sites"), apps: list("apps"), shell: d.covers?.shell === true, keys: list("keys"),

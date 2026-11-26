@@ -1285,6 +1285,9 @@ private struct PlanRow: View {
 /// need (a site, an app, commands, an install) then goes ahead without cards
 /// of its own, for the rest of the task. The user can reword, delete, add and
 /// reorder steps and take needs off, but not add one: agentd refuses that.
+/// They can also add more details in their own words (a card with `notes`),
+/// sent with either answer: the agent follows them, and they approve nothing
+/// the steps don't.
 private struct PlanApprovalCard: View {
     let approval: Approval
     let plan: PlanApproval
@@ -1295,6 +1298,8 @@ private struct PlanApprovalCard: View {
     /// Why agentd refused the version sent.
     @State private var refused: String?
     @State private var sending = false
+    /// What the user adds, in their own words.
+    @State private var note = ""
     @FocusState private var focused: Int?
 
     init(approval: Approval, plan: PlanApproval) {
@@ -1332,6 +1337,9 @@ private struct PlanApprovalCard: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(!draft.canAdd)
+            }
+            if plan.notes {
+                details
             }
             summary
             if let problem = draft.problem {
@@ -1413,6 +1421,31 @@ private struct PlanApprovalCard: View {
         .font(.app(.callout))
     }
 
+    /// More details for the agent, optional: sent with the answer.
+    private var details: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            (Text("More details ").fontWeight(.semibold) + Text("(optional)").foregroundStyle(.secondary))
+                .font(.app(.footnote))
+            TextField("Anything the agent should know or do differently", text: $note, axis: .vertical)
+                .lineLimit(2...6)
+                .textFieldStyle(.plain)
+                .font(.app(.callout))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Theme.inset, in: .rect(cornerRadius: 10))
+                .onChange(of: note) { _, text in
+                    if text.count > Self.noteLimit { note = String(text.prefix(Self.noteLimit)) }
+                }
+                .accessibilityLabel("More details, optional")
+            Text("Goes to the agent with your answer. It doesn't approve anything the steps don't.")
+                .font(.app(.caption))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// agentd's limit on what the user adds.
+    private static let noteLimit = 2000
+
     /// What approving lets the task do without asking, as the steps are now.
     private var summary: some View {
         let phrases = draft.covered(by: plan.covers).phrases
@@ -1473,7 +1506,8 @@ private struct PlanApprovalCard: View {
         let edits = approved ? draft.edits(from: plan.steps) : nil
         sending = true
         Task {
-            refused = await store.answer(approval, approved: approved, plan: edits, client: client)
+            refused = await store.answer(
+                approval, approved: approved, plan: edits, note: plan.notes ? note : nil, client: client)
             sending = false
         }
     }

@@ -108,6 +108,8 @@ FORM = b"""<!doctype html><title>Message Lawrence</title><p id="echo">Nothing wr
 SUPERVISOR = "(agentd supervisor)"
 # How agentd's nudge to plan before a task's first card starts.
 PLAN_FIRST = "not done yet: this needs the user's OK."
+# How agentd passes on what the person added to a plan card they approved.
+PLAN_NOTE = "They also wrote this with their answer."
 STUCK = {"verdict": "stuck", "reason": "It has read the same page 6 times without anything changing.",
          "advice": "Stop re-reading the page."}
 PROGRESSING = {"verdict": "progressing", "reason": "Making progress.", "advice": ""}
@@ -160,7 +162,15 @@ def reply(messages, tools=(), body=None):
             return call(*steps[done])
     if after_tool:
         result = str(messages[-1].get("content", ""))[:300]
-        return {"role": "assistant", "content": f"Done. The tool said: {result}"}
+        # What the person added to a plan card, as agentd passed it on.
+        added = ""
+        for message in reversed(messages):
+            if own(message):
+                break
+            content = str(message.get("content", ""))
+            if message.get("role") == "tool" and PLAN_NOTE in content:
+                added = f" Your note: {content.split(PLAN_NOTE, 1)[1].split(':', 1)[1].strip()[:200]}"
+        return {"role": "assistant", "content": f"Done. The tool said: {result}{added}"}
     if "slow" in text:
         time.sleep(6)
     if "status site" in text:

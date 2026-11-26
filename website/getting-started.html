@@ -99,13 +99,13 @@
         <ul class="plain">
           <li>A VPC with private subnets. Outbound internet goes through a fck-nat instance (a t4g.nano), or AWS’s NAT gateway if you set <code>enable_nat_gateway</code>.</li>
           <li><strong>One desktop</strong> (a t3a.medium by default) in a private subnet: no public IP, no inbound rules, its own IAM role (SSM only) and its own KMS key for its disk. You administer it with SSM Session Manager; there’s no SSH.</li>
-          <li>An S3 bucket for Terraform’s state, one for Ansible’s file transfers, and two SSM parameters you create yourself: your Together AI key and a Tailscale auth key.</li>
+          <li>An S3 bucket for Terraform’s state, one for Ansible’s file transfers, and two SSM parameters you create yourself: your model key and a Tailscale auth key.</li>
         </ul>
 
         <h3>Accounts</h3>
         <ul class="plain">
           <li>An AWS account. Step 1 walks you through a new one.</li>
-          <li>A <a href="https://api.together.ai">Together AI</a> API key.</li>
+          <li>An Anthropic API key, from the <a href="https://platform.claude.com">Claude Console</a>. The agent uses Claude Opus 4.6 by default, and you can switch to Opus 5.5 in the app. API use is billed per token; a Claude Pro or Max subscription doesn’t cover it, and its sign-in is only for Claude’s own apps. Prefer <a href="https://api.together.ai">Together AI</a>? Set <code>agentd_llm_provider: together</code> in <code>ansible/inventory/group_vars/desktop.yml</code> and run <code>make model-key PROVIDER=together</code>.</li>
           <li>A <a href="https://tailscale.com">Tailscale</a> account. The free personal plan is enough.</li>
         </ul>
 
@@ -286,7 +286,7 @@ make preflight</code></pre>
             <div class="code" data-copy>
 <pre><code>make model-key</code></pre>
             </div>
-            <p>Paste your Together AI key. Then:</p>
+            <p>Paste your Anthropic API key. Then:</p>
             <div class="code" data-copy>
 <pre><code>make tailscale-key</code></pre>
             </div>
@@ -338,6 +338,7 @@ make preflight</code></pre>
         <ul class="tools">
           <li><span class="t">Plans</span><span class="d">Anything with three or more steps gets a checklist that ticks off as the agent goes.</span></li>
           <li><span class="t">Approval cards</span><span class="d">Show the exact command, browser input or app input the agent wants. Every click, bit of typing and key press needs your OK, and typing and submitting are separate cards.</span></li>
+          <li><span class="t">Plans</span><span class="d">When a task would ask again and again, the agent shows its plan first, on one card: each step, with the site, app, command or install it needs your OK for. Reword, add, remove or reorder steps, take off anything you’d rather approve one at a time, then approve. What’s left goes ahead without more cards until the task ends, and each action shows in the chat as <strong>Under your plan</strong>. Saved keys, new sites and direct internet still ask on their own.</span></li>
           <li><span class="t">Signing in to sites</span><span class="d">When a site needs you (a login, 2FA, a CAPTCHA), an Action needed card offers <strong>Take over</strong>. The desktop opens in the page, and the agent carries on when you’re done. Chrome stays signed in.</span></li>
           <li><span class="t">Keys and tokens</span><span class="d">Give them through the secure card or the Keys and tokens screen, never in the chat. Review the exact command before granting a key, and prefer narrowly scoped tokens: the command runs in the agent’s workspace, so anything there it uses (a tool the agent installed, a repository’s git hooks, package scripts) runs with the key too.</span></li>
           <li><span class="t">Desktop apps</span><span class="d">Beyond Chrome, the agent uses the desktop’s own apps: it clicks, types, presses shortcuts and fills dialogs, each batch on one card. It can also install apps from the Snap Store, with your OK. See <a href="#desktop-apps">Desktop apps</a>.</span></li>
@@ -481,7 +482,7 @@ APP_PUSH=1 make app-device</code></pre>
       <section id="desktop-apps" aria-labelledby="desktop-apps-h">
         <h2 id="desktop-apps-h">Desktop apps</h2>
         <p>Beyond Chrome, the agent uses the desktop’s own Linux apps the way you would. It reads their controls through the accessibility tree that screen readers use, with Microsoft Research’s open-source <a href="https://github.com/microsoft/Hybrid-Computer-Use">Hybrid Computer Use</a>, and then clicks, types (any language, newlines included), presses shortcuts, picks from menus, fills dialogs, scrolls, and switches or closes windows.</p>
-        <p>Each batch of input is one card. It lists every step: the full text to type, each key, each control and where it sits. You also get the agent’s reason and a screenshot. Everything is checked again just before it happens: if anything changed while you decided, nothing is sent. It never types into password fields, and scheduled runs can’t use apps.</p>
+        <p>Each batch of input is one card, unless you approved a plan that names the app. It lists every step: the full text to type, each key, each control and where it sits. You also get the agent’s reason and a screenshot. Everything is checked again just before it happens: if anything changed while you decided, nothing is sent. It never types into password fields, and scheduled runs can’t use apps.</p>
         <p>The apps it may use are listed: Mousepad and Slack to start. Chrome stays with the browser tools, and terminals and the file manager are out of reach.</p>
 
         <h3>On and off</h3>
@@ -494,12 +495,12 @@ APP_PUSH=1 make app-device</code></pre>
         <ol class="steps">
           <li><p>Take over the desktop and open Mousepad (Applications → Accessories → Mousepad). The agent doesn’t start apps itself.</p></li>
           <li><p>In the chat, ask: “In Mousepad, write a shopping list with three items and save it as list.txt in my home folder.”</p></li>
-          <li><p>Approve the cards. Expect two or three: the typing and Ctrl+S, then the file name in the Save As dialog. Each shows the desktop as it was when the agent asked. Mousepad’s title changes to <code>list.txt</code>.</p></li>
+          <li><p>Approve the plan card: its steps name Mousepad, so the typing, Ctrl+S and the file name in the Save As dialog then go ahead without more cards, each listed in the chat as <strong>Under your plan</strong>. If the agent goes ahead without a plan, or you take Mousepad off it, you approve each batch instead: two or three cards, each showing the desktop as it was when the agent asked. Mousepad’s title changes to <code>list.txt</code>.</p></li>
         </ol>
         <p>Reading needs no card: “What does the file open in Mousepad say?”</p>
 
         <h3>Screenshots</h3>
-        <p>With a model that sees images, set in Settings (Kimi-K3 today), the agent also looks at screenshots of the desktop, zooms into them, and can click, drag or type at a spot on the screen, for anything the accessibility tree leaves out. Those cards number each spot on the screenshot. The default model, GLM-5.3, doesn’t take images, so the agent works from the tree alone.</p>
+        <p>With a model that sees images (Claude Opus; on Together, Kimi-K3), the agent also looks at screenshots of the desktop, zooms into them, and can click, drag or type at a spot on the screen, for anything the accessibility tree leaves out. Those cards number each spot on the screenshot. On Together, the default model, GLM-5.3, doesn’t take images, so the agent works from the tree alone.</p>
 
         <h3>Installing apps</h3>
         <p>Ask the agent to install a desktop app, like Spotify or Zoom. It looks the app up in the Snap Store and asks on a card that shows the app, its publisher, version and size. Only sandboxed apps from verified publishers qualify. Once you approve, it’s installed with launchers on the desktop and in the Applications menu. Installing an app doesn’t let the agent use it: add the app to the list below first.</p>
@@ -558,7 +559,7 @@ make desktop          <span class="c"># OS hardening, the display stack, Chrome<
             </tbody>
           </table>
         </div>
-        <p>Plus what you spend on Together AI. <code>make stop</code> brings the desktop’s part down to its disk. Unlimited CPU credits (<code>cpu_credits</code>) can add to it under sustained load.</p>
+        <p>Plus what you spend on the model: Claude Opus 4.6 is $5 per million tokens in and $25 out, Opus 5.5 $4 and $20, and input read back from the cache costs a tenth of that or less. <code>make stop</code> brings the desktop’s part down to its disk. Unlimited CPU credits (<code>cpu_credits</code>) can add to it under sustained load.</p>
       </section>
 
       <!-- Reference: teardown -->

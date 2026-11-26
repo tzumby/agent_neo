@@ -9,6 +9,9 @@ last user message, with no real model and no key.
 - "status site": asks to reach status.example.com (request_access: a card)
 - "make a plan": writes a three-step plan with update_plan and ticks it off,
   a second per step (the plan checklist)
+- "post with a plan": a plan whose steps name the page it types on and the
+  command it runs (one plan card), then both, which the plan covers (no
+  more cards)
 - "keep checking": reads the same page over and over (the supervisor finds it
   stuck: run.sh has it check every 6 steps)
 - anything else: a Markdown answer with a table, a list and code
@@ -77,6 +80,18 @@ SCRIPTS = {
         ("read_text", {}),
     ],
     "risky command": [("run_shell", {"command": "rm -rf ./old-build", "summary": "Clear the old build"})],
+    "post with a plan": [
+        ("update_plan", {"items": [
+            {"step": "Open the message page", "status": "pending"},
+            {"step": "Write to Lawrence", "status": "pending", "site": "form.test"},
+            {"step": "Clear the old build", "status": "pending", "commands": ["rm -rf ./old-build"]},
+            {"step": "Say it's done", "status": "pending"},
+        ]}),
+        ("open_url", {"url": "http://form.test/form"}),
+        ("type_text", {"role": "textbox", "name": "Message Lawrence", "text": "Hello under the plan"}),
+        ("run_shell", {"command": "rm -rf ./old-build", "summary": "Clear the old build"}),
+        ("read_text", {}),
+    ],
     "schedule after reading": [
         ("run_shell", {"command": "echo some outside content"}),
         ("schedule_task", {"name": "Morning check", "prompt": "Check everything", "cron": "0 8 * * *"}),
@@ -91,6 +106,8 @@ FORM = b"""<!doctype html><title>Message Lawrence</title><p id="echo">Nothing wr
 
 
 SUPERVISOR = "(agentd supervisor)"
+# How agentd's nudge to plan before a task's first card starts.
+PLAN_FIRST = "not done yet: this needs the user's OK."
 STUCK = {"verdict": "stuck", "reason": "It has read the same page 6 times without anything changing.",
          "advice": "Stop re-reading the page."}
 PROGRESSING = {"verdict": "progressing", "reason": "Making progress.", "advice": ""}
@@ -124,12 +141,18 @@ def reply(messages, tools=(), body=None):
     text = request.get("content") if isinstance(request.get("content"), str) else json.dumps(request.get("content"))
     text = (text or "").lower()
     after_tool = messages and messages[-1].get("role") == "tool"
-    # Calls one after another, each once the last one has answered.
+    # agentd asked to plan before the first card: this is the only thing that
+    # needs an OK, so the same call again (what a model would do).
+    if after_tool and str(messages[-1].get("content", "")).startswith(PLAN_FIRST):
+        again = next(m for m in reversed(messages) if m.get("role") == "assistant" and m.get("tool_calls"))
+        return call(again["tool_calls"][0]["function"]["name"], json.loads(again["tool_calls"][0]["function"]["arguments"]))
+    # Calls one after another, each once the last one has answered (the
+    # nudge to plan doesn't count).
     done = 0
     for message in reversed(messages):
         if own(message):
             break
-        done += message.get("role") == "tool"
+        done += message.get("role") == "tool" and not str(message.get("content", "")).startswith(PLAN_FIRST)
     for trigger, steps in SCRIPTS.items():
         if trigger in text and done < len(steps):
             if trigger in SLOW_SCRIPTS:

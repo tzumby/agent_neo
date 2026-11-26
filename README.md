@@ -25,14 +25,14 @@ In your AWS account, in one region:
   no inbound rules, its own IAM role (SSM only) and its own KMS key for its
   disk. You administer it with SSM Session Manager only; there's no SSH.
 - An S3 bucket for Terraform's state, one for Ansible's file transfers, and
-  two SSM parameters you create yourself: your Together AI key and a Tailscale
-  auth key.
+  two SSM parameters you create yourself: your model key (Anthropic's, or
+  Together AI's) and a Tailscale auth key.
 
 On the desktop:
 
 | | |
 |---|---|
-| **agentd** | The agent (`services/agentd`, Rust): the model loop, browser control over Chrome's DevTools Protocol, a sandboxed shell, memory, schedules and approvals. It calls Together AI directly with your key. |
+| **agentd** | The agent (`services/agentd`, Rust): the model loop, browser control over Chrome's DevTools Protocol, a sandboxed shell, memory, schedules and approvals. It calls the model provider directly with your key: Claude through Anthropic's API (Opus 4.6 by default, Opus 5.5 a pick in the app), or Together AI. |
 | **tailnet-proxy** | The desktop's only presence on your tailnet (`services/tailnet-proxy`, Go, Tailscale's tsnet), at `https://neo-agent.<your tailnet>.ts.net`. It serves the web app, agentd's API and the desktop viewer, and port 5900 for the apps' take-over view. The rest of the VM, including the agent's commands, can't reach your other tailnet devices. |
 | **The web app** | `apps/web` (static files, no build step): the chat, approval cards, the desktop (take over), schedules, keys and tokens, and settings. |
 | Chrome, Xvfb, XFCE, x11vnc, noVNC | The desktop the agent works in, on localhost only. |
@@ -51,7 +51,11 @@ On the desktop:
 - Rust (rustup installs the pinned 1.93.1), [zig](https://ziglang.org) and
   `cargo install cargo-zigbuild`, to build agentd as a static Linux binary.
 - Go ≥ 1.27, for tailnet-proxy.
-- A [Together AI](https://api.together.ai) API key.
+- An Anthropic API key, from the [Claude Console](https://platform.claude.com)
+  (billed per token; a Claude Pro or Max subscription doesn't include API use,
+  and its sign-in may only be used in Claude's own apps). Or a
+  [Together AI](https://api.together.ai) key: set `agentd_llm_provider:
+  together` in `ansible/inventory/group_vars/desktop.yml`.
 - A Tailscale account (the free personal plan is enough).
 - Optional, for the iPhone and Mac apps: a Mac with Xcode 26 or later and an
   Apple Account (a free one works). See
@@ -204,7 +208,7 @@ make bootstrap       # once: the S3 bucket for Terraform's state
 make init
 make plan            # review what it will create
 make apply           # VPC, NAT, the desktop (a few minutes)
-make model-key       # paste your Together AI key (hidden input; stored in SSM)
+make model-key       # paste your Anthropic API key (hidden input; stored in SSM; PROVIDER=together for Together's)
 make tailscale-key   # paste the auth key from above
 make deploy          # the desktop, agentd, then tailnet-proxy (first run: 15-20 minutes)
 ```
@@ -500,7 +504,7 @@ contain data deleted from the desktop. [EBS snapshot encryption](https://docs.aw
 - **The model key** is a SecureString in SSM. Ansible reads it on your machine
   and writes it to `/etc/agentd/secrets.env` (root:agentd, 0640), so on the
   desktop only agentd can read it. The desktop's own IAM role is denied the
-  project's SSM parameters. Prompts go straight from agentd to Together AI;
+  project's SSM parameters. Prompts go straight from agentd to the model provider (Anthropic or Together AI);
   there is no gateway in between. So anyone with root on the desktop can read
   the key, and that's you, over SSM. Your Apple APNs key, if you set up
   notifications for the apps, is handled the same way (same file, same SSM
@@ -525,7 +529,8 @@ contain data deleted from the desktop. [EBS snapshot encryption](https://docs.aw
 Roughly, on demand in ca-central-1: the t3a.medium desktop (~$31/month), its
 20 GB gp3 disk (~$2), the fck-nat t4g.nano with its public IPv4 address (~$7)
 and the KMS key ($1). That's about **$40/month** while it runs, plus what you
-spend on Together AI. `make stop` brings the desktop's part to just its disk.
+spend on the model (Claude Opus 4.6 is $5/$25 per million tokens in/out, Opus
+5.5 $4/$20, less for cached input). `make stop` brings the desktop's part to just its disk.
 Unlimited CPU credits (`cpu_credits`) can add to it under sustained load.
 
 ## Developing

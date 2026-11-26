@@ -209,3 +209,19 @@ import Testing
     let removed = try JSONEncoder().encode(BudgetSetting(usd: nil))
     #expect(String(decoding: removed, as: UTF8.self) == #"{"monthly_budget_usd":null}"#)
 }
+
+@Test func aPlanAnswerSendsThePlanOnlyWhenEdited() throws {
+    let plain = try JSONEncoder().encode(ApprovalAnswer(approved: true, text: nil, plan: nil))
+    #expect(String(decoding: plain, as: UTF8.self) == #"{"approved":true}"#)
+    let plan = [
+        PlanEdit(step: "Push the branch", status: "pending", commands: ["git push -u origin fix"]),
+        PlanEdit(step: "Check CI", status: "pending"),
+    ]
+    let edited = try JSONSerialization.jsonObject(
+        with: JSONEncoder().encode(ApprovalAnswer(approved: true, text: nil, plan: plan))) as? [String: Any]
+    #expect(edited?.keys.sorted() == ["approved", "plan"])
+    let steps = try #require(edited?["plan"] as? [[String: Any]])
+    #expect(steps[0]["step"] as? String == "Push the branch" && steps[0]["commands"] as? [String] == ["git push -u origin fix"])
+    // A need it doesn't have isn't sent at all.
+    #expect(steps[1].keys.sorted() == ["status", "step"])
+}

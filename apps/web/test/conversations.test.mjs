@@ -10,7 +10,7 @@ import {
 } from "../public/assets/js/conversations.js";
 import { Store } from "../public/assets/js/store.js";
 import { Timeline } from "../public/assets/js/timeline.js";
-import { axisMoney, budgetShare, chartDays, kindRows, money, niceCeiling, todayIn } from "../public/assets/js/usage.js";
+import { axisMoney, budgetShare, chartDays, kindRows, modelName, money, niceCeiling, todayIn } from "../public/assets/js/usage.js";
 
 let seq = 0;
 const ev = (kind, data = {}) => ({ seq: ++seq, ts: "2026-11-24T08:00:00Z", kind, data });
@@ -81,7 +81,7 @@ async function connected(api, open = MAIN) {
 test("an event's conversation: its session, else main for conversation kinds, else global", () => {
   assert.equal(sessionOf(ev("message", { role: "user", text: "hi", session: "c1" })), "c1");
   assert.equal(sessionOf({ ...ev("plan", { task: "t1" }), session: "c2" }), "c2", "the stream's own field");
-  for (const kind of ["message", "message.queued", "message.unqueued", "task.started", "run.finished", "approval.requested", "action_needed", "action.resolved", "image", "plan"]) {
+  for (const kind of ["message", "message.queued", "message.unqueued", "task.started", "run.finished", "approval.requested", "approval.plan", "action_needed", "action.resolved", "image", "plan"]) {
     assert.equal(sessionOf(ev(kind, {})), MAIN, `${kind} without a session is main's`);
   }
   assert.equal(sessionOf(ev("memory.saved", { task: "t1" })), MAIN, "saved during a task");
@@ -94,7 +94,8 @@ test("the list is fetched again on the kinds that change it, not on others", () 
   for (const kind of ["session.created", "session.deleted", "message", "message.queued", "message.unqueued", "task.finished", "approval.resolved", "action_needed", "action.resolved", "budget.alert"]) {
     assert.ok(refetchesSessions(kind), kind);
   }
-  for (const kind of ["settings", "plan", "secret.saved", "image", "step"]) assert.ok(!refetchesSessions(kind), kind);
+  // An action a plan covered changes nothing the list shows, and comes one per action.
+  for (const kind of ["settings", "plan", "secret.saved", "image", "step", "approval.plan"]) assert.ok(!refetchesSessions(kind), kind);
 });
 
 test("routes: #/chat is main, #/chat/<id> its conversation, nothing at all the last one", () => {
@@ -391,4 +392,12 @@ test("usage: the scale, money and the budget", () => {
   assert.deepEqual([over.fill, over.percent, over.tone], [1, 122, "over"]);
   assert.deepEqual(kindRows({ chat: 30.1, scheduled: 9.8, tidy_up: 1.3, other: 0 }).map((k) => k.name),
     ["Chat", "Scheduled runs", "Memory tidy-up", "other"]);
+});
+
+test("models have names for people", () => {
+  assert.equal(modelName("claude-opus-4-6"), "Claude Opus 4.6");
+  assert.equal(modelName("claude-opus-5-5"), "Claude Opus 5.5");
+  assert.equal(modelName("claude-haiku-5-5"), "Claude Haiku 5.5");
+  assert.equal(modelName("zai-org/GLM-5.3"), "GLM-5.3");
+  assert.equal(modelName(""), "");
 });

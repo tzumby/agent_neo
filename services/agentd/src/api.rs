@@ -17,9 +17,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_stream::StreamExt;
 
-use crate::agent::{Agent, SecretError, StartError};
+use crate::agent::{Agent, Edit, SecretError, StartError};
 use crate::clock::UserClock;
-use crate::llm::KNOWN_MODELS;
 use crate::memory;
 use crate::schedule;
 use crate::sessions::{PostError, SessionError};
@@ -209,7 +208,8 @@ async fn status(State(agent): App) -> Json<Value> {
         "waiting_on": agent.waiting_on(),
         "settings": agent.settings(),
         "last_seq": agent.store.last_seq().unwrap_or(0),
-        "known_models": KNOWN_MODELS,
+        "known_models": agent.cfg.provider.models(),
+        "provider": agent.cfg.provider.name(),
         "shell_tool": agent.cfg.shell_tool,
         "version": env!("CARGO_PKG_VERSION"),
         // The rules in force (policy.rs), and the side-effects queue's health.
@@ -423,6 +423,8 @@ struct Approval {
     /// What the user changed the card's text to (a command, a message, a
     /// schedule's instructions): it replaces the agent's.
     text: Option<String>,
+    /// A plan card's steps as the user edited them: they replace the agent's.
+    plan: Option<Value>,
 }
 
 async fn answer_approval(
@@ -432,11 +434,19 @@ async fn answer_approval(
     Json(body): Json<Approval>,
 ) -> Response {
     let edited = body.text.as_deref().filter(|_| body.approved);
-    tracing::info!(id, approved = body.approved, edited = edited.is_some(), by = ?caller(&headers), "approval answered");
+    let plan = body.plan.as_ref().filter(|_| body.approved);
+    tracing::info!(id, approved = body.approved, edited = edited.is_some() || plan.is_some(), by = ?caller(&headers), "approval answered");
+    if edited.is_some() && plan.is_some() {
+        return error(StatusCode::BAD_REQUEST, "send text or plan, not both");
+    }
     if let Some(problem) = edited.and_then(|text| agent.edit_problem(&id, text)) {
         return error(StatusCode::BAD_REQUEST, problem);
     }
-    match agent.answer_approval(&id, body.approved, edited, caller(&headers)) {
+    if let Some(problem) = plan.and_then(|steps| agent.plan_problem(&id, steps)) {
+        return error(StatusCode::BAD_REQUEST, &problem);
+    }
+    let edit = edited.map(Edit::Text).or(plan.map(Edit::Plan));
+    match agent.answer_approval(&id, body.approved, edit, caller(&headers)) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(StartError::NotFound) => error(
             StatusCode::NOT_FOUND,
@@ -669,6 +679,7 @@ async fn consolidation(State(agent): App) -> Response {
     Json(crate::consolidate::stats(
         &agent.store,
         &agent.cfg.consolidation_model,
+        agent.cfg.provider,
     ))
     .into_response()
 }
@@ -1348,19 +1359,19 @@ mod tests {
         assert!(agent.settings().auto_approve);
         assert_eq!(confirm(true, Some(current)).await.status(), StatusCode::CONFLICT);
         assert_eq!(
-            update(json!({"model": "legacy model", "auto_approve": false}))
+            update(json!({"model": "zai-org/GLM-5.3-Flash", "auto_approve": false}))
                 .await
                 .status(),
             StatusCode::OK
         );
         assert_eq!(
-            update(json!({"model": "new model", "allow_actions": false, "auto_approve": true}))
+            update(json!({"model": "moonshotai/Kimi-K3", "allow_actions": false, "auto_approve": true}))
                 .await
                 .status(),
             StatusCode::OK
         );
         let settings = agent.settings();
-        assert_eq!(settings.model, "new model");
+        assert_eq!(settings.model, "moonshotai/Kimi-K3");
         assert!(!settings.allow_actions);
         assert!(!settings.auto_approve);
         std::fs::remove_dir_all(dir).unwrap();

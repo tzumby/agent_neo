@@ -25,7 +25,7 @@ use crate::cdp::Cdp;
 use crate::clock::UserClock;
 use crate::config::Config;
 use crate::guard;
-use crate::llm::{self, Together, Usage, truncate};
+use crate::llm::{self, Llm, Usage, truncate};
 use crate::memory;
 use crate::plan;
 use crate::policy::Policy;
@@ -318,6 +318,13 @@ struct RunState {
     /// measure of progress.
     #[serde(default)]
     plan: Vec<plan::Item>,
+    /// What the plans the user approved cover: those actions go ahead
+    /// without their own cards, for this task only.
+    #[serde(default)]
+    grant: plan::Grant,
+    /// Asked once to plan before its first card (PlanFirst).
+    #[serde(default)]
+    plan_asked: bool,
     /// When the supervisor last checked (supervise.rs).
     #[serde(default)]
     review: ReviewClock,
@@ -505,9 +512,20 @@ struct Answer {
     by: Option<String>,
     /// What they changed the card's text to, if they did.
     edited: Option<String>,
+    /// A plan card's steps as they edited them, if they did.
+    plan: Option<Vec<plan::Item>>,
+}
+
+/// What the user changed on a card before approving it.
+pub enum Edit<'a> {
+    /// A command, what to type, or a schedule's instructions.
+    Text(&'a str),
+    /// A plan card's steps.
+    Plan(&'a Value),
 }
 
 /// What an approval decided.
+#[derive(Debug)]
 enum Decision {
     Approved,
     Denied,
@@ -533,6 +551,25 @@ impl std::fmt::Display for Park {
 
 impl std::error::Error for Park {}
 
+/// Raised, once a task, before its first card for input or an install: the
+/// model is asked to plan first, so the user can approve the rest at once.
+#[derive(Debug)]
+struct PlanFirst;
+
+impl std::fmt::Display for PlanFirst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("asked to plan first")
+    }
+}
+
+impl std::error::Error for PlanFirst {}
+
+/// What the model gets instead of its first card (PlanFirst).
+const PLAN_FIRST: &str = "not done yet: this needs the user's OK. If this task will need their OK more than once, \
+     call update_plan first and name on each step what it needs (site, app, commands, install): the user then \
+     approves it all on one card, and you do this after. If this is the only thing that needs their OK, call it \
+     again as it is.";
+
 enum Outcome {
     Finished(String, &'static str),
     Parked(Park),
@@ -542,7 +579,7 @@ pub struct Agent {
     pub cfg: Config,
     pub store: Arc<Store>,
     pub bus: broadcast::Sender<Event>,
-    llm: Together,
+    llm: Llm,
     pub(crate) cdp: Cdp,
     policy: Arc<Policy>,
     shell: Shell,
@@ -579,6 +616,11 @@ pub struct Agent {
     model_images: Mutex<HashMap<String, Vec<String>>>,
     model_frames: Mutex<HashMap<String, String>>,
     vision_tasks: Mutex<HashSet<String>>,
+    /// Each running task's grant from its approved plan (RunState's, while
+    /// its loop runs), for the cards it would ask (approve).
+    plan_grants: Mutex<HashMap<String, plan::Grant>>,
+    /// Chat tasks not yet asked to plan before their first card (PlanFirst).
+    unplanned: Mutex<HashSet<String>>,
     /// APNs for the iPhone and Mac apps' notifications (apns.rs), when an APNs
     /// key is configured; None leaves the apps' notifications off.
     pub apns: Option<crate::apns::Apns>,
@@ -675,7 +717,7 @@ impl Agent {
         let secrets = Secrets::open(&cfg.state_dir.join("secrets")).context("opening the saved keys")?;
         let agent = Self {
             secrets,
-            llm: Together::new(&cfg)?,
+            llm: Llm::new(&cfg)?,
             cdp: Cdp::new(&cfg.cdp_url)?,
             shell: Shell {
                 run_as: cfg.run_as.clone(),
@@ -699,6 +741,8 @@ impl Agent {
             model_images: Mutex::default(),
             model_frames: Mutex::default(),
             vision_tasks: Mutex::default(),
+            plan_grants: Mutex::default(),
+            unplanned: Mutex::default(),
             apns: crate::apns::Apns::from_config(&cfg).context("the APNs key (APNS_AUTH_KEY)")?,
             desktop: cfg
                 .desktop_apps
@@ -823,14 +867,22 @@ impl Agent {
         let get = |key: &str| self.store.setting(key).ok().flatten();
         let auto_approve = get("auto_approve").unwrap_or_else(|| "initial".into());
         Settings {
-            model: get("model").unwrap_or_else(|| self.cfg.model.clone()),
+            // A model the provider doesn't have (picked before a switch of
+            // provider) gives way to the desktop's default.
+            model: get("model")
+                .filter(|m| self.cfg.provider.allows(m))
+                .unwrap_or_else(|| self.cfg.model.clone()),
             // On by default: writing and sending in the browser ask first.
             allow_actions: get("allow_actions").as_deref() != Some("false"),
             // Off by default.
             auto_approve: auto_approve == "true" || auto_approve.starts_with("true:"),
             auto_approve_version: auto_approve,
             memory_consolidation: crate::consolidate::mode(&self.store).name().to_string(),
-            memory_consolidation_model: crate::consolidate::model(&self.store, &self.cfg.consolidation_model),
+            memory_consolidation_model: crate::consolidate::model(
+                &self.store,
+                &self.cfg.consolidation_model,
+                self.cfg.provider,
+            ),
             memory_consolidation_daily_cap_usd: crate::consolidate::daily_cap(&self.store),
             monthly_budget_usd: crate::usage::monthly_budget(&self.store),
         }
@@ -892,10 +944,12 @@ impl Agent {
             self.store.set_setting("memory_consolidation", mode.name())?;
         }
         if let Some(model) = model {
-            if !llm::KNOWN_MODELS.contains(&model) {
+            let provider = self.cfg.provider;
+            if !provider.allows_helper(model) {
                 return Ok(Err(format!(
-                    "memory_consolidation_model must be one of {}",
-                    llm::KNOWN_MODELS.join(", ")
+                    "memory_consolidation_model must be one of {}, {}",
+                    provider.models().join(", "),
+                    provider.helper()
                 )));
             }
             self.store.set_setting("memory_consolidation_model", model)?;
@@ -988,7 +1042,7 @@ impl Agent {
             settings.auto_approve,
             self.cfg.shell_tool,
             &self.cfg.run_as,
-            &llm::KNOWN_MODELS,
+            self.cfg.provider.models(),
         )
     }
 
@@ -1211,7 +1265,7 @@ impl Agent {
         self: &Arc<Self>,
         id: &str,
         approved: bool,
-        edited: Option<&str>,
+        edit: Option<Edit>,
         by: Option<String>,
     ) -> Result<(), StartError> {
         let Ok(Some(parked)) = self.store.parked(id) else {
@@ -1254,17 +1308,22 @@ impl Agent {
         let mut card = parked.card.clone();
         // An edit that can't be used stops here: going ahead would run the
         // agent's words when the user approved their own.
-        let edited = match edited.filter(|_| approved) {
-            Some(text) => {
+        let (edited, plan) = match edit.filter(|_| approved) {
+            Some(Edit::Text(text)) => {
                 let applied = state
                     .as_mut()
                     .and_then(|state| self.apply_edit(state, &mut card, text));
                 if applied.is_none() {
                     return Err(StartError::NotFound);
                 }
-                applied
+                (applied, None)
             }
-            None => None,
+            Some(Edit::Plan(steps)) if card["kind"] == "plan" => match plan::edited(&card, steps) {
+                Ok(items) => (None, Some(items)),
+                Err(_) => return Err(StartError::NotFound),
+            },
+            Some(Edit::Plan(_)) => return Err(StartError::NotFound),
+            None => (None, None),
         };
         let session = self.session_of(&parked.run).unwrap_or_else(main_session);
         {
@@ -1292,6 +1351,10 @@ impl Agent {
             resolved["edited"] = json!(true);
             resolved["text"] = json!(text);
         }
+        if let Some(items) = &plan {
+            resolved["edited"] = json!(true);
+            resolved["plan"] = json!(items);
+        }
         self.emit("approval.resolved", resolved);
         let _ = self.store.set_run_status(&state.task, "running");
         self.emit("task.resumed", json!({"task": state.task}));
@@ -1305,6 +1368,7 @@ impl Agent {
             card,
             by: by.clone(),
             edited,
+            plan,
         };
         let task = state.task.clone();
         let drive = tokio::spawn(async move { agent.drive(state, Some(answer)).await });
@@ -1337,6 +1401,16 @@ impl Agent {
         } else {
             None
         }
+    }
+
+    /// Why this plan card can't be approved as the user edited it, if it
+    /// can't (for the user). A card that's gone isn't a problem here.
+    pub fn plan_problem(&self, id: &str, steps: &Value) -> Option<String> {
+        let parked = self.store.parked(id).ok().flatten()?;
+        if parked.card["kind"] != "plan" {
+            return Some("this card has no plan to edit".into());
+        }
+        plan::edited(&parked.card, steps).err()
     }
 
     /// Puts what the user wrote into the tool call the task parked on, and into
@@ -1398,7 +1472,7 @@ impl Agent {
                 Some("system administration is available through SSM")
             }
             Some("shell") if !self.cfg.shell_tool => Some("the shell tool is off"),
-            _ if model.is_some_and(|m| !llm::KNOWN_MODELS.contains(&m)) => Some("the model isn't allowed"),
+            _ if model.is_some_and(|m| !self.cfg.provider.allows(m)) => Some("the model isn't allowed"),
             _ => None,
         }
     }
@@ -1621,6 +1695,8 @@ impl Agent {
             reported: None,
             empty_retries: 0,
             plan: Vec::new(),
+            grant: plan::Grant::default(),
+            plan_asked: false,
             review: ReviewClock {
                 // From the request on: the history before it isn't this task's work.
                 at_message: messages_len - 1,
@@ -1652,6 +1728,8 @@ impl Agent {
     async fn drive(self: &Arc<Self>, mut state: RunState, answer: Option<Answer>) {
         let started = Instant::now();
         let result = self.run_loop(&mut state, answer).await;
+        self.plan_grants.lock().unwrap().remove(&state.task);
+        self.unplanned.lock().unwrap().remove(&state.task);
         state.seconds += started.elapsed().as_secs_f64();
         let chat = state.scheduled.is_none();
         match result {
@@ -1962,6 +2040,16 @@ impl Agent {
             (lane.cancel.subscribe(), lane.cancel.subscribe())
         };
         let task_id = state.task.clone();
+        // What the approved plan covers, for the cards this stretch would ask.
+        if !state.grant.needs.is_empty() {
+            self.plan_grants
+                .lock()
+                .unwrap()
+                .insert(task_id.clone(), state.grant.clone());
+        }
+        if !background && !state.plan_asked && state.grant.needs.is_empty() {
+            self.unplanned.lock().unwrap().insert(task_id.clone());
+        }
         // The tab last remembered for the conversation, saved again when it changes.
         let mut tab = None;
 
@@ -2074,19 +2162,14 @@ impl Agent {
                     break 'task Outcome::Finished(format!("I need you: {reason}"), "needs_user");
                 }
                 if name == "update_plan" {
-                    state.queue.remove(0);
-                    let content = match plan::parse(&args) {
-                        Ok(items) => {
-                            state.plan = items;
-                            // The web app's checklist: a scheduled run's isn't watched.
-                            if !background {
-                                self.emit("plan", json!({"task": task_id, "items": state.plan}));
-                            }
-                            let (done, total) = plan::progress(&state.plan);
-                            format!("ok: plan saved ({done} of {total} done)")
-                        }
-                        Err(why) => format!("error: {why}"),
+                    let content = match self.update_plan(state, &args, resumed) {
+                        Ok(content) => content,
+                        Err(err) => match err.downcast::<Park>() {
+                            Ok(park) => break 'task Outcome::Parked(park),
+                            Err(err) => format!("error: {err:#}"),
+                        },
                     };
+                    state.queue.remove(0);
                     state
                         .messages
                         .push(json!({"role": "tool", "tool_call_id": call["id"], "content": content}));
@@ -2119,6 +2202,16 @@ impl Agent {
                         Ok(result) => result,
                         Err(err) => match err.downcast::<Park>() {
                             Ok(park) => break 'task Outcome::Parked(park),
+                            // agentd's words, not the tool's: never labelled as outside content.
+                            Err(err) if err.is::<PlanFirst>() => {
+                                tracing::info!(task = %task_id, step, "asked to plan before the first card");
+                                state.plan_asked = true;
+                                let id = state.queue.remove(0)["id"].clone();
+                                state
+                                    .messages
+                                    .push(json!({"role": "tool", "tool_call_id": id, "content": PLAN_FIRST}));
+                                continue;
+                            }
                             Err(err) => format!("error: {err:#}"),
                         },
                     }
@@ -2331,6 +2424,100 @@ impl Agent {
             self.set_tab_target(&state.session, &target);
         }
         Ok(outcome)
+    }
+
+    /// update_plan: the plan, saved and shown. One whose steps need what the
+    /// task hasn't been granted parks on a plan card first; approved (as the
+    /// user edited it, if they did), its needs are the task's grant.
+    fn update_plan(&self, state: &mut RunState, args: &Value, resumed: Option<Answer>) -> Result<String> {
+        let mut items = match plan::parse(args) {
+            Ok(items) => items,
+            Err(why) => return Ok(format!("error: {why}")),
+        };
+        // Commands that never ask need no grant, and sudo is refused anyway.
+        for item in &mut items {
+            item.commands.retain(|command| {
+                !split_sudo(command).0
+                    && (self.policy.danger(command).is_some() || self.policy.sends_data(command))
+            });
+        }
+        let new = plan::Needs::of(&items).without(&state.grant.needs);
+        let background = state.scheduled.is_some();
+        if new.is_empty() || background {
+            self.save_plan(state, items);
+            let (done, total) = plan::progress(&state.plan);
+            let note = if new.is_empty() {
+                ""
+            } else {
+                " A scheduled run can't ask, so it covers nothing: what needs the user's OK is skipped."
+            };
+            return Ok(format!("ok: plan saved ({done} of {total} done).{note}"));
+        }
+        let card = json!({
+            "kind": "plan", "steps": items, "covers": new, "editable": true, "tainted": state.tainted,
+        });
+        let approval = resumed
+            .as_ref()
+            .and_then(|a| a.card["id"].as_str().map(String::from));
+        let by = resumed.as_ref().and_then(|a| a.by.clone());
+        let edited = resumed.as_ref().and_then(|a| a.plan.clone());
+        match self.approve(&state.task, card, resumed, false)? {
+            Decision::Approved => {
+                let asked = plan::Needs::of(&items);
+                let approved = edited.clone().unwrap_or(items);
+                let kept = plan::Needs::of(&approved);
+                // What the user took off a step is no longer granted, even
+                // from an earlier plan; what the agent left off stays.
+                let dropped = asked.without(&kept);
+                state.grant = plan::Grant {
+                    needs: state.grant.needs.and(&kept).without(&dropped),
+                    approval,
+                    by,
+                };
+                self.plan_grants
+                    .lock()
+                    .unwrap()
+                    .insert(state.task.clone(), state.grant.clone());
+                state.plan_asked = true;
+                self.unplanned.lock().unwrap().remove(&state.task);
+                tracing::info!(task = %state.task, edited = edited.is_some(), "plan approved");
+                self.save_plan(state, approved);
+                let covered = if state.grant.needs.is_empty() {
+                    "The user took off everything that needed their OK, so each of those actions still asks."
+                        .to_string()
+                } else {
+                    format!(
+                        "For the rest of this task, these go ahead without asking: {}. Anything else still asks.",
+                        state.grant.needs.describe()
+                    )
+                };
+                let changed = if edited.is_some() {
+                    format!(
+                        "\n\nThe user changed the plan before approving it. Follow their version:\n{}",
+                        self.secrets.redact(&plan::numbered(&state.plan))
+                    )
+                } else {
+                    String::new()
+                };
+                Ok(format!(
+                    "approved: the user approved your plan. {covered}{changed}"
+                ))
+            }
+            Decision::Denied | Decision::Changed => Ok(
+                "denied: the user didn't approve this plan, so don't start on it. Ask them what they'd like \
+                 instead; don't try another way."
+                    .into(),
+            ),
+            Decision::Unattended => Ok("not approved: a scheduled run can't ask.".into()),
+        }
+    }
+
+    /// The plan, saved on the task and shown: a scheduled run's isn't watched.
+    fn save_plan(&self, state: &mut RunState, items: Vec<plan::Item>) {
+        state.plan = items;
+        if state.scheduled.is_none() {
+            self.emit("plan", json!({"task": state.task, "items": state.plan}));
+        }
     }
 
     /// Remembers a conversation's tab: `main`'s in settings, another's on
@@ -2685,7 +2872,12 @@ impl Agent {
                 } else if action == "key" {
                     card["key"] = json!(value);
                 }
-                if resumed.is_none() {
+                // A picture for the card, unless the plan covers it (no card).
+                card["kind"] = json!("browser");
+                if resumed.is_none()
+                    && self.covering(task_id, &card).is_none()
+                    && !self.plan_first(task_id, &card)
+                {
                     self.explain_card(browser, &mut card).await;
                 }
                 if let Err(refusal) = self.gate_browser_action(task_id, reason, card, resumed, false)? {
@@ -3522,11 +3714,20 @@ impl Agent {
         }
         // A resumed command's terminal card is already showing, waiting on the approval.
         if resumed.is_none() {
+            // One the plan covers won't wait for a card.
+            let planned = reason.is_some()
+                && !unattended
+                && self
+                    .covering(
+                        task_id,
+                        &json!({"kind": "shell", "command": command, "secrets": keys, "direct": direct_internet}),
+                    )
+                    .is_some();
             self.emit(
                 "shell",
                 json!({
                     "task": task_id, "command": command, "as_root": false, "direct": direct_internet,
-                    "needs_approval": reason.is_some(), "secrets": keys,
+                    "needs_approval": reason.is_some() && !planned, "secrets": keys,
                 }),
             );
         }
@@ -3668,6 +3869,40 @@ impl Agent {
         self.emit("approval.auto", json!({"task": task_id, "card": card}));
     }
 
+    /// The task's grant, if its approved plan covers what this card asks.
+    fn covering(&self, task_id: &str, card: &Value) -> Option<plan::Grant> {
+        self.plan_grants
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .filter(|grant| grant.needs.covers(card))
+            .cloned()
+    }
+
+    /// Whether this would be the task's first card for input or an install,
+    /// before it was asked to plan: it asks the model to plan first instead.
+    /// Commands aren't (their row is already showing), nor keys, sites,
+    /// schedules or plans.
+    fn plan_first(&self, task_id: &str, card: &Value) -> bool {
+        matches!(card["kind"].as_str(), Some("browser" | "app" | "install"))
+            && self.unplanned.lock().unwrap().contains(task_id)
+    }
+
+    /// What the plan let through, for the chat and the event log: no card
+    /// showed it, so this is the record of what went ahead under the plan.
+    fn planned(&self, task_id: &str, grant: &plan::Grant, mut card: Value) {
+        tracing::info!(task = %task_id, kind = card["kind"].as_str().unwrap_or(""), "covered by the plan");
+        if let Some(fields) = card.as_object_mut() {
+            for key in ["binding", "image", "id", "task", "editable", "manual"] {
+                fields.remove(key);
+            }
+        }
+        self.emit(
+            "approval.plan",
+            json!({"task": task_id, "approval": grant.approval, "by": grant.by, "card": card}),
+        );
+    }
+
     /// Asks the user about an action. A resumed task brings the answer to the
     /// card it parked on; otherwise this returns a Park error: the task parks
     /// and the card goes to the apps.
@@ -3679,10 +3914,22 @@ impl Agent {
         unattended: bool,
     ) -> Result<Decision> {
         card["task"] = json!(task_id);
+        // The plan the user approved covers it: no card, but a record.
+        if resumed.is_none()
+            && !unattended
+            && let Some(grant) = self.covering(task_id, &card)
+        {
+            self.planned(task_id, &grant, card);
+            return Ok(Decision::Approved);
+        }
+        if resumed.is_none() && !unattended && self.plan_first(task_id, &card) {
+            self.unplanned.lock().unwrap().remove(task_id);
+            return Err(PlanFirst.into());
+        }
         // These actions always require a person's decision.
         let manual = matches!(
             card["kind"].as_str(),
-            Some("secret" | "browser" | "app" | "install" | "access")
+            Some("secret" | "browser" | "app" | "install" | "access" | "plan")
         ) || card["manual"] == true;
         if resumed.is_none() && !manual && self.settings().auto_approve {
             self.auto_approved(task_id, card);
@@ -3856,6 +4103,7 @@ pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
     std::fs::create_dir_all(dir.join("images")).unwrap();
     let cfg = Config {
         listen: "127.0.0.1:0".into(),
+        provider: llm::Provider::Together,
         api_key: "test-key-not-used".to_string().into(),
         llm_url: crate::llm::TOGETHER_URL.into(),
         model: "zai-org/GLM-5.3".into(),
@@ -4205,6 +4453,7 @@ mod tests {
             card: park.card,
             by: None,
             edited: None,
+            plan: None,
         };
         let started = Instant::now();
         let (direct, ordinary) = tokio::join!(
@@ -4252,6 +4501,7 @@ mod tests {
                 card: card.clone(),
                 by: None,
                 edited: None,
+                plan: None,
             })
         };
 
@@ -4557,6 +4807,7 @@ mod tests {
                     card,
                     by: None,
                     edited: Some(edited.into()),
+                    plan: None,
                 }),
                 &mut cancel,
             )
@@ -4612,6 +4863,7 @@ mod tests {
                     card: park.card,
                     by: None,
                     edited: None,
+                    plan: None,
                 }),
                 &mut cancel,
             )
@@ -4673,6 +4925,7 @@ mod tests {
                     card,
                     by: None,
                     edited: Some("Check only the build".into()),
+                    plan: None,
                 }),
             )
             .unwrap();
@@ -5560,6 +5813,7 @@ mod user_schedule_tests {
             card: park.card,
             by: None,
             edited: None,
+            plan: None,
         };
         let made = agent.schedule_task("t2", &after, true, Some(approved)).unwrap();
         assert!(made.starts_with("scheduled #"), "{made}");
@@ -6087,6 +6341,134 @@ mod background_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A stand-in for Anthropic's Messages API: each request (its headers and
+    /// body) is kept, and `reply` answers it in the API's own shape.
+    async fn claude_api(
+        reply: impl Fn(usize, &Value) -> Value + Send + Sync + 'static,
+    ) -> (String, Arc<std::sync::Mutex<Vec<(axum::http::HeaderMap, Value)>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let reply = Arc::new(reply);
+        let app = Router::new().route(
+            "/v1/messages",
+            post(
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let (reply, log) = (reply.clone(), log.clone());
+                    async move {
+                        let n = log.lock().unwrap().len();
+                        let answer = reply(n, &body);
+                        log.lock().unwrap().push((headers, body));
+                        axum::Json(answer)
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, seen)
+    }
+
+    #[tokio::test]
+    async fn a_task_on_claude_sends_the_messages_api_its_turns_and_thinking_back() {
+        let thinking =
+            json!({"type": "thinking", "thinking": "Check the schedules first.", "signature": "sig-1"});
+        let first = json!({
+            "model": "claude-opus-4-6", "stop_reason": "tool_use",
+            "content": [thinking, {"type": "tool_use", "id": "toolu_1", "name": "list_schedules", "input": {}}],
+            "usage": {"input_tokens": 3, "cache_creation_input_tokens": 2000, "cache_read_input_tokens": 0, "output_tokens": 40},
+        });
+        let answer = |text: &str| {
+            json!({
+                "model": "claude-opus-4-6", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": text}],
+                "usage": {"input_tokens": 2, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 2000, "output_tokens": 5},
+            })
+        };
+        let replied = first.clone();
+        let (url, seen) = claude_api(move |n, body| {
+            let task_turn = body["system"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("You are an assistant"));
+            match n {
+                0 if task_turn => replied.clone(),
+                _ if task_turn => answer("All quiet."),
+                _ => answer("{}"),
+            }
+        })
+        .await;
+        let (agent, dir) = test_agent();
+        let mut cfg = agent.cfg.clone();
+        drop(agent);
+        cfg.provider = llm::Provider::Anthropic;
+        cfg.llm_url = url;
+        cfg.model = crate::claude::MODELS[0].into();
+        let agent = Arc::new(Agent::new(cfg).unwrap());
+        // A model picked before the switch gives way to Claude's default.
+        agent.update_settings(Some("zai-org/GLM-5.3"), None).unwrap();
+        assert_eq!(agent.settings().model, "claude-opus-4-6");
+        let schedule = a_schedule(&agent);
+        let queued = queue(&agent, &schedule, "sched1");
+        agent.clone().run_queued(queued, schedule).await;
+
+        assert_eq!(events(&agent, "run.finished")[0]["status"], "done");
+        assert_eq!(events(&agent, "message").last().unwrap()["text"], "All quiet.");
+        let seen = seen.lock().unwrap();
+        let turns: Vec<&(axum::http::HeaderMap, Value)> = seen
+            .iter()
+            .filter(|(_, b)| {
+                b["system"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("You are an assistant"))
+            })
+            .collect();
+        assert_eq!(turns.len(), 2);
+        let (headers, body) = turns[0];
+        assert_eq!(headers["x-api-key"], "test-key-not-used");
+        assert_eq!(headers["anthropic-version"], crate::claude::VERSION);
+        assert!(headers.get("anthropic-beta").is_none() && headers.get("authorization").is_none());
+        assert_eq!(body["model"], "claude-opus-4-6");
+        assert!(
+            body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["input_schema"]["type"] == "object")
+        );
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["role"] != "system")
+        );
+        // The second turn has the first reply as it came, thinking and all,
+        // then the call's result.
+        let messages = turns[1].1["messages"].as_array().unwrap();
+        let n = messages.len();
+        assert_eq!(messages[n - 2]["content"], first["content"]);
+        assert_eq!(messages[n - 1]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[n - 1]["content"][0]["tool_use_id"], "toolu_1");
+        // Its cost at Claude's prices: 2,105 tokens written to the cache, 2,000
+        // read, 45 out.
+        let done = events(&agent, "run.finished")[0].clone();
+        let usage = &done["usage"];
+        assert_eq!(
+            (
+                usage["input"].as_u64(),
+                usage["cached"].as_u64(),
+                usage["output"].as_u64()
+            ),
+            (Some(4105), Some(2000), Some(45))
+        );
+        // $6.25 per million written, $0.50 read, $25 out.
+        assert!(
+            (done["cost"].as_f64().unwrap() - 0.015_281_25).abs() < 1e-9,
+            "{done}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_cut_off_reply_is_asked_again_with_more_room() {
         let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -6262,6 +6644,7 @@ mod access_tests {
             card: park.card,
             by: Some("me@acme.com".into()),
             edited: None,
+            plan: None,
         };
         let reply = agent
             .request_access("t1", &args, true, Some(answer), false)
@@ -6342,6 +6725,7 @@ mod access_tests {
             card,
             by: None,
             edited: None,
+            plan: None,
         };
         let reply = agent
             .request_access(
@@ -6420,5 +6804,293 @@ mod access_tests {
             .filter(|e| e.kind == kind)
             .map(|e| e.data)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn a_task(agent: &Agent) -> RunState {
+        agent
+            .store
+            .start_run(
+                "t1",
+                "write the list",
+                None,
+                "zai-org/GLM-5.3",
+                &agent.policy_version(),
+                None,
+            )
+            .unwrap();
+        serde_json::from_value(json!({
+            "task": "t1", "model": "zai-org/GLM-5.3", "messages": [], "queue": [], "step": 1,
+            "tainted": false, "reminded": false, "loops": guard::LoopDetector::default(),
+            "usage": Usage::default(), "seconds": 0.0,
+        }))
+        .unwrap()
+    }
+
+    fn plan_args() -> Value {
+        json!({"items": [
+            {"step": "Write the list in Mousepad", "status": "pending", "app": "Mousepad"},
+            {"step": "Post it in #general", "status": "pending", "site": "app.slack.com"},
+            {"step": "Check on it", "status": "pending", "commands": ["kill -0 $$", "ls -la"]},
+            {"step": "Tell the user", "status": "pending"},
+        ]})
+    }
+
+    fn parks(result: Result<String>) -> Park {
+        match result {
+            Err(err) => err.downcast::<Park>().expect("parks"),
+            Ok(text) => panic!("didn't park: {text}"),
+        }
+    }
+
+    fn events(agent: &Agent, kind: &str) -> Vec<Value> {
+        agent
+            .store
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.data)
+            .collect()
+    }
+
+    fn answer(card: &Value, approved: bool, plan: Option<Vec<plan::Item>>) -> Option<Answer> {
+        Some(Answer {
+            approved,
+            card: card.clone(),
+            by: Some("me".into()),
+            edited: None,
+            plan,
+        })
+    }
+
+    #[tokio::test]
+    async fn one_approved_plan_covers_its_steps_and_nothing_else() {
+        let (agent, dir) = test_agent();
+        let mut state = a_task(&agent);
+        let app = json!({"kind": "app", "action": "act", "app": "Mousepad", "steps": [{"action": "type"}]});
+        let slack = json!({"kind": "browser", "action": "type", "site": "app.slack.com", "text": "hi"});
+
+        // Steps that need the user's OK: one card for all of them. A command
+        // that never asks isn't on it.
+        let park = parks(agent.update_plan(&mut state, &plan_args(), None));
+        assert_eq!(park.card["kind"], "plan");
+        assert_eq!(park.card["covers"]["apps"], json!(["Mousepad"]));
+        assert_eq!(park.card["covers"]["sites"], json!(["app.slack.com"]));
+        assert_eq!(park.card["covers"]["commands"], json!(["kill -0 $$"]));
+        assert_eq!(park.card["steps"][2]["commands"], json!(["kill -0 $$"]));
+        assert!(state.plan.is_empty() && agent.covering("t1", &app).is_none());
+
+        // Approved without Slack: the user took the step's site off.
+        let edited = plan::edited(
+            &park.card,
+            &json!([
+                {"step": "Write the list in Mousepad, with eggs", "app": "Mousepad"},
+                {"step": "Post it in #general"},
+                {"step": "Check on it", "commands": ["kill -0 $$"]},
+            ]),
+        )
+        .unwrap();
+        let said = agent
+            .update_plan(&mut state, &plan_args(), answer(&park.card, true, Some(edited)))
+            .unwrap();
+        assert!(said.starts_with("approved:"), "{said}");
+        assert!(
+            said.contains("input in Mousepad") && !said.contains("slack"),
+            "{said}"
+        );
+        assert!(
+            said.contains("Follow their version:\n1. Write the list in Mousepad, with eggs"),
+            "{said}"
+        );
+        assert_eq!(state.plan.len(), 3);
+        assert_eq!(state.grant.approval.as_deref(), Some(park.id.as_str()));
+        assert_eq!(
+            events(&agent, "plan").last().unwrap()["items"][0]["step"],
+            "Write the list in Mousepad, with eggs"
+        );
+
+        // Mousepad goes ahead, on the record; Slack still asks.
+        assert!(matches!(
+            agent.approve("t1", app.clone(), None, false),
+            Ok(Decision::Approved)
+        ));
+        let covered = events(&agent, "approval.plan");
+        assert_eq!(covered.len(), 1);
+        assert_eq!(
+            (covered[0]["approval"].as_str(), covered[0]["by"].as_str()),
+            (Some(park.id.as_str()), Some("me"))
+        );
+        assert_eq!(covered[0]["card"]["app"], "Mousepad");
+        assert!(
+            agent
+                .approve("t1", slack.clone(), None, false)
+                .unwrap_err()
+                .is::<Park>()
+        );
+        // Another task has its own plan; a scheduled run never has one.
+        assert!(
+            agent
+                .approve("t2", app.clone(), None, false)
+                .unwrap_err()
+                .is::<Park>()
+        );
+        assert!(matches!(
+            agent.approve("t1", app.clone(), None, true),
+            Ok(Decision::Unattended)
+        ));
+
+        // The command it named runs without a card; the shell's row doesn't wait.
+        let ran = {
+            let (_stop, mut cancel) = watch::channel(false);
+            agent
+                .run_shell(
+                    "t1",
+                    "kill -0 $$",
+                    Some("Check the shell is there"),
+                    &[],
+                    10,
+                    false,
+                    false,
+                    false,
+                    false,
+                    None,
+                    &mut cancel,
+                )
+                .await
+                .unwrap()
+        };
+        assert!(!ran.starts_with("denied") && !ran.contains("waiting"), "{ran}");
+        let shell = events(&agent, "shell");
+        assert_eq!(shell.last().unwrap()["needs_approval"], false);
+        assert_eq!(events(&agent, "approval.plan").len(), 2);
+
+        // Progress with the same needs doesn't ask again.
+        let mut progress = plan_args();
+        progress["items"][0]["status"] = json!("done");
+        progress["items"].as_array_mut().unwrap().remove(1);
+        let said = agent.update_plan(&mut state, &progress, None).unwrap();
+        assert!(said.starts_with("ok: plan saved (1 of 3 done)"), "{said}");
+
+        // Something new asks again, about only what's new; denied, nothing changes.
+        let mut more = progress.clone();
+        more["items"][1]["site"] = json!("mail.google.com");
+        let again = parks(agent.update_plan(&mut state, &more, None));
+        assert_eq!(
+            again.card["covers"],
+            json!({"sites": ["mail.google.com"], "apps": [], "commands": [], "installs": []})
+        );
+        let said = agent
+            .update_plan(&mut state, &more, answer(&again.card, false, None))
+            .unwrap();
+        assert!(said.starts_with("denied:"), "{said}");
+        assert_eq!(state.grant.needs.sites, Vec::<String>::new());
+        assert_eq!(state.grant.needs.apps, vec!["Mousepad"]);
+
+        // The grant lasts as long as the task's loop.
+        agent.plan_grants.lock().unwrap().remove("t1");
+        assert!(agent.approve("t1", app, None, false).unwrap_err().is::<Park>());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_first_card_for_input_asks_the_model_to_plan_once() {
+        let (agent, dir) = test_agent();
+        let mut state = a_task(&agent);
+        let app = json!({"kind": "app", "action": "act", "app": "Mousepad", "steps": []});
+        // As run_loop starts a chat task with no plan approved.
+        agent.unplanned.lock().unwrap().insert("t1".into());
+        // A command, a key, a scheduled run: never asked to plan first.
+        let shell = json!({"kind": "shell", "command": "rm -rf ./old", "reason": "r", "timeout": 10});
+        assert!(agent.approve("t1", shell, None, false).unwrap_err().is::<Park>());
+        let secret = json!({"kind": "secret", "name": "GITHUB_TOKEN"});
+        assert!(agent.approve("t1", secret, None, false).unwrap_err().is::<Park>());
+        assert!(matches!(
+            agent.approve("t1", app.clone(), None, true),
+            Ok(Decision::Unattended)
+        ));
+        // The first card for input: plan first, once; then it asks as before.
+        assert!(
+            agent
+                .approve("t1", app.clone(), None, false)
+                .unwrap_err()
+                .is::<PlanFirst>()
+        );
+        assert!(
+            agent
+                .approve("t1", app.clone(), None, false)
+                .unwrap_err()
+                .is::<Park>()
+        );
+        // A plan approved before any card: never asked.
+        agent.unplanned.lock().unwrap().insert("t1".into());
+        let park = parks(agent.update_plan(&mut state, &plan_args(), None));
+        agent
+            .update_plan(&mut state, &plan_args(), answer(&park.card, true, None))
+            .unwrap();
+        assert!(state.plan_asked && !agent.unplanned.lock().unwrap().contains("t1"));
+        let slack = json!({"kind": "browser", "action": "click", "site": "mail.google.com"});
+        assert!(agent.approve("t1", slack, None, false).unwrap_err().is::<Park>());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_plan_always_asks_a_person_and_a_scheduled_run_never_waits_on_one() {
+        let (agent, dir) = test_agent();
+        agent
+            .set_auto_approve(true, Some(&agent.settings().auto_approve_version), None)
+            .unwrap();
+        let mut state = a_task(&agent);
+        parks(agent.update_plan(&mut state, &plan_args(), None));
+        assert!(events(&agent, "approval.auto").is_empty());
+
+        state.scheduled = Some("Every morning".into());
+        let said = agent.update_plan(&mut state, &plan_args(), None).unwrap();
+        assert!(
+            said.contains("A scheduled run can't ask, so it covers nothing"),
+            "{said}"
+        );
+        assert!(state.grant.needs.is_empty() && state.plan.len() == 4);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_plan_card_takes_only_an_edit_within_what_it_asked() {
+        let (agent, dir) = test_agent();
+        let mut state = a_task(&agent);
+        let park = parks(agent.update_plan(&mut state, &plan_args(), None));
+        agent
+            .store
+            .park(&park.id, "t1", &park.card, "{}", &agent.policy_version())
+            .unwrap();
+        assert_eq!(
+            agent.plan_problem(&park.id, &json!([{"step": "Only Mousepad", "app": "Mousepad"}])),
+            None
+        );
+        let problem = agent
+            .plan_problem(
+                &park.id,
+                &json!([{"step": "And mail", "site": "mail.google.com"}]),
+            )
+            .unwrap();
+        assert!(problem.contains("input on mail.google.com"), "{problem}");
+        assert!(agent.plan_problem(&park.id, &json!([])).is_some());
+        // Not a plan card: nothing to edit.
+        agent
+            .store
+            .park(
+                "other",
+                "t1",
+                &json!({"kind": "shell", "command": "rm -rf x"}),
+                "{}",
+                &agent.policy_version(),
+            )
+            .unwrap();
+        assert!(agent.plan_problem("other", &json!([{"step": "x"}])).is_some());
+        std::fs::remove_dir_all(dir).ok();
     }
 }

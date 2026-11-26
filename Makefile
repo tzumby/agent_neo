@@ -61,8 +61,8 @@ lint: inventory ## Check formatting, validate Terraform, syntax-check playbooks
 
 # --- Keys (SSM, prompted, never echoed) --------------------------------------
 
-model-key: ## Store your Together AI API key in SSM
-	scripts/put-secret.py $(SSM_PREFIX)/llm/together_api_key
+model-key: ## Store your model key in SSM: Anthropic's (Claude), or PROVIDER=together for Together AI's
+	scripts/put-secret.py $(SSM_PREFIX)/llm/$(if $(filter together,$(PROVIDER)),together,anthropic)_api_key
 
 tailscale-key: ## Store a Tailscale auth key (tagged tag:neo-agent) in SSM
 	scripts/put-secret.py $(SSM_PREFIX)/tailscale/auth_key

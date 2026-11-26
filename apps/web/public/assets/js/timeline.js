@@ -1,7 +1,8 @@
 // The chat as the web app shows it, built from agentd's event log: the user's
 // messages, the agent's answers and pictures, scheduled runs as reports, the
 // cards waiting for the user, a task's plan (the steps the agent wrote for
-// itself, ticked off as it goes), and the messages queued behind the running
+// itself, ticked off as it goes), a line for each action an approved plan let
+// go ahead without its card, and the messages queued behind the running
 // task. One conversation's: the store routes each its own events. What the
 // agent does on the way (tool calls,
 // commands, saves) stays out; `busy` only says that it's working.
@@ -11,11 +12,15 @@
 /** The event kinds it reads: the app asks agentd for these only. */
 export const KINDS = [
   "message", "image", "task.started", "task.paused", "task.resumed", "task.stopping", "task.finished",
-  "approval.requested", "approval.resolved", "action_needed", "action.resolved", "secret.saved", "plan",
-  "message.queued", "message.unqueued",
+  "approval.requested", "approval.resolved", "approval.plan", "action_needed", "action.resolved", "secret.saved",
+  "plan", "message.queued", "message.unqueued",
 ];
 
 const PLAN_STATUSES = ["pending", "in_progress", "done"];
+
+/** agentd's limits on a plan the person edits. */
+export const PLAN_MAX_STEPS = 20;
+export const PLAN_STEP_LENGTH = 120;
 
 /** "1 min", "24 min", "1 h 5 min" for whole minutes; "" under one. */
 export function duration(minutes) {
@@ -109,6 +114,115 @@ export function appStepWords(step, { pixels = false, window = "" } = {}) {
   return words;
 }
 
+/**
+ * A plan step's needs, in order, one per chip: its site (clicks, typing and
+ * keys there), its app (input in it), each of its commands, its install.
+ */
+export function stepNeeds(step) {
+  return [
+    ...(step.site ? [{ kind: "site", value: step.site }] : []),
+    ...(step.app ? [{ kind: "app", value: step.app }] : []),
+    ...(step.commands || []).map((value) => ({ kind: "command", value })),
+    ...(step.install ? [{ kind: "install", value: step.install }] : []),
+  ];
+}
+
+/** The step without its `index`th need (a chip's ×). */
+export function withoutNeed(step, index) {
+  const { site, app, commands, install, ...rest } = step;
+  const next = { ...rest };
+  stepNeeds(step).forEach((need, i) => {
+    if (i === index) return;
+    if (need.kind === "command") (next.commands ||= []).push(need.value);
+    else next[need.kind] = need.value;
+  });
+  return next;
+}
+
+/**
+ * What approving a plan card lets the task do without asking: its `covers`
+ * (only what's new), less what the person's edits took off every step.
+ */
+export function planCovers(covers, steps) {
+  const left = { sites: new Set(), apps: new Set(), commands: new Set(), installs: new Set() };
+  for (const step of steps) for (const need of stepNeeds(step)) left[`${need.kind}s`].add(need.value);
+  const keep = (key) => covers[key].filter((value) => left[key].has(value));
+  return { sites: keep("sites"), apps: keep("apps"), commands: keep("commands"), installs: keep("installs") };
+}
+
+/**
+ * The plan card's summary, a phrase per kind of need: `lead`, then its
+ * `items` in a list (`code`: as code). None: approving only starts the plan.
+ */
+export function planPhrases(covered) {
+  return [
+    { lead: "clicking, typing and pressing keys on ", items: covered.sites },
+    { lead: "input in ", items: covered.apps },
+    { lead: "running ", items: covered.commands, code: true },
+    { lead: "installing ", items: covered.installs },
+  ].filter((phrase) => phrase.items.length);
+}
+
+/** "a, b and c", each item through `wrap` (as code, say). */
+export function andList(items, wrap = (item) => item) {
+  return items.flatMap((item, i) => [i === 0 ? "" : i === items.length - 1 ? " and " : ", ", wrap(item)]).slice(1);
+}
+
+/**
+ * The steps to approve: the person's version, or undefined when it's the
+ * agent's own (only a change is sent; an older agentd ignores it anyway).
+ */
+export function planAnswer(original, steps) {
+  const mine = steps.map((s) => ({ ...s, step: s.step.trim() }));
+  const same = mine.length === original.length && mine.every((s, i) => {
+    const o = original[i];
+    return s.step === o.step.trim() && s.status === o.status && JSON.stringify(stepNeeds(s)) === JSON.stringify(stepNeeds(o));
+  });
+  return same ? undefined : mine;
+}
+
+/** Why the person's version can't be approved as it is (agentd would refuse it), or "". */
+export function planProblem(steps) {
+  if (!steps.length) return "A plan needs a step. Add one, or deny it.";
+  if (steps.length > PLAN_MAX_STEPS) return `A plan has at most ${PLAN_MAX_STEPS} steps.`;
+  if (steps.some((s) => !s.step.trim())) return "Write the empty step, or delete it.";
+  return "";
+}
+
+/**
+ * The line for an action an approved plan covered: where (the site or app;
+ * "" for a command or an install) and what (the summary, else the target or
+ * the command; `code` for a command), and whether it has more to unfold.
+ */
+export function coveredWords(item) {
+  const b = item.browser;
+  const a = item.app;
+  let where = "";
+  let what = item.summary;
+  let code = false;
+  if (b) {
+    where = b.site;
+    what ||= b.action === "type" ? (b.target ? `Write in “${b.target}”` : "Write")
+      : b.action === "key" ? `Press ${b.key || "a key"}` : `Click ${clickTarget(b.role, b.target)}`;
+  } else if (a) {
+    where = a.app;
+    what ||= a.target ? clickTarget(a.role, a.target)
+      : a.steps.length ? `${a.steps.length} ${a.steps.length === 1 ? "step" : "steps"}` : a.window || "Input";
+  } else if (item.kind === "install") {
+    // Its summary, if any, would be the store's: the name says it.
+    what = `Install ${item.install.app || item.install.name || "an app"}`;
+  } else if (!what) {
+    what = item.command.split("\n")[0];
+    code = Boolean(what);
+    what ||= "An action"; // a kind from a newer agentd
+  }
+  const more = b ? b.text !== null || Boolean(b.key) || Boolean(item.summary && b.target)
+    : a ? a.steps.length > 0 || Boolean(a.window) || a.text !== null
+    : item.kind === "install" ? Boolean(item.install.app && item.install.name)
+    : item.command !== "" && item.command !== what;
+  return { where, what, code, more };
+}
+
 /** A scheduled run's answer that found nothing new, in a line. */
 export function isOneLine(text) {
   const t = text.trim();
@@ -193,9 +307,7 @@ export class Timeline {
       case "plan": {
         // Each one is the whole plan: the latest wins.
         if (d.task == null || !Array.isArray(d.items)) break;
-        const steps = d.items
-          .filter((i) => i && typeof i.step === "string" && i.step.trim())
-          .map((i) => ({ step: i.step, status: PLAN_STATUSES.includes(i.status) ? i.status : "pending" }));
+        const steps = planSteps(d.items);
         if (this.planIndex.has(d.task)) {
           this.update(this.planIndex, d.task, { steps });
         } else {
@@ -208,7 +320,7 @@ export class Timeline {
         const id = str(d.id);
         const card = {
           type: "approval", id, seq: event.seq, state: "pending",
-          kind: ["secret", "schedule", "browser", "app", "install", "access", "stuck"].includes(d.kind) ? d.kind : "shell",
+          kind: ["secret", "schedule", "browser", "app", "install", "access", "stuck", "plan"].includes(d.kind) ? d.kind : "shell",
           command: str(d.command), reason: str(d.reason), summary: d.summary || null, tainted: d.tainted === true,
           editable: d.editable === true,
         };
@@ -230,23 +342,17 @@ export class Timeline {
             ? { done: d.plan.done, total: d.plan.total } : null;
           card.stuck = { reason: str(d.reason), minutes: num(d.minutes), steps: num(d.steps), plan };
         } else if (card.kind === "browser") {
-          card.browser = {
-            action: str(d.action), target: str(d.target), text: d.text ?? null, key: d.key ?? null,
-            submit: d.submit === true, sends: d.sends === true, site: str(d.site),
-            role: str(d.role), page: str(d.page), url: str(d.url), destination: str(d.destination),
-            around: str(d.around), image: d.image || null,
-          };
+          card.browser = browserAction(d);
         } else if (card.kind === "app") {
-          // A native app on the desktop, through its accessibility tree, or
-          // (action "gui") by pixels of the picture, whose size is `frame`.
-          // A batch has all its steps; a lone input's are on the card too.
-          const frame = d.frame && num(d.frame.width) > 0 && num(d.frame.height) > 0
-            ? { width: d.frame.width, height: d.frame.height } : null;
-          card.app = {
-            action: str(d.action), app: str(d.app), window: str(d.window), target: str(d.target),
-            role: str(d.role), text: d.text ?? null, key: d.key ?? null, around: str(d.around), image: d.image || null,
-            steps: Array.isArray(d.steps) ? d.steps.filter((s) => s && typeof s === "object").map(appStep) : [],
-            frame,
+          card.app = appAction(d);
+        } else if (card.kind === "plan") {
+          // The task's plan, approved as a whole: what its steps need then
+          // goes ahead without cards of its own, for the rest of the task.
+          // `covers` is what approving adds (a later card's: only what's new).
+          const list = (key) => [...new Set(Array.isArray(d.covers?.[key]) ? d.covers[key].filter((v) => typeof v === "string" && v) : [])];
+          card.plan = {
+            steps: Array.isArray(d.steps) ? planSteps(d.steps) : [],
+            covers: { sites: list("sites"), apps: list("apps"), commands: list("commands"), installs: list("installs") },
           };
         } else if (card.kind === "install") {
           // An app from a store (the Snap Store), installed on the desktop as
@@ -267,6 +373,20 @@ export class Timeline {
         // Expired: given up (stopped, a new message, or the rules changed).
         const state = d.expired === true ? "expired" : d.approved === true ? "approved" : "denied";
         this.update(this.approvalIndex, str(d.id), { state });
+        break;
+      }
+      case "approval.plan": {
+        // An action that went ahead without its card: the plan the person
+        // approved covers it. What that card would have shown, in a line.
+        const c = d.card && typeof d.card === "object" ? d.card : {};
+        const item = {
+          type: "covered", id: event.seq, task: d.task ?? null, approval: str(d.approval), by: str(d.by),
+          kind: str(c.kind), summary: str(c.summary), command: str(c.command), browser: null, app: null, install: null,
+        };
+        if (item.kind === "browser") item.browser = browserAction(c);
+        else if (item.kind === "app") item.app = appAction(c);
+        else if (item.kind === "install") item.install = { name: str(c.name), app: str(c.app) };
+        this.items.push(item);
         break;
       }
       case "action_needed": {
@@ -352,8 +472,8 @@ export class Timeline {
 
   /**
    * What the chat shows: messages, pictures, reports, the cards still
-   * waiting (answered, they leave the chat), and each task's plan right after
-   * its message. Runs of one schedule that found nothing, one after another,
+   * waiting (answered, they leave the chat), the actions a plan covered, and
+   * each task's plan right after its message. Runs of one schedule that found nothing, one after another,
    * fold into the latest; the row keeps the first one's id.
    */
   visible() {
@@ -405,6 +525,44 @@ function num(value) {
 
 function capitalised(text) {
   return text ? `${text[0].toUpperCase()}${text.slice(1)}` : "";
+}
+
+// A plan's steps, with what's missing or odd left out (a step without words
+// isn't one). A need is there only when the step has it.
+function planSteps(items) {
+  return items.filter((i) => i && typeof i.step === "string" && i.step.trim()).map((i) => {
+    const step = { step: i.step, status: PLAN_STATUSES.includes(i.status) ? i.status : "pending" };
+    if (str(i.site)) step.site = i.site;
+    if (str(i.app)) step.app = i.app;
+    const commands = Array.isArray(i.commands) ? i.commands.filter((c) => typeof c === "string" && c) : [];
+    if (commands.length) step.commands = commands;
+    if (str(i.install)) step.install = i.install;
+    return step;
+  });
+}
+
+// What a browser card asks: a click, typing or a key on a page.
+function browserAction(d) {
+  return {
+    action: str(d.action), target: str(d.target), text: d.text ?? null, key: d.key ?? null,
+    submit: d.submit === true, sends: d.sends === true, site: str(d.site),
+    role: str(d.role), page: str(d.page), url: str(d.url), destination: str(d.destination),
+    around: str(d.around), image: d.image || null,
+  };
+}
+
+// A native app on the desktop, through its accessibility tree, or (action
+// "gui") by pixels of the picture, whose size is `frame`. A batch has all its
+// steps; a lone input's are on the card too.
+function appAction(d) {
+  const frame = d.frame && num(d.frame.width) > 0 && num(d.frame.height) > 0
+    ? { width: d.frame.width, height: d.frame.height } : null;
+  return {
+    action: str(d.action), app: str(d.app), window: str(d.window), target: str(d.target),
+    role: str(d.role), text: d.text ?? null, key: d.key ?? null, around: str(d.around), image: d.image || null,
+    steps: Array.isArray(d.steps) ? d.steps.filter((s) => s && typeof s === "object").map(appStep) : [],
+    frame,
+  };
 }
 
 // One step of an app card, with what's missing or odd left empty. A pixel

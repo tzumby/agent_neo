@@ -337,3 +337,94 @@ private let status015 = """
     #expect(await store.newConversation(client: stub.client) == "s9")
     #expect(stub.count("POST /api/v1/sessions") == 1)
 }
+
+// MARK: Plan cards
+
+/// What the app sent, as JSON (a stub's request has its body as a stream).
+private final class SentBodies: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bodies: [[String: JSONValue]] = []
+
+    var all: [[String: JSONValue]] { lock.withLock { bodies } }
+
+    func add(_ request: URLRequest) -> [String: JSONValue] {
+        var data = request.httpBody ?? Data()
+        if let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while case let count = stream.read(&buffer, maxLength: buffer.count), count > 0 {
+                data.append(buffer, count: count)
+            }
+        }
+        let body = (try? JSONDecoder().decode([String: JSONValue].self, from: data)) ?? [:]
+        lock.withLock { bodies.append(body) }
+        return body
+    }
+}
+
+@MainActor
+@Test func anActionAPlanCoveredIsItsConversationsAndLeavesTheListAlone() throws {
+    let covered = try event(5, "approval.plan", #"{"task":"t1","approval":"a1","by":"me","card":{"kind":"shell","command":"ls"},"session":"s2"}"#)
+    #expect(ChatStore.conversation(of: covered) == "s2")
+    #expect(ChatStore.conversation(of: try event(6, "approval.plan", #"{"task":"t1","approval":"a1"}"#)) == "main")
+    #expect(!ChatStore.changesList("approval.plan"))
+    #expect(ChatStore.changesList("approval.requested") && ChatStore.changesList("approval.resolved"))
+    #expect(ChatStore.streamed.contains("approval.plan"))
+}
+
+@MainActor
+@Test func aPlanCardsAnswerCarriesItsPlanAndARefusalComesBackToTheCard() async throws {
+    let stub = StubAgentd()
+    let sent = SentBodies()
+    stub.on("POST /api/v1/approvals/p1") { request in
+        let body = sent.add(request)
+        // agentd refuses a need the card didn't have.
+        return body["plan"]?.array?.contains { $0["site"] != nil } == true
+            ? StubAgentd.Reply(status: 400, body: #"{"error":"step 1 adds a need the plan didn't have"}"#)
+            : StubAgentd.Reply(body: #"{"ok":true}"#)
+    }
+    stub.on("POST /api/v1/approvals/c1", status: 400, #"{"error":"the command is empty"}"#)
+    let store = ChatStore()
+    store.apply(SessionList(sessions: [AgentSession(id: "main", title: "First")]))
+    store.show(
+        newest: EventPage(
+            events: [
+                try event(
+                    1, "approval.requested",
+                    #"{"id":"p1","task":"t1","kind":"plan","editable":true,"steps":[{"step":"Push the branch","status":"pending","commands":["git push"]}],"covers":{"commands":["git push"]}}"#
+                ),
+                try event(2, "approval.requested", #"{"id":"c1","task":"t2","command":"ls","reason":"r","editable":true}"#),
+            ], more: false, lastSeq: 2))
+    let cards = store.timeline.visibleItems.compactMap { if case .approval(let card) = $0 { card } else { nil } }
+    let (plan, shell) = (cards[0], cards[1])
+
+    // As shown: no plan in the answer.
+    #expect(await store.answer(plan, approved: true, client: stub.client) == nil)
+    // The user's version: the whole plan.
+    let mine = [PlanEdit(step: "Push the branch", status: "pending"), PlanEdit(step: "Check CI", status: "pending")]
+    #expect(await store.answer(plan, approved: true, plan: mine, client: stub.client) == nil)
+    // Refused: agentd's words come back for the card, not as a notice.
+    let refused = await store.answer(
+        plan, approved: true, plan: [PlanEdit(step: "Post it", site: "app.slack.com")], client: stub.client)
+    #expect(refused == "step 1 adds a need the plan didn't have")
+    #expect(store.notice == nil)
+    #expect(
+        sent.all == [
+            ["approved": .bool(true)],
+            [
+                "approved": .bool(true),
+                "plan": .array([
+                    .object(["step": .string("Push the branch"), "status": .string("pending")]),
+                    .object(["step": .string("Check CI"), "status": .string("pending")]),
+                ]),
+            ],
+            [
+                "approved": .bool(true),
+                "plan": .array([.object(["step": .string("Post it"), "site": .string("app.slack.com")])]),
+            ],
+        ])
+    // Any other card's refusal is a notice, as before.
+    #expect(await store.answer(shell, approved: true, text: "", client: stub.client) == nil)
+    #expect(store.notice?.contains("the command is empty") == true)
+}

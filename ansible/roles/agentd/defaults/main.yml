@@ -57,7 +57,14 @@ agentd_nix_baseline_marker: uv
 # The agent's how-tos (services/agentd/skills).
 agentd_skills_dir: "{{ playbook_dir }}/../../services/agentd/skills/"
 
-agentd_model: zai-org/GLM-5.3
+# Where the models come from: together (Together AI) or anthropic (Claude,
+# through Anthropic's API). Each reads its key from SSM:
+# <prefix>/llm/together_api_key or <prefix>/llm/anthropic_api_key
+# (make model-key).
+agentd_llm_provider: together
+# The default model; empty: the provider's (GLM-5.3 on Together, Claude Opus
+# 4.6 on Anthropic). The user picks among the provider's models in the app.
+agentd_model: ""
 # No cap on a task's steps: a supervisor (a separate model call) checks on a
 # running task after this many minutes of work or model turns, whichever comes
 # first, and nudges it, asks you on a card if it looks stuck, or stops a stuck

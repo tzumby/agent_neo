@@ -15,7 +15,9 @@ struct ChatRow: View, Equatable {
             if message.quiet { QuietLine(text: message.text) } else { AssistantMessage(text: message.text) }
         case .report(let report): ReportRow(report: report)
         case .approval(let approval):
-            if let request = approval.secret {
+            if let plan = approval.plan {
+                PlanApprovalCard(approval: approval, plan: plan)
+            } else if let request = approval.secret {
                 SecretRequestCard(approval: approval, request: request)
             } else if let proposal = approval.schedule {
                 ScheduleApprovalCard(approval: approval, proposal: proposal)
@@ -35,6 +37,7 @@ struct ChatRow: View, Equatable {
         case .action(let action): ActionCard(action: action)
         case .image(let picture): PictureRow(picture: picture)
         case .plan(let plan): PlanRow(plan: plan)
+        case .covered(let action): CoveredRow(action: action)
         }
     }
 }
@@ -1229,13 +1232,20 @@ private struct PlanRow: View {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Image(systemName: Self.mark(step.status))
                         .foregroundStyle(step.status == .pending ? .tertiary : .secondary)
-                    Text(step.step)
-                        .foregroundStyle(step.status == .done ? .secondary : .primary)
-                        .strikethrough(step.status == .done, color: .secondary)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(step.step)
+                            .foregroundStyle(step.status == .done ? .secondary : .primary)
+                            .strikethrough(step.status == .done, color: .secondary)
+                        if !step.needs.isEmpty {
+                            ChipFlow {
+                                ForEach(Array(step.needs.enumerated()), id: \.offset) { _, need in NeedChip(need: need) }
+                            }
+                        }
+                    }
                 }
                 .font(.app(.subheadline))
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(Self.said(step.status)): \(step.step)")
+                .accessibilityLabel("\(Self.said(step.status)): \(step.step)\(NeedChip.spoken(step.needs))")
             }
         }
     }
@@ -1253,6 +1263,374 @@ private struct PlanRow: View {
         case .done: "Done"
         case .inProgress: "In progress"
         case .pending: "To do"
+        }
+    }
+}
+
+// MARK: - A plan to approve
+
+/// "Approve this plan?": the task's plan, approved as a whole. What its steps
+/// need (a site, an app, commands, an install) then goes ahead without cards
+/// of its own, for the rest of the task. The user can reword, delete, add and
+/// reorder steps and take needs off, but not add one: agentd refuses that.
+private struct PlanApprovalCard: View {
+    let approval: Approval
+    let plan: PlanApproval
+    @Environment(\.chatStore) private var store
+    @Environment(\.agentClient) private var client
+    /// The user's version until it's answered: a redraw doesn't start it over.
+    @State private var draft: PlanDraft
+    /// Why agentd refused the version sent.
+    @State private var refused: String?
+    @State private var sending = false
+    @FocusState private var focused: Int?
+
+    init(approval: Approval, plan: PlanApproval) {
+        self.approval = approval
+        self.plan = plan
+        _draft = State(initialValue: PlanDraft(plan.steps))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label {
+                Text("Approve this plan?").font(.app(.headline))
+            } icon: {
+                Image(systemName: "checklist").foregroundStyle(.orange)
+            }
+            if approval.tainted {
+                Label(
+                    "The agent wrote this plan after reading web pages or other outside content. Check each step is something you asked for.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.app(.footnote))
+                .foregroundStyle(.orange)
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(Array(draft.steps.enumerated()), id: \.element.id) { index, step in
+                    row(index, step)
+                }
+            }
+            if approval.editable {
+                Button(action: add) {
+                    Label("Add a step", systemImage: "plus")
+                        .font(.app(.footnote).weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .disabled(!draft.canAdd)
+            }
+            summary
+            if let problem = draft.problem {
+                Text(problem).font(.app(.footnote)).foregroundStyle(.secondary)
+            }
+            if let refused {
+                Label("Not approved: \(refused)", systemImage: "exclamationmark.triangle")
+                    .font(.app(.footnote))
+                    .foregroundStyle(.orange)
+            }
+            // Shown only while it waits: answered, it leaves the chat.
+            HStack(spacing: 10) {
+                Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
+                    .glassButton()
+                Button { answer(true) } label: {
+                    Text("Approve plan").foregroundStyle(.black).frame(maxWidth: .infinity)
+                }
+                .primaryGlass()
+                .disabled(draft.problem != nil || sending)
+            }
+            .controlSize(.large)
+        }
+        .card()
+    }
+
+    /// A step: its number, its words, its needs (each with an ×), and a menu to move or delete it.
+    private func row(_ index: Int, _ step: PlanDraft.Step) -> some View {
+        let done = step.plan.status == .done
+        return HStack(alignment: .firstTextBaseline, spacing: 10) {
+            StepNumber(number: index + 1, marked: false)
+            VStack(alignment: .leading, spacing: 6) {
+                if approval.editable {
+                    TextField("What to do", text: words(of: step.id), axis: .vertical)
+                        .lineLimit(1...4)
+                        .textFieldStyle(.plain)
+                        .focused($focused, equals: step.id)
+                        .foregroundStyle(done ? .secondary : .primary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(Theme.inset, in: .rect(cornerRadius: 10))
+                        .accessibilityLabel("Step \(index + 1)\(done ? ", done" : "")")
+                } else {
+                    Text(step.plan.step).foregroundStyle(done ? .secondary : .primary)
+                }
+                let needs = step.plan.needs
+                if !needs.isEmpty {
+                    ChipFlow {
+                        ForEach(Array(needs.enumerated()), id: \.offset) { which, need in
+                            NeedChip(
+                                need: need,
+                                remove: approval.editable ? { change { $0.removeNeed(which, from: step.id) } } : nil)
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if approval.editable {
+                Menu {
+                    Button("Move up", systemImage: "arrow.up") { change { $0.move(step.id, by: -1) } }
+                        .disabled(index == 0)
+                    Button("Move down", systemImage: "arrow.down") { change { $0.move(step.id, by: 1) } }
+                        .disabled(index == draft.steps.count - 1)
+                    Divider()
+                    Button("Delete step", systemImage: "trash", role: .destructive) { change { $0.delete(step.id) } }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.app(.callout).weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .contentShape(.rect)
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .accessibilityLabel("Move or delete step \(index + 1)")
+            }
+        }
+        .font(.app(.callout))
+    }
+
+    /// What approving lets the task do without asking, as the steps are now.
+    private var summary: some View {
+        let phrases = draft.covered(by: plan.covers).phrases
+        return VStack(alignment: .leading, spacing: 4) {
+            if phrases.isEmpty {
+                Text("Approving just starts the plan. Everything will ask you as usual.")
+            } else {
+                Text(Self.sentence(phrases))
+                Text("Anything else still asks you.").foregroundStyle(.secondary)
+            }
+        }
+        .font(.app(.footnote))
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.inset, in: .rect(cornerRadius: 14))
+    }
+
+    /// "For this task, it won't ask again before: … · running `git push`.", commands as code.
+    private static func sentence(_ phrases: [PlanCovers.Phrase]) -> AttributedString {
+        var sentence = AttributedString("For this task, it won't ask again before: ")
+        for (index, phrase) in phrases.enumerated() {
+            if index > 0 { sentence.append(AttributedString(" · ")) }
+            for piece in phrase.pieces {
+                var run = AttributedString(piece.text)
+                if piece.code { run.font = .app(.footnote, design: .monospaced) }
+                sentence.append(run)
+            }
+        }
+        sentence.append(AttributedString("."))
+        return sentence
+    }
+
+    /// A step's words, as the user types them.
+    private func words(of id: Int) -> Binding<String> {
+        Binding {
+            draft.steps.first { $0.id == id }?.plan.step ?? ""
+        } set: {
+            draft.set($0, of: id)
+            refused = nil
+        }
+    }
+
+    /// A change to the steps: the list animates, and a refusal no longer applies.
+    private func change(_ edit: (inout PlanDraft) -> Void) {
+        withAnimation(.snappy(duration: 0.2)) { edit(&draft) }
+        refused = nil
+    }
+
+    private func add() {
+        var id = 0
+        change { id = $0.add() }
+        Task { focused = id }  // once its field is there
+    }
+
+    private func answer(_ approved: Bool) {
+        guard let store, let client else { return }
+        let edits = approved ? draft.edits(from: plan.steps) : nil
+        sending = true
+        Task {
+            refused = await store.answer(approval, approved: approved, plan: edits, client: client)
+            sending = false
+        }
+    }
+}
+
+/// A need of a plan step as a chip: what for, with its icon (a command as
+/// code); with `remove`, an × that takes it off the step.
+private struct NeedChip: View {
+    let need: PlanNeed
+    var remove: (() -> Void)?
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon).font(.app(.caption2)).foregroundStyle(.secondary)
+            Text(need.kind == .install ? "Install \(need.value)" : need.value)
+                .font(need.kind == .command ? .app(.caption).monospaced() : .app(.caption))
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let remove {
+                Button(action: remove) {
+                    Image(systemName: "xmark")
+                        .font(.app(.caption2).weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Take \(need.kind == .install ? "installing \(need.value)" : "“\(need.value)”") off this step")
+            }
+        }
+        .padding(.leading, 9)
+        .padding(.trailing, remove == nil ? 9 : 2)
+        .padding(.vertical, remove == nil ? 4 : 1)
+        .background(Color.white.opacity(0.08), in: .rect(cornerRadius: 11))
+    }
+
+    private var icon: String {
+        switch need.kind {
+        case .site: "globe"
+        case .app: "macwindow"
+        case .command: "terminal"
+        case .install: "arrow.down.app"
+        }
+    }
+
+    /// The needs read out after a step's words (empty without any).
+    static func spoken(_ needs: [PlanNeed]) -> String {
+        needs.isEmpty ? "" : ". Needs your OK for: " + needs.map { $0.kind == .install ? "installing \($0.value)" : $0.value }
+            .joined(separator: ", ")
+    }
+}
+
+/// Chips side by side, onto more lines as they need; a chip wider than the
+/// line wraps its own text.
+private struct ChipFlow: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let frames = arrange(proposal.width ?? .infinity, subviews)
+        return CGSize(width: frames.map(\.maxX).max() ?? 0, height: frames.map(\.maxY).max() ?? 0)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for (subview, frame) in zip(subviews, arrange(bounds.width, subviews)) {
+            subview.place(
+                at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY), proposal: ProposedViewSize(frame.size))
+        }
+    }
+
+    private func arrange(_ width: CGFloat, _ subviews: Subviews) -> [CGRect] {
+        var frames: [CGRect] = []
+        var origin = CGPoint.zero
+        var lineHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(ProposedViewSize(width: width, height: nil))
+            if origin.x > 0, origin.x + size.width > width {
+                origin = CGPoint(x: 0, y: origin.y + lineHeight + spacing)
+                lineHeight = 0
+            }
+            frames.append(CGRect(origin: origin, size: size))
+            origin.x += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
+        }
+        return frames
+    }
+}
+
+// MARK: - What a plan covered
+
+/// An action that went ahead without its card, under a plan the user
+/// approved: a quiet line of what it did; what it typed or ran unfolds under it.
+private struct CoveredRow: View {
+    let action: CoveredAction
+    @State private var unfolded = false
+
+    var body: some View {
+        let line = action.line
+        VStack(alignment: .leading, spacing: 8) {
+            if line.more {
+                Button {
+                    withAnimation(.snappy(duration: 0.2)) { unfolded.toggle() }
+                } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        said(line)
+                        Image(systemName: "chevron.right")
+                            .font(.app(.caption2).weight(.bold))
+                            .rotationEffect(.degrees(unfolded ? 90 : 0))
+                    }
+                    .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                if unfolded {
+                    VStack(alignment: .leading, spacing: 8) { details }
+                        .padding(.leading, 22)
+                        .transition(.opacity)
+                }
+            } else {
+                said(line)
+            }
+        }
+        .font(.app(.footnote))
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// "✓ Under your plan · Mousepad — Add the milk line and save", one line until unfolded.
+    private func said(_ line: CoveredAction.Line) -> some View {
+        var words = AttributedString("Under your plan\(line.place.isEmpty ? "" : " · \(line.place)") — ")
+        var what = AttributedString(line.what)
+        if line.code { what.font = .app(.footnote, design: .monospaced) }
+        words.append(what)
+        return HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "checkmark").font(.app(.caption).weight(.bold)).foregroundStyle(.green)
+            Text(words).lineLimit(unfolded ? nil : 1)
+        }
+    }
+
+    @ViewBuilder private var details: some View {
+        if let browser = action.browser {
+            switch browser.action {
+            case "type":
+                if !browser.target.isEmpty { Text("In “\(browser.target)”") }
+                AppQuote(text: browser.text ?? "").foregroundStyle(.primary)
+            case "key":
+                HStack(spacing: 8) {
+                    KeyCap(key: browser.key ?? "?").foregroundStyle(.primary)
+                    if !browser.target.isEmpty { Text("in “\(browser.target)”") }
+                }
+            default:
+                Text(clickTarget(role: browser.role, name: browser.target)).foregroundStyle(.primary)
+            }
+        } else if let app = action.app {
+            if !app.steps.isEmpty {
+                AppStepList(action: app)
+            } else if let text = app.text {
+                AppQuote(text: text).foregroundStyle(.primary)
+            }
+            if !app.window.isEmpty { Text(app.window).textSelection(.enabled) }
+        } else if action.kind == "install" {
+            Text(action.installName).font(.app(.footnote).monospaced()).textSelection(.enabled)
+        } else {
+            Text(action.command)
+                .font(.app(.footnote).monospaced())
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.inset, in: .rect(cornerRadius: 14))
         }
     }
 }

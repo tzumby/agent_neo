@@ -197,7 +197,7 @@
         <div class="section-head">
           <p class="kicker">New</p>
           <h2 class="display-2">Beyond the browser</h2>
-          <p class="lede">Not everything lives in a web page. Agent Neo also uses the desktop’s own apps the way you would: it reads them, then clicks, types, presses shortcuts, picks from menus, fills dialogs and scrolls. It reads freely. Every batch of input waits for your OK.</p>
+          <p class="lede">Not everything lives in a web page. Agent Neo also uses the desktop’s own apps the way you would: it reads them, then clicks, types, presses shortcuts, picks from menus, fills dialogs and scrolls. It reads freely. Every batch of input waits for your OK: on its own card, or once, on a plan you can edit.</p>
         </div>
 
         <div class="apps-top">
@@ -236,7 +236,7 @@
             </li>
             <li>
               <h3>One card per batch, every step on it</h3>
-              <p>You see each step in words: the full text it will type, any language, newlines included; every shortcut; each control and where it sits. You also get the agent’s reason and a screenshot. Clicks at pixels are numbered on the screenshot.</p>
+              <p>You see each step in words: the full text it will type, any language, newlines included; every shortcut; each control and where it sits. You also get the agent’s reason and a screenshot. Clicks at pixels are numbered on the screenshot. For a longer job, approve its plan once instead: you can edit the steps first, and the apps it names stop asking until the task ends.</p>
             </li>
             <li>
               <h3>Checked again before it happens</h3>
@@ -249,7 +249,7 @@
           </ul>
         </div>
 
-        <p class="apps-note"><strong>On x86 desktops,</strong> with the Mousepad text editor and Slack to start. Screenshots go to the model only if it’s one checked to see images (Kimi-K3 today); with the default model, the agent works from the accessibility tree alone. <a href="https://github.com/tzumby/agent_neo/blob/main/docs/desktop-apps.md">How it works</a></p>
+        <p class="apps-note"><strong>On x86 desktops,</strong> with the Mousepad text editor and Slack to start. Screenshots go to the model only if it sees images: Claude Opus does; on Together, Kimi-K3 does and the default GLM-5.3 doesn’t, so there the agent works from the accessibility tree alone. <a href="https://github.com/tzumby/agent_neo/blob/main/docs/desktop-apps.md">How it works</a></p>
       </div>
     </section>
 
@@ -295,7 +295,7 @@ task <span class="x">tainted</span></pre>
           <li class="stage gate">
             <div class="stage-text">
               <h4>Anything with real authority waits for you</h4>
-              <p>You get a card with the exact command, or the page and the full text to type. Browser input is bound to the tab, the document, the element and the form’s state, and checked again just before it happens. If the page changed, nothing is clicked. Typing never lands in a password or one-time-code field. Input in a desktop app is bound the same way: to the app, its window and each control, or, for a click at pixels, to the window under the pointer.</p>
+              <p>You get a card with the exact command, or the page and the full text to type. For a task that would ask again and again, you get its plan on one card instead: edit the steps, take off anything you’d rather approve one at a time, and what’s left goes ahead until the task ends, each action listed in the chat. Browser input is bound to the tab, the document, the element and the form’s state, and checked again just before it happens. If the page changed, nothing is clicked. Typing never lands in a password or one-time-code field. Input in a desktop app is bound the same way: to the app, its window and each control, or, for a click at pixels, to the window under the pointer.</p>
             </div>
             <div class="stage-eg">
               <ul class="eg-list">
@@ -307,7 +307,7 @@ task <span class="x">tainted</span></pre>
                 <li>Direct internet, around the proxy</li>
                 <li>Sending data out after reading outside content</li>
               </ul>
-              <p class="eg-caption">These always ask, even with Auto approve on.</p>
+              <p class="eg-caption">These always ask, even with Auto approve on. A plan you approve can cover input on the sites and apps it names, and the exact commands it lists; saved keys, new sites and direct internet always get their own card.</p>
             </div>
           </li>
           <li class="stage">
@@ -521,7 +521,7 @@ paste.example.net:443      <span class="x">denied</span>
           <ul class="needs">
             <li>An AWS account, ideally a new one just for this</li>
             <li>A Tailscale account; the free plan is enough</li>
-            <li>A Together AI API key</li>
+            <li>An Anthropic API key for Claude, or a Together AI key</li>
             <li>Terraform, Ansible, Rust, Go and the AWS CLI on your machine</li>
           </ul>
           <p class="run-cost">About $40 a month for the desktop, its disk and the NAT while it runs, plus what you spend on the model. <code>make stop</code> brings the desktop’s share down to its disk.</p>
@@ -539,7 +539,7 @@ make bootstrap      <span class="c"># once: Terraform's state bucket</span>
 make init
 make plan           <span class="c"># review it</span>
 make apply          <span class="c"># VPC, NAT, the desktop</span>
-make model-key      <span class="c"># paste your Together AI key</span>
+make model-key      <span class="c"># paste your Anthropic API key</span>
 make tailscale-key  <span class="c"># paste your Tailscale auth key</span>
 make deploy         <span class="c"># 15–20 minutes the first time</span>
 make url            <span class="c"># open this on your tailnet</span></code></pre>

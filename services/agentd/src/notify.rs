@@ -171,6 +171,27 @@ pub fn card_notice(card: &Value) -> Option<(String, String)> {
                 .collect();
             ("Let it reach a site?".into(), hosts.join(", "))
         }
+        "plan" => {
+            // What it would go ahead with: the sites and apps, the commands,
+            // the installs.
+            let covers = &card["covers"];
+            let names: Vec<&str> = ["sites", "apps", "commands", "installs"]
+                .iter()
+                .filter_map(|key| covers[key].as_array())
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let steps = card["steps"].as_array().map_or(0, Vec::len);
+            let what = if names.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", names.join(", "))
+            };
+            (
+                "Approve this plan?".into(),
+                format!("{steps} step{}{what}", if steps == 1 { "" } else { "s" }),
+            )
+        }
         "stuck" => ("Looks stuck".into(), text("reason")?.to_string()),
         _ => return None,
     };
@@ -783,6 +804,16 @@ mod tests {
             (
                 "Looks stuck".into(),
                 "The build fails the same way each time.".into()
+            )
+        );
+        assert_eq!(
+            n(
+                json!({"kind": "plan", "steps": [{"step": "a"}, {"step": "b"}, {"step": "c"}],
+                     "covers": {"sites": ["app.slack.com"], "apps": ["Mousepad"], "commands": [], "installs": []}})
+            ),
+            (
+                "Approve this plan?".into(),
+                "3 steps · app.slack.com, Mousepad".into()
             )
         );
         assert!(card_notice(&json!({"kind": "mystery"})).is_none());

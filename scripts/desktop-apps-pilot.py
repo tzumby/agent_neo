@@ -3,13 +3,15 @@ as root (copy it over `make shell`): a fixture in Mousepad, a chat request to
 agentd over its socket, and its approval cards answered by a rule.
 
     python3 -I desktop-apps-pilot.py setup [clean]  # notes.txt open in Mousepad, unsaved (clean: saved)
-    python3 -I desktop-apps-pilot.py chat "<request>" [approve|deny|off|tamper|kill] [model]
+    python3 -I desktop-apps-pilot.py chat "<request>" [approve|plan-edit|deny|off|tamper|kill] [model]
     python3 -I desktop-apps-pilot.py schedule "<request>"   # as a scheduled run
     python3 -I desktop-apps-pilot.py check      # the file and the window title
     python3 -I desktop-apps-pilot.py cleanup    # the pilot's conversations, memories and files
 
-approve: OKs Mousepad's cards (any input), denies the rest. deny:
-denies all. off: turns Browser actions off first (and on after). tamper: the
+approve: OKs plan cards as they are and Mousepad's cards (any input), denies
+the rest. plan-edit: approves a plan card as the user would after editing it
+(the first step reworded, a step added, every need but the apps taken off).
+deny: denies all. off: turns Browser actions off first (and on after). tamper: the
 app saves itself while the first card waits. kill: computer-use is killed
 0.6 s after the first OK. Each chat starts a conversation called "HCU pilot",
 and the agent may remember what it did there; cleanup removes both.
@@ -128,10 +130,32 @@ def chat(request, policy, model=None):
             if kind in ("tool.call", "tool_call", "step"):
                 tools += 1
             print(f"[{t:6}s] {kind}: {compact(kind, data)}")
+            if kind == "approval.requested" and data.get("kind") == "plan":
+                cards += 1
+                ok = policy != "deny"
+                body = {"approved": ok}
+                print(f"          plan card: covers {json.dumps(data.get('covers'), ensure_ascii=False)}")
+                for n, step in enumerate(data.get("steps", []), 1):
+                    print(f"            {n}. {json.dumps(step, ensure_ascii=False)}")
+                if ok and policy == "plan-edit":
+                    edited = []
+                    for step in data["steps"]:
+                        step = {k: v for k, v in step.items() if k in ("step", "status", "app")}
+                        edited.append(step)
+                    edited[0]["step"] = edited[0]["step"][:90] + " (as the user put it)"
+                    edited.append({"step": "Tell the user the file's name"})
+                    body["plan"] = edited
+                    print(f"          -> approve, edited: {json.dumps(edited, ensure_ascii=False)}")
+                else:
+                    print(f"          -> {'approve' if ok else 'deny'}")
+                status, reply = api("POST", f"/api/v1/approvals/{data['id']}", body)
+                if status != 200:
+                    print(f"          !! {status} {reply}")
+                continue
             if kind == "approval.requested":
                 cards += 1
                 card = data
-                ok = policy != "deny" and card.get("kind") == "app" and card.get("app") == "Mousepad"
+                ok = policy not in ("deny",) and card.get("kind") == "app" and card.get("app") == "Mousepad"
                 if ok and policy == "tamper" and cards == 1:
                     # While the user decides, the app changes: it saves on its
                     # own (the title loses its "*"), so the card is out of date.
@@ -156,7 +180,7 @@ def chat(request, policy, model=None):
     events = sorted(page["events"], key=lambda e: e["seq"])
     from datetime import datetime
     ts = lambda e: datetime.fromisoformat(e["ts"].replace("Z", "+00:00")).timestamp()
-    mine = [e for e in events if e["kind"] in ("message", "task.started", "task.finished", "approval.requested", "approval.resolved", "step")]
+    mine = [e for e in events if e["kind"] in ("message", "task.started", "task.finished", "approval.requested", "approval.resolved", "step", "approval.plan")]
     start = next(ts(e) for e in mine if e["kind"] == "task.started")
     end = next(ts(e) for e in mine if e["kind"] == "task.finished")
     asked = {e["data"]["id"]: ts(e) for e in mine if e["kind"] == "approval.requested"}
@@ -165,7 +189,9 @@ def chat(request, policy, model=None):
     tools = [e["data"]["tool"] for e in mine if e["kind"] == "step"]
     print("SUMMARY " + json.dumps({"seconds": round(end - start, 1), "approval_wait": round(waited, 1),
                                     "agent_seconds": round(end - start - waited, 1), "model_turns": done.get("steps"),
-                                    "tool_calls": len(tools), "cards": cards, "cost": round(done.get("cost") or 0, 4),
+                                    "tool_calls": len(tools), "cards": cards,
+                                    "under_plan": sum(e["kind"] == "approval.plan" for e in mine),
+                                    "cost": round(done.get("cost") or 0, 4),
                                     "status": done.get("status")}))
     if policy == "off":
         api("PUT", "/api/v1/settings", {"allow_actions": True})

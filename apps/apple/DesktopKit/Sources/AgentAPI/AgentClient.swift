@@ -232,6 +232,31 @@ public struct EventPage: Decodable, Sendable, Equatable {
 struct ApprovalAnswer: Encodable, Equatable {
     let approved: Bool
     let text: String?
+    var plan: [PlanEdit]? = nil
+}
+
+/// One step of a plan card's steps as the user approves them, when they
+/// changed the plan: its words, its status, and the needs it kept (none
+/// added: agentd refuses a need the card didn't have). nil fields are left out.
+public struct PlanEdit: Encodable, Sendable, Equatable {
+    public var step: String
+    public var status: String?
+    public var site: String?
+    public var app: String?
+    public var commands: [String]?
+    public var install: String?
+
+    public init(
+        step: String, status: String? = nil, site: String? = nil, app: String? = nil, commands: [String]? = nil,
+        install: String? = nil
+    ) {
+        self.step = step
+        self.status = status
+        self.site = site
+        self.app = app
+        self.commands = commands
+        self.install = install
+    }
 }
 
 public struct AgentSettings: Codable, Sendable, Equatable {
@@ -360,10 +385,12 @@ public struct AgentClient: Sendable {
         try await post("/api/v1/messages", body: NewMessage(text, timeZone))
     }
 
-    /// `text`: what the user changed the card's text to, on a card that takes an edit.
-    public func answer(approval id: String, approved: Bool, text: String? = nil) async throws {
+    /// `text`: what the user changed the card's text to, on a card that takes
+    /// an edit; `plan`: their version of a plan card's steps. Each only when
+    /// they changed it.
+    public func answer(approval id: String, approved: Bool, text: String? = nil, plan: [PlanEdit]? = nil) async throws {
         let _: [String: Bool] = try await post(
-            "/api/v1/approvals/\(id)", body: ApprovalAnswer(approved: approved, text: text))
+            "/api/v1/approvals/\(id)", body: ApprovalAnswer(approved: approved, text: text, plan: plan))
     }
 
     /// "I'm done" (true) or "Skip" (false) on an action-needed card; starts a

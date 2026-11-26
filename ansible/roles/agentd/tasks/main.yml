@@ -215,11 +215,27 @@
 # The model key (and the APNs key), read on the controller with your AWS
 # credentials, never by the desktop itself. root:agentd 0640: agentd reads it,
 # the shell user can't.
+- name: Read the model provider's key (from SSM)
+  ansible.builtin.set_fact:
+    agentd_llm_key: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/llm/' ~ agentd_llm_provider ~ '_api_key', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
+  no_log: true
+
+- name: Check there's a key for the model provider
+  ansible.builtin.assert:
+    that:
+      - agentd_llm_provider in ['together', 'anthropic']
+      - agentd_llm_key | length > 0
+    fail_msg: >-
+      No {{ agentd_llm_provider }} key in SSM ({{ agentd_ssm_prefix }}/llm/{{ agentd_llm_provider }}_api_key).
+      Store it first: make model-key{{ ' PROVIDER=together' if agentd_llm_provider == 'together' else '' }}
+      (agentd_llm_provider is together or anthropic).
+    quiet: true
+
 - name: Write the keys agentd reads (from SSM)
   ansible.builtin.copy:
     dest: /etc/agentd/secrets.env
     content: |
-      TOGETHER_API_KEY={{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/llm/together_api_key', region=agentd_ssm_region) }}
+      {{ 'ANTHROPIC_API_KEY' if agentd_llm_provider == 'anthropic' else 'TOGETHER_API_KEY' }}={{ agentd_llm_key }}
       {% if agentd_apns | length > 0 %}
       APNS_AUTH_KEY={{ (agentd_apns | from_json).auth_key }}
       APNS_KEY_ID={{ (agentd_apns | from_json).key_id }}

@@ -570,3 +570,177 @@ private func run(_ seq: Int, _ task: String, _ schedule: String, _ answer: Strin
     timeline.apply(AgentEvent(seq: 2, ts: "2026-11-23T10:30:00Z", kind: "task.finished", data: .object(["task": .string("t1")])))
     #expect(timeline.workingSince == nil)
 }
+
+// MARK: Plan cards
+
+/// The plan card agentd sends (approval.requested, kind "plan").
+private let planCard = """
+    {"id":"a1b2c3d4e5f6","task":"t1","kind":"plan","editable":true,"tainted":false,
+     "steps":[
+       {"step":"Open notes.txt in Mousepad","status":"pending","app":"Mousepad"},
+       {"step":"Write the list and save it","status":"pending","app":"Mousepad"},
+       {"step":"Post it in #general","status":"pending","site":"app.slack.com"},
+       {"step":"Push the branch","status":"pending","commands":["git push -u origin fix"]},
+       {"step":"Install Slack","status":"pending","install":"slack"},
+       {"step":"Tell the user what changed","status":"pending"}],
+     "covers":{"sites":["app.slack.com"],"apps":["Mousepad"],"commands":["git push -u origin fix"],"installs":["slack"]}}
+    """
+
+private struct NoPlanCard: Error {}
+
+private func planApproval(_ json: String = planCard) throws -> (Approval, PlanApproval) {
+    var timeline = ChatTimeline()
+    timeline.apply(try event(1, "approval.requested", json))
+    guard case .approval(let card) = timeline.visibleItems.last, let plan = card.plan else { throw NoPlanCard() }
+    return (card, plan)
+}
+
+/// The summary as the card says it, commands in backticks.
+private func said(_ covers: PlanCovers) -> String {
+    covers.phrases.map { $0.pieces.map { $0.code ? "`\($0.text)`" : $0.text }.joined() }.joined(separator: " · ")
+}
+
+@Test func aPlanCardHasItsStepsWithWhatEachNeedsAndWhatItCovers() throws {
+    let (card, plan) = try planApproval()
+    #expect(card.editable && !card.tainted && card.app == nil && card.browser == nil && card.command.isEmpty)
+    #expect(plan.steps.count == 6)
+    #expect(plan.steps[0] == PlanStep(step: "Open notes.txt in Mousepad", status: .pending, app: "Mousepad"))
+    #expect(plan.steps[3].needs == [PlanNeed(kind: .command, value: "git push -u origin fix")])
+    #expect(plan.steps[4].install == "slack" && plan.steps[5].needs.isEmpty)
+    #expect(
+        plan.covers
+            == PlanCovers(
+                sites: ["app.slack.com"], apps: ["Mousepad"], commands: ["git push -u origin fix"], installs: ["slack"]))
+    #expect(
+        said(plan.covers)
+            == "clicking, typing and pressing keys on app.slack.com · input in Mousepad · running `git push -u origin fix` · installing slack"
+    )
+    #expect(said(PlanCovers(sites: ["a.com", "b.com", "c.com"], commands: ["ls", "pwd"]))
+        == "clicking, typing and pressing keys on a.com, b.com and c.com · running `ls` and `pwd`")
+
+    // Odd fields are left out; missing lists are empty; repeats go.
+    let (odd, oddPlan) = try planApproval(
+        #"{"id":"p2","kind":"plan","steps":[{"step":"Go","status":"weird","site":"","app":7,"commands":["ls","",3],"install":null},{"step":" "},"x"],"covers":{"sites":["a.com","a.com"],"apps":null}}"#
+    )
+    #expect(oddPlan.steps == [PlanStep(step: "Go", status: .pending, commands: ["ls"])])
+    #expect(oddPlan.covers == PlanCovers(sites: ["a.com"]))
+    #expect(!odd.editable, "only a card that says it takes an edit offers one")
+
+    var timeline = ChatTimeline(replaying: [try event(1, "approval.requested", planCard)])
+    timeline.apply(
+        try event(2, "approval.resolved", #"{"task":"t1","id":"a1b2c3d4e5f6","approved":true,"by":"someone@example.com","edited":true,"plan":[]}"#))
+    #expect(timeline.visibleItems.isEmpty, "answered, it leaves the chat")
+}
+
+@Test func thePlanChecklistKeepsEachStepsNeeds() throws {
+    let timeline = ChatTimeline(replaying: [
+        try event(
+            1, "plan",
+            #"{"task":"t1","items":[{"step":"Post it in #general","status":"in_progress","site":"app.slack.com"},{"step":"Push","status":"pending","commands":["git push","npm publish"]},{"step":"Tell the user","status":"pending"}]}"#
+        )
+    ])
+    guard case .plan(let plan) = timeline.visibleItems.first else {
+        Issue.record("no plan")
+        return
+    }
+    #expect(plan.steps[0] == PlanStep(step: "Post it in #general", status: .inProgress, site: "app.slack.com"))
+    #expect(plan.steps[1].needs.map(\.value) == ["git push", "npm publish"])
+    #expect(plan.steps[2] == PlanStep(step: "Tell the user", status: .pending))
+}
+
+@Test func aPlanCardsEditsTakeNeedsOffAndOnlyAChangeIsSent() throws {
+    let (_, plan) = try planApproval()
+    var draft = PlanDraft(plan.steps)
+    #expect(draft.edits(from: plan.steps) == nil, "as the agent wrote it: nothing to send")
+    #expect(draft.problem == nil && draft.canAdd)
+    draft.set("Open notes.txt in Mousepad  ", of: 0)
+    #expect(draft.edits(from: plan.steps) == nil, "spaces around aren't a change")
+
+    // Take Mousepad off one step: still on the other, so still covered.
+    draft.removeNeed(0, from: 0)
+    #expect(draft.steps[0].plan == PlanStep(step: "Open notes.txt in Mousepad  ", status: .pending))
+    #expect(draft.covered(by: plan.covers).apps == ["Mousepad"])
+    draft.removeNeed(0, from: 1)
+    #expect(
+        draft.covered(by: plan.covers)
+            == PlanCovers(sites: ["app.slack.com"], commands: ["git push -u origin fix"], installs: ["slack"]))
+
+    // One command at a time.
+    let two = PlanStep(step: "Ship", status: .pending, site: "github.com", commands: ["git push", "npm publish"])
+    #expect(two.needs.map(\.kind) == [.site, .command, .command])
+    #expect(two.removing(need: 1) == PlanStep(step: "Ship", status: .pending, site: "github.com", commands: ["npm publish"]))
+    #expect(two.removing(need: 1).removing(need: 1) == PlanStep(step: "Ship", status: .pending, site: "github.com"))
+
+    // Reword, delete, add, reorder; a step's words stay one line, at most 120 characters.
+    draft.set("Push the fix branch\n", of: 3)
+    for id in [0, 1, 5] { draft.delete(id) }
+    draft.move(3, by: -1)
+    draft.move(2, by: -5)  // nowhere to go
+    let added = draft.add()
+    draft.set("Check CI", of: added)
+    #expect(draft.steps.map(\.id) == [3, 2, 4, added])
+    let edits = try #require(draft.edits(from: plan.steps))
+    #expect(
+        edits == [
+            PlanEdit(step: "Push the fix branch", status: "pending", commands: ["git push -u origin fix"]),
+            PlanEdit(step: "Post it in #general", status: "pending", site: "app.slack.com"),
+            PlanEdit(step: "Install Slack", status: "pending", install: "slack"),
+            PlanEdit(step: "Check CI", status: "pending"),
+        ], "the whole plan, its words trimmed")
+    draft.set(String(repeating: "x", count: 130), of: added)
+    #expect(draft.steps.last?.plan.step.count == PlanDraft.maxLength)
+
+    // Nothing left to cover: approving only starts the plan.
+    var bare = PlanDraft(plan.steps.map { PlanStep(step: $0.step, status: $0.status) })
+    #expect(bare.covered(by: plan.covers).phrases.isEmpty)
+    // A later card covers only what's new, though its steps are the whole plan.
+    #expect(said(PlanDraft(plan.steps).covered(by: PlanCovers(installs: ["slack"]))) == "installing slack")
+
+    // What agentd would refuse can't be approved.
+    bare.add()
+    #expect(bare.problem == "Write the empty step, or delete it.")
+    for step in bare.steps { bare.delete(step.id) }
+    #expect(bare.problem == "A plan needs a step. Add one, or deny it.")
+    for _ in 0..<PlanDraft.maxSteps {
+        bare.set("x", of: bare.add())
+    }
+    #expect(!bare.canAdd && bare.problem == nil)
+}
+
+@Test func anActionThePlanCoveredIsAQuietLine() throws {
+    #expect(ChatTimeline.kinds.contains("approval.plan"), "the apps ask for it")
+    let covered = { (seq: Int, card: String) in
+        try event(
+            seq, "approval.plan", #"{"task":"t1","approval":"a1b2c3d4e5f6","by":"someone@example.com","card":\#(card)}"#)
+    }
+    let timeline = ChatTimeline(replaying: [
+        try event(1, "message", #"{"role":"user","text":"Tidy up","task":"t1"}"#),
+        try covered(
+            2,
+            #"{"kind":"app","action":"act","app":"Mousepad","window":"notes.txt - Mousepad","summary":"Add the milk line and save","steps":[{"action":"type","text":"- milk"},{"action":"key","key":"CTRL+S"}]}"#
+        ),
+        try covered(3, #"{"kind":"browser","action":"type","site":"app.slack.com","target":"Message","text":"Done","summary":""}"#),
+        try covered(4, #"{"kind":"browser","action":"click","site":"app.slack.com","role":"button","target":"Send","summary":"Send it"}"#),
+        try covered(5, #"{"kind":"shell","command":"git push -u origin fix","summary":""}"#),
+        try covered(6, #"{"kind":"shell","command":"git push -u origin fix","summary":"Push the branch"}"#),
+        try covered(7, #"{"kind":"install","name":"slack","app":"Slack"}"#),
+        try covered(8, "null"),
+    ])
+    let rows = timeline.visibleItems
+    #expect(rows.map(\.id) == ["user-1"] + (2...8).map { "covered-\($0)" })
+    let actions = rows.compactMap { if case .covered(let action) = $0 { action } else { nil } }
+    #expect(actions[0].task == "t1" && actions[0].approval == "a1b2c3d4e5f6" && actions[0].by == "someone@example.com")
+    #expect(actions[0].app?.steps.map(\.action) == ["type", "key"] && actions[0].app?.steps[1].key == "CTRL+S")
+    #expect(actions[0].app?.imagePath == nil && actions[1].browser?.text == "Done")
+    typealias Line = CoveredAction.Line
+    #expect(
+        actions.map(\.line) == [
+            Line(place: "Mousepad", what: "Add the milk line and save", more: true),
+            Line(place: "app.slack.com", what: "Write in “Message”", more: true),
+            Line(place: "app.slack.com", what: "Send it", more: true),
+            Line(place: "", what: "git push -u origin fix", code: true),
+            Line(place: "", what: "Push the branch", more: true),
+            Line(place: "", what: "Install Slack", more: true),
+            Line(place: "", what: "An action"),
+        ])
+}

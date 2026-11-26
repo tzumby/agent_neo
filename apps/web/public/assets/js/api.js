@@ -52,7 +52,9 @@ export const api = {
   // The old endpoints: main's, on any desktop.
   send: (text) => request("POST", "/api/v1/messages", withTime(text)),
   stop: () => request("POST", "/api/v1/stop", {}),
-  answer: (id, approved, text) => request("POST", `/api/v1/approvals/${enc(id)}`, { approved, text }),
+  // `text`, `plan`: the person's version of the card's text, or of a plan
+  // card's steps; each left out (undefined) unless they changed it.
+  answer: (id, approved, text, plan) => request("POST", `/api/v1/approvals/${enc(id)}`, { approved, text, plan }),
   resolve: (id, done) => request("POST", `/api/v1/actions/${enc(id)}`, { choice: done ? "done" : "skip" }),
   // Conversations (agentd 0.16): 404 on an older desktop.
   sessions: (archived) => request("GET", `/api/v1/sessions${archived ? "?archived=1" : ""}`),

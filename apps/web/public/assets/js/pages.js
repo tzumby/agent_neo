@@ -6,7 +6,7 @@ import { MAIN, chatHash, lastLine, sessionBadge, sessionTitle } from "./conversa
 import { busyButton, day, fill, h, icon, when } from "./dom.js";
 import { isValidName, normalizedName } from "./keys.js";
 import { deviceLabel, fromBase64Url, iosOutsideHomeScreen, ownSubscription, pushState, pushSupported } from "./push.js";
-import { axisMoney, budgetShare, chartDays, compact, kindRows, money, niceCeiling, shortDate, todayIn } from "./usage.js";
+import { axisMoney, budgetShare, chartDays, compact, kindRows, modelName, money, niceCeiling, shortDate, todayIn } from "./usage.js";
 
 // --- Conversations -------------------------------------------------------------------
 
@@ -383,7 +383,7 @@ export function mountSettings(store, view, session) {
     const settings = status.settings || {};
     const autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser and app changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content.";
     const models = [...new Set([settings.model, ...(status.known_models || [])])].filter(Boolean);
-    const model = h("select", { class: "field" }, models.map((m) => h("option", { value: m, selected: m === settings.model }, m)));
+    const model = h("select", { class: "field" }, models.map((m) => h("option", { value: m, selected: m === settings.model }, modelName(m))));
     const actions = h("input", { type: "checkbox", checked: settings.allow_actions === true });
     const autoApprove = h("input", {
       type: "checkbox", checked: settings.auto_approve === true,
@@ -668,7 +668,7 @@ function breakdowns(u) {
   const models = list(u.by_model).map((m) => {
     const tokens = [`${compact(m.input_tokens)} in`, `${compact(m.output_tokens)} out`];
     if (m.cached_tokens > 0) tokens.push(`${compact(m.cached_tokens)} cached`);
-    return { name: String(m.model || "").split("/").pop() || "Unknown model", full: m.model, cost: m.cost ?? 0, detail: `${runs(m.runs)} · ${tokens.join(" · ")} tokens` };
+    return { name: modelName(m.model) || "Unknown model", full: m.model, cost: m.cost ?? 0, detail: `${runs(m.runs)} · ${tokens.join(" · ")} tokens` };
   });
   const sessions = list(u.by_session).map((s) => ({ name: sessionTitle(s), href: chatHash(s.id), cost: s.cost ?? 0, detail: runs(s.runs) }));
   const schedules = list(u.by_schedule).map((s) => ({ name: s.name || "A deleted schedule", cost: s.cost ?? 0, detail: runs(s.runs) }));

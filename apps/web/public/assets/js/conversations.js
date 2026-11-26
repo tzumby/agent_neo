@@ -28,9 +28,12 @@ export function sessionOf(event) {
   return null;
 }
 
-/** Events after which the list is fetched again: its states, queues and last messages change with them. */
+/**
+ * Events after which the list is fetched again: its states, queues and last
+ * messages change with them. Not an action a plan covered: it changes none.
+ */
 export function refetchesSessions(kind) {
-  return /^(session\.|message|task\.|approval\.|action|budget\.alert$)/.test(String(kind || ""));
+  return /^(session\.|message|task\.|approval\.(?!plan$)|action|budget\.alert$)/.test(String(kind || ""));
 }
 
 export function sessionTitle(session) {

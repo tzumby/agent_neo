@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Clicks through the web app in headless Chrome against `make web-dev`
 (apps/web/dev/run.sh): sends a message and waits for the answer, answers a
-card, saves a key, follows a task's plan, stops a task the supervisor finds
+card, saves a key, approves a plan once, follows a task's plan, stops a task the supervisor finds
 stuck and opens each page; then queues messages behind a task, works in a
 second conversation beside main, renames, archives and deletes it, and sets
 a monthly budget (docs/conversations-and-usage.md). Prints a line per check;
@@ -234,6 +234,31 @@ async def main(out):
             p.check(bool(made) and made[0]["prompt"] == "Check only the status page", "…and the edited instructions are what's scheduled")
             if made:
                 await p.js(f"fetch('/api/v1/schedules/{made[0]['id']}', {{method: 'DELETE'}})")
+
+            # A task that would ask several times: one plan card; reworded and approved,
+            # what it names goes ahead with no more cards, each as a quiet row.
+            covered = "document.querySelectorAll('.row-covered').length"
+            covered_before = await p.js(covered)
+            answers = "document.querySelectorAll('.row-agent').length"
+            await say("Post with a plan to Lawrence")
+            card = "[...document.querySelectorAll('.card-needs')].find(c => c.getAttribute('aria-label') === 'Approve this plan?')"
+            p.check(await p.until(f"!!{card}", 20), "a task that would ask several times: one plan card")
+            words = await p.js(f"{card}.textContent")
+            p.check("form.test" in words and "rm -rf ./old-build" in words, "…naming the page it types on and the command it runs")
+            await p.js(f"""(() => {{ const t = {card}.querySelector('.plan-edit-text');
+                t.value = 'Open the page with the message box'; t.dispatchEvent(new Event('input')); }})()""")
+            await p.js(f"{card}.scrollIntoView({{block: 'center'}})")
+            await p.shot(f"{out}/smoke-plan-card.png")
+            answered = await p.js(answers)
+            await press(card, "Approve plan")
+            p.check(await p.until(f"{covered} >= {covered_before} + 2", 25), "…approved, the typing and the command go ahead under it")
+            p.check(await p.until(f"{answers} > {answered}", 15), "…and the task ends")
+            p.check(await p.js("[...document.querySelectorAll('.row-agent')].pop().textContent.includes('Hello under the plan')"),
+                    "…the page has the text")
+            p.check(await p.js("!document.querySelector('.card-needs')"), "…with no more cards")
+            last = "[...document.querySelectorAll('.row-plan')].pop()"
+            p.check(await p.js(f"{last}?.textContent.includes('Open the page with the message box')"), "…and the plan is the person's version")
+            await p.shot(f"{out}/smoke-plan-covered.png")
 
             # A task with steps: its plan shows right away, ticks off live, and folds once it's done.
             plans = "document.querySelectorAll('.row-plan').length"

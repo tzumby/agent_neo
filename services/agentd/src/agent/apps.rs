@@ -183,7 +183,11 @@ impl Agent {
                 }
                 let mut card = act_card(&window, &steps, &bindings);
                 card["summary"] = json!(summary.and_then(clip_summary));
-                if resumed.is_none() {
+                // A picture for the card, unless the plan covers it (no card).
+                if resumed.is_none()
+                    && self.covering(task_id, &card).is_none()
+                    && !self.plan_first(task_id, &card)
+                {
                     self.picture_for(&mut card, desktop, &task).await;
                 }
                 match self.approve(task_id, card, resumed, false)? {
@@ -655,6 +659,7 @@ mod tests {
             card: park.card.clone(),
             by: None,
             edited: None,
+            plan: None,
         })
     }
 

@@ -56,6 +56,13 @@ const ICONS = {
   more: "M5.5 12h.01M12 12h.01M18.5 12h.01",
   chart: "M4 20h16M7 16v-4M12 16V6M17 16v-7",
   plus: "M12 5v14M5 12h14",
+  list: "M9 7h11M9 12h11M9 17h11M4.5 7h.01M4.5 12h.01M4.5 17h.01",
+  up: "M6 15l6-6 6 6",
+  next: "M9 6l6 6-6 6",
+  down: "M6 9l6 6 6-6",
+  trash: "M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12M10 11v5M14 11v5",
+  terminal: "M4 5h16v14H4zM8 10l3 2-3 2M13 15h3",
+  download: "M12 4v11M7 10l5 5 5-5M5 20h14",
 };
 
 export function icon(name, className = "icon") {

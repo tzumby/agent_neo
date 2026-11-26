@@ -115,3 +115,13 @@ export function kindRows(byKind) {
     .map(([kind, cost]) => ({ kind, name: KINDS[kind] || kind, cost: amount(cost) }))
     .sort((a, b) => b.cost - a.cost);
 }
+
+/** A model's name for people: "zai-org/GLM-5.3" is "GLM-5.3", "claude-opus-4-6" is "Claude Opus 4.6". */
+export function modelName(id) {
+  const claude = /^claude-([a-z]+)-(\d+)(?:-(\d+))?$/.exec(id || "");
+  if (claude) {
+    const [, family, major, minor] = claude;
+    return `Claude ${family[0].toUpperCase()}${family.slice(1)} ${minor ? `${major}.${minor}` : major}`;
+  }
+  return String(id || "").split("/").pop();
+}

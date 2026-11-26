@@ -528,10 +528,32 @@ export class Store {
 
   async answer(card, approved, text) {
     const conversation = this.conversation;
-    return this.attempt(() => this.api.answer(card.id, approved, text), () => {
-      conversation.expiredApprovals.add(card.id);
-      conversation.timeline.expireApproval(card.id);
-    });
+    return this.attempt(() => this.api.answer(card.id, approved, text), () => this.expire(conversation, card));
+  }
+
+  /**
+   * A plan card's answer, with the person's version of its steps when they
+   * changed it. Resolves to agentd's reason when it refused that version (a
+   * 400: an empty step, too many, a need the card didn't have), for the card
+   * to show; else null.
+   */
+  async answerPlan(card, approved, plan) {
+    const conversation = this.conversation;
+    let refused = null;
+    await this.attempt(async () => {
+      try {
+        await this.api.answer(card.id, approved, undefined, plan);
+      } catch (error) {
+        if (!(error instanceof ApiError && error.status === 400)) throw error;
+        refused = error.message;
+      }
+    }, () => this.expire(conversation, card));
+    return refused;
+  }
+
+  expire(conversation, card) {
+    conversation.expiredApprovals.add(card.id);
+    conversation.timeline.expireApproval(card.id);
   }
 
   async resolve(action, done) {

@@ -33,7 +33,7 @@ The pieces:
 - **tailnet-proxy** (Go, Tailscale's tsnet): a userspace Tailscale node inside one process, at `https://neo-agent.<your tailnet>.ts.net`. It serves the web app, agentd's API and the noVNC viewer, and port 5900 for the apps' take-over view.
 - **The web app** (`apps/web`, static files, no build step): the chat, approval cards, the desktop (take over), schedules, keys and tokens, and settings.
 - **The iPhone and Mac apps** (`apps/apple`, SwiftUI, optional): the same chat against the same API, a native take-over view over port 5900, a Memory screen, and APNs notifications. Each is a Tailscale node of its own (TailscaleKit), signed in as you (§7.4).
-- **The model provider**: Together AI (serverless). The default model is `zai-org/GLM-5.3`, which is text-only. The agent reads pages through the accessibility tree and text, not screenshots. A model checked to see images (`moonshotai/Kimi-K3`) also gets the desktop's screenshots for native apps ([desktop-apps.md](desktop-apps.md) §5). Whether Together keeps prompts is your Together account's setting (zero data retention); agentd doesn't enforce it.
+- **The model provider**, one per desktop (`LLM_PROVIDER`, Ansible's `agentd_llm_provider`): Anthropic's API for Claude, where the default model is `claude-opus-4-6` and `claude-opus-5-5` is the other pick (§6.7), or Together AI (serverless), where the default is `zai-org/GLM-5.3`, which is text-only. A Claude Pro or Max subscription can't stand in for an API key: its sign-in is for Claude's own apps only, under Anthropic's terms. The agent reads pages through the accessibility tree and text, not screenshots. A model checked to see images (`moonshotai/Kimi-K3`) also gets the desktop's screenshots for native apps ([desktop-apps.md](desktop-apps.md) §5). Whether Together keeps prompts is your Together account's setting (zero data retention); agentd doesn't enforce it.
 
 ```
  Browser on a laptop  ┌──────────────────────── your tailnet (WireGuard, end to end) ─────────────────────────┐
@@ -64,7 +64,7 @@ What the code calls things:
 |---|---|
 | **Task** (run) | One request carried out by the agent: model turns and tool calls until an answer |
 | **Event** | An entry in agentd's append-only log. The web app's chat is built from the events |
-| **Card** | Something the user is asked: an approval (command, browser action, schedule, key, site) or Action needed |
+| **Card** | Something the user is asked: an approval (command, browser action, app input, install, schedule, key, site, plan) or Action needed |
 | **Parking** | A task waiting on a card saves its state and frees the desktop; the answer resumes it |
 | **Tainted** | The task has read outside content (a page, command output), which may carry injected instructions |
 | **Skill** | A Markdown how-to the agent reads on demand |
@@ -86,10 +86,10 @@ The rules the code keeps to:
    - Ansible reads them on your machine with `no_log` and writes them to the desktop.
    - The desktop's own IAM role is denied the project's SSM parameters.
    - Logs carry metadata only.
-6. **The model key is on the desktop.** It's in `/etc/agentd/secrets.env` (root:agentd 0640), so agentd and root can read it; the shell user and the browser can't. agentd calls Together directly, with no gateway in between. Anyone with root on the desktop can read the key, and that's you, over SSM.
+6. **The model key is on the desktop.** It's in `/etc/agentd/secrets.env` (root:agentd 0640), so agentd and root can read it; the shell user and the browser can't. agentd calls the provider directly, with no gateway in between. Anyone with root on the desktop can read the key, and that's you, over SSM.
 7. **The owner reviews actions that need additional authority.** Browser input, saved credentials, new proxy sites, and direct network access require explicit approval. The owner handles system administration through SSM. Auto approve applies to eligible worker commands and scheduled-task setup (§6.11).
 8. **Untrusted content is data, not instructions.** It's labelled, it taints the task, and the privilege split limits what an injected instruction could do (§6.12).
-9. **No dependency on a single model vendor.** Models are reached through an OpenAI-compatible API: Together by default, another endpoint with `LLM_URL`.
+9. **No dependency on a single model vendor.** agentd speaks one OpenAI-style chat format inside. Together (or another OpenAI-compatible endpoint, with `LLM_URL`) takes it as it is; for Claude, `claude.rs` translates each request to Anthropic's Messages API and each reply back.
 10. **Every apply is shown first.** `make plan` saves a plan for you to review, and `make apply` applies only that plan.
 
 ## 3. Repository map
@@ -189,7 +189,8 @@ Terraform creates no parameters. You create these with `scripts/put-secret.py` (
 
 | Parameter | Written by | Read by |
 |---|---|---|
-| `/neo-agent/<env>/llm/together_api_key` | `make model-key` | Ansible on your machine → `/etc/agentd/secrets.env`; `make agentd-evals` when `TOGETHER_API_KEY` isn't set |
+| `/neo-agent/<env>/llm/anthropic_api_key` | `make model-key` | Ansible on your machine → `/etc/agentd/secrets.env`, when `agentd_llm_provider` is `anthropic` |
+| `/neo-agent/<env>/llm/together_api_key` | `make model-key PROVIDER=together` | The same, when it's `together`; `make agentd-evals` when `TOGETHER_API_KEY` isn't set |
 | `/neo-agent/<env>/tailscale/auth_key` | `make tailscale-key` | Ansible → `/etc/tailnet-proxy.env` |
 | `/neo-agent/<env>/tailscale/allowed_logins` | `make tailscale-allow` (optional) | Ansible → tailnet-proxy's `-allow`. Missing or empty: no login allowlist |
 | `/neo-agent/<env>/apns` | `make apns-key` (optional; `scripts/put-apns-key.py`) | Ansible → `/etc/agentd/secrets.env` (`APNS_AUTH_KEY` base64, `APNS_KEY_ID`, `APNS_TEAM_ID`). One JSON blob. Missing: the apps' notifications are off |
@@ -316,7 +317,7 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
 | `/usr/local/bin/agentd` | root 0755 | The binary |
 | `/etc/agentd/` | root:agentd 0750 | Configuration directory |
 | `/etc/agentd/agentd.env` | root:agentd 0640 | `LISTEN`, `MODEL`, `CDP_URL`, `STATE_DIR`, `WORKDIR`, `RUN_AS=worker`, `POLICY`, `REVIEW_EVERY_SECS`, `REVIEW_EVERY_STEPS`, `SHELL_TOOL`, `MEMORY_V2`, `DESKTOP_NAME`, `SHELL_PROXY=http://127.0.0.1:3128`, `EGRESS_USER_HOSTS`, `EGRESS_BASE_HOSTS` |
-| `/etc/agentd/secrets.env` | root:agentd 0640 | `TOGETHER_API_KEY`, read from SSM `<prefix>/llm/together_api_key` on your machine at each deploy (`no_log`). agentd reads it; the shell user can't |
+| `/etc/agentd/secrets.env` | root:agentd 0640 | `ANTHROPIC_API_KEY` or `TOGETHER_API_KEY`, read from SSM `<prefix>/llm/<provider>_api_key` on your machine at each deploy (`no_log`; the play stops with what to run if it's missing). agentd reads it; the shell user can't |
 | `/etc/agentd/policy.toml` | root:agentd 0640 | Only when `agentd_dangerous` overrides the built-in approval rules |
 | `/etc/agentd/skills/*.md` | root:agentd 0640 | Skills |
 | `/usr/local/libexec/neo-agent-privileged` | root 0755 | Fixed worker launch and stop operations, Squid policy reconciliation, and (with app installs on) `install-snap`. The launcher sets the worker identity, sandbox configuration, and shell limits from Ansible |
@@ -404,7 +405,7 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 
 ## 6. agentd: the agent on the desktop
 
-`services/agentd` is a single static Rust binary (edition 2024, tokio, axum 0.8, rusqlite with bundled SQLite, reqwest with rustls, regex, croner and jiff). It's built with `cargo zigbuild` for `x86_64-unknown-linux-musl` (or aarch64), with Rust 1.93.1 from `rust-toolchain.toml`. It runs the model loop, owns the browser and the shell launcher, keeps all of the agent's state, and serves the API the web app uses. Version 0.17.0: native apps through the desktop broker and HCU, when the deployment has them ([desktop-apps.md](desktop-apps.md)); 0.16.0 brought several conversations, queued messages, and usage with a monthly budget ([conversations-and-usage.md](conversations-and-usage.md)).
+`services/agentd` is a single static Rust binary (edition 2024, tokio, axum 0.8, rusqlite with bundled SQLite, reqwest with rustls, regex, croner and jiff). It's built with `cargo zigbuild` for `x86_64-unknown-linux-musl` (or aarch64), with Rust 1.93.1 from `rust-toolchain.toml`. It runs the model loop, owns the browser and the shell launcher, keeps all of the agent's state, and serves the API the web app uses. Version 0.19.0: Claude through Anthropic's API as the model provider, Opus 4.6 by default and Opus 5.5 a pick (§6.7); 0.18.0 brought plan approval, one card for the steps of a task that would otherwise ask again and again (§6.11); 0.17.0 brought native apps through the desktop broker and HCU, when the deployment has them ([desktop-apps.md](desktop-apps.md)); 0.16.0 brought several conversations, queued messages, and usage with a monthly budget ([conversations-and-usage.md](conversations-and-usage.md)).
 
 ### 6.1 Process, configuration and startup
 
@@ -415,10 +416,13 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 | Key | Default | Meaning |
 |---|---|---|
 | `LISTEN` | `unix:/run/agentd/agentd.sock` | Unix socket on the desktop; `127.0.0.1:8765` in local development |
-| `TOGETHER_API_KEY` | (none) | The model key, from `secrets.env` on the desktop. It or `LLM_API_KEY` is required: without a key agentd doesn't start. Held as `secrecy::SecretString`, never printed |
-| `LLM_API_KEY` | (none) | Wins over `TOGETHER_API_KEY`: the key for `LLM_URL` |
-| `LLM_URL` | `https://api.together.ai/v1/chat/completions` | Another OpenAI-compatible endpoint, such as Bedrock's for the evals or `fake_llm.py` for `make web-dev` |
-| `MODEL` | `zai-org/GLM-5.3` | Default model (the web app can change it) |
+| `LLM_PROVIDER` | `anthropic` if `ANTHROPIC_API_KEY` is set, else `together` | Where the models come from: `anthropic` (Claude) or `together` |
+| `ANTHROPIC_API_KEY` | (none) | The model key on Anthropic, from `secrets.env` on the desktop |
+| `TOGETHER_API_KEY` | (none) | The model key on Together. The provider's key (or `LLM_API_KEY`) is required: without one agentd doesn't start. Held as `secrecy::SecretString`, never printed |
+| `LLM_API_KEY` | (none) | Wins over the provider's own: the key for `LLM_URL` |
+| `LLM_URL` | Anthropic's `https://api.anthropic.com/v1/messages`, or `https://api.together.ai/v1/chat/completions` | Another endpoint, such as Bedrock's (OpenAI-compatible) for the evals or `fake_llm.py` for `make web-dev` |
+| `MODEL` | `claude-opus-4-6` on Anthropic, `zai-org/GLM-5.3` on Together | Default model (the apps pick among the provider's) |
+| `CONSOLIDATION_MODEL` | `claude-haiku-5-5` on Anthropic, `zai-org/GLM-5.3-Flash` on Together | Memory tidy-up's default |
 | `CONSOLIDATION_MODEL` | `zai-org/GLM-5.3-Flash` | Memory tidy-up's model until the user picks one (the evals set it for Bedrock) |
 | `CDP_URL` | `http://127.0.0.1:9222` | Chrome DevTools endpoint |
 | `STATE_DIR` | `/var/lib/agentd` | SQLite, images, saved keys |
@@ -462,7 +466,8 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 | `sessions.rs` | Conversations: messages started or queued, the queue (`pump`), Stop, titles, create, rename, archive, delete, and their state for the apps (§6.6) |
 | `usage.rs` | Usage figures in the user's time zone, the monthly budget and its alerts (§6.22) |
 | `tools.rs` | The system prompt and the tool schemas the model sees |
-| `llm.rs` | The chat-completions client (Together, or `LLM_URL`), `KNOWN_MODELS`, prices, reasoning handling, usage and cost, retries, `truncate` |
+| `llm.rs` | The model client: the provider (`LLM_PROVIDER`) and its models, Together's chat completions (or `LLM_URL`), prices, reasoning handling, usage and cost, retries, `truncate` |
+| `claude.rs` | Claude through Anthropic's Messages API: each request translated from the OpenAI-style format and each reply back, thinking blocks kept verbatim, Opus 5.5's fallbacks and thinking binding (§6.7) |
 | `browser.rs`, `cdp.rs` | Browser tools over the Chrome DevTools Protocol (§6.9) |
 | `desktop/` | Native apps: the broker's protocol and HCU's text (`mod.rs`), steps and pixel actions (`steps.rs`), the MCP client (`hcu.rs`), the broker itself (`broker.rs`, `agentd desktop-broker`), agentd's client (`client.rs`) ([desktop-apps.md](desktop-apps.md)) |
 | `agent/apps.rs` | The app_* tools and their `app` cards |
@@ -543,7 +548,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/usage?days=` | The usage figures (§6.22): `days` 1–90, default 30 |
 | GET | `/api/v1/events?after=&kinds=&session=` | Server-Sent Events from the durable log in sequence order: every conversation's, or with `session` that conversation's and the global ones. `kinds` (comma-separated) filters what is sent. Each event has `id: seq`, `event: kind` and the JSON event. The live bus wakes the stream when it is caught up, including when a subscriber has fallen behind. Keep-alive comments every 15 s |
 | GET | `/api/v1/events/page?before=&limit=&kinds=&session=` | A page of the log, oldest first: up to `limit` (default 100, at most 500) events of `kinds` before `before` (from the newest when absent); with `session`, that conversation's and the global ones (`session = ? OR session IS NULL`). `{events, more, last_seq}`: `more` says older ones remain, and `last_seq` is the log's newest seq, read under the same lock, for the stream to go on from. Keys redacted as in the stream (0.15.1) |
-| POST | `/api/v1/approvals/{id}` | `{approved, text?}`. Resumes the parked task in its conversation at once, past `MAX_PARALLEL_TASKS` and a used-up budget; `text` replaces the card's text (§6.11). 400 if it can't, 404 if unknown or expired, 409 only while another card of the same conversation is being resumed |
+| POST | `/api/v1/approvals/{id}` | `{approved, text?, plan?}`. Resumes the parked task in its conversation at once, past `MAX_PARALLEL_TASKS` and a used-up budget; `text` replaces the card's text, and `plan` (a `plan` card's steps, `[{step, status?, site?, app?, commands?, install?}]`) the agent's plan (§6.11). 400 if it can't (an edit that adds a need the card didn't have, an empty step, none or more than 20), 404 if unknown or expired, 409 only while another card of the same conversation is being resumed |
 | POST | `/api/v1/actions/{id}` | `{choice: done or skip}` on an Action needed card: a message in the card's conversation, "I've done what you asked… continue" or "I'm skipping that step…", which starts or queues. The card is claimed first: a second answer is a 404. An archived conversation comes back (`session.updated`). 202 `{task}` or `{queued}` |
 | POST | `/api/v1/stop` | `main`'s Stop: `{stopping, stopped, dropped}`, as for a conversation |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
@@ -610,13 +615,13 @@ Every change the web app shows is an event: appended to `events` and broadcast o
 | `task.started` | `task`, `model` | A conversation's task starts (the app shows that conversation as working until `task.finished` or `task.paused`) |
 | `run.started` | `task`, `model`, `schedule` ({id, name}) | A scheduled run starts, beside the conversations (0.15.10). Not `task.started`, so the app doesn't show its conversation as working |
 | `step` | `task`, `step`, `tool`, `args` (first 300 characters) | Each tool call, except a resumed one |
-| `plan` | `task`, `items` ([{step, status: pending, in_progress or done}]) | A chat task's `update_plan`: the whole plan each time |
+| `plan` | `task`, `items` ([{step, status: pending, in_progress or done, and what the step needs: `site`, `app`, `commands`, `install`}]) | A chat task's `update_plan`: the whole plan each time (after an approval, the user's version) |
 | `review` | `task`, `verdict` (progressing, nudge, stuck or failed), `reason` | Each supervisor check (§6.6) |
 | `shell` | `task`, `command`, `as_root`, `direct` (outside the proxy, §6.21), `needs_approval`, `secrets` (key names) | A command is about to run or ask |
 | `shell.output` | `task`, `command`, `exit_code`, `timed_out`, `stopped`, `output` (last 4,000 characters), `seconds` | A command ended |
-| `approval.requested` | The card: `id`, `task`, `kind` (`shell`, `browser`, `schedule`, `secret`, `access` or `stuck`) and its fields. A `shell` card has `command`, `reason`, `secrets`, `summary` (the model's plain words, one line, at most 120 characters), `tainted` (asked after outside content) and, only for a direct command, `direct: true` (§6.21) | A task parks |
+| `approval.requested` | The card: `id`, `task`, `kind` (`shell`, `browser`, `app`, `install`, `schedule`, `secret`, `access`, `plan` or `stuck`) and its fields. A `shell` card has `command`, `reason`, `secrets`, `summary` (the model's plain words, one line, at most 120 characters), `tainted` (asked after outside content) and, only for a direct command, `direct: true` (§6.21). A `plan` card has `steps` (as in `plan`, with each step's needs), `covers` (`{sites, apps, commands, installs}`, what approving adds), `tainted` and `editable: true` | A task parks |
 | `task.paused` | `task`, `approval` | Right after the card |
-| `approval.resolved` | `task`, `id`, `approved`, `by`, `edited`, `text`, `expired`, `reason` (`policy_changed`) | Answered (`text`: what the person changed it to), or given up on |
+| `approval.resolved` | `task`, `id`, `approved`, `by`, `edited`, `text`, `plan`, `expired`, `reason` (`policy_changed`) | Answered (`text` or `plan`: what the person changed it to), or given up on |
 | `task.resumed` | `task` | A parked task carries on |
 | `task.stopping` | `session` | Stop was pressed while a task ran |
 | `task.finished` | `task`, `status`, `steps`, `seconds`, `model`, `usage` ({input, output, cached}), `cost` (USD) | A chat task ends |
@@ -633,6 +638,7 @@ Every change the web app shows is an event: appended to `events` and broadcast o
 | `settings` | `{model, allow_actions, auto_approve, …}` | Settings changed |
 | `auto_approve.changed` | `{on, by}` | A person turned Auto approve on or off (§6.11) |
 | `approval.auto` | `{task, card}` | Auto approve let an action through with no card: what the card would have shown (§6.11) |
+| `approval.plan` | `{task, approval, by, card}` | The approved plan covered an action, so it had no card: what the card would have shown (no picture or binding), the plan card's id and who approved it (§6.11) |
 | `session.created` / `session.updated` | The `Session` (§6.4) | A conversation was created; renamed, archived or brought back, or titled from its first message |
 | `session.deleted` | `id` | A conversation was deleted |
 | `budget.alert` | `level` (80 or 100), `spent`, `budget`, `month` (`YYYY-MM`) | This month's spending crossed 80% or 100% of the budget, once each a month for a given budget (§6.22) |
@@ -703,8 +709,8 @@ Each model turn (`run_loop`):
    - the skills listing.
 2. Run the queued tool calls in order (below). Then, if a check is due, the supervisor reviews the task (§6.6).
 3. Trim the context. When tool results total more than 120,000 characters, the oldest are replaced by a note; the 2 newest stay whole. Every turn resends the whole context, so this also caps cost.
-4. Call the model: `{model, messages, tools, tool_choice: auto, max_tokens: 8192}`, POSTed to `LLM_URL` with the key as a bearer token (180 s timeout). A Stop cancels the call. After an empty reply, the retry gets 16,384 and then 32,768 tokens; if the provider refuses the larger limit (a 4xx, such as Together's 402 when the account can't cover it), the turn is sent again with 8,192.
-5. Add the reply to the conversation. For GLM and Kimi, `reasoning_content` is kept and sent back on later turns, since they reason worse without it; it's dropped for other models, which reject it.
+4. Call the model: `{model, messages, tools, tool_choice: auto, max_tokens: 8192}`, POSTed to `LLM_URL` with the key as a bearer token (180 s timeout), or for Claude translated to the Messages API (below; 600 s). A Stop cancels the call. After an empty reply, the retry gets 16,384 and then 32,768 tokens; if the provider refuses the larger limit (a 4xx, such as Together's 402 when the account can't cover it), the turn is sent again with 8,192.
+5. Add the reply to the conversation. For GLM and Kimi, `reasoning_content` is kept and sent back on later turns, since they reason worse without it; it's dropped for other models, which reject it. A Claude reply keeps its content blocks (`claude_content`), thinking and signatures included, which go back verbatim.
 6. No tool calls means the answer is final. Exceptions, each adding one reminder and running another turn:
    - the reply has no text either: the model's thinking used up `max_tokens` (`finish_reason` "length"; on the dev desktop, every empty reply in three weeks). It's asked again, up to twice in a row and with more room each time (step 4), to make its next call or give its answer; after that the task ends with a wrap-up (status `stuck`, not `error`, so a scheduled run isn't tried again only to be cut off again). The count resets after any reply with text or calls. Nothing ends as "(empty answer)";
    - the open tab looks like a sign-in page: the reminder says to call `needs_user` instead (once per task);
@@ -730,7 +736,24 @@ For each tool call:
 
 **Usage and cost:** input, cached and output tokens are added up per task and priced per model in `llm.rs`. They're written to the task's `runs` row after every model call (its turns, supervisor checks and wrap-ups), so a running task counts in the usage figures and the budget (§6.22); the total also goes on `task.finished`.
 
-**Models and prices.** `KNOWN_MODELS` in `llm.rs`, in USD per 1M tokens (Together serverless; GLM and Kimi checked 2026-10-30, DeepSeek 2026-11-02):
+**Claude** (`claude.rs`, raw HTTP to `https://api.anthropic.com/v1/messages`, `anthropic-version: 2026-10-21`, the key as `x-api-key`). Each request is translated:
+
+- the leading system message becomes `system`; tools become `{name, description, input_schema}`; `tool_choice` `auto` or `none`;
+- tool results go into the next user turn, results first, with any screenshot after them; a call a stopped task never ran gets a result saying so; a conversation that would start with agentd's notes (an assistant turn) starts with a short user line;
+- screenshots (data URLs) become base64 `image` blocks;
+- adaptive thinking; effort `high` on the Opus models (Opus 5.5's default is `medium`); `max_tokens` at least 16,000 (thinking counts against it) and at most 32,000, since replies aren't streamed; top-level `cache_control`, so each turn reads the prefix the last one wrote; no sampling parameters, which this API version refuses.
+
+On `claude-opus-5-5`, the request also opts into refusal fallbacks (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`) and replayed thinking that's dropped rather than refused when the history no longer matches (`thinking.block_binding.prefix_mismatch_behavior: "drop_block"`, beta `thinking-binding-controls-2026-08-01`). agentd edits its history: it trims old tool output, swaps older screenshots for a line of text, and rebuilds the system prompt when a parked task resumes. Each edit invalidates Opus 5.5's later thinking blocks, which an account created since 2026-08-31 would otherwise refuse with a 400. Replies come back with text as `content`, `tool_use` blocks as `tool_calls`, `stop_reason` as `finish_reason`, and usage with cache reads as cached tokens and cache writes as input. After a fallback, what the declined model wrote before the switch is kept as text only. A refusal of the whole chain is the task's answer: "The model declined to continue with this request."
+
+**Models and prices.** The provider's list (`Provider::models` in `llm.rs`), in USD per 1M tokens. On Anthropic (2026-11-03), input is priced as a cache write, 1.25× the base price, since the whole prompt is cached:
+
+| Model | Input (cache write) | Cached input | Output | Notes |
+|---|---|---|---|---|
+| `claude-opus-4-6` (default) | 6.25 | 0.50 | 25.00 | Sees images |
+| `claude-opus-5-5` | 5.00 | 0.20 | 20.00 | Sees images; fallbacks, thinking dropped on history edits |
+| `claude-haiku-5-5` | 0.125 | 0.01 | 0.50 | Tidy-up's default, not a chat pick; prompts up to 100K |
+
+On Together (serverless; GLM and Kimi checked 2026-10-30, DeepSeek 2026-11-02):
 
 | Model | Input | Cached input | Output | Notes |
 |---|---|---|---|---|
@@ -740,8 +763,8 @@ For each tool call:
 | `deepseek-ai/DeepSeek-V4-Pro-0813` | 1.32 | 0.13 | 3.96 | Pinned snapshot; `reasoning_content` dropped |
 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | 0.30 | 0.006 | 1.20 | Pinned snapshot; `reasoning_content` dropped |
 
-- **`KNOWN_MODELS`** is what `/status` lists for the web app's model menu, what the policy version hashes (§6.11), and what tidy-up's model must be one of. `llm.rs` also prices `zai.glm-4.7-flash` (Bedrock) for the evals; it isn't a known model.
-- **Adding a model** takes two places in `llm.rs`: `prices` and `KNOWN_MODELS`.
+- **The provider's models** are what `/status` lists (`known_models`, with `provider`) for the apps' model menu, what the policy version hashes (§6.11), and, with the provider's helper, what tidy-up's model must be one of. A model picked under another provider gives way to the default. `llm.rs` also prices `zai.glm-4.7-flash` (Bedrock) for the evals; it isn't a known model.
+- **Adding a model** takes two places: `prices` in `llm.rs`, and `KNOWN_MODELS` there or `MODELS` in `claude.rs`.
 - **Checked:** both DeepSeek models passed two memory evals on 2026-11-02: a remembered fact recalled in a later task, and a scheduled check reporting a result. V4.1 Flash cost $0.004 for both, V4 Pro $0.018. Together has no non-Flash V4.1; V4 Pro is DeepSeek's larger model there.
 
 ### 6.8 Tools the model has
@@ -759,7 +782,7 @@ For each tool call:
 | `wait_for` | `text`, `timeout` (10 s; 1–25) | Until the text appears, or the page is idle without it | No |
 | `show_screenshot` | `caption` | Saves a JPEG and shows it in the chat | No |
 | `needs_user` | `reason` | Ends the task with an Action needed card: a screenshot and the page | Not an approval: you sign in or solve the CAPTCHA, then I'm done, Skip or Take over |
-| `update_plan` | `items` ([{step ≤ 120 characters, status: pending, in_progress or done}], 1–20) | Replaces the task's plan; a chat task's goes to the web app as a `plan` event, the checklist. The prompt asks for one on tasks of three or more steps. The supervisor reads it to judge progress | No |
+| `update_plan` | `items` ([{step ≤ 120 characters, status: pending, in_progress or done, and optionally `site` (a host), `app`, `commands` (≤ 10, exact), `install` (a store name)}], 1–20) | Replaces the task's plan; a chat task's goes to the web app as a `plan` event, the checklist. The prompt asks for one on tasks of three or more steps, and for one naming what needs an OK whenever a task would ask more than once. The supervisor reads it to judge progress | Only when its steps name something the task hasn't been granted: one `plan` card (§6.11) |
 | `remember` / `forget` | `text` / `id` | Save or remove an inferred note (§6.13) | Standing changes require the owner |
 | `remember` / `forget` / `search_memory` (memory v2) | `text`, `kind` (rule, preference, fact), `replaces`, `valid_until` / `id` or `query` / `query`, `kinds`, `limit` | Save or replace inferred notes, forget by ID or description, and search memory (§6.13) | Standing changes require the owner |
 | `schedule_task` | `name`, `prompt`, `cron` or `at` | Sets up a scheduled task (§6.14) | Only after outside content. Refused in scheduled runs |
@@ -867,8 +890,8 @@ deployment's patterns and Auto approve setting. Cards contain the command,
 the requested keys, the reason, and the model's summary. Edits cannot add
 credentials to an existing grant.
 
-**Browser.** Every click, typing action, and key press needs a separate
-approval. Browser actions off and unattended runs block these inputs.
+**Browser.** Every click, typing action, and key press needs approval: its
+own card, or an approved plan that names the site (Plans, below). Browser actions off and unattended runs block these inputs.
 Cards include the page URL, destination when available, nearby context, and
 the entire text to be typed. URLs on cards show scheme, host, port and path
 only: query strings and fragments can carry tokens, so the binding keeps a
@@ -887,7 +910,42 @@ for sensitive fields or a target the tool cannot verify. A generic website contr
 after input or navigation. Its interface cannot establish all server-side
 effects.
 
-**Native apps.** Every batch of input in an app is one `app` card: the app, the window's title, the model's summary, each step in words (typed text in full, keys, each element's role, name and place), and a screenshot, with pixel steps numbered on it. The bindings the broker read (its epoch, each window and element, the app's id, process and executable, the title, role, name and path; for pixels, the window under each point and the frame) stay server-side. A changed binding on resume, or in the broker's own check under its lock just before input, means nothing is sent. Browser actions off and scheduled runs block app input too, and a saved key's value is never typed ([desktop-apps.md](desktop-apps.md) §5).
+**Native apps.** Every batch of input in an app is one `app` card, unless an approved plan names the app (Plans, below): the app, the window's title, the model's summary, each step in words (typed text in full, keys, each element's role, name and place), and a screenshot, with pixel steps numbered on it. The bindings the broker read (its epoch, each window and element, the app's id, process and executable, the title, role, name and path; for pixels, the window under each point and the frame) stay server-side. A changed binding on resume, or in the broker's own check under its lock just before input, means nothing is sent. Browser actions off and scheduled runs block app input too, and a saved key's value is never typed ([desktop-apps.md](desktop-apps.md) §5).
+
+**Plans.** When a task would ask more than once, the prompt has the agent
+start with `update_plan` and name, on each step, what it needs an OK for. Models
+don't always do that unprompted, so agentd also asks once per chat task:
+before the task's first card for browser input, app input or an install
+(with no plan approved yet), the call isn't carried out and the model is
+told to plan first, or to call it again if it's the only thing that needs
+an OK (a command's card isn't held back: its row is already showing). Each
+step can name: a
+`site` (a host it clicks, types or presses keys on), an `app` (a desktop app
+it gives input to), `commands` (exact ones that ask; agentd drops those that
+never would) or an `install` (a Snap Store name). A plan with needs the task
+hasn't been granted parks on one `plan` card: the steps, each with its
+needs, and `covers`, what approving adds. The user can edit the steps' text,
+delete, add and reorder steps, and take needs off; agentd refuses an edit
+that adds a need the card didn't ask for. The approved plan's needs become
+the task's grant (what the user took off is revoked, even from an earlier
+plan), and the model gets the user's version to follow. For the rest of that
+task, `approve` lets through what the grant covers before anything else: a
+browser action on the site or a host under it, an app batch whose every
+window is the app's, a shell command equal to a named one (lines trimmed,
+spaces collapsed; line breaks still count), an install of the named app.
+Each goes on record as `approval.plan`, which the chat shows, with no card,
+picture or notification. Everything else asks as before: other sites, apps
+and commands, saved keys, direct connections, new sites for the proxy,
+schedules, stuck checks and a later plan that adds needs (that card shows
+only what's new). The grant only removes the wait for an OK: the checks
+around it still run. Browser actions off, Take over targets, typed text
+with a saved key's value, and the bindings agentd and the broker check just
+before input all apply as before. A plan card is always a person's: Auto approve never answers one, a
+scheduled run's plan never asks (it covers nothing there), and the grant
+ends with the task. The trade is that, within the sites and apps it names,
+what the agent clicks and types isn't shown before it happens, so it's for
+work the user is happy to let run; a denied plan tells the model not to
+start on it.
 
 **Editing.** The web and Apple apps can edit cards that carry
 `editable: true`. Shell, typing, and schedule edits re-enter the same
@@ -917,7 +975,7 @@ Web pages, emails and command output can carry injected instructions. The defenc
    - schedules need approval;
    - memories are saved as unverified (v2: inferred);
    - key and site requests carry a warning.
-3. **Approvals** for browser input, credential use, direct networking, and recognized shell data-out after outside content. Scheduled runs skip actions that need a person (§6.11).
+3. **Approvals** for browser input, credential use, direct networking, and recognized shell data-out after outside content: on their own cards, or for the sites, apps and exact commands of a plan the user approved. A plan card warns when the plan was written after outside content (`tainted`). Scheduled runs skip actions that need a person (§6.11).
 4. **Privilege split:**
    - the shell user can't reach the browser, agentd's state, the model key, the socket, the metadata service or other tailnet devices;
    - the browser can't open internal addresses.
@@ -1221,6 +1279,7 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
   - Three dots while a task runs, with how long it has worked ("Working · 24 min", from `task.started`), and a Stop button. **Send still works while it runs:** the message is queued, a grey "Queued" bubble below the dots ("Queued · 2 of 3" when there are more) with a ✕ to take it back, which gives way to the message itself when it starts (`message.queued`, `message.unqueued`). With messages queued, Stop says it drops them too, and asks first. Suggestions in an empty chat.
   - **The budget:** while `status.budget.paused`, a banner says new messages wait until you raise it, with a button to Usage; a `budget.alert` shows a toast.
   - **The plan:** when the agent writes one (`update_plan`), a checklist after your message: "Plan" with "3 of 5", each step ✓ done, ◐ in progress or ○ to do, updated with each `plan` event. When the task ends it folds to "Plan · 4 of 5 done", above the answer.
+  - **A plan card** ("Approve this plan?"), when the plan's steps name what they need an OK for (§6.11): the steps, each editable, with its needs as chips you can take off; add, delete and reorder steps; a line saying what it won't ask about again, built from what's left; Approve plan sends your version only if you changed it. What then goes ahead under the plan shows as a quiet row ("Under your plan · Mousepad — Add the milk line and save").
   - Answers are Markdown (`markdown.js`): blocks and tables, single newlines break lines, raw HTML stays text, only web and mail links, images become links.
   - **Scheduled runs are reports,** not you speaking: the schedule's name and time, the instructions folded away, and the answer. A one-line run that found nothing is a quiet grey line, and such runs of one schedule fold into the latest.
   - **Cards,** only while they wait for you (answered or expired, a card leaves the chat):
@@ -1290,7 +1349,7 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
    - answers 202 `{task}`.
 2. Each model turn:
    - agentd builds the request: system prompt, last 20 history entries, the conversation so far;
-   - POSTs it to Together over TLS, with your key as the bearer token, out through the NAT;
+   - POSTs it to the provider over TLS, with your key, out through the NAT;
    - retries rate limits and outages (§6.7).
 3. agentd runs the tool calls:
    - each one emits a `step` event (or `shell` and `shell.output` for commands);
@@ -1373,7 +1432,7 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 | agentd ↔ the browser | `agentd` and `agent` | CDP is on localhost. Chrome's socket traffic is filtered independently of browser URL validation. |
 | agentd ↔ the desktop broker (native apps) | `agentd` and `agent` | A socket only agentd can open, and the broker's peer check; typed steps and pixel actions on listed apps' windows only, each bound to what its card showed ([desktop-apps.md](desktop-apps.md) §7) |
 | The model ↔ the desktop | The model's tool calls | agentd's tool layer: approvals, gates, refusals, the step budget, redaction. The model never sees secrets |
-| The desktop ↔ the model provider | agentd; Together | TLS with the system's CAs and your key as a bearer token. What Together keeps is your account's setting |
+| The desktop ↔ the model provider | agentd; Anthropic or Together | TLS with the system's CAs and your key. What the provider keeps is your account's setting |
 | The desktop ↔ your AWS account | The instance role | SSM's managed policy only, denied the project's parameters; the metadata service is root-only on the desktop |
 | You ↔ the agent | Root over SSM and agentd | The owner administers the desktop through SSM. Agentd can call only fixed privileged helper operations. |
 
@@ -1388,7 +1447,7 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 | The agent's files | `/home/worker` | `worker`; root |
 | The model key | SSM SecureString; `/etc/agentd/secrets.env` (root:agentd 0640) | You, with your AWS credentials; agentd; root. Not `worker`, `agent` or the instance role |
 | The Tailscale auth key | SSM SecureString; `/etc/tailnet-proxy.env` (root 0600) | You; root |
-| Prompts and answers in transit | TLS from agentd to Together | Together (its retention is your account's setting) |
+| Prompts and answers in transit | TLS from agentd to the provider | The provider (its retention is your account's setting) |
 | Commands' web requests | Squid's `access.log` on the desktop | root |
 | Terraform state | The S3 state bucket | Whoever your account's IAM lets read it. No secrets in it |
 
@@ -1422,7 +1481,7 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 | `bootstrap`, `init`, `plan`, `apply`, `destroy`, `fmt`, `lint` | Terraform: the state bucket (in the bootstrap stack's workspace `<env>`); init against it; `plan` writes `tfplan`, `apply` applies it; `destroy` (the state bucket stays: `prevent_destroy`). `lint` checks formatting, validates, and syntax-checks the playbooks |
 | `galaxy` | Ansible collections (`amazon.aws` 11.x, `community.general` ≥ 12) |
 | `inventory` | Writes `ansible/inventory/aws_ec2.yml` from its template; every playbook target runs it first |
-| `model-key`, `tailscale-key`, `tailscale-allow` | Store your Together key, a Tailscale auth key, and optionally the allowed logins, in SSM from hidden input (`scripts/put-secret.py`). After `tailscale-allow`, `make tailnet-deploy` |
+| `model-key`, `tailscale-key`, `tailscale-allow` | Store your model key (Anthropic's; `PROVIDER=together` for Together's), a Tailscale auth key, and optionally the allowed logins, in SSM from hidden input (`scripts/put-secret.py`). After `tailscale-allow`, `make tailnet-deploy` |
 | `apns-key` | Optional: store your Apple APNs key for the apps' notifications in SSM (`scripts/put-apns-key.py`: the `.p8`, Key ID and Team ID as one JSON blob). Then `make agentd-deploy` (§6.17, §7.4) |
 | `deploy` | `desktop`, `agentd-deploy` and `tailnet-deploy`, in that order |
 | `desktop` | `common` + `desktop` roles (`TAGS=chrome_policy` for only Chrome's policy) |
@@ -1474,7 +1533,7 @@ There are no alarms, CloudTrail trails, GuardDuty or budgets in Terraform.
 | The KMS key | $1/month |
 | S3, SSM | Pennies at this scale |
 | Options | A NAT gateway instead of fck-nat ≈ $33/month; SSM endpoints ≈ $45/month |
-| Model usage | Per task, on your Together account. GLM-5.3 at $1.40/$0.26/$4.40 per 1M tokens (input/cached/output); a browsing task is usually cents |
+| Model usage | Per task, on your provider's account. Claude Opus 4.6 at $5/$0.50/$25 per 1M tokens (input/cached/output; cache writes $6.25), Opus 5.5 at $4/$0.20/$20; on Together, GLM-5.3 at $1.40/$0.26/$4.40 |
 
 About $40/month while the desktop runs. `make stop` brings the desktop's part down to its disk.
 
@@ -1494,7 +1553,7 @@ Found while writing this document. None of them is a known exploit; most are tra
 **Security and robustness.**
 - The daemon holds the model key on the desktop. Rotate it with `make model-key` and `make agentd-deploy`.
 - Model calls have no spending limit unless you set a monthly budget (§6.22), and even then tasks already running finish and answered cards resume past it. No cap on a task's steps: the supervisor's checks, the context budget and loop detection limit each task, and a fast loop can run up to 60 turns before the first check.
-- `PUT /api/v1/settings` stores any `model` without checking `KNOWN_MODELS`; the web app offers only the known ones. A task on another model runs (Together decides), with no price, so its cost is null; a card it parks expires when answered, since today's rules refuse that model.
+- `PUT /api/v1/settings` stores any `model` without checking it; the apps offer only the provider's. One the provider doesn't have gives way to the desktop's default when tasks read the setting.
 - A direct command (`direct_internet`) waits for every running command, and they for it (§6.6).
 - A conversation other than `main` works in one tab of its own window: `open_url` with `new_tab` loads there, since Chrome puts a new tab in whichever window was last at the front. Tabs a page opens in that window are its own. A new tab `main` opens can still land in a conversation's window if that one was last at the front: it's closed and the page loads in `main`'s current tab instead.
 - With no `allowed_logins`, every device your tailnet's rules let through reaches the web app, agentd's API and raw VNC (`-nopw`).

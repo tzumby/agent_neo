@@ -3,8 +3,9 @@ import Foundation
 
 /// The chat as the apps show it, built from agentd's event log: the user's
 /// messages, the agent's answers and pictures, scheduled runs as reports, the
-/// cards waiting for the user, and a task's plan (the steps the agent wrote
-/// for itself, ticked off as it goes). The same rules as the web app
+/// cards waiting for the user, a task's plan (the steps the agent wrote
+/// for itself, ticked off as it goes), and a line for each action an approved
+/// plan let go ahead without its card. The same rules as the web app
 /// (apps/web/public/assets/js/timeline.js). What the agent does on the way
 /// (tool calls, commands, saves) stays out;
 /// `busy` only says that it's working. A pure value: apply events in order.
@@ -15,8 +16,8 @@ public struct ChatTimeline: Sendable, Equatable {
     /// The event kinds it reads: the apps ask agentd for these only.
     public static let kinds: Set<String> = [
         "message", "image", "task.started", "task.paused", "task.resumed", "task.stopping", "task.finished",
-        "approval.requested", "approval.resolved", "action_needed", "action.resolved", "secret.saved", "plan",
-        "message.queued", "message.unqueued",
+        "approval.requested", "approval.resolved", "approval.plan", "action_needed", "action.resolved",
+        "secret.saved", "plan", "message.queued", "message.unqueued",
     ]
 
     public private(set) var items: [ChatItem] = []
@@ -199,11 +200,7 @@ public struct ChatTimeline: Sendable, Equatable {
         case "plan":
             // Each one is the whole plan: the latest wins.
             guard let task = data["task"]?.string, let list = data["items"]?.array else { break }
-            let steps = list.compactMap { item -> PlanStep? in
-                guard let step = item["step"]?.string, !step.trimmingCharacters(in: .whitespaces).isEmpty
-                else { return nil }
-                return PlanStep(step: step, status: PlanStep.Status(rawValue: item["status"]?.string ?? "") ?? .pending)
-            }
+            let steps = list.compactMap { PlanStep($0) }
             if planIndex[task] != nil {
                 update(plan: task) { $0.steps = steps }
             } else {
@@ -239,31 +236,12 @@ public struct ChatTimeline: Sendable, Equatable {
                     reason: data["reason"]?.string ?? "", minutes: data["minutes"]?.int ?? 0,
                     steps: data["steps"]?.int ?? 0, plan: total > 0 ? StuckCheck.Progress(done: done, total: total) : nil)
             } else if data["kind"]?.string == "browser" {
-                var action = BrowserAction(
-                    action: data["action"]?.string ?? "", target: data["target"]?.string ?? "",
-                    text: data["text"]?.string, key: data["key"]?.string, submit: data["submit"]?.bool ?? false,
-                    sends: data["sends"]?.bool ?? false, site: data["site"]?.string ?? "")
-                action.role = data["role"]?.string ?? ""
-                action.page = data["page"]?.string ?? ""
-                action.url = data["url"]?.string ?? ""
-                action.destination = data["destination"]?.string ?? ""
-                action.around = data["around"]?.string ?? ""
-                action.imagePath = data["image"]?.string
-                approval.browser = action
+                approval.browser = BrowserAction(data)
             } else if data["kind"]?.string == "app" {
-                // A batch has all its steps; a lone input's are on the card too.
-                var action = AppAction(
-                    action: data["action"]?.string ?? "", app: data["app"]?.string ?? "",
-                    window: data["window"]?.string ?? "", target: data["target"]?.string ?? "",
-                    role: data["role"]?.string ?? "", text: data["text"]?.string, key: data["key"]?.string,
-                    around: data["around"]?.string ?? "", imagePath: data["image"]?.string)
-                action.steps = data["steps"]?.array?.compactMap(AppStep.init) ?? []
-                if let width = data["frame"]?["width"]?.double, let height = data["frame"]?["height"]?.double,
-                    width > 0, height > 0
-                {
-                    action.frame = AppAction.Frame(width: width, height: height)
-                }
-                approval.app = action
+                approval.app = AppAction(data)
+            } else if data["kind"]?.string == "plan" {
+                approval.plan = PlanApproval(
+                    steps: data["steps"]?.array?.compactMap { PlanStep($0) } ?? [], covers: PlanCovers(data["covers"]))
             } else if data["kind"]?.string == "install" {
                 // Its summary is the store's description, kept with the store's facts.
                 approval.summary = nil
@@ -283,6 +261,10 @@ public struct ChatTimeline: Sendable, Equatable {
             let state: Approval.State =
                 data["expired"]?.bool == true ? .expired : data["approved"]?.bool == true ? .approved : .denied
             update(approval: data["id"]?.string ?? "") { $0.state = state }
+        case "approval.plan":
+            // An action that went ahead without its card: the plan the user
+            // approved covers it. What that card would have shown, in a line.
+            items.append(.covered(CoveredAction(seq: event.seq, data)))
         case "action_needed":
             let id = data["id"]?.string ?? ""
             actionIndex[id] = items.count
@@ -363,6 +345,8 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
     case image(Picture)
     /// A task's plan: the agent's own steps, ticked off as it goes.
     case plan(Plan)
+    /// An action that went ahead without its card, under an approved plan.
+    case covered(CoveredAction)
 
     public var id: String {
         switch self {
@@ -373,6 +357,7 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
         case .action(let a): "action-\(a.id)"
         case .image(let p): "image-\(p.id)"
         case .plan(let p): "plan-\(p.task)"
+        case .covered(let c): "covered-\(c.seq)"
         }
     }
 
@@ -385,6 +370,7 @@ public enum ChatItem: Sendable, Equatable, Identifiable {
         case .action(let a): a.seq
         case .image(let p): p.id
         case .plan(let p): p.seq
+        case .covered(let c): c.seq
         }
     }
 }
@@ -478,6 +464,8 @@ public struct Approval: Sendable, Equatable {
     public var access: AccessRequest?
     /// Set when a check on the task found it going in circles: carry on or stop.
     public var stuck: StuckCheck?
+    /// Set when it's the task's plan, to approve as a whole.
+    public var plan: PlanApproval?
 }
 
 /// "Looks stuck": a check on the running task (agentd's supervisor) found it
@@ -528,12 +516,239 @@ public struct Plan: Sendable, Equatable {
 
 public struct PlanStep: Sendable, Equatable {
     public enum Status: String, Sendable { case pending, inProgress = "in_progress", done }
-    public let step: String
-    public let status: Status
+    public var step: String
+    public var status: Status
+    /// What it needs the user's OK for, when it says: a site (clicks, typing
+    /// and keys there), an app (input in it), commands that would ask, an
+    /// install. A plan card approves them for the rest of the task.
+    public var site: String?
+    public var app: String?
+    public var commands: [String] = []
+    public var install: String?
 
-    public init(step: String, status: Status) {
+    public init(
+        step: String, status: Status, site: String? = nil, app: String? = nil, commands: [String] = [],
+        install: String? = nil
+    ) {
         self.step = step
         self.status = status
+        self.site = site
+        self.app = app
+        self.commands = commands
+        self.install = install
+    }
+
+    /// A step as agentd sends it, with what's odd left out; nil without words.
+    init?(_ json: JSONValue) {
+        guard let step = json["step"]?.string, !step.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        let named = { (key: String) in json[key]?.string.flatMap { $0.isEmpty ? nil : $0 } }
+        self.init(
+            step: step, status: Status(rawValue: json["status"]?.string ?? "") ?? .pending, site: named("site"),
+            app: named("app"), commands: json["commands"]?.array?.compactMap(\.string).filter { !$0.isEmpty } ?? [],
+            install: named("install"))
+    }
+
+    /// Its needs in order, one per chip: one per command.
+    public var needs: [PlanNeed] {
+        [site.map { PlanNeed(kind: .site, value: $0) }, app.map { PlanNeed(kind: .app, value: $0) }].compactMap { $0 }
+            + commands.map { PlanNeed(kind: .command, value: $0) }
+            + (install.map { [PlanNeed(kind: .install, value: $0)] } ?? [])
+    }
+
+    /// The step without its `index`th need (a chip's ×).
+    public func removing(need index: Int) -> PlanStep {
+        var step = PlanStep(step: self.step, status: status)
+        for (i, need) in needs.enumerated() where i != index {
+            switch need.kind {
+            case .site: step.site = need.value
+            case .app: step.app = need.value
+            case .command: step.commands.append(need.value)
+            case .install: step.install = need.value
+            }
+        }
+        return step
+    }
+
+    /// As agentd takes it back, in a plan card's answer.
+    var edit: PlanEdit {
+        PlanEdit(
+            step: step, status: status.rawValue, site: site, app: app, commands: commands.isEmpty ? nil : commands,
+            install: install)
+    }
+}
+
+/// One thing a plan step needs the user's OK for: a chip on the plan card.
+public struct PlanNeed: Sendable, Equatable {
+    public enum Kind: Sendable { case site, app, command, install }
+    public let kind: Kind
+    public let value: String
+
+    public init(kind: Kind, value: String) {
+        self.kind = kind
+        self.value = value
+    }
+}
+
+/// A plan card: the task's plan, approved as a whole. What its steps need then
+/// goes ahead without cards of its own for the rest of the task; anything
+/// else still asks, and saved keys, direct internet, proxy sites and
+/// schedules always do.
+public struct PlanApproval: Sendable, Equatable {
+    /// The whole plan, as the agent wrote it.
+    public let steps: [PlanStep]
+    /// What approving adds for the task (a later card's: only what's new).
+    public let covers: PlanCovers
+}
+
+/// What a plan covers, each list without repeats.
+public struct PlanCovers: Sendable, Equatable {
+    public var sites: [String] = []
+    public var apps: [String] = []
+    public var commands: [String] = []
+    public var installs: [String] = []
+
+    public init(sites: [String] = [], apps: [String] = [], commands: [String] = [], installs: [String] = []) {
+        self.sites = sites
+        self.apps = apps
+        self.commands = commands
+        self.installs = installs
+    }
+
+    /// agentd's `covers`, any of whose lists may be missing.
+    init(_ json: JSONValue?) {
+        func list(_ key: String) -> [String] {
+            var seen = Set<String>()
+            return (json?[key]?.array ?? []).compactMap(\.string).filter { !$0.isEmpty && seen.insert($0).inserted }
+        }
+        self.init(sites: list("sites"), apps: list("apps"), commands: list("commands"), installs: list("installs"))
+    }
+
+    /// Only what some step still needs: the user may have taken needs off.
+    public func needed(by steps: [PlanStep]) -> PlanCovers {
+        let needs = steps.flatMap(\.needs)
+        func left(_ kind: PlanNeed.Kind, _ list: [String]) -> [String] {
+            let values = Set(needs.filter { $0.kind == kind }.map(\.value))
+            return list.filter(values.contains)
+        }
+        return PlanCovers(
+            sites: left(.site, sites), apps: left(.app, apps), commands: left(.command, commands),
+            installs: left(.install, installs))
+    }
+
+    /// The plan card's summary, a phrase per kind of need. None: approving
+    /// only starts the plan.
+    public var phrases: [Phrase] {
+        [
+            Phrase(lead: "clicking, typing and pressing keys on ", items: sites),
+            Phrase(lead: "input in ", items: apps),
+            Phrase(lead: "running ", items: commands, code: true),
+            Phrase(lead: "installing ", items: installs),
+        ].filter { !$0.items.isEmpty }
+    }
+
+    /// "running `a` and `b`": `lead`, then its items in a list.
+    public struct Phrase: Sendable, Equatable {
+        public let lead: String
+        public let items: [String]
+        /// The items are commands, shown as code.
+        public var code = false
+
+        /// The phrase in pieces: the words, and each item (as code, or not).
+        public var pieces: [Piece] {
+            [Piece(text: lead)]
+                + items.enumerated().flatMap { index, item in
+                    let gap = index == 0 ? nil : index == items.count - 1 ? " and " : ", "
+                    return [gap.map { Piece(text: $0) }, Piece(text: item, code: code)].compactMap { $0 }
+                }
+        }
+
+        public struct Piece: Sendable, Equatable {
+            public let text: String
+            public var code = false
+        }
+    }
+}
+
+/// The user's version of a plan card's steps while they edit it: reworded,
+/// deleted, added, moved, needs taken off. None can be added (agentd refuses
+/// a need the card didn't have), so a new step has none.
+public struct PlanDraft: Sendable, Equatable {
+    public struct Step: Sendable, Equatable, Identifiable {
+        public let id: Int
+        public var plan: PlanStep
+    }
+
+    /// agentd's limits.
+    public static let maxSteps = 20
+    public static let maxLength = 120
+
+    public var steps: [Step]
+    private var nextID: Int
+
+    public init(_ steps: [PlanStep]) {
+        self.steps = steps.enumerated().map { Step(id: $0.offset, plan: $0.element) }
+        nextID = steps.count
+    }
+
+    public var canAdd: Bool { steps.count < Self.maxSteps }
+
+    /// An empty step at the end. Returns its id, to focus it.
+    @discardableResult
+    public mutating func add() -> Int {
+        defer { nextID += 1 }
+        steps.append(Step(id: nextID, plan: PlanStep(step: "", status: .pending)))
+        return nextID
+    }
+
+    public mutating func delete(_ id: Int) {
+        steps.removeAll { $0.id == id }
+    }
+
+    /// Up (-1) or down (1) a place.
+    public mutating func move(_ id: Int, by offset: Int) {
+        guard let index = steps.firstIndex(where: { $0.id == id }), steps.indices.contains(index + offset) else {
+            return
+        }
+        steps.swapAt(index, index + offset)
+    }
+
+    /// A step's words as typed: one line, at most `maxLength` characters.
+    public mutating func set(_ text: String, of id: Int) {
+        guard let index = steps.firstIndex(where: { $0.id == id }) else { return }
+        steps[index].plan.step = String(text.replacingOccurrences(of: "\n", with: " ").prefix(Self.maxLength))
+    }
+
+    public mutating func removeNeed(_ need: Int, from id: Int) {
+        guard let index = steps.firstIndex(where: { $0.id == id }) else { return }
+        steps[index].plan = steps[index].plan.removing(need: need)
+    }
+
+    /// Why it can't be approved as it is (agentd would refuse it), or nil.
+    public var problem: String? {
+        if steps.isEmpty { return "A plan needs a step. Add one, or deny it." }
+        if steps.count > Self.maxSteps { return "A plan has at most \(Self.maxSteps) steps." }
+        if steps.contains(where: { $0.plan.step.trimmingCharacters(in: .whitespaces).isEmpty }) {
+            return "Write the empty step, or delete it."
+        }
+        return nil
+    }
+
+    /// What approving lets the task do without asking: the card's `covers`,
+    /// less what the edits took off every step.
+    public func covered(by covers: PlanCovers) -> PlanCovers {
+        covers.needed(by: steps.map(\.plan))
+    }
+
+    /// The steps to send with the approval, their words trimmed: nil when
+    /// they're the agent's own (only a change is sent).
+    public func edits(from original: [PlanStep]) -> [PlanEdit]? {
+        let trim = { (step: PlanStep) in
+            var step = step
+            step.step = step.step.trimmingCharacters(in: .whitespaces)
+            return step
+        }
+        let mine = steps.map { trim($0.plan) }
+        return mine == original.map(trim) ? nil : mine.map(\.edit)
     }
 }
 
@@ -613,6 +828,22 @@ public struct BrowserAction: Sendable, Equatable {
     public var imagePath: String?
 }
 
+extension BrowserAction {
+    /// What a browser card (or an action a plan covered) says.
+    init(_ data: JSONValue) {
+        self.init(
+            action: data["action"]?.string ?? "", target: data["target"]?.string ?? "", text: data["text"]?.string,
+            key: data["key"]?.string, submit: data["submit"]?.bool ?? false, sends: data["sends"]?.bool ?? false,
+            site: data["site"]?.string ?? "")
+        role = data["role"]?.string ?? ""
+        page = data["page"]?.string ?? ""
+        url = data["url"]?.string ?? ""
+        destination = data["destination"]?.string ?? ""
+        around = data["around"]?.string ?? ""
+        imagePath = data["image"]?.string
+    }
+}
+
 /// A change the agent wants to make in one of the desktop's own apps, which
 /// it drives through their accessibility tree, or (action "gui", with a model
 /// that sees the screen) by pixels of a screenshot. What it says about where
@@ -669,6 +900,109 @@ public struct AppAction: Sendable, Equatable {
     public struct Mark: Sendable, Equatable {
         public let step: Int
         public let points: [AppStep.Point]
+    }
+}
+
+extension AppAction {
+    /// What an app card (or an action a plan covered) says. A batch has all
+    /// its steps; a lone input's are on the card too.
+    init(_ data: JSONValue) {
+        self.init(
+            action: data["action"]?.string ?? "", app: data["app"]?.string ?? "",
+            window: data["window"]?.string ?? "", target: data["target"]?.string ?? "",
+            role: data["role"]?.string ?? "", text: data["text"]?.string, key: data["key"]?.string,
+            around: data["around"]?.string ?? "", imagePath: data["image"]?.string)
+        steps = data["steps"]?.array?.compactMap(AppStep.init) ?? []
+        if let width = data["frame"]?["width"]?.double, let height = data["frame"]?["height"]?.double,
+            width > 0, height > 0
+        {
+            frame = Frame(width: width, height: height)
+        }
+    }
+}
+
+/// An action that went ahead without its card: the plan the user approved
+/// covers it (`approval.plan`). What that card would have shown, as a quiet
+/// line in the chat.
+public struct CoveredAction: Sendable, Equatable {
+    public let seq: Int
+    public let task: String?
+    /// The plan card that covers it, and who approved that.
+    public let approval: String
+    public let by: String
+    /// "browser", "app", "shell" or "install".
+    public let kind: String
+    public let summary: String?
+    public var browser: BrowserAction?
+    public var app: AppAction?
+    /// A shell action's command.
+    public var command = ""
+    /// An install's snap name (what got installed) and its title.
+    public var installName = ""
+    public var installTitle = ""
+
+    init(seq: Int, _ data: JSONValue) {
+        self.seq = seq
+        task = data["task"]?.string
+        approval = data["approval"]?.string ?? ""
+        by = data["by"]?.string ?? ""
+        let card = data["card"] ?? .null
+        kind = card["kind"]?.string ?? ""
+        summary = card["summary"]?.string.flatMap { $0.isEmpty ? nil : $0 }
+        command = card["command"]?.string ?? ""
+        switch kind {
+        case "browser": browser = BrowserAction(card)
+        case "app": app = AppAction(card)
+        case "install":
+            installName = card["name"]?.string ?? ""
+            installTitle = card["app"]?.string ?? ""
+        default: break
+        }
+    }
+
+    /// The line the chat shows: where it acted (the site or app; empty for a
+    /// command or an install), what it did (the summary, else the target or
+    /// the command), and whether there's more to unfold.
+    public struct Line: Sendable, Equatable {
+        public let place: String
+        public let what: String
+        /// `what` is a command, shown as code.
+        public var code = false
+        public var more = false
+    }
+
+    public var line: Line {
+        if let browser {
+            let said =
+                switch browser.action {
+                case "type": browser.target.isEmpty ? "Write" : "Write in “\(browser.target)”"
+                case "key": "Press \(browser.key ?? "a key")"
+                default: "Click \(AppStep.clickTarget(role: browser.role, name: browser.target))"
+                }
+            let what = summary ?? said
+            let more = browser.text != nil || browser.key != nil || (summary != nil && !browser.target.isEmpty)
+            return Line(place: browser.site, what: what, more: more)
+        }
+        if let app {
+            let count = app.steps.count
+            let what =
+                summary
+                ?? (!app.target.isEmpty
+                    ? AppStep.clickTarget(role: app.role, name: app.target)
+                    : count > 0 ? "\(count) \(count == 1 ? "step" : "steps")" : app.window.isEmpty ? "Input" : app.window)
+            return Line(place: app.app, what: what, more: count > 0 || !app.window.isEmpty || app.text != nil)
+        }
+        if kind == "install" {
+            // Its summary, if any, would be the store's: the name says it.
+            let name = !installTitle.isEmpty ? installTitle : !installName.isEmpty ? installName : "an app"
+            return Line(place: "", what: "Install \(name)", more: !installTitle.isEmpty && !installName.isEmpty)
+        }
+        if let summary { return Line(place: "", what: summary, more: !command.isEmpty && command != summary) }
+        let first = command.components(separatedBy: "\n").first ?? ""
+        // A kind from a newer agentd says nothing more.
+        return first.isEmpty
+            ? Line(place: "", what: "An action")
+            : Line(place: "", what: first, code: true, more: first != command)
     }
 }
 

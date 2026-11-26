@@ -7,9 +7,12 @@ import { test } from "node:test";
 import { findKey, isValidName, normalizedName } from "../public/assets/js/keys.js";
 import { inline, parse, safeHref } from "../public/assets/js/markdown.js";
 import { deviceLabel, fromBase64Url, iosOutsideHomeScreen, isIOS, ownSubscription, pushState, pushSupported } from "../public/assets/js/push.js";
-import { ApiError } from "../public/assets/js/api.js";
+import { ApiError, api } from "../public/assets/js/api.js";
 import { Store } from "../public/assets/js/store.js";
-import { Timeline, appStepWords, clickTarget, duration, megabytes, rowKey, workingFor } from "../public/assets/js/timeline.js";
+import {
+  KINDS, Timeline, andList, appStepWords, clickTarget, coveredWords, duration, megabytes, planAnswer, planCovers, planPhrases,
+  planProblem, rowKey, stepNeeds, withoutNeed, workingFor,
+} from "../public/assets/js/timeline.js";
 
 let seq = 0;
 const ev = (kind, data = {}) => ({ seq: ++seq, ts: "2026-11-03T08:00:00Z", kind, data });
@@ -315,6 +318,170 @@ test("a task's plan: after its message, the latest wins, folded once the task en
   assert.deepEqual(t.visible()[4].steps, [{ step: "Build", status: "pending" }]);
   t.apply(ev("plan", { task: "t2", items: [] }));
   assert.deepEqual(t.visible().map((i) => i.type), ["user", "plan", "assistant", "user"]);
+});
+
+// The plan card agentd sends (docs: approval.requested, kind "plan").
+const PLAN_CARD = {
+  id: "a1b2c3d4e5f6", task: "t1", kind: "plan", editable: true, tainted: false,
+  steps: [
+    { step: "Open notes.txt in Mousepad", status: "pending", app: "Mousepad" },
+    { step: "Write the list and save it", status: "pending", app: "Mousepad" },
+    { step: "Post it in #general", status: "pending", site: "app.slack.com" },
+    { step: "Push the branch", status: "pending", commands: ["git push -u origin fix"] },
+    { step: "Install Slack", status: "pending", install: "slack" },
+    { step: "Tell the user what changed", status: "pending" },
+  ],
+  covers: { sites: ["app.slack.com"], apps: ["Mousepad"], commands: ["git push -u origin fix"], installs: ["slack"] },
+};
+
+test("a plan card: its steps with what each needs, and what approving covers", () => {
+  const t = new Timeline([
+    ev("message", { role: "user", text: "Tidy up and tell Slack", task: "t1" }),
+    ev("approval.requested", PLAN_CARD),
+    ev("task.paused", { task: "t1", approval: PLAN_CARD.id }),
+  ]);
+  const card = t.visible()[1];
+  assert.deepEqual([card.type, card.kind, card.editable, card.tainted, card.command], ["approval", "plan", true, false, ""]);
+  assert.deepEqual(card.plan.steps, PLAN_CARD.steps, "a need is there only when the step has it");
+  assert.deepEqual(card.plan.covers, PLAN_CARD.covers);
+  assert.deepEqual(stepNeeds(card.plan.steps[3]), [{ kind: "command", value: "git push -u origin fix" }]);
+  assert.deepEqual(stepNeeds(card.plan.steps[5]), []);
+  // The summary, as the card says it.
+  const said = planPhrases(planCovers(card.plan.covers, card.plan.steps))
+    .map((p) => p.lead + andList(p.items, (item) => (p.code ? `\`${item}\`` : item)).join("")).join(" · ");
+  assert.equal(said, "clicking, typing and pressing keys on app.slack.com · input in Mousepad · running `git push -u origin fix` · installing slack");
+  assert.deepEqual([andList(["a"]), andList(["a", "b"]).join(""), andList(["a", "b", "c"]).join("")], [["a"], "a and b", "a, b and c"]);
+
+  // Odd fields are left out; missing lists are empty; repeats go.
+  const odd = new Timeline([ev("approval.requested", {
+    id: "p2", kind: "plan", steps: [{ step: "Go", status: "weird", site: "", app: 7, commands: ["ls", "", 3], install: null }, { step: " " }, "x"],
+    covers: { sites: ["a.com", "a.com"], apps: null },
+  })]).visible()[0];
+  assert.deepEqual(odd.plan.steps, [{ step: "Go", status: "pending", commands: ["ls"] }]);
+  assert.deepEqual(odd.plan.covers, { sites: ["a.com"], apps: [], commands: [], installs: [] });
+  assert.equal(odd.editable, false, "only a card that says it takes an edit offers one");
+
+  t.apply(ev("approval.resolved", { task: "t1", id: PLAN_CARD.id, approved: true, by: "someone@example.com", edited: true, plan: [] }));
+  assert.deepEqual(t.visible().map((i) => i.type), ["user"], "answered, it leaves the chat");
+});
+
+test("the plan checklist keeps each step's needs", () => {
+  const t = new Timeline([ev("plan", { task: "t1", items: PLAN_CARD.steps.map((s, i) => ({ ...s, status: i < 2 ? "done" : s.status })) })]);
+  const [plan] = t.visible();
+  assert.deepEqual(plan.steps[2], { step: "Post it in #general", status: "pending", site: "app.slack.com" });
+  assert.deepEqual(plan.steps[0].status, "done");
+  assert.deepEqual(plan.steps[5], { step: "Tell the user what changed", status: "pending" });
+});
+
+test("a plan card's edits: needs only come off, the summary follows, and only a change is sent", () => {
+  const original = new Timeline([ev("approval.requested", PLAN_CARD)]).visible()[0].plan.steps;
+  const covers = PLAN_CARD.covers;
+  assert.equal(planAnswer(original, original), undefined, "as the agent wrote it: nothing to send");
+  assert.equal(planAnswer(original, original.map((s) => ({ ...s, step: `${s.step}  ` }))), undefined, "spaces around aren't a change");
+
+  // Take Mousepad off one step: still on the other, so still covered.
+  let mine = original.map((s, i) => (i === 0 ? withoutNeed(s, 0) : s));
+  assert.deepEqual(mine[0], { step: "Open notes.txt in Mousepad", status: "pending" });
+  assert.deepEqual(planCovers(covers, mine).apps, ["Mousepad"]);
+  mine = mine.map((s, i) => (i === 1 ? withoutNeed(s, 0) : s));
+  assert.deepEqual(planCovers(covers, mine), { sites: ["app.slack.com"], apps: [], commands: ["git push -u origin fix"], installs: ["slack"] });
+
+  // One command at a time.
+  const two = { step: "Ship", status: "pending", commands: ["git push", "npm publish"], site: "github.com" };
+  assert.deepEqual(stepNeeds(two).map((n) => n.kind), ["site", "command", "command"]);
+  assert.deepEqual(withoutNeed(two, 1), { step: "Ship", status: "pending", site: "github.com", commands: ["npm publish"] });
+  assert.deepEqual(withoutNeed(withoutNeed(two, 1), 1), { step: "Ship", status: "pending", site: "github.com" });
+
+  // Reword, delete, add, reorder.
+  mine = [
+    { ...mine[3], step: "Push the fix branch " }, mine[2], mine[4],
+    { step: "Check CI", status: "pending" },
+  ];
+  assert.deepEqual(planAnswer(original, mine), [
+    { step: "Push the fix branch", status: "pending", commands: ["git push -u origin fix"] },
+    { step: "Post it in #general", status: "pending", site: "app.slack.com" },
+    { step: "Install Slack", status: "pending", install: "slack" },
+    { step: "Check CI", status: "pending" },
+  ], "the whole plan, its words trimmed");
+  assert.deepEqual(planAnswer(original, [...original].reverse()).length, 6, "a new order is a change");
+
+  // Nothing left to cover: approving only starts the plan.
+  const bare = mine.map((s) => ({ step: s.step, status: s.status }));
+  assert.deepEqual(planPhrases(planCovers(covers, bare)), []);
+  // A later card covers only what's new, though its steps are the whole plan.
+  assert.deepEqual(planPhrases(planCovers({ sites: [], apps: [], commands: [], installs: ["slack"] }, original)),
+    [{ lead: "installing ", items: ["slack"] }]);
+
+  // What agentd would refuse can't be approved.
+  assert.equal(planProblem(original), "");
+  assert.match(planProblem([]), /needs a step/);
+  assert.match(planProblem([...original, { step: "  ", status: "pending" }]), /empty step/);
+  assert.match(planProblem(Array.from({ length: 21 }, () => ({ step: "x", status: "pending" }))), /at most 20/);
+});
+
+test("an action the approved plan covered is a quiet line, with what it did", () => {
+  assert.ok(KINDS.includes("approval.plan"), "the app asks for it");
+  const covered = (card) => ev("approval.plan", { task: "t1", approval: "a1b2c3d4e5f6", by: "someone@example.com", card });
+  const t = new Timeline([
+    ev("message", { role: "user", text: "Tidy up", task: "t1" }),
+    covered({ kind: "app", action: "act", app: "Mousepad", window: "notes.txt - Mousepad", summary: "Add the milk line and save",
+      steps: [{ action: "type", text: "- milk" }, { action: "key", key: "CTRL+S" }] }),
+    covered({ kind: "browser", action: "type", site: "app.slack.com", target: "Message", text: "Done: notes are tidy", summary: "" }),
+    covered({ kind: "browser", action: "click", site: "app.slack.com", role: "button", target: "Send", summary: "Send it" }),
+    covered({ kind: "shell", command: "git push -u origin fix", summary: "" }),
+    covered({ kind: "shell", command: "git push -u origin fix", summary: "Push the branch" }),
+    covered({ kind: "install", name: "slack", app: "Slack" }),
+    covered(null),
+  ]);
+  const rows = t.visible();
+  assert.deepEqual(rows.map((r) => r.type), ["user", ...Array(7).fill("covered")]);
+  assert.equal(rowKey(rows[1]), `covered-${rows[1].id}`);
+  assert.deepEqual([rows[1].task, rows[1].approval, rows[1].by], ["t1", "a1b2c3d4e5f6", "someone@example.com"]);
+  assert.deepEqual(rows[1].app.steps.map((s) => [s.action, s.text, s.key]), [["type", "- milk", null], ["key", null, "CTRL+S"]]);
+  assert.deepEqual(rows.slice(1).map(coveredWords), [
+    { where: "Mousepad", what: "Add the milk line and save", code: false, more: true },
+    { where: "app.slack.com", what: "Write in “Message”", code: false, more: true },
+    { where: "app.slack.com", what: "Send it", code: false, more: true },
+    { where: "", what: "git push -u origin fix", code: true, more: false },
+    { where: "", what: "Push the branch", code: false, more: true },
+    { where: "", what: "Install Slack", code: false, more: true },
+    { where: "", what: "An action", code: false, more: false },
+  ]);
+});
+
+test("answering a plan card sends the plan only when edited, and a refused edit says why", async (t) => {
+  // The request body, through the real client.
+  const bodies = [];
+  let reply = { status: 200, body: { ok: true } };
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    bodies.push([url, JSON.parse(init.body)]);
+    return new Response(JSON.stringify(reply.body), { status: reply.status });
+  });
+  const plan = [{ step: "Push the branch", status: "pending", commands: ["git push -u origin fix"] }, { step: "Check CI", status: "pending" }];
+  await api.answer("a1b2c3d4e5f6", true, undefined, undefined);
+  await api.answer("a1b2c3d4e5f6", true, undefined, plan);
+  await api.answer("a1b2c3d4e5f6", false);
+  assert.deepEqual(bodies, [
+    ["/api/v1/approvals/a1b2c3d4e5f6", { approved: true }],
+    ["/api/v1/approvals/a1b2c3d4e5f6", { approved: true, plan }],
+    ["/api/v1/approvals/a1b2c3d4e5f6", { approved: false }],
+  ]);
+
+  // agentd refuses an edit: its words come back to the card, not as a notice.
+  const store = new Store(api);
+  const notices = [];
+  store.onNotice((text) => notices.push(text));
+  const card = { id: "a1b2c3d4e5f6" };
+  reply = { status: 400, body: { error: "step 2 adds a need the plan didn't have" } };
+  assert.equal(await store.answerPlan(card, true, plan), "step 2 adds a need the plan didn't have");
+  assert.deepEqual(notices, []);
+  reply = { status: 200, body: { ok: true } };
+  assert.equal(await store.answerPlan(card, true, plan), null);
+  // Gone: expired, as any card.
+  reply = { status: 404, body: { error: "not found" } };
+  assert.equal(await store.answerPlan(card, true), null);
+  assert.deepEqual(notices, ["That request has expired."]);
+  assert.ok(store.conversation.expiredApprovals.has(card.id));
 });
 
 test("a plan whose message is on an older page still shows", () => {

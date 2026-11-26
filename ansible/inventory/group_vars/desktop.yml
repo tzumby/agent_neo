@@ -6,6 +6,11 @@ chrome_start_url: "https://www.google.com"
 # stays "off".
 agentd_memory_v2: "on"
 
+# Claude, through Anthropic's API (make model-key stores the key). Opus 4.6
+# by default; Opus 5.5 is a pick in the app. "together" goes back to Together
+# AI (make model-key PROVIDER=together).
+agentd_llm_provider: anthropic
+
 # More hosts the agent's shell may reach, beyond the agentd role's list
 # (agentd_shell_allowed_domains). A leading dot also allows subdomains. Sites
 # you allow from the web app's Settings don't need to be here.

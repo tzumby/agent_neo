@@ -7,6 +7,7 @@ mod api;
 mod apns;
 mod browser;
 mod cdp;
+mod claude;
 mod clock;
 mod config;
 mod consolidate;

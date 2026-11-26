@@ -237,6 +237,7 @@ mod tests {
             card: park.card.clone(),
             by: None,
             edited: None,
+            plan: None,
         };
         let denied = agent
             .install_app("t1", &args, None, true, Some(answer))

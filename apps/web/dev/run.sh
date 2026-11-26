@@ -57,5 +57,6 @@ pids+=($!)
 echo "The web app: http://127.0.0.1:8088/  (logs in $work; Ctrl-C stops it)"
 echo "Try: a question; \"sign in\" (Action needed); \"schedule a report\" (a run in two minutes); \"slow\"; \"status site\" (a site to allow);"
 echo "     \"write a message\", \"risky command\", \"schedule after reading\" (cards to edit);"
-echo "     \"make a plan\" (the plan checklist); \"keep checking\" (the supervisor finds it stuck: it checks every 6 steps here)."
+echo "     \"make a plan\" (the plan checklist); \"post with a plan\" (one plan card, then nothing more to approve);"
+echo "     \"keep checking\" (the supervisor finds it stuck: it checks every 6 steps here)."
 wait

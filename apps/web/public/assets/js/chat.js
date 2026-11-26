@@ -1,14 +1,19 @@
 // The chat: one conversation, scheduled runs as reports, the cards waiting
-// for the person, and a task's plan as a checklist. Three dots while the agent
+// for the person, a task's plan as a checklist, and a quiet line for each
+// action an approved plan let go ahead without its card. Three dots while the agent
 // works, with how long it has been at it; nothing else of what it does; then
 // the messages queued behind it. Opens at its end; older pages load as the
 // person scrolls up, without moving what's on screen. Another conversation
 // starts over, at its end.
 
 import { findKey } from "./keys.js";
+import { modelName } from "./usage.js";
 import { parse, render, safeHref } from "./markdown.js";
-import { busyButton, h, icon, time, when } from "./dom.js";
-import { appStepWords, clickTarget, duration, megabytes, rowKey, workingFor } from "./timeline.js";
+import { busyButton, fill, h, icon, time, when } from "./dom.js";
+import {
+  PLAN_MAX_STEPS, PLAN_STEP_LENGTH, andList, appStepWords, clickTarget, coveredWords, duration, megabytes,
+  planAnswer, planCovers, planPhrases, planProblem, rowKey, stepNeeds, withoutNeed, workingFor,
+} from "./timeline.js";
 
 export function mountChat(store, view, { openDesktop, openKeys }) {
   const scroll = view.querySelector(".chat-scroll");
@@ -86,6 +91,7 @@ export function mountChat(store, view, { openDesktop, openKeys }) {
       if (!seen.has(key)) {
         entry.node.remove();
         rows.delete(key);
+        if (key.startsWith("approval-")) planDrafts.delete(key.slice("approval-".length)); // answered
       }
     }
 
@@ -190,6 +196,8 @@ function renderRow(item, ctx) {
       return h("li", { class: "row row-card" }, approvalCard(item, ctx));
     case "action":
       return h("li", { class: "row row-card" }, actionCard(item, ctx));
+    case "covered":
+      return h("li", { class: "row row-covered" }, coveredRow(item));
     default:
       return h("li", { class: "row" });
   }
@@ -263,7 +271,7 @@ function plan(item) {
     h("li", { class: `plan-step is-${s.status.replace("_", "-")}` },
       h("span", { class: "plan-mark", "aria-hidden": "true" }, MARKS[s.status]),
       h("span", { class: "visually-hidden" }, `${SAID[s.status]}: `),
-      h("span", { class: "plan-text" }, s.step))));
+      h("span", { class: "plan-text" }, s.step, needChips(s)))));
   if (item.finished) {
     return h("details", { class: "plan plan-finished" },
       h("summary", null, `Plan · ${count} done`), steps);
@@ -271,6 +279,180 @@ function plan(item) {
   return h("section", { class: "plan", "aria-label": `Plan, ${count} done` },
     h("div", { class: "plan-head" }, h("span", { class: "plan-title" }, "Plan"), h("span", { class: "plan-count" }, count)),
     steps);
+}
+
+// What a step needs the person's OK for, each a chip: a site (clicks, typing
+// and keys there), an app (input in it), a command, an install.
+const NEED_ICONS = { site: "globe", app: "desktop", command: "terminal", install: "download" };
+
+/** A step's chips; `onRemove(i)` gives each an × that takes the `i`th off. */
+function needChips(step, onRemove) {
+  const needs = stepNeeds(step);
+  if (!needs.length) return null;
+  return h("span", { class: "plan-needs" }, needs.map((need, i) => {
+    const label = need.kind === "command" ? h("code", null, need.value) : need.kind === "install" ? `Install ${need.value}` : need.value;
+    let remove = null;
+    if (onRemove) {
+      const said = need.kind === "install" ? `installing ${need.value}` : `“${need.value}”`;
+      remove = h("button", { class: "plan-need-remove", type: "button", "aria-label": `Take ${said} off this step`, title: "Take it off" }, icon("close"));
+      remove.addEventListener("click", () => onRemove(i));
+    }
+    return h("span", { class: "plan-need" }, icon(NEED_ICONS[need.kind]), h("span", { class: "plan-need-text" }, label), remove);
+  }));
+}
+
+// --- A plan to approve ---------------------------------------------------------------
+
+// The person's version of each plan card's steps, by card, until it's
+// answered: a row drawn again (or another conversation and back) keeps it.
+const planDrafts = new Map();
+
+// The task's plan, approved as a whole: what its steps need then goes ahead
+// without cards of its own, for the rest of the task. The person can reword,
+// delete, add and reorder steps, and take needs off, but not add one (agentd
+// refuses that), so a new step has none.
+function planCard(card, ctx) {
+  const p = card.plan;
+  const editable = card.editable;
+  let steps = planDrafts.get(card.id) || p.steps;
+  const change = (next) => {
+    steps = next;
+    planDrafts.set(card.id, next);
+  };
+
+  const list = h("ol", { class: "plan-edit" });
+  const add = editable ? h("button", { class: "button button-quiet plan-add", type: "button" }, icon("plus"), "Add a step") : null;
+  const summary = h("div", { class: "card-inset plan-summary" });
+  const problem = h("p", { class: "card-text muted", hidden: true });
+  const refusal = h("p", { class: "card-warning", role: "alert", hidden: true });
+  const deny = h("button", { class: "button", type: "button" }, "Deny");
+  const approve = h("button", { class: "button button-primary", type: "button" }, "Approve plan");
+
+  /** The steps again, after a change to the list; `focus` picks what has focus after. */
+  function draw(focus) {
+    list.replaceChildren(...steps.map(stepRow));
+    refresh();
+    focus?.();
+  }
+
+  /** What depends on the steps: the summary, and whether it can be approved. */
+  function refresh() {
+    const phrases = planPhrases(planCovers(p.covers, steps));
+    if (phrases.length) {
+      const said = phrases.flatMap((phrase, i) => [i ? " · " : "", phrase.lead,
+        andList(phrase.items, (item) => (phrase.code ? h("code", null, item) : item))]);
+      fill(summary,
+        h("p", null, "For this task, it won't ask again before: ", said, "."),
+        h("p", { class: "muted" }, "Anything else still asks you."));
+    } else {
+      fill(summary, h("p", null, "Approving just starts the plan. Everything will ask you as usual."));
+    }
+    const why = planProblem(steps);
+    problem.textContent = why;
+    problem.hidden = !why;
+    approve.disabled = Boolean(why);
+    if (add) add.disabled = steps.length >= PLAN_MAX_STEPS;
+    refusal.hidden = true; // about the version it refused
+  }
+
+  const focusIn = (index, selector) => () => {
+    const row = list.children[Math.min(index, list.children.length - 1)];
+    const target = [...(row?.querySelectorAll(selector) || [])].find((el) => !el.disabled) || row?.querySelector("input");
+    (target || add)?.focus();
+  };
+
+  function stepRow(step, index) {
+    const replace = (next) => change(steps.map((s, i) => (i === index ? next : s)));
+    const chips = needChips(step, editable ? (need) => {
+      replace(withoutNeed(steps[index], need)); // its words as typed since
+      draw(focusIn(index, ".plan-need-remove"));
+    } : null);
+    const n = h("span", { class: "app-step-n" }, String(index + 1));
+    const done = step.status === "done" ? h("span", { class: "visually-hidden" }, "Done: ") : null;
+    if (!editable) {
+      return h("li", { class: `plan-edit-step is-fixed is-${step.status.replace("_", "-")}` }, n,
+        h("p", { class: "card-text" }, done, step.step), chips);
+    }
+    const input = h("input", {
+      class: "field plan-edit-text", type: "text", value: step.step, maxlength: PLAN_STEP_LENGTH,
+      "aria-label": `Step ${index + 1}${step.status === "done" ? ", done" : ""}`, placeholder: "What to do",
+    });
+    input.addEventListener("input", () => {
+      replace({ ...steps[index], step: input.value });
+      refresh();
+    });
+    const tool = (name, label, disabled, act) => {
+      const button = h("button", { class: "plan-tool", type: "button", "aria-label": label, title: label, disabled }, icon(name));
+      button.addEventListener("click", act);
+      return button;
+    };
+    const move = (by) => {
+      const next = [...steps];
+      [next[index], next[index + by]] = [next[index + by], next[index]];
+      change(next);
+      draw(focusIn(index + by, `[aria-label="${by < 0 ? "Move up" : "Move down"}"]`));
+    };
+    return h("li", { class: `plan-edit-step is-${step.status.replace("_", "-")}` }, n, input, chips,
+      h("div", { class: "plan-tools" },
+        tool("up", "Move up", index === 0, () => move(-1)),
+        tool("down", "Move down", index === steps.length - 1, () => move(1)),
+        tool("trash", "Delete this step", false, () => {
+          change(steps.filter((_, i) => i !== index));
+          draw(focusIn(index, "input"));
+        })));
+  }
+
+  add?.addEventListener("click", () => {
+    change([...steps, { step: "", status: "pending" }]);
+    draw(focusIn(steps.length - 1, "input"));
+  });
+  deny.addEventListener("click", () => busyButton(deny, () => ctx.store.answer(card, false)));
+  approve.addEventListener("click", () => busyButton(approve, async () => {
+    const refused = await ctx.store.answerPlan(card, true, planAnswer(p.steps, steps));
+    if (refused) fill(refusal, icon("warning"), h("span", null, `Not approved: ${refused}`));
+    refusal.hidden = !refused;
+  }));
+  draw();
+  return h("section", { class: "card card-needs", "aria-label": "Approve this plan?" },
+    h("h3", { class: "card-title" }, icon("list"), "Approve this plan?"),
+    card.tainted ? warning("The agent wrote this plan after reading web pages or other outside content. Check each step is something you asked for.") : null,
+    list, add, summary, problem, refusal, buttons(deny, approve));
+}
+
+// --- What a plan covered -----------------------------------------------------------
+
+// An action that went ahead without its card, under a plan the person
+// approved: a quiet line of what it did, what it typed or ran folded under it.
+function coveredRow(item) {
+  const words = coveredWords(item);
+  const where = words.where ? ` · ${words.where}` : "";
+  const title = `Under your plan${where} — ${words.what}`;
+  const line = [h("span", { class: "covered-mark", "aria-hidden": "true" }, "✓"),
+    h("span", { class: "covered-line" }, "Under your plan", where, " — ", words.code ? h("code", null, words.what) : words.what)];
+  if (!words.more) return h("p", { class: "covered", title }, line);
+  return h("details", { class: "covered" },
+    h("summary", { title }, line, icon("next", "icon covered-more")),
+    h("div", { class: "covered-details" }, coveredDetails(item)));
+}
+
+function coveredDetails(item) {
+  const b = item.browser;
+  const a = item.app;
+  if (b) {
+    if (b.action === "type") {
+      return [b.target ? h("p", { class: "card-text muted" }, `In “${b.target}”`) : null, h("blockquote", { class: "card-quote" }, b.text ?? "")];
+    }
+    if (b.action === "key") return h("p", { class: "card-text" }, h("kbd", null, b.key || "?"), b.target ? ` in “${b.target}”` : "");
+    return h("p", { class: "card-text card-target" }, clickTarget(b.role, b.target));
+  }
+  if (a) {
+    return [
+      a.steps.length ? appSteps(a, false) : a.text !== null ? h("blockquote", { class: "card-quote" }, a.text) : null,
+      a.window ? h("p", { class: "card-text muted card-value" }, a.window) : null,
+    ];
+  }
+  if (item.kind === "install") return h("p", { class: "muted mono card-value" }, item.install.name);
+  return h("pre", { class: "covered-command" }, h("code", null, item.command));
 }
 
 // --- Cards -----------------------------------------------------------------------
@@ -327,6 +509,7 @@ function warning(text) {
 }
 
 function approvalCard(card, ctx) {
+  if (card.kind === "plan") return planCard(card, ctx);
   if (card.kind === "browser") return browserCard(card, ctx);
   if (card.kind === "app") return appCard(card, ctx);
   if (card.kind === "install") return installCard(card, ctx);
@@ -718,7 +901,7 @@ function mountComposer(store, view, { openKeys, onSent }) {
       const current = status.settings?.model || "";
       const models = [...new Set([current, ...(status.known_models || [])])].filter(Boolean);
       if (model.dataset.models !== models.join(",")) {
-        model.replaceChildren(...models.map((m) => h("option", { value: m }, m.split("/").pop())));
+        model.replaceChildren(...models.map((m) => h("option", { value: m }, modelName(m))));
         model.dataset.models = models.join(",");
       }
       model.value = current;

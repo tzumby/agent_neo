@@ -186,6 +186,49 @@ a.icon-button { color: inherit; }
 .plan-finished { padding: 0.55rem 1rem; background: transparent; }
 .plan-finished summary { cursor: pointer; color: var(--slate); font-size: 0.9rem; width: fit-content; }
 .plan-finished[open] .plan-steps { margin-top: 0.5rem; }
+/* What a step needs your OK for (a site, an app, a command, an install), as chips. */
+.plan-needs { display: inline-flex; flex-wrap: wrap; gap: 0.3rem; margin-left: 0.45rem; vertical-align: 0.05em; max-width: 100%; }
+.plan-need { display: inline-flex; align-items: center; gap: 0.3rem; max-width: 100%; min-height: 1.55rem; padding: 0 0.55rem; border-radius: 999px; background: var(--inset); color: var(--ink-2); font-size: 0.8rem; font-weight: 400; line-height: 1.35; }
+.plan-need .icon { width: 0.95em; height: 0.95em; color: var(--slate); }
+.plan-need-text { min-width: 0; overflow-wrap: anywhere; }
+.plan-need code { font: 0.92em var(--mono); }
+.plan-need-remove { display: inline-grid; place-items: center; flex: none; width: 1.45rem; height: 1.45rem; margin: 0 -0.4rem 0 -0.1rem; border: 0; border-radius: 50%; background: transparent; color: var(--slate); cursor: pointer; }
+.plan-need-remove:hover { background: var(--rule); color: var(--ink); }
+.plan-need-remove .icon { width: 0.85rem; height: 0.85rem; color: inherit; }
+/* A plan to approve: each step's words editable, its needs removable. On a
+   phone the words get the whole width, and the tools go beside the chips. */
+.plan-edit { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.7rem; }
+.plan-edit-step {
+  display: grid; grid-template-columns: 1.4rem minmax(0, 1fr) auto; grid-template-areas: "n text tools" ". needs needs";
+  column-gap: 0.55rem; row-gap: 0.35rem; align-items: start;
+}
+.plan-edit-step > .app-step-n { grid-area: n; margin-top: 0.5rem; }
+.plan-edit-step > .plan-edit-text, .plan-edit-step > .card-text { grid-area: text; min-width: 0; }
+.plan-edit-step > .plan-needs { grid-area: needs; margin-left: 0; }
+.plan-edit-step > .plan-tools { grid-area: tools; }
+.plan-edit-step.is-fixed { grid-template-columns: 1.4rem minmax(0, 1fr); grid-template-areas: "n text" ". needs"; }
+.plan-edit-step.is-fixed > .app-step-n { margin-top: 0.08rem; }
+.plan-edit-step.is-done .plan-edit-text, .plan-edit-step.is-done .card-text { color: var(--slate); }
+.plan-tools { display: flex; }
+.plan-tool { display: inline-grid; place-items: center; width: 1.9rem; height: 2.5rem; border: 0; border-radius: 0.5rem; background: transparent; color: var(--slate); cursor: pointer; }
+.plan-tool:hover:not(:disabled) { background: var(--inset); color: var(--ink); }
+.plan-tool:disabled { opacity: 0.35; cursor: default; }
+.plan-add { align-self: flex-start; padding-left: 0.6rem; }
+.plan-summary code { font: 0.85em var(--mono); overflow-wrap: anywhere; }
+/* An action an approved plan let go ahead: a quiet line, what it did folded under it. */
+.row-covered + .row-covered { margin-top: -0.9rem; }
+.covered { margin: 0; color: var(--slate); font-size: 0.88rem; }
+.covered > summary, p.covered { display: flex; align-items: baseline; gap: 0.4rem; min-width: 0; }
+.covered > summary { cursor: pointer; list-style: none; width: fit-content; max-width: 100%; }
+.covered > summary::-webkit-details-marker { display: none; }
+.covered-line { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.covered[open] .covered-line { white-space: normal; overflow-wrap: anywhere; }
+.covered-more { align-self: center; transition: transform 0.15s ease; }
+.covered[open] .covered-more { transform: rotate(90deg); }
+.covered-mark { color: var(--ok); font-weight: 700; flex: none; }
+.covered > summary code, p.covered code { font: 0.92em var(--mono); }
+.covered-details { margin: 0.5rem 0 0.2rem 1.2rem; display: flex; flex-direction: column; gap: 0.45rem; color: var(--ink); font-size: 0.93rem; }
+.covered-command { margin: 0; background: var(--inset); border-radius: 0.6rem; padding: 0.6rem 0.8rem; overflow-x: auto; font: 0.8rem/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .empty { padding: 14vh 0 2rem; }
 .empty h2 { margin: 0 0 1.2rem; font-size: clamp(1.45rem, 1.1rem + 1.2vw, 1.9rem); font-weight: 600; font-stretch: 112%; letter-spacing: -0.01em; line-height: 1.2; }
@@ -504,6 +547,7 @@ kbd { font: 600 0.85em var(--mono); border: 1px solid var(--slate); border-radiu
 
 @media (max-width: 560px) {
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .plan-edit-step { grid-template-areas: "n text text" ". needs tools"; }
 }
 
 /* A wide screen: the sidebar says how the desktop is, and the chat gets a

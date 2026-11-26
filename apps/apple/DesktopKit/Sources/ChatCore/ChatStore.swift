@@ -76,10 +76,11 @@ public final class ChatStore {
 
     /// Events after which the list is worth fetching again: its states,
     /// queues and last messages change with them (rather than being worked
-    /// out here).
+    /// out here). Not an action a plan covered: it changes none of them.
     nonisolated static func changesList(_ kind: String) -> Bool {
         kind.hasPrefix("session.") || kind.hasPrefix("message") || kind.hasPrefix("task.")
-            || kind.hasPrefix("approval.") || kind.hasPrefix("action") || kind == "budget.alert"
+            || (kind.hasPrefix("approval.") && kind != "approval.plan") || kind.hasPrefix("action")
+            || kind == "budget.alert"
     }
 
     /// The kinds that are a conversation's even without a `session` (with any
@@ -583,10 +584,23 @@ public final class ChatStore {
         }
     }
 
-    public func answer(_ approval: Approval, approved: Bool, text: String? = nil, client: AgentClient) async {
+    /// `plan`: the user's version of a plan card's steps, when they changed
+    /// it. Returns agentd's reason when it refused a plan card's answer (a
+    /// 400: an empty step, too many, a need the card didn't have), for the
+    /// card to show rather than a notice.
+    @discardableResult
+    public func answer(
+        _ approval: Approval, approved: Bool, text: String? = nil, plan: [PlanEdit]? = nil, client: AgentClient
+    ) async -> String? {
+        var refused: String?
         await attempt(onGone: { $0.conversations.values.forEach { $0.expire(approval: approval.id) } }) {
-            try await client.answer(approval: approval.id, approved: approved, text: text)
+            do {
+                try await client.answer(approval: approval.id, approved: approved, text: text, plan: plan)
+            } catch let error as AgentError where error.statusCode == 400 && approval.plan != nil {
+                refused = Self.message(error)
+            }
         }
+        return refused
     }
 
     public func resolve(_ action: Action, done: Bool, client: AgentClient) async {

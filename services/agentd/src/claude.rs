@@ -95,8 +95,16 @@ pub fn request(body: &Value) -> Value {
         // The whole prefix is cached: each turn reads what the last one wrote.
         "cache_control": {"type": "ephemeral"},
     });
+    // And the tools and system prompt on their own, which stay the same for
+    // a stretch of the task: when agentd changes an older message (old tool
+    // output cut, guard.rs), the turn's breakpoint finds no entry to read
+    // within its 20-block lookback, and without this one the whole prompt
+    // would be written again.
     if !system.is_empty() {
-        out["system"] = json!(system.join("\n\n"));
+        out["system"] = json!([{
+            "type": "text", "text": system.join("\n\n"),
+            "cache_control": {"type": "ephemeral"},
+        }]);
     }
     // Agentic work, at the effort Anthropic suggests for it (Opus 5.5's
     // default is a level lower).
@@ -123,6 +131,12 @@ pub fn request(body: &Value) -> Value {
             Some("auto") => out["tool_choice"] = json!({"type": "auto"}),
             _ => {}
         }
+    }
+    // Cache diagnostics (telemetry.rs): the task's previous response, or
+    // null on its first request; the response says why the cache missed.
+    // Only the task's own turns carry it, so each compares with the last.
+    if let Some(previous) = body.get("claude_previous_message") {
+        out["diagnostics"] = json!({"previous_message_id": previous});
     }
     if is_opus_5_5(model) {
         out["fallbacks"] = json!("default");
@@ -181,13 +195,16 @@ pub fn reply(response: &Value) -> Value {
     let usage = &response["usage"];
     let count = |key: &str| usage[key].as_u64().unwrap_or(0);
     let read = count("cache_read_input_tokens");
+    let written = count("cache_creation_input_tokens");
     json!({
+        "id": response["id"],
+        "diagnostics": response["diagnostics"],
         "model": response["model"],
         "choices": [{"message": message, "finish_reason": finish}],
         "usage": {
-            "prompt_tokens": count("input_tokens") + read + count("cache_creation_input_tokens"),
+            "prompt_tokens": count("input_tokens") + read + written,
             "completion_tokens": count("output_tokens"),
-            "prompt_tokens_details": {"cached_tokens": read},
+            "prompt_tokens_details": {"cached_tokens": read, "cache_write_tokens": written},
         },
     })
 }
@@ -377,7 +394,10 @@ mod tests {
             ],
         });
         let out = request(&body);
-        assert_eq!(out["system"], "You are an assistant.");
+        assert_eq!(
+            out["system"],
+            json!([{"type": "text", "text": "You are an assistant.", "cache_control": {"type": "ephemeral"}}])
+        );
         assert_eq!(out["max_tokens"], 16_000);
         assert_eq!(out["thinking"], json!({"type": "adaptive"}));
         assert_eq!(out["output_config"]["effort"], "high");
@@ -432,6 +452,32 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_asks_why_the_cache_missed() {
+        let first = request(
+            &json!({"model": "claude-opus-4-6", "claude_previous_message": null,
+            "messages": [{"role": "user", "content": "Go"}]}),
+        );
+        assert_eq!(first["diagnostics"], json!({"previous_message_id": null}));
+        let next = request(
+            &json!({"model": "claude-opus-4-6", "claude_previous_message": "msg_01",
+            "messages": [{"role": "user", "content": "Go"}]}),
+        );
+        assert_eq!(next["diagnostics"], json!({"previous_message_id": "msg_01"}));
+        // Calls outside a task's turns don't.
+        let other =
+            request(&json!({"model": "claude-opus-4-6", "messages": [{"role": "user", "content": "Go"}]}));
+        assert!(other.get("diagnostics").is_none());
+        let verdict =
+            json!({"cache_miss_reason": {"type": "messages_changed", "cache_missed_input_tokens": 900}});
+        let out = reply(
+            &json!({"id": "msg_02", "stop_reason": "end_turn", "diagnostics": verdict,
+            "content": [{"type": "text", "text": "Done"}]}),
+        );
+        assert_eq!(out["id"], "msg_02");
+        assert_eq!(out["diagnostics"], verdict);
+    }
+
+    #[test]
     fn the_models_own_blocks_go_back_as_they_came() {
         let response = json!({
             "model": "claude-opus-4-6", "stop_reason": "tool_use",
@@ -453,6 +499,7 @@ mod tests {
         );
         assert_eq!(out["usage"]["prompt_tokens"], 10_010);
         assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], 9000);
+        assert_eq!(out["usage"]["prompt_tokens_details"]["cache_write_tokens"], 1000);
         assert_eq!(out["usage"]["completion_tokens"], 50);
         // Next turn: the thinking block and its signature, unchanged.
         let next = request(&json!({"model": "claude-opus-4-6", "messages": [

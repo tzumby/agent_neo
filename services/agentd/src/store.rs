@@ -303,6 +303,8 @@ pub struct Effect {
 pub const EFFECT_MAX_ATTEMPTS: i64 = 10;
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+/// Telemetry rows older than this are deleted when agentd starts.
+const TELEMETRY_CUTOFF: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')";
 
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -442,6 +444,11 @@ impl Store {
         ))?;
         migrate(&conn)?;
         reconcile_legacy_memory_provenance(&conn)?;
+        // Telemetry is kept 90 days.
+        conn.execute_batch(&format!(
+            "DELETE FROM model_calls WHERE at < {TELEMETRY_CUTOFF};
+             DELETE FROM tool_calls WHERE at < {TELEMETRY_CUTOFF};"
+        ))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -533,6 +540,68 @@ impl Store {
                 usage.cached as i64,
                 steps
             ],
+        )?;
+        Ok(())
+    }
+
+    /// A model call's telemetry row (telemetry.rs).
+    pub fn record_model_call(&self, call: &crate::telemetry::ModelCall) -> Result<()> {
+        let parts = &call.composition;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO model_calls (run, kind, step, plan_step, model, ms, prompt_tokens, cache_read,
+               cache_write, output_tokens, cost, finish, calls, tools, messages, kept, previous, cut,
+               system_chars, tools_chars, tool_result_chars, assistant_chars, user_chars, images,
+               cache_miss, cache_missed_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+               ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+            params![
+                call.run,
+                call.kind,
+                call.step,
+                call.plan_step.map(|n| n as i64),
+                call.model,
+                call.ms as i64,
+                call.tokens("prompt_tokens") as i64,
+                call.tokens("cache_read") as i64,
+                call.tokens("cache_write") as i64,
+                call.tokens("completion_tokens") as i64,
+                call.cost,
+                call.finish,
+                call.tools.len() as i64,
+                call.tools.join(","),
+                parts.messages as i64,
+                call.kept.map(|(kept, _)| kept as i64),
+                call.kept.map(|(_, previous)| previous as i64),
+                call.cut as i64,
+                parts.system_chars as i64,
+                parts.tools_chars as i64,
+                parts.tool_result_chars as i64,
+                parts.assistant_chars as i64,
+                parts.user_chars as i64,
+                parts.images as i64,
+                call.cache_miss.as_ref().map(|(kind, _)| kind.as_str()),
+                call.cache_miss.as_ref().and_then(|(_, tokens)| *tokens),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A tool call's telemetry row (telemetry.rs): its name, time, the size
+    /// of what the model got back, and agentd's word on how it went.
+    pub fn record_tool_call(
+        &self,
+        run: &str,
+        step: u32,
+        tool: &str,
+        ms: u64,
+        result_chars: usize,
+        outcome: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tool_calls (run, step, tool, ms, result_chars, outcome) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![run, step, tool, ms as i64, result_chars as i64, outcome],
         )?;
         Ok(())
     }
@@ -1946,7 +2015,7 @@ fn migrate(conn: &Connection) -> Result<()> {
 }
 
 /// The schema version this agentd migrates to.
-const LATEST_VERSION: i64 = 9;
+const LATEST_VERSION: i64 = 10;
 
 /// Migrates up to `target` (tests build older databases with it).
 fn migrate_to(conn: &Connection, target: i64) -> Result<()> {
@@ -2064,12 +2133,65 @@ fn migrate_to(conn: &Connection, target: i64) -> Result<()> {
         tx.execute_batch("PRAGMA user_version = 9")?;
         tx.commit()?;
     }
+    if version < 10 && target >= 10 {
+        // Telemetry (0.23.0): a row per model call and per tool call.
+        conn.execute_batch(&format!(
+            "BEGIN; {} PRAGMA user_version = 10; COMMIT;",
+            migration_10()
+        ))?;
+    }
     // A queued resume's window came after 0.16.0's first builds made
     // `chat_queue`: their databases get it too.
     if target >= 9 && conn.prepare("SELECT tab_target FROM chat_queue LIMIT 0").is_err() {
         conn.execute_batch("ALTER TABLE chat_queue ADD COLUMN tab_target TEXT")?;
     }
     Ok(())
+}
+
+/// Telemetry's tables (telemetry.rs): numbers and names only, never content.
+fn migration_10() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS model_calls (
+             id INTEGER PRIMARY KEY,
+             run TEXT NOT NULL,
+             at TEXT NOT NULL DEFAULT ({NOW}),
+             kind TEXT NOT NULL,
+             step INTEGER NOT NULL,
+             plan_step INTEGER,
+             model TEXT NOT NULL,
+             ms INTEGER NOT NULL,
+             prompt_tokens INTEGER NOT NULL,
+             cache_read INTEGER NOT NULL,
+             cache_write INTEGER NOT NULL,
+             output_tokens INTEGER NOT NULL,
+             cost REAL,
+             finish TEXT,
+             calls INTEGER NOT NULL,
+             tools TEXT NOT NULL,
+             messages INTEGER NOT NULL,
+             kept INTEGER,
+             previous INTEGER,
+             cut INTEGER NOT NULL,
+             system_chars INTEGER NOT NULL,
+             tools_chars INTEGER NOT NULL,
+             tool_result_chars INTEGER NOT NULL,
+             assistant_chars INTEGER NOT NULL,
+             user_chars INTEGER NOT NULL,
+             images INTEGER NOT NULL,
+             cache_miss TEXT,
+             cache_missed_tokens INTEGER);
+         CREATE INDEX IF NOT EXISTS model_calls_by_run ON model_calls (run);
+         CREATE TABLE IF NOT EXISTS tool_calls (
+             id INTEGER PRIMARY KEY,
+             run TEXT NOT NULL,
+             at TEXT NOT NULL DEFAULT ({NOW}),
+             step INTEGER NOT NULL,
+             tool TEXT NOT NULL,
+             ms INTEGER NOT NULL,
+             result_chars INTEGER NOT NULL,
+             outcome TEXT NOT NULL);
+         CREATE INDEX IF NOT EXISTS tool_calls_by_run ON tool_calls (run);"
+    )
 }
 
 /// Conversations (`sessions`; `history`, `runs`, `schedules` and `events`
@@ -2435,7 +2557,7 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(version, 9);
+            assert_eq!(version, LATEST_VERSION);
             // Everything from before is in the first conversation.
             let main: String = conn
                 .query_row("SELECT id FROM sessions", [], |r| r.get(0))
@@ -2895,7 +3017,7 @@ mod tests {
             )
             .unwrap();
             let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            assert_eq!(version, 9);
+            assert_eq!(version, LATEST_VERSION);
         }
         assert_eq!(
             store.history_in(MAIN, 10).unwrap().last().unwrap().text,

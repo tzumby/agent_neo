@@ -28,6 +28,7 @@ mod skills;
 mod snaps;
 mod store;
 mod supervise;
+mod telemetry;
 mod tools;
 mod usage;
 mod vision;

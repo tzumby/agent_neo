@@ -336,12 +336,19 @@ public struct AgentSettings: Codable, Sendable, Equatable {
     /// Eligible shell actions and schedules can run without waiting for the user.
     public var autoApprove: Bool
     public let autoApproveVersion: String?
+    /// Screenshots go to the model and it can act at pixels in apps that
+    /// don't expose their controls (agentd 0.24.0). Off by default: it costs more.
+    public var pixelInput: Bool
+    /// The desktop has native apps, so Pixel input means something there.
+    public let pixelInputAvailable: Bool
 
     enum CodingKeys: String, CodingKey {
         case model
         case allowActions = "allow_actions"
         case autoApprove = "auto_approve"
         case autoApproveVersion = "auto_approve_version"
+        case pixelInput = "pixel_input"
+        case pixelInputAvailable = "pixel_input_available"
     }
 
     public init(from decoder: Decoder) throws {
@@ -350,6 +357,9 @@ public struct AgentSettings: Codable, Sendable, Equatable {
         allowActions = try container.decode(Bool.self, forKey: .allowActions)
         autoApprove = try container.decodeIfPresent(Bool.self, forKey: .autoApprove) ?? false
         autoApproveVersion = try container.decodeIfPresent(String.self, forKey: .autoApproveVersion)
+        // An older desktop has neither: no toggle.
+        pixelInput = try container.decodeIfPresent(Bool.self, forKey: .pixelInput) ?? false
+        pixelInputAvailable = try container.decodeIfPresent(Bool.self, forKey: .pixelInputAvailable) ?? false
     }
 }
 
@@ -503,16 +513,22 @@ public struct AgentClient: Sendable {
         let _: [String: Bool] = try await send("DELETE", "/api/v1/devices/\(id)", body: [String: String]())
     }
 
-    public func updateSettings(model: String? = nil, allowActions: Bool? = nil) async throws -> AgentSettings {
+    public func updateSettings(
+        model: String? = nil, allowActions: Bool? = nil, pixelInput: Bool? = nil
+    ) async throws -> AgentSettings {
         struct Update: Encodable {
             let model: String?
             let allowActions: Bool?
+            let pixelInput: Bool?
             enum CodingKeys: String, CodingKey {
                 case model
                 case allowActions = "allow_actions"
+                case pixelInput = "pixel_input"
             }
         }
-        return try await send("PUT", "/api/v1/settings", body: Update(model: model, allowActions: allowActions))
+        return try await send(
+            "PUT", "/api/v1/settings",
+            body: Update(model: model, allowActions: allowActions, pixelInput: pixelInput))
     }
 
     public func setAutoApprove(_ enabled: Bool, expectedVersion: String?) async throws -> AgentSettings {

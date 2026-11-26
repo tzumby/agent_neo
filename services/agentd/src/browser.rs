@@ -264,7 +264,24 @@ pub struct Browser {
     foreign: Vec<String>,
     /// A scheduled run's window, closed when the browser is dropped unless kept.
     opened: Option<String>,
+    /// The page as the model last saw it, so an action's result can say
+    /// what changed since rather than the model taking a snapshot after it.
+    seen: std::sync::Mutex<Option<Seen>>,
 }
+
+/// A page's outline (`format_snapshot`) as the model last got it.
+struct Seen {
+    target: String,
+    url: String,
+    outline: String,
+}
+
+/// After an action on the same page: at most this much of what's new, and
+/// of what's gone. After a navigation: at most this much of the new page's
+/// outline (snapshot for the rest).
+const NEW_MAX_CHARS: usize = 4_000;
+const GONE_MAX_CHARS: usize = 1_000;
+const OUTLINE_MAX_CHARS: usize = 6_000;
 
 impl Drop for Browser {
     fn drop(&mut self) {
@@ -290,6 +307,7 @@ impl Browser {
             remembered: None,
             foreign: Vec::new(),
             opened: None,
+            seen: std::sync::Mutex::new(None),
         }
     }
 
@@ -491,6 +509,12 @@ impl Browser {
     }
 
     pub async fn where_am_i(&self) -> Result<String> {
+        let (title, url) = self.location().await?;
+        Ok(format!("{title} | {url}"))
+    }
+
+    /// The current tab's title and URL.
+    async fn location(&self) -> Result<(String, String)> {
         // `<img name="title">` makes `document.title` that image: read the getter.
         let value = self
             .page()?
@@ -499,8 +523,42 @@ impl Browser {
                  ?.get?.call(document) ?? ''), location.href])",
             )
             .await?;
-        let pair: (String, String) = serde_json::from_str(value.as_str().unwrap_or("[\"\",\"\"]"))?;
-        Ok(format!("{} | {}", pair.0, pair.1))
+        Ok(serde_json::from_str(value.as_str().unwrap_or("[\"\",\"\"]"))?)
+    }
+
+    /// The page after an action, for its result: what changed since the
+    /// model last saw this page, or, on another page or tab, the new page's
+    /// outline. Either way the model has now seen it. Empty when the page
+    /// can't be read: the action's own line stands.
+    async fn page_after(&self) -> String {
+        match self.page_report().await {
+            Ok(report) => report,
+            Err(err) => {
+                tracing::debug!(err = %format!("{err:#}"), "couldn't read the page after an action");
+                String::new()
+            }
+        }
+    }
+
+    async fn page_report(&self) -> Result<String> {
+        let outline = format_snapshot(&self.ax_nodes().await?);
+        let (_, url) = self.location().await?;
+        let target = self.current_target().unwrap_or_default();
+        let before = self.saw(&target, &url, &outline);
+        Ok(match before.filter(|b| b.target == target && b.url == url) {
+            Some(before) => describe_changes(&before.outline, &outline),
+            None => format!("\n\nThe page:\n{}", truncate(&outline, OUTLINE_MAX_CHARS)),
+        })
+    }
+
+    /// The model got this page's outline (or what changed in it): returns
+    /// what it had seen before.
+    fn saw(&self, target: &str, url: &str, outline: &str) -> Option<Seen> {
+        self.seen.lock().unwrap().replace(Seen {
+            target: target.to_string(),
+            url: url.to_string(),
+            outline: outline.to_string(),
+        })
     }
 
     /// A heuristic: the open tab shows a visible password field or has a sign-in URL.
@@ -619,7 +677,11 @@ impl Browser {
                 }
             }
         };
-        Ok(format!("{outcome}; now at {}", self.where_am_i().await?))
+        Ok(format!(
+            "{outcome}; now at {}{}",
+            self.where_am_i().await?,
+            self.page_after().await
+        ))
     }
 
     // --- Tools ---------------------------------------------------------------
@@ -645,7 +707,11 @@ impl Browser {
             .ok_or_else(|| anyhow!("there is no tab {index}"))?
             .clone();
         self.switch_to(&target).await?;
-        Ok(format!("current tab: {}", self.where_am_i().await?))
+        Ok(format!(
+            "current tab: {}{}",
+            self.where_am_i().await?,
+            self.page_after().await
+        ))
     }
 
     pub async fn open_url(&mut self, url: &str, new_tab: bool) -> Result<String> {
@@ -676,9 +742,10 @@ impl Browser {
         }
         let settled = self.settle(Duration::from_secs(10)).await?;
         Ok(format!(
-            "{} ({settled}){}",
+            "{} ({settled}){}{}",
             self.where_am_i().await?,
-            self.sign_in_hint().await
+            self.sign_in_hint().await,
+            self.page_after().await
         ))
     }
 
@@ -701,8 +768,10 @@ impl Browser {
     }
 
     pub async fn snapshot(&self, max_chars: usize) -> Result<String> {
-        let nodes = self.ax_nodes().await?;
-        Ok(truncate(&format_snapshot(&nodes), max_chars))
+        let outline = format_snapshot(&self.ax_nodes().await?);
+        let (_, url) = self.location().await?;
+        self.saw(&self.current_target().unwrap_or_default(), &url, &outline);
+        Ok(truncate(&outline, max_chars))
     }
 
     /// Finds the element a click or type_text call means.
@@ -732,10 +801,11 @@ impl Browser {
         }
         let settled = self.settle(Duration::from_secs(8)).await?;
         Ok(format!(
-            "clicked '{}' ({settled}); now at {}{}",
+            "clicked '{}' ({settled}); now at {}{}{}",
             element.label,
             self.where_am_i().await?,
-            self.sign_in_hint().await
+            self.sign_in_hint().await,
+            self.page_after().await
         ))
     }
 
@@ -764,10 +834,13 @@ impl Browser {
         .await;
         release(page, &object).await;
         typed?;
+        // Suggestions or checks the typing brings up.
+        let settled = self.settle(Duration::from_secs(3)).await?;
         Ok(format!(
-            "typed into '{}'; now at {}",
+            "typed into '{}' ({settled}); now at {}{}",
             element.label,
-            self.where_am_i().await?
+            self.where_am_i().await?,
+            self.page_after().await
         ))
     }
 
@@ -784,7 +857,11 @@ impl Browser {
         page.hold_file_pickers(false).await;
         pressed?;
         let settled = self.settle(Duration::from_secs(8)).await?;
-        Ok(format!("pressed ({settled})"))
+        Ok(format!(
+            "pressed ({settled}); now at {}{}",
+            self.where_am_i().await?,
+            self.page_after().await
+        ))
     }
 
     /// Bind approval to the target, main document, node, and current form state.
@@ -1485,6 +1562,56 @@ pub fn format_snapshot(nodes: &[Value]) -> String {
     out
 }
 
+/// What changed between two outlines of a page, line by line (a line is an
+/// element or a text, whatever its depth): what's new, in page order with
+/// its refs, and what's gone. A line that only moved is unchanged.
+pub fn describe_changes(before: &str, after: &str) -> String {
+    let mut left: HashMap<&str, usize> = HashMap::new();
+    for line in before.lines() {
+        *left.entry(line.trim()).or_default() += 1;
+    }
+    let mut new = Vec::new();
+    for line in after.lines() {
+        match left.get_mut(line.trim()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => new.push(line),
+        }
+    }
+    let mut gone = Vec::new();
+    for line in before.lines() {
+        if let Some(count) = left.get_mut(line.trim())
+            && *count > 0
+        {
+            *count -= 1;
+            gone.push(line.trim());
+        }
+    }
+    if new.is_empty() && gone.is_empty() {
+        return "\n\nThe page didn't change.".into();
+    }
+    let mut out = String::new();
+    if !new.is_empty() {
+        // As deep as the shallowest new line: the new part's own structure.
+        let indent = new
+            .iter()
+            .map(|line| line.len() - line.trim_start_matches(' ').len())
+            .min()
+            .unwrap_or(0);
+        let lines: Vec<&str> = new.iter().map(|line| &line[indent..]).collect();
+        out.push_str(&format!(
+            "\n\nNew on the page:\n{}",
+            truncate(&lines.join("\n"), NEW_MAX_CHARS)
+        ));
+    }
+    if !gone.is_empty() {
+        out.push_str(&format!(
+            "\n\nGone from the page:\n{}",
+            truncate(&gone.join("\n"), GONE_MAX_CHARS)
+        ));
+    }
+    out
+}
+
 /// Finds the element to act on: by ref, by role and name, or by visible text.
 /// Returns (backend node ID, role, label).
 fn resolve(
@@ -1650,6 +1777,62 @@ mod tests {
             .unwrap();
         println!("{result}");
         assert!(result.contains("disabled"), "{result}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CDP_URL pointing at a Chrome"]
+    async fn live_actions_say_what_changed_on_the_page() {
+        let cdp = Cdp::new(&std::env::var("CDP_URL").expect("CDP_URL")).unwrap();
+        let target = cdp.new_page().await.unwrap();
+        let mut browser = Browser::new(cdp.clone());
+        browser.switch_to(&target).await.unwrap();
+        let page = "data:text/html,<title>Mail</title><button>Compose</button>\
+            <button onclick=\"this.remove()\">Dismiss</button><div id=d></div><script>\
+            document.querySelector('button').onclick = () => { document.getElementById('d').innerHTML = \
+            '<div role=dialog aria-label=\"New message\"><input aria-label=\"To\"></div>'; };</script>";
+        let opened = browser.open_url(page, false).await.unwrap();
+        println!("{opened}\n---");
+        assert!(
+            opened.contains("The page:\n") && opened.contains("button \"Compose\" [ref="),
+            "{opened}"
+        );
+
+        let compose = browser
+            .find(None, Some("button"), Some("Compose"), None)
+            .await
+            .unwrap();
+        let place = browser.place_of(Some(&compose)).await.unwrap();
+        let clicked = browser.click(&compose, &place).await.unwrap();
+        println!("{clicked}\n---");
+        assert!(
+            clicked.contains("New on the page:\n- dialog \"New message\" [ref="),
+            "{clicked}"
+        );
+        assert!(clicked.contains("textbox \"To\" [ref="), "{clicked}");
+        assert!(!clicked.contains("Gone from the page"), "{clicked}");
+
+        // Typing changes nothing else here.
+        let to = browser
+            .find(None, Some("textbox"), Some("To"), None)
+            .await
+            .unwrap();
+        let place = browser.place_of(Some(&to)).await.unwrap();
+        let typed = browser.type_text(&to, "ana@example.com", &place).await.unwrap();
+        println!("{typed}\n---");
+        assert!(typed.contains("typed into 'To'"), "{typed}");
+
+        let dismiss = browser
+            .find(None, Some("button"), Some("Dismiss"), None)
+            .await
+            .unwrap();
+        let place = browser.place_of(Some(&dismiss)).await.unwrap();
+        let gone = browser.click(&dismiss, &place).await.unwrap();
+        println!("{gone}\n---");
+        assert!(
+            gone.contains("Gone from the page:\n- button \"Dismiss\""),
+            "{gone}"
+        );
+        let _ = cdp.close(&target.id).await;
     }
 
     #[tokio::test]
@@ -1975,6 +2158,37 @@ mod tests {
         assert_eq!(
             text,
             "- button \"Compose\" [ref=40]\n- link \"Inbox 3 unread\" [ref=50]\n  - text: Inbox\n"
+        );
+    }
+
+    #[test]
+    fn an_action_says_what_changed_on_the_page() {
+        let before = "- main\n  - button \"Compose\" [ref=40]\n  - link \"Inbox 3 unread\" [ref=50]\n";
+        // A dialog opened deep in the tree; the inbox count changed.
+        let after = "- main\n  - button \"Compose\" [ref=40]\n  - link \"Inbox 2 unread\" [ref=51]\n  \
+                     - dialog \"New message\" [ref=60]\n    - textbox \"To\" [ref=61]\n";
+        assert_eq!(
+            describe_changes(before, after),
+            "\n\nNew on the page:\n- link \"Inbox 2 unread\" [ref=51]\n- dialog \"New message\" [ref=60]\n  \
+             - textbox \"To\" [ref=61]\n\nGone from the page:\n- link \"Inbox 3 unread\" [ref=50]"
+        );
+        assert_eq!(describe_changes(before, before), "\n\nThe page didn't change.");
+        // Moved, not changed: the same lines at another depth.
+        let moved = "- button \"Compose\" [ref=40]\n- main\n    - link \"Inbox 3 unread\" [ref=50]\n";
+        assert_eq!(describe_changes(before, moved), "\n\nThe page didn't change.");
+        // Two equal lines and one goes: one is gone, not both.
+        let twice = "- text: Saved\n- text: Saved\n";
+        assert_eq!(
+            describe_changes(twice, "- text: Saved\n"),
+            "\n\nGone from the page:\n- text: Saved"
+        );
+        // A big change is cut short.
+        let big: String = (0..2000).map(|i| format!("- text: row {i}\n")).collect();
+        let report = describe_changes("", &big);
+        assert!(
+            report.len() < NEW_MAX_CHARS + 200 && report.contains("[truncated:"),
+            "{}",
+            report.len()
         );
     }
 

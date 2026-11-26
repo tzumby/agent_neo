@@ -10,10 +10,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// Characters of tool output kept in the context; older results beyond this
+/// Characters of tool output kept in the context; past this, older results
 /// are replaced by a short note. Every step resends the whole context, so this
 /// also caps the cost of long tasks.
 pub const TOOL_OUTPUT_BUDGET: usize = 120_000;
+/// A cut goes down to this share of the budget, all at once: replacing an old
+/// result changes the conversation from there on, which the model's prompt
+/// cache has to write again, so cuts are rare and big rather than one old
+/// result on every step.
+const CUT_TO_PERCENT: usize = 50;
 /// The newest results are always kept whole.
 const KEEP_NEWEST: usize = 2;
 
@@ -66,7 +71,8 @@ pub fn label_untrusted(tool: &str, result: String) -> String {
 }
 
 /// Replaces the oldest tool results with a note once their total passes the
-/// budget, keeping the newest ones whole. Returns how many were cut.
+/// budget, down to half of it (`CUT_TO_PERCENT`), keeping the newest ones
+/// whole. Returns how many were cut.
 pub fn enforce_budget(messages: &mut [Value], budget: usize) -> usize {
     let tools: Vec<usize> = messages
         .iter()
@@ -76,9 +82,13 @@ pub fn enforce_budget(messages: &mut [Value], budget: usize) -> usize {
         .collect();
     let size = |m: &Value| m["content"].as_str().map_or(0, str::len);
     let mut total: usize = tools.iter().map(|&i| size(&messages[i])).sum();
+    if total <= budget {
+        return 0;
+    }
+    let target = budget * CUT_TO_PERCENT / 100;
     let mut cut = 0;
     for &i in tools.iter().take(tools.len().saturating_sub(KEEP_NEWEST)) {
-        if total <= budget {
+        if total <= target {
             break;
         }
         let len = size(&messages[i]);
@@ -92,6 +102,30 @@ pub fn enforce_budget(messages: &mut [Value], budget: usize) -> usize {
     }
     cut
 }
+
+/// An action that didn't go through (refused, denied, failed, or not done
+/// on the page): the calls after it in the same reply were planned on it,
+/// so they get `NOT_RUN_AFTER_FAILURE` rather than running (a form isn't
+/// sent after one of its fields wasn't typed in).
+pub fn stops_the_reply(tool: &str, result: &str) -> bool {
+    matches!(
+        tool,
+        "click" | "type_text" | "press_key" | "open_url" | "switch_tab" | "app_act" | "run_shell"
+    ) && [
+        "error:",
+        "blocked:",
+        "denied:",
+        "not run:",
+        "not clicked",
+        "not typed",
+        "not done",
+    ]
+    .iter()
+    .any(|prefix| result.starts_with(prefix))
+}
+
+pub const NOT_RUN_AFTER_FAILURE: &str = "not run: a call before it in the same reply didn't go through. \
+     Look at that call's result, then decide what to do next.";
 
 /// What the model gets instead of running a shell sleep.
 pub const SLEEP_REFUSAL: &str = "not run: don't sleep in the shell to wait for the browser. Opening a page, \
@@ -519,6 +553,36 @@ mod tests {
         assert_eq!(messages[4]["content"].as_str().unwrap().len(), 50_000);
         // Under budget: untouched.
         assert_eq!(enforce_budget(&mut [tool(10), tool(10)], 120_000), 0);
+    }
+
+    #[test]
+    fn an_action_that_didnt_go_through_stops_the_rest_of_its_reply() {
+        assert!(stops_the_reply("type_text", "not typed: 'To' is disabled"));
+        assert!(stops_the_reply(
+            "click",
+            "denied: the user did not approve this (it sends)."
+        ));
+        assert!(stops_the_reply("run_shell", "error: the command timed out"));
+        assert!(!stops_the_reply(
+            "click",
+            "clicked 'Save' (ready after 80 ms); now at x | y"
+        ));
+        // A command that ran and failed is the model's to read, like any output.
+        assert!(!stops_the_reply("run_shell", "exit code 1\nnot found"));
+        // Reads don't stop the others.
+        assert!(!stops_the_reply("read_text", "error: no tab is open"));
+    }
+
+    #[test]
+    fn budget_cuts_down_to_half_at_once_so_cuts_are_rare() {
+        let tool = |n: usize| json!({"role": "tool", "content": "x".repeat(n)});
+        let mut messages: Vec<Value> = (0..5).map(|_| tool(30_000)).collect();
+        // 150,000 is over: cut to 60,000 in one go, not just under 120,000.
+        assert_eq!(enforce_budget(&mut messages, 120_000), 3);
+        // The next results don't cut again until the budget is passed again.
+        messages.push(tool(30_000));
+        messages.push(tool(25_000));
+        assert_eq!(enforce_budget(&mut messages, 120_000), 0);
     }
 
     #[test]

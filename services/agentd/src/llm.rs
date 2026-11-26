@@ -276,11 +276,12 @@ pub const KNOWN_MODELS: [&str; 5] = [
     "deepseek-ai/DeepSeek-V4.1-Flash-1017",
 ];
 
-/// Whether the model takes images (screenshots for app_gui; vision.rs).
-/// Checked against Together's API with an image, 2026-11-25: Kimi-K3 reads
-/// one; GLM-5.3 refuses image input (`multimodal_not_supported`), and the
-/// others weren't tried. Claude's models all read images.
-pub fn sees_images(model: &str) -> bool {
+/// Whether the model takes images, for Pixel input (Settings, off by
+/// default; `Agent::pixel_input`). Checked against Together's API with an
+/// image, 2026-11-25: Kimi-K3 reads one; GLM-5.3 refuses image input
+/// (`multimodal_not_supported`), and the others weren't tried. Claude's
+/// models all read images.
+pub fn takes_images(model: &str) -> bool {
     model == "moonshotai/Kimi-K3" || model.starts_with("claude-")
 }
 
@@ -498,6 +499,14 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_models_checked_with_an_image_take_screenshots() {
+        for model in ["claude-opus-5-5", "claude-opus-4-6", "moonshotai/Kimi-K3"] {
+            assert!(takes_images(model), "{model}");
+        }
+        assert!(!takes_images("zai-org/GLM-5.3"));
+    }
 
     #[test]
     fn a_model_goes_to_the_provider_that_lists_it() {

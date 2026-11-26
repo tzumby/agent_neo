@@ -393,6 +393,11 @@ export function mountSettings(store, view, session) {
       : models.map(option));
     const keyPrompt = h("div", { class: "model-key-prompt", hidden: true });
     const actions = h("input", { type: "checkbox", checked: settings.allow_actions === true });
+    // Pixel input (agentd 0.24.0), on a desktop with native apps only.
+    const pixelCost = "It costs more: each screenshot adds about 1,500 tokens to every later step of the task, so tasks that use it can cost several times as much. Only Claude and Kimi-K3 get screenshots.";
+    const pixel = settings.pixel_input_available
+      ? h("input", { type: "checkbox", checked: settings.pixel_input === true })
+      : null;
     const autoApprove = h("input", {
       type: "checkbox", checked: settings.auto_approve === true,
       disabled: !settings.auto_approve && settings.auto_approve_version === undefined,
@@ -435,6 +440,14 @@ export function mountSettings(store, view, session) {
     });
     actions.addEventListener("change", () => save(() => store.api.updateSettings({ allow_actions: actions.checked }),
       (now) => { actions.checked = now.allow_actions === true; }));
+    pixel?.addEventListener("change", () => {
+      if (pixel.checked && !confirm(`Turn on Pixel input?\n\n${pixelCost}`)) {
+        pixel.checked = false;
+        return;
+      }
+      save(() => store.api.updateSettings({ pixel_input: pixel.checked }),
+        (now) => { pixel.checked = now.pixel_input === true; });
+    });
     autoApprove.addEventListener("change", async () => {
       const enabled = autoApprove.checked;
       if (enabled && !confirm(`Turn on Auto approve?\n\n${autoApproveDescription}`)) {
@@ -468,6 +481,10 @@ export function mountSettings(store, view, session) {
         h("label", { class: "toggle" }, actions,
           h("span", null, h("span", { class: "strong" }, "Browser actions"),
             h("span", { class: "muted block" }, "Lets the agent ask before typing, clicking, or pressing a key in your desktop's browser and apps."))),
+        pixel && h("label", { class: "toggle" }, pixel,
+          h("span", null, h("span", { class: "strong" }, "Pixel input"),
+            h("span", { class: "muted block" }, "For desktop apps that don't show the agent their buttons and fields, like drawing canvases: it looks at screenshots of the desktop and asks before clicking at points. Web pages never need it."),
+            h("span", { class: "cost-warning block" }, pixelCost))),
         h("label", { class: "toggle" }, autoApprove,
           h("span", null, h("span", { class: "strong" }, "Auto approve"),
             h("span", { class: "muted block" }, autoApproveDescription)))),

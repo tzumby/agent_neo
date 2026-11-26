@@ -10,6 +10,7 @@ struct SettingsView: View {
     @Environment(PushCenter.self) private var push
     @Environment(\.dismiss) private var dismiss
     @State private var autoApproveConfirmationVersion: String?
+    @State private var confirmingPixelInput = false
     @State private var loggingOut = false
     /// The desktop didn't confirm it stopped notifying this device.
     @State private var stillRegistered = false
@@ -20,6 +21,8 @@ struct SettingsView: View {
     /// Light (the default), Dark, or as the system is set: this device only.
     @AppStorage(Appearance.key) private var appearance = Appearance.light
     private let autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser and app changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content."
+    private let pixelInputDescription = "For desktop apps that don't show the agent their buttons and fields, like drawing canvases: it looks at screenshots of the desktop and asks before clicking at points. Web pages never need it."
+    private let pixelInputCost = "It costs more: each screenshot adds about 1,500 tokens to every later step of the task, so tasks that use it can cost several times as much. Only Claude and Kimi-K3 get screenshots."
 
     var body: some View {
         GroupedList {
@@ -96,6 +99,39 @@ struct SettingsView: View {
                     Text("Agent")
                 } footer: {
                     Text(autoApproveDescription).sectionFooter()
+                }
+                if status.settings.pixelInputAvailable {
+                    Section {
+                        Toggle(
+                            "Pixel input",
+                            isOn: Binding(
+                                get: { status.settings.pixelInput },
+                                set: { on in
+                                    if on {
+                                        confirmingPixelInput = true
+                                    } else {
+                                        Task { problem = await store.updateSettings(pixelInput: false, client: client) }
+                                    }
+                                })
+                        )
+                        .confirmationDialog(
+                            "Turn on Pixel input?", isPresented: $confirmingPixelInput, titleVisibility: .visible
+                        ) {
+                            Button("Turn on") {
+                                Task { problem = await store.updateSettings(pixelInput: true, client: client) }
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text(pixelInputCost)
+                        }
+                    } footer: {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(pixelInputDescription)
+                            Label(pixelInputCost, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(Theme.amber)
+                        }
+                        .sectionFooter()
+                    }
                 }
             }
             if store.conversationsAvailable == true {

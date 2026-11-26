@@ -825,6 +825,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pixel_input_is_off_until_the_user_turns_it_on() {
+        let (agent, dir, _broker) = with_apps();
+        assert!(agent.settings().pixel_input_available);
+        assert!(!agent.settings().pixel_input);
+        assert!(!agent.pixel_input("claude-opus-4-6"));
+        assert!(agent.set_pixel_input(true, None).unwrap().pixel_input);
+        assert!(agent.pixel_input("claude-opus-4-6"));
+        // Only for a model that takes images.
+        assert!(!agent.pixel_input("zai-org/GLM-5.3"));
+        agent.set_pixel_input(false, None).unwrap();
+        assert!(!agent.pixel_input("claude-opus-4-6"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_seeing_model_gets_screenshots_and_pixel_cards_mark_its_frame() {
         let (agent, dir, broker) = with_apps();
         agent.vision_tasks.lock().unwrap().insert("t1".into());

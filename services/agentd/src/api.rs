@@ -1331,6 +1331,7 @@ struct SettingsUpdate {
     /// A number sets the monthly budget; null removes it.
     #[serde(default, deserialize_with = "double_option")]
     monthly_budget_usd: Option<Option<f64>>,
+    pixel_input: Option<bool>,
 }
 
 async fn put_settings(State(agent): App, headers: HeaderMap, Json(body): Json<SettingsUpdate>) -> Response {
@@ -1348,6 +1349,12 @@ async fn put_settings(State(agent): App, headers: HeaderMap, Json(body): Json<Se
     if body.auto_approve == Some(false)
         && agent.settings().auto_approve
         && let Err(err) = agent.set_auto_approve(false, None, caller(&headers).as_deref())
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+    }
+    if let Some(on) = body.pixel_input
+        && on != agent.settings().pixel_input
+        && let Err(err) = agent.set_pixel_input(on, caller(&headers).as_deref())
     {
         return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
     }
@@ -1373,7 +1380,11 @@ async fn put_settings(State(agent): App, headers: HeaderMap, Json(body): Json<Se
             Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
     }
-    if !has_memory && body.monthly_budget_usd.is_none() && body.auto_approve == Some(true) {
+    if !has_memory
+        && body.monthly_budget_usd.is_none()
+        && body.pixel_input.is_none()
+        && body.auto_approve == Some(true)
+    {
         return error(
             StatusCode::CONFLICT,
             "Use the Auto approve confirmation endpoint to turn it on",
@@ -1459,6 +1470,18 @@ mod tests {
         assert_eq!(settings.model, "moonshotai/Kimi-K3");
         assert!(!settings.allow_actions);
         assert!(!settings.auto_approve);
+        // Pixel input: off by default, a setting of its own. No native apps here.
+        assert!(!settings.pixel_input && !settings.pixel_input_available);
+        assert_eq!(
+            update(json!({"pixel_input": true})).await.status(),
+            StatusCode::OK
+        );
+        assert!(agent.settings().pixel_input);
+        assert_eq!(
+            update(json!({"pixel_input": false})).await.status(),
+            StatusCode::OK
+        );
+        assert!(!agent.settings().pixel_input);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

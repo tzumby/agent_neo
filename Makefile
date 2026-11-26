@@ -21,7 +21,7 @@ SSM_BUCKET = $(shell $(TF) output -raw ssm_transfer_bucket)
 
 .DEFAULT_GOAL := help
 .PHONY: help preflight bootstrap init plan apply destroy fmt lint galaxy inventory deploy desktop screenshot \
-  model-key tailscale-key tailscale-allow apns-key agentd-test helper-test agentd-build agentd-deploy agentd-evals agentd-reset agentd-logs \
+  model-key tailscale-key tailscale-allow apns-key agentd-test helper-test agentd-build agentd-deploy agentd-evals agentd-reset agentd-logs agentd-telemetry \
   tailnet-test tailnet-build tailnet-deploy url web-test web-dev web-smoke \
   app-tailscalekit app-project app-test app-sim app-device app-mac stop start cdp viewer shell
 
@@ -116,6 +116,9 @@ agentd-logs: ## Show agentd's recent log
 agentd-reset: ## Wipe the agent clean: chat, memories, schedules, keys, and Chrome's profile (asks first): FILES=1 KEEP_COPY=1 RESTORE=1 DRY_RUN=1
 	scripts/agentd-reset.py $(INSTANCE) $(if $(FILES),--files) $(if $(KEEP_COPY),--keep-copy) \
 	  $(if $(RESTORE),--restore) $(if $(DRY_RUN),--dry-run)
+
+agentd-telemetry: ## Where the model tokens go, per task (DAYS=7); one task call by call (TASK=id); all rows to a file (EXPORT=file.json)
+	scripts/agentd-telemetry.py $(INSTANCE) --days $(or $(DAYS),7) $(if $(TASK),--task $(TASK)) $(if $(EXPORT),--export $(EXPORT))
 
 agentd-evals: ## Memory evals on this machine against Together (cents per scenario): MEMORY_V2=on|off SCENARIO=name MODEL=id PROVIDER=together|bedrock
 	cd services/agentd && cargo build --quiet

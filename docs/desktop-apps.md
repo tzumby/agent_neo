@@ -2,7 +2,7 @@
 
 The agent uses the desktop's own Linux apps the way you would: it reads them, clicks, types, presses keys, sets values, selects, scrolls, switches and closes windows, and waits for what it set off. It works through their accessibility tree (AT-SPI2), using Microsoft Research's [Hybrid Computer Use](https://github.com/microsoft/Hybrid-Computer-Use) (HCU, `computer-use`).
 
-With a model that sees images (Claude's; on Together, Kimi-K3), it also takes screenshots, looks at them, and acts at pixels. That covers what the tree doesn't expose, such as canvases or custom widgets. Chrome stays the browser tools' (DevTools, [architecture §6.9](architecture.md#69-browser-control-chrome-devtools-protocol)).
+With a model that sees images (Claude's; on Together, Kimi-K3), it could also take screenshots, look at them, and act at pixels, for what the tree doesn't expose, such as canvases or custom widgets. That's **Pixel input**, a setting, off by default (agentd 0.24.0; 0.22.0 turned screenshots off for every task): screenshots cost a model call and about 1.5K tokens on every later call, and each new one rewrites Claude's prompt cache, while models mostly took them to look at what the tree already said. Settings in the apps show it only on a desktop with native apps, with that cost, and ask before turning it on. Chrome stays the browser tools' (DevTools, [architecture §6.9](architecture.md#69-browser-control-chrome-devtools-protocol)).
 
 Three rules hold throughout:
 
@@ -170,7 +170,7 @@ Mousepad took "Café ☕ crème brûlée" and "Zürich 東京 ✓" exactly (§8)
 
 **Screenshots for the model** (`vision.rs`):
 
-- `llm::sees_images` lists the models that take images: Claude's (all of them do), and on Together the ones checked with a real image on 2026-11-25. Kimi-K3 read one; GLM-5.3 refuses images (`multimodal_not_supported`).
+- `Agent::pixel_input` decides, as a task starts or resumes: Pixel input on (the `pixel_input` setting), a desktop with native apps, and a model that takes images (`llm::takes_images`). Otherwise `app_screenshot`, `app_zoom` and `app_gui` aren't offered and no screenshot goes to the model. The models that take images: Claude's (all of them do), and on Together the ones checked with a real image on 2026-11-25. Kimi-K3 read one; GLM-5.3 refuses images (`multimodal_not_supported`).
 - A screenshot is saved like any other image, and the conversation holds only a reference to it.
 - Before the model's next turn, one message brings the new screenshots, labelled as the apps' content.
 - When a request goes out, the newest two are attached as images for a model that sees them. Every other reference becomes a line of text, and so does every reference for a model that doesn't see images.
@@ -262,7 +262,7 @@ What the numbers mean:
 
 - **You and the agent share the screen.** Take over doesn't lock the agent out, and the agent doesn't wait for you. Excluding one while the other acts needs explicit ownership across the web and native VNC clients.
 - **One HCU process for every task.** A task that takes over voids the others' refs and frames, and a parked card then asks again. One process per conversation would avoid it, at the cost of memory.
-- **Seeing models.** On Together, only Kimi-K3 is checked; others can be added to `llm::sees_images` after the same image test. Claude Opus 4.6 and 5.5 take images, but neither has run the pixel path on this desktop yet.
+- **Seeing models.** On Together, only Kimi-K3 is checked; others can be added to `llm::takes_images` after the same image test. Claude Opus 4.6 and 5.5 take images, but neither has run the pixel path on this desktop yet.
 - **arm64** waits for a checked build (§2).
 - **Plan approval with a real model** (0.18.0) isn't measured yet: the first live run (GLM-5.3) acted without a plan and got four cards, which led to agentd asking the model to plan before a task's first card. The model provider's account ran out of credit before that build could be tried, so plan cards are checked only against a scripted model so far (`make web-dev`, the smoke test's plan checks).
 

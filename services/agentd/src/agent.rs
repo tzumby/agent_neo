@@ -35,6 +35,7 @@ use crate::shell::{KeyFile, Route, Shell, split_sudo};
 use crate::skills::Skills;
 use crate::store::{Event, MAIN, Pending, QueuedRun, Schedule, SecretInfo, Store};
 use crate::supervise::{self, Verdict};
+use crate::telemetry;
 use crate::tools;
 
 /// The native app tools (app_*), through the desktop broker.
@@ -238,6 +239,12 @@ pub struct Settings {
     pub memory_consolidation_daily_cap_usd: f64,
     /// What the model may cost a month, in USD (usage.rs); None: no budget.
     pub monthly_budget_usd: Option<f64>,
+    /// Pixel input: screenshots of the desktop go to the model, and it can
+    /// act at pixels in apps that don't expose their controls. Off by
+    /// default: it costs more (`Agent::pixel_input`).
+    pub pixel_input: bool,
+    /// The desktop has native apps, so Pixel input means something here.
+    pub pixel_input_available: bool,
 }
 
 pub enum StartError {
@@ -336,6 +343,9 @@ struct RunState {
     /// The conversation it belongs to (`main` for tasks from before them).
     #[serde(default = "main_session")]
     session: String,
+    /// The previous request, for telemetry (telemetry.rs); not saved.
+    #[serde(skip)]
+    sent: telemetry::Sent,
 }
 
 fn main_session() -> String {
@@ -883,7 +893,29 @@ impl Agent {
             memory_consolidation_model: self.consolidation_model(),
             memory_consolidation_daily_cap_usd: crate::consolidate::daily_cap(&self.store),
             monthly_budget_usd: crate::usage::monthly_budget(&self.store),
+            // Off by default.
+            pixel_input: get("pixel_input").as_deref() == Some("true"),
+            pixel_input_available: self.desktop.is_some(),
         }
+    }
+
+    /// Turns Pixel input on or off; tasks started (or resumed) after it use it.
+    pub fn set_pixel_input(&self, on: bool, by: Option<&str>) -> Result<Settings> {
+        self.store
+            .set_setting("pixel_input", if on { "true" } else { "false" })?;
+        tracing::info!(on, by = ?by, "pixel input changed");
+        let settings = self.settings();
+        self.emit("settings", json!(settings));
+        Ok(settings)
+    }
+
+    /// Whether a task on `model` gets screenshots and the pixel tools
+    /// (app_screenshot, app_zoom, app_gui): with Pixel input on, on a desktop
+    /// with native apps, for a model that takes images. Each screenshot costs
+    /// a model call and about 1.5K tokens on every later one, and a new one
+    /// turns an older one into text, which rewrites the prompt cache.
+    fn pixel_input(&self, model: &str) -> bool {
+        self.desktop.is_some() && llm::takes_images(model) && self.settings().pixel_input
     }
 
     /// The chat model: the user's pick, if a provider lists it, else the
@@ -1887,6 +1919,7 @@ impl Agent {
             scheduled: scheduled.map(|s| s.name),
             request: text,
             session,
+            sent: telemetry::Sent::default(),
         };
         if let Some(command) = memory_command {
             match self.apply_memory_command(&state.task, command, by.as_deref()) {
@@ -2128,6 +2161,73 @@ impl Agent {
         self.check_budget();
     }
 
+    /// Telemetry for one model call (telemetry.rs): its `model_calls` row and
+    /// a log line, numbers and names only.
+    #[allow(clippy::too_many_arguments)]
+    fn record_call(
+        &self,
+        state: &RunState,
+        kind: &str,
+        request: &Value,
+        reply: &Value,
+        ms: u64,
+        kept: Option<(usize, usize)>,
+        cut: usize,
+    ) {
+        let usage = &reply["usage"];
+        let mut this_call = Usage::default();
+        this_call.add(Some(usage));
+        let tools: Vec<String> = reply["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|call| call["function"]["name"].as_str())
+            .map(String::from)
+            .collect();
+        let call = telemetry::ModelCall {
+            run: &state.task,
+            kind,
+            step: state.step,
+            plan_step: telemetry::plan_step(&state.plan),
+            model: &state.model,
+            ms,
+            usage,
+            cost: this_call.cost(&state.model),
+            finish: reply["choices"][0]["finish_reason"].as_str().unwrap_or_default(),
+            tools,
+            composition: telemetry::composition(request),
+            kept,
+            cut,
+            cache_miss: telemetry::cache_miss(&reply["diagnostics"]),
+        };
+        tracing::info!(
+            task = %state.task, step = state.step, kind, ms,
+            prompt = call.tokens("prompt_tokens"),
+            cache_read = call.tokens("cache_read"),
+            cache_write = call.tokens("cache_write"),
+            output = call.tokens("completion_tokens"),
+            kept = kept.map(|(kept, _)| kept as i64).unwrap_or(-1),
+            cache_miss = call.cache_miss.as_ref().map_or("", |(kind, _)| kind.as_str()),
+            "model call"
+        );
+        if let Err(err) = self.store.record_model_call(&call) {
+            tracing::warn!(%err, task = %state.task, "couldn't record a model call");
+        }
+    }
+
+    /// Telemetry for one tool call: its `tool_calls` row. `outcome` comes from
+    /// the result as the tool gave it (telemetry::outcome), `chars` is what
+    /// the model got.
+    fn record_tool(&self, state: &RunState, tool: &str, started: Instant, outcome: &str, chars: usize) {
+        let ms = started.elapsed().as_millis() as u64;
+        if let Err(err) = self
+            .store
+            .record_tool_call(&state.task, state.step, tool, ms, chars, outcome)
+        {
+            tracing::warn!(%err, task = %state.task, "couldn't record a tool call");
+        }
+    }
+
     async fn run_loop(&self, state: &mut RunState, mut answer: Option<Answer>) -> Result<Outcome> {
         // Working time: what the task had, plus this stretch (drive adds it on).
         let loop_started = Instant::now();
@@ -2140,6 +2240,8 @@ impl Agent {
         } else {
             self.memory_prompt()
         };
+        // Pixel input, as set now: for this stretch of the task.
+        let vision = self.pixel_input(&state.model);
         let prompt = tools::system_prompt(
             self.cfg.shell_tool,
             &now,
@@ -2150,7 +2252,7 @@ impl Agent {
             tools::Desktop {
                 apps: self.desktop.is_some(),
                 installs: self.cfg.app_installs,
-                vision: llm::sees_images(&state.model),
+                vision,
             },
         );
         state.messages[0] = json!({"role": "system", "content": prompt});
@@ -2162,7 +2264,7 @@ impl Agent {
             tools::Desktop {
                 apps: self.desktop.is_some(),
                 installs: self.cfg.app_installs,
-                vision: llm::sees_images(&state.model),
+                vision,
             },
         );
         // The user answered a stuck card (review): keep going with the
@@ -2293,6 +2395,7 @@ impl Agent {
                         break 'task Outcome::Finished(answer, "stuck");
                     }
                     let content = format!("{refusal}{edited_note}");
+                    self.record_tool(state, &name, Instant::now(), "refused", content.len());
                     state
                         .messages
                         .push(json!({"role": "tool", "tool_call_id": call["id"], "content": content}));
@@ -2355,6 +2458,7 @@ impl Agent {
                     break 'task Outcome::Finished(format!("I need you: {reason}"), "needs_user");
                 }
                 if name == "update_plan" {
+                    let started = Instant::now();
                     let content = match self.update_plan(state, &args, resumed) {
                         Ok(content) => content,
                         Err(err) => match err.downcast::<Park>() {
@@ -2363,11 +2467,14 @@ impl Agent {
                         },
                     };
                     state.queue.remove(0);
+                    let outcome = telemetry::outcome(&content);
+                    self.record_tool(state, &name, started, &outcome, content.len());
                     state
                         .messages
                         .push(json!({"role": "tool", "tool_call_id": call["id"], "content": content}));
                     continue;
                 }
+                let started = Instant::now();
                 let result = if args.is_object() {
                     let call = self.call_tool(
                         &mut browser,
@@ -2413,6 +2520,8 @@ impl Agent {
                 };
                 // A saved key's value never reaches the model.
                 let result = self.secrets.redact(&result).into_owned();
+                let stops = guard::stops_the_reply(&name, &result);
+                let outcome = telemetry::outcome(&result);
                 state.queue.remove(0);
                 let repeat = state.loops.record(&name, &raw, &result);
                 if guard::carries_outside_content(&name) {
@@ -2442,6 +2551,17 @@ impl Agent {
                 state
                     .messages
                     .push(json!({"role": "tool", "tool_call_id": call["id"], "content": content}));
+                self.record_tool(state, &name, started, &outcome, content.len());
+                if stops && !state.queue.is_empty() {
+                    tracing::info!(task = %task_id, step, skipped = state.queue.len(),
+                        "a call didn't go through: the rest of its reply isn't run");
+                    for skipped in std::mem::take(&mut state.queue) {
+                        state.messages.push(json!({
+                            "role": "tool", "tool_call_id": skipped["id"],
+                            "content": guard::NOT_RUN_AFTER_FAILURE,
+                        }));
+                    }
+                }
                 // The conversation's tab, as soon as it has one: a card parked
                 // on it, or its next task, finds it again.
                 if !background && browser.current_target() != tab {
@@ -2486,7 +2606,7 @@ impl Agent {
             }
             let max_tokens = turn_max_tokens(state.empty_retries);
             // A model that sees images gets the screenshots its tools took.
-            let sees = self.desktop.is_some() && llm::sees_images(&state.model);
+            let sees = vision;
             if sees {
                 self.vision_tasks.lock().unwrap().insert(task_id.clone());
             } else {
@@ -2517,6 +2637,13 @@ impl Agent {
                 "model": state.model, "messages": messages, "tools": schemas,
                 "tool_choice": "auto", "max_tokens": max_tokens,
             });
+            let kept = state
+                .sent
+                .track(request["messages"].as_array().map_or(&[], Vec::as_slice));
+            if state.model.starts_with("claude-") {
+                request["claude_previous_message"] = json!(state.sent.response);
+            }
+            let started = Instant::now();
             // A stop interrupts the model call rather than waiting for its answer.
             let reply = tokio::select! {
                 reply = self.llm.chat(&request) => reply,
@@ -2541,6 +2668,9 @@ impl Agent {
             };
             state.usage.add(reply.get("usage"));
             self.record_usage(state);
+            let ms = started.elapsed().as_millis() as u64;
+            self.record_call(state, "turn", &request, &reply, ms, kept, cut);
+            state.sent.response = reply["id"].as_str().map(String::from);
             let message = reply["choices"][0]["message"].clone();
             // Back into the conversation, with reasoning_content for the
             // models that want it (GLM, Kimi) and without for the rest.
@@ -2873,16 +3003,19 @@ impl Agent {
             .push(json!({"role": "user", "content": tools::wrap_up(why)}));
         guard::enforce_budget(&mut state.messages, guard::TOOL_OUTPUT_BUDGET);
         let mut messages = state.messages.clone();
-        let sees = self.desktop.is_some() && llm::sees_images(&state.model);
+        let sees = self.pixel_input(&state.model);
         crate::vision::resolve(&mut messages, sees, &self.cfg.state_dir.join("images"));
         let request = json!({
             "model": state.model, "messages": messages, "tools": schemas,
             "tool_choice": "none", "max_tokens": TURN_MAX_TOKENS,
         });
+        let started = Instant::now();
         let answer = match self.llm.chat(&request).await {
             Ok(reply) => {
                 state.usage.add(reply.get("usage"));
                 self.record_usage(state);
+                let ms = started.elapsed().as_millis() as u64;
+                self.record_call(state, "wrap_up", &request, &reply, ms, None, 0);
                 reply["choices"][0]["message"]["content"]
                     .as_str()
                     .map(str::trim)
@@ -2922,10 +3055,14 @@ impl Agent {
             previous: state.review.previous.as_deref(),
         }
         .text();
-        let review = match self.llm.chat(&supervise::request(&state.model, &digest)).await {
+        let request = supervise::request(&state.model, &digest);
+        let started = Instant::now();
+        let review = match self.llm.chat(&request).await {
             Ok(reply) => {
                 state.usage.add(reply.get("usage"));
                 self.record_usage(state);
+                let ms = started.elapsed().as_millis() as u64;
+                self.record_call(state, "review", &request, &reply, ms, None, 0);
                 supervise::parse(&reply)
             }
             Err(err) => {
@@ -3040,13 +3177,7 @@ impl Agent {
         // their own checks, which need no Chrome.
         if matches!(
             name,
-            "list_tabs"
-                | "switch_tab"
-                | "open_url"
-                | "read_text"
-                | "snapshot"
-                | "wait_for"
-                | "show_screenshot"
+            "list_tabs" | "switch_tab" | "open_url" | "read_text" | "snapshot" | "wait_for"
         ) {
             browser.ensure().await?;
         }
@@ -3239,14 +3370,6 @@ impl Agent {
             "wait_for" => {
                 let timeout = number("timeout").map_or(10, |n| n.max(1) as u64);
                 browser.wait_for(text("text"), timeout).await
-            }
-            "show_screenshot" => {
-                let id = self.save_image(&browser.screenshot_jpeg().await?)?;
-                self.emit(
-                    "image",
-                    json!({"task": task_id, "id": id, "url": format!("/api/v1/images/{id}"), "caption": text("caption")}),
-                );
-                Ok("shown to the user".into())
             }
             "run_shell" if self.cfg.shell_tool => {
                 let timeout = number("timeout").map_or(120, |n| n.max(1) as u64);
@@ -6532,6 +6655,45 @@ mod background_tests {
     }
 
     #[tokio::test]
+    async fn an_action_that_doesnt_go_through_stops_the_rest_of_its_reply() {
+        // A click (which a scheduled run can't do) and then a call planned on it.
+        let (model, seen) = scripted_model(|request| {
+            if !is_turn(request) {
+                says("{}")
+            } else if request["messages"].as_array().unwrap().iter().any(|m| m["role"] == "tool") {
+                says("Couldn't click.")
+            } else {
+                json!({"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "click", "arguments": r#"{"ref": 7, "summary": "Send it"}"#}},
+                    {"id": "c2", "type": "function", "function": {"name": "list_schedules", "arguments": "{}"}},
+                ]})
+            }
+        })
+        .await;
+        let (_agent, dir) = run_scheduled(&model).await;
+        let seen = seen.lock().unwrap();
+        let last = seen.iter().rfind(|r| is_turn(r)).unwrap();
+        let result = |id: &str| {
+            last["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["tool_call_id"] == id)
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(
+            result("c1").contains("not done: browser inputs"),
+            "{}",
+            result("c1")
+        );
+        assert_eq!(result("c2"), guard::NOT_RUN_AFTER_FAILURE);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn the_supervisor_stops_a_scheduled_run_that_is_stuck() {
         let (model, seen) = scripted_model(|request| {
             if is_review(request) {
@@ -6702,20 +6864,21 @@ mod background_tests {
         let thinking =
             json!({"type": "thinking", "thinking": "Check the schedules first.", "signature": "sig-1"});
         let first = json!({
-            "model": "claude-opus-4-6", "stop_reason": "tool_use",
+            "id": "msg_1", "model": "claude-opus-4-6", "stop_reason": "tool_use",
             "content": [thinking, {"type": "tool_use", "id": "toolu_1", "name": "list_schedules", "input": {}}],
             "usage": {"input_tokens": 3, "cache_creation_input_tokens": 2000, "cache_read_input_tokens": 0, "output_tokens": 40},
         });
         let answer = |text: &str| {
             json!({
-                "model": "claude-opus-4-6", "stop_reason": "end_turn",
+                "id": "msg_2", "model": "claude-opus-4-6", "stop_reason": "end_turn",
                 "content": [{"type": "text", "text": text}],
                 "usage": {"input_tokens": 2, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 2000, "output_tokens": 5},
+                "diagnostics": {"cache_miss_reason": {"type": "messages_changed", "cache_missed_input_tokens": 100}},
             })
         };
         let replied = first.clone();
         let (url, seen) = claude_api(move |n, body| {
-            let task_turn = body["system"]
+            let task_turn = body["system"][0]["text"]
                 .as_str()
                 .is_some_and(|s| s.starts_with("You are an assistant"));
             match n {
@@ -6747,7 +6910,7 @@ mod background_tests {
         let turns: Vec<&(axum::http::HeaderMap, Value)> = seen
             .iter()
             .filter(|(_, b)| {
-                b["system"]
+                b["system"][0]["text"]
                     .as_str()
                     .is_some_and(|s| s.starts_with("You are an assistant"))
             })
@@ -6796,6 +6959,76 @@ mod background_tests {
             (done["cost"].as_f64().unwrap() - 0.015_281_25).abs() < 1e-9,
             "{done}"
         );
+        // Each turn asks why the cache missed, against the turn before.
+        assert_eq!(turns[0].1["diagnostics"], json!({"previous_message_id": null}));
+        assert_eq!(turns[1].1["diagnostics"], json!({"previous_message_id": "msg_1"}));
+        // Telemetry: a row per turn and per tool call, numbers and names only.
+        type Row = (
+            String,
+            i64,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        );
+        let calls: Vec<Row> = agent
+            .store
+            .read(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT kind, step, cache_write, cache_read, tools, cache_miss, kept, previous
+                     FROM model_calls WHERE kind = 'turn' ORDER BY id",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                })?;
+                Ok(rows.collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "turn".into(),
+                    1,
+                    2000,
+                    0,
+                    "list_schedules".into(),
+                    None,
+                    None,
+                    None
+                ),
+                (
+                    "turn".into(),
+                    2,
+                    100,
+                    2000,
+                    String::new(),
+                    Some("messages_changed".into()),
+                    Some(2),
+                    Some(2)
+                ),
+            ]
+        );
+        let tools: Vec<(String, String)> = agent
+            .store
+            .read(|conn| {
+                let mut stmt = conn.prepare("SELECT tool, outcome FROM tool_calls")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                Ok(rows.collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap();
+        assert_eq!(tools, vec![("list_schedules".to_string(), "ok".to_string())]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

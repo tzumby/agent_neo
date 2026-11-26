@@ -64,6 +64,15 @@ import Testing
     #expect(sent.autoApproveVersion == "v1")
 }
 
+@Test func pixelInputIsOffWithoutIt() throws {
+    // An older desktop: no Pixel input, so no toggle.
+    let old = try JSONDecoder().decode(AgentSettings.self, from: Data(#"{"model":"m","allow_actions":true}"#.utf8))
+    #expect(!old.pixelInput && !old.pixelInputAvailable)
+    let json = #"{"model":"m","allow_actions":true,"pixel_input":true,"pixel_input_available":true}"#
+    let settings = try JSONDecoder().decode(AgentSettings.self, from: Data(json.utf8))
+    #expect(settings.pixelInput && settings.pixelInputAvailable)
+}
+
 @Test func decodesAPageOfEvents() throws {
     // As served by agentd 0.15.1 (GET /api/v1/events/page).
     let json = """

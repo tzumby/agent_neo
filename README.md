@@ -317,6 +317,8 @@ make viewer         # the desktop in your browser: http://localhost:6080/vnc.htm
 make shell          # a shell on the desktop
 make screenshot     # → screenshots/<instance-id>.png
 make agentd-logs    # agentd's recent log
+make agentd-telemetry            # where the model tokens went, per task (DAYS=7)
+make agentd-telemetry TASK=<id>  # one task call by call: tokens, cache, tools
 make cdp            # Chrome's DevTools on localhost:9222, for scripts/browser.py
 make stop / start   # stop the desktop when you don't need it (the disk stays)
 make agentd-reset   # wipe the chat, memories, schedules, keys and Chrome's profile (asks first)

@@ -640,14 +640,16 @@ public final class ChatStore {
         }
     }
 
-    /// Changes the model or browser actions. Returns what went wrong, for the
-    /// screen that asked to show (nil: saved). The status is read again either
-    /// way, so controls show what the desktop has.
+    /// Changes the model, browser actions or Pixel input. Returns what went
+    /// wrong, for the screen that asked to show (nil: saved). The status is
+    /// read again either way, so controls show what the desktop has.
     @discardableResult
-    public func updateSettings(model: String? = nil, allowActions: Bool? = nil, client: AgentClient) async -> String? {
+    public func updateSettings(
+        model: String? = nil, allowActions: Bool? = nil, pixelInput: Bool? = nil, client: AgentClient
+    ) async -> String? {
         var problem: String?
         do {
-            _ = try await client.updateSettings(model: model, allowActions: allowActions)
+            _ = try await client.updateSettings(model: model, allowActions: allowActions, pixelInput: pixelInput)
         } catch {
             problem = "Couldn't save the setting. \(Self.message(error))"
         }

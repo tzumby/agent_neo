@@ -5,6 +5,7 @@
 import { MAIN, chatHash, lastLine, sessionBadge, sessionTitle } from "./conversations.js";
 import { busyButton, day, fill, h, icon, when } from "./dom.js";
 import { isValidName, normalizedName } from "./keys.js";
+import { keyLabel, keySource, modelKeyForm, providerOf, savedWords } from "./modelkeys.js";
 import { deviceLabel, fromBase64Url, iosOutsideHomeScreen, ownSubscription, pushState, pushSupported } from "./push.js";
 import { axisMoney, budgetShare, chartDays, compact, kindRows, modelName, money, niceCeiling, shortDate, todayIn } from "./usage.js";
 
@@ -382,8 +383,15 @@ export function mountSettings(store, view, session) {
     }
     const settings = status.settings || {};
     const autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser and app changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content.";
+    // Every provider's models (agentd 0.20.0), a keyless one's marked: picking
+    // one asks for its key first. An older desktop lists only its own.
+    const providers = status.model_providers || [];
+    const option = (m) => h("option", { value: m, selected: m === settings.model }, modelName(m));
     const models = [...new Set([settings.model, ...(status.known_models || [])])].filter(Boolean);
-    const model = h("select", { class: "field" }, models.map((m) => h("option", { value: m, selected: m === settings.model }, modelName(m))));
+    const model = h("select", { class: "field" }, providers.length
+      ? providers.map((p) => h("optgroup", { label: p.key ? p.name : `${p.name}: needs a key` }, (p.models || []).map(option)))
+      : models.map(option));
+    const keyPrompt = h("div", { class: "model-key-prompt", hidden: true });
     const actions = h("input", { type: "checkbox", checked: settings.allow_actions === true });
     const autoApprove = h("input", {
       type: "checkbox", checked: settings.auto_approve === true,
@@ -400,8 +408,31 @@ export function mountSettings(store, view, session) {
       }
       if (await store.reloadStatus()) sync(store.status.settings || {});
     };
-    model.addEventListener("change", () => save(() => store.api.updateSettings({ model: model.value }),
-      (now) => { if (now.model) model.value = now.model; }));
+    const syncModel = (now) => { if (now.model) model.value = now.model; };
+    model.addEventListener("change", () => {
+      const wanted = model.value;
+      const provider = providerOf(status, wanted);
+      keyPrompt.hidden = true;
+      if (provider && !provider.key) {
+        keyPrompt.replaceChildren(
+          h("p", null, `${modelName(wanted)} needs your ${keyLabel(provider)}.`),
+          modelKeyForm(store, provider, {
+            onSaved: async (result) => {
+              store.notice(savedWords(provider, result));
+              await save(() => store.api.updateSettings({ model: wanted }), syncModel);
+              load();
+            },
+            onCancel: () => {
+              keyPrompt.hidden = true;
+              model.value = settings.model;
+            },
+          }));
+        keyPrompt.hidden = false;
+        keyPrompt.querySelector("input")?.focus();
+        return;
+      }
+      save(() => store.api.updateSettings({ model: wanted }), syncModel);
+    });
     actions.addEventListener("change", () => save(() => store.api.updateSettings({ allow_actions: actions.checked }),
       (now) => { actions.checked = now.allow_actions === true; }));
     autoApprove.addEventListener("change", async () => {
@@ -433,12 +464,14 @@ export function mountSettings(store, view, session) {
       h("section", { class: "settings-group" },
         h("h2", { class: "page-h2" }, "Agent"),
         h("label", { class: "label" }, "Model", model),
+        keyPrompt,
         h("label", { class: "toggle" }, actions,
           h("span", null, h("span", { class: "strong" }, "Browser actions"),
             h("span", { class: "muted block" }, "Lets the agent ask before typing, clicking, or pressing a key in your desktop's browser and apps."))),
         h("label", { class: "toggle" }, autoApprove,
           h("span", null, h("span", { class: "strong" }, "Auto approve"),
             h("span", { class: "muted block" }, autoApproveDescription)))),
+      modelKeysSection(store, providers, load),
       usageLink(store),
       pushSection(store),
       sitesSection(store),
@@ -458,6 +491,53 @@ export function mountSettings(store, view, session) {
   }
 
   return { enter: load };
+}
+
+/**
+ * Settings → Model keys: each provider, where its key comes from, and a way
+ * to add, replace or remove the one saved here. A deployment's key (Ansible's)
+ * can be replaced here but not removed: it's root's file on the desktop.
+ */
+function modelKeysSection(store, providers, redraw) {
+  if (!providers.length) return null;
+  const rows = providers.map((provider) => {
+    const slot = h("div", { class: "model-key-prompt", hidden: true });
+    const change = h("button", { class: "button", type: "button" }, provider.key ? "Replace" : "Add");
+    change.addEventListener("click", () => {
+      slot.replaceChildren(modelKeyForm(store, provider, {
+        onSaved: (result) => {
+          store.notice(savedWords(provider, result));
+          redraw();
+        },
+        onCancel: () => { slot.hidden = true; },
+      }));
+      slot.hidden = false;
+      slot.querySelector("input")?.focus();
+    });
+    const remove = provider.key === "app" ? h("button", { class: "button button-quiet", type: "button" }, "Remove") : null;
+    remove?.addEventListener("click", () => busyButton(remove, async () => {
+      if (!confirm(`Remove your ${keyLabel(provider)} from this desktop? Its models stop working until you add a key again, unless the deployment has one.`)) return;
+      try {
+        await store.api.deleteModelKey(provider.id);
+        store.notice(`Removed your ${keyLabel(provider)}.`);
+      } catch (error) {
+        store.notice(error.message);
+      }
+      await store.reloadStatus();
+      redraw();
+    }));
+    return h("li", { class: "list-row-wrap" },
+      h("div", { class: "list-row" },
+        h("div", { class: "list-main" },
+          h("p", { class: "strong" }, provider.name),
+          h("p", { class: "muted" }, `${keySource(provider)} · ${(provider.models || []).map(modelName).join(", ")}`)),
+        h("div", { class: "list-actions" }, change, remove)),
+      slot);
+  });
+  return h("section", { class: "settings-group" },
+    h("h2", { class: "page-h2" }, "Model keys"),
+    h("p", { class: "muted" }, "Your agent's own API keys, one per provider. A key saved here is used from the next message on, with no redeploy, and only agentd can read it: your agent's commands never get it."),
+    h("ul", { class: "list" }, rows));
 }
 
 /** Settings → Usage: this month so far, and the way to the page. Not on a desktop from before usage. */

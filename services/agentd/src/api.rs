@@ -19,6 +19,7 @@ use tokio_stream::StreamExt;
 
 use crate::agent::{Agent, Edit, SecretError, StartError};
 use crate::clock::UserClock;
+use crate::llm;
 use crate::memory;
 use crate::schedule;
 use crate::sessions::{PostError, SessionError};
@@ -72,6 +73,11 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/api/v1/push/test", post(test_push))
         .route("/api/v1/devices", post(register_device))
         .route("/api/v1/devices/{id}", delete(unregister_device))
+        .route("/api/v1/model-keys", get(model_keys))
+        .route(
+            "/api/v1/model-keys/{provider}",
+            put(save_model_key).delete(delete_model_key),
+        )
         .route("/api/v1/secrets", get(list_secrets))
         .route("/api/v1/secrets/{name}", put(save_secret).delete(delete_secret))
         .route("/api/v1/access", get(access_list).post(allow_host))
@@ -208,8 +214,15 @@ async fn status(State(agent): App) -> Json<Value> {
         "waiting_on": agent.waiting_on(),
         "settings": agent.settings(),
         "last_seq": agent.store.last_seq().unwrap_or(0),
-        "known_models": agent.cfg.provider.models(),
-        "provider": agent.cfg.provider.name(),
+        // The models tasks can use now (older apps list these).
+        "known_models": agent.usable_models(),
+        // The chat model's provider.
+        "provider": llm::Provider::of(&agent.settings().model).unwrap_or(agent.cfg.provider).name(),
+        // Every provider, its models and where its key comes from (agentd
+        // 0.20.0); and the chat model's provider when it has no key yet, so
+        // the apps ask for one.
+        "model_providers": agent.model_providers(),
+        "needs_model_key": agent.needs_model_key().map(|p| json!({"id": p.id(), "name": p.name()})),
         "shell_tool": agent.cfg.shell_tool,
         "version": env!("CARGO_PKG_VERSION"),
         // The rules in force (policy.rs), and the side-effects queue's health.
@@ -280,6 +293,17 @@ fn post_to(agent: &Arc<Agent>, session: &str, headers: &HeaderMap, body: NewMess
             StatusCode::NOT_FOUND,
             "no such conversation (it may be archived or deleted)",
         ),
+        Err(PostError::NeedsKey(provider)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "Your agent needs your {} API key before it can work: add it in Settings, under Model",
+                    provider.name()
+                ),
+                "needs_model_key": {"id": provider.id(), "name": provider.name()},
+            })),
+        )
+            .into_response(),
         Err(PostError::Failed(err)) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{err:#}")),
     }
 }
@@ -680,12 +704,7 @@ async fn consolidation(State(agent): App) -> Response {
     if !agent.cfg.memory_v2 {
         return v2_off();
     }
-    Json(crate::consolidate::stats(
-        &agent.store,
-        &agent.cfg.consolidation_model,
-        agent.cfg.provider,
-    ))
-    .into_response()
+    Json(agent.consolidation_stats()).into_response()
 }
 
 /// Memory v2's endpoints answer this while the flag is off.
@@ -1169,6 +1188,55 @@ async fn test_push(State(agent): App, body: Option<Json<PushTest>>) -> Response 
     }
 }
 
+async fn model_keys(State(agent): App) -> Json<Value> {
+    Json(json!({"providers": agent.model_providers()}))
+}
+
+#[derive(Deserialize)]
+struct NewModelKey {
+    value: String,
+}
+
+/// Saves a provider's key from the app (pasted into a secure field), once
+/// the provider takes it: it's used from the next model call on, with no
+/// restart. `checked` false: the provider couldn't be asked, and it was saved
+/// anyway. The body is never logged.
+async fn save_model_key(
+    State(agent): App,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<NewModelKey>,
+) -> Response {
+    let Some(provider) = llm::Provider::parse(&provider) else {
+        return error(StatusCode::NOT_FOUND, "no such provider (anthropic or together)");
+    };
+    match agent
+        .save_model_key(provider, &body.value, caller(&headers))
+        .await
+    {
+        Ok(checked) => {
+            Json(json!({"checked": checked, "providers": agent.model_providers()})).into_response()
+        }
+        Err(SecretError::Invalid(problem)) => error(StatusCode::BAD_REQUEST, &problem),
+        Err(SecretError::Failed(err)) => {
+            tracing::error!(%err, provider = provider.id(), "couldn't save a model key");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "couldn't save the key")
+        }
+    }
+}
+
+/// Removes the key pasted in the app (the deployment's, if any, takes over).
+async fn delete_model_key(State(agent): App, Path(provider): Path<String>, headers: HeaderMap) -> Response {
+    let Some(provider) = llm::Provider::parse(&provider) else {
+        return error(StatusCode::NOT_FOUND, "no such provider (anthropic or together)");
+    };
+    match agent.remove_model_key(provider, caller(&headers)) {
+        Ok(true) => Json(json!({"providers": agent.model_providers()})).into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "no key for it was saved in the app"),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
+}
+
 async fn list_secrets(State(agent): App) -> Json<Value> {
     Json(json!({"secrets": agent.secret_infos()}))
 }
@@ -1288,7 +1356,8 @@ async fn put_settings(State(agent): App, headers: HeaderMap, Json(body): Json<Se
     if body.model.is_some() || body.allow_actions.is_some() {
         // Older clients include the whole settings object on unrelated edits.
         return match agent.update_settings(body.model.as_deref(), body.allow_actions) {
-            Ok(settings) => Json(json!(settings)).into_response(),
+            Ok(Ok(settings)) => Json(json!(settings)).into_response(),
+            Ok(Err(problem)) => error(StatusCode::BAD_REQUEST, &problem),
             Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
     }
@@ -1399,7 +1468,7 @@ mod tests {
         };
         let version = agent.settings().auto_approve_version;
         assert_eq!(
-            update(json!({"model": "m", "allow_actions": true, "auto_approve": false}))
+            update(json!({"model": "zai-org/GLM-5.3", "allow_actions": true, "auto_approve": false}))
                 .await
                 .status(),
             StatusCode::OK

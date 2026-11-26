@@ -70,6 +70,10 @@ async fn main() -> Result<()> {
     let cfg = config::Config::load()?;
     std::fs::create_dir_all(cfg.state_dir.join("images")).context("creating the state directory")?;
     let agent = Arc::new(agent::Agent::new(cfg.clone())?);
+    // A desktop with no key starts all the same: the apps ask for one.
+    if let Some(provider) = agent.needs_model_key() {
+        tracing::warn!(provider = provider.id(), "no model key yet: the apps ask for one");
+    }
     let app = api::router(agent.clone());
 
     if let Some(path) = cfg.listen.strip_prefix("unix:") {

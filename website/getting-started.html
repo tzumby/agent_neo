@@ -99,13 +99,13 @@
         <ul class="plain">
           <li>A VPC with private subnets. Outbound internet goes through a fck-nat instance (a t4g.nano), or AWS’s NAT gateway if you set <code>enable_nat_gateway</code>.</li>
           <li><strong>One desktop</strong> (a t3a.medium by default) in a private subnet: no public IP, no inbound rules, its own IAM role (SSM only) and its own KMS key for its disk. You administer it with SSM Session Manager; there’s no SSH.</li>
-          <li>An S3 bucket for Terraform’s state, one for Ansible’s file transfers, and two SSM parameters you create yourself: your model key and a Tailscale auth key.</li>
+          <li>An S3 bucket for Terraform’s state, one for Ansible’s file transfers, and SSM parameters you create yourself: a Tailscale auth key and, if you like, your model key (the app can take it instead).</li>
         </ul>
 
         <h3>Accounts</h3>
         <ul class="plain">
           <li>An AWS account. Step 1 walks you through a new one.</li>
-          <li>An Anthropic API key, from the <a href="https://platform.claude.com">Claude Console</a>. The agent uses Claude Opus 4.6 by default, and you can switch to Opus 5.5 in the app. API use is billed per token; a Claude Pro or Max subscription doesn’t cover it, and its sign-in is only for Claude’s own apps. Prefer <a href="https://api.together.ai">Together AI</a>? Set <code>agentd_llm_provider: together</code> in <code>ansible/inventory/group_vars/desktop.yml</code> and run <code>make model-key PROVIDER=together</code>.</li>
+          <li>An Anthropic API key, from the <a href="https://platform.claude.com">Claude Console</a>. The agent uses Claude Opus 4.6 by default, and you can switch to Opus 5.5 in the app. API use is billed per token; a Claude Pro or Max subscription doesn’t cover it, and its sign-in is only for Claude’s own apps. Prefer <a href="https://api.together.ai">Together AI</a>? Pick one of its models in the app and paste its key when asked; you can switch back and forth, with no redeploy.</li>
           <li>A <a href="https://tailscale.com">Tailscale</a> account. The free personal plan is enough.</li>
         </ul>
 
@@ -281,16 +281,13 @@ make preflight</code></pre>
             <p>The first instance launch in a new account, or in a region the account hasn’t used, can fail with <code>PendingVerification</code> while AWS checks the account. It usually clears within minutes but can take a few hours; then run <code>make plan</code> and <code>make apply</code> again.</p>
           </li>
           <li>
-            <h4>Store your two secrets</h4>
-            <p>Each command asks for a value with hidden input and stores it as a SecureString in SSM. Run them one at a time.</p>
-            <div class="code" data-copy>
-<pre><code>make model-key</code></pre>
-            </div>
-            <p>Paste your Anthropic API key. Then:</p>
+            <h4>Store your secrets</h4>
+            <p>The command asks for a value with hidden input and stores it as a SecureString in SSM.</p>
             <div class="code" data-copy>
 <pre><code>make tailscale-key</code></pre>
             </div>
             <p>Paste the auth key from <a href="#tailscale">step 2</a>.</p>
+            <p>Your Anthropic API key can go in the same way, with <code>make model-key</code>. Or skip it: the first time you open the app, the chat asks for the key, and agentd keeps it on the desktop. Either way you can replace it later in the app’s Settings, with no redeploy.</p>
           </li>
           <li>
             <h4>Set up the desktop</h4>
@@ -326,6 +323,7 @@ make preflight</code></pre>
         </div>
         <ul class="plain">
           <li>The first load can be slow while Tailscale issues the site’s certificate.</li>
+          <li>If you skipped <code>make model-key</code>, the chat asks for your Anthropic API key above the message box. Paste it once: agentd checks it with Anthropic and keeps it on the desktop.</li>
           <li>On a phone, add the page to your Home Screen to use it like an app.</li>
           <li><strong>Notifications:</strong> under Settings → Notifications, turn them on for each device you use. You’ll hear when a card needs you, when a site needs you to sign in, when a chat task that ran over a minute finishes, and when a scheduled run finds something. On iPhone or iPad, add the web app to your Home Screen first (Share → Add to Home Screen), open it from there, then turn them on; iOS only allows web notifications for Home Screen apps.</li>
         </ul>

@@ -244,7 +244,7 @@ async def main(out):
             card = "[...document.querySelectorAll('.card-needs')].find(c => c.getAttribute('aria-label') === 'Approve this plan?')"
             p.check(await p.until(f"!!{card}", 20), "a task that would ask several times: one plan card")
             words = await p.js(f"{card}.textContent")
-            p.check("form.test" in words and "rm -rf ./old-build" in words, "…naming the page it types on and the command it runs")
+            p.check("form.test" in words and "Commands that would ask" in words, "…naming the page it types on and that it runs commands")
             await p.js(f"""(() => {{ const t = {card}.querySelector('.plan-edit-text');
                 t.value = 'Open the page with the message box'; t.dispatchEvent(new Event('input')); }})()""")
             await p.js(f"{card}.scrollIntoView({{block: 'center'}})")

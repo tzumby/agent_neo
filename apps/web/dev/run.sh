@@ -9,7 +9,9 @@
 #   make web-dev      then open http://127.0.0.1:8088/
 #
 # The desktop view needs a VNC server, so it stays blank here. State is
-# thrown away when this stops; WORK=<dir> keeps it.
+# thrown away when this stops; WORK=<dir> keeps it. NO_MODEL_KEY=1 starts
+# agentd with no model key, as a new desktop may: the chat asks for one (any
+# key works here, unless it has "bad" in it).
 set -euo pipefail
 
 cd "$(dirname "$0")/../../.."
@@ -38,10 +40,12 @@ chrome=${CHROME:-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
   --no-first-run --no-default-browser-check --host-resolver-rules="MAP form.test 127.0.0.1:8091" \
   about:blank >/dev/null 2>&1 &
 pids+=($!)
+model_key=dev
+[ -z "${NO_MODEL_KEY:-}" ] || model_key=
 env -i PATH="$PATH" HOME="$work/home" LISTEN="unix:$sock" STATE_DIR="$work/state" \
   CDP_URL=http://127.0.0.1:9333 RUN_AS= WORKDIR="$work" SHELL_TOOL=on POLICY=/nonexistent SKILLS_DIR=/nonexistent \
   EGRESS_USER_HOSTS="$work/state/allowed-hosts.txt" EGRESS_BASE_HOSTS=".github.com pypi.org" \
-  MODEL=zai-org/GLM-5.3 LLM_URL=http://127.0.0.1:8091/v1/chat/completions LLM_API_KEY=dev \
+  MODEL=zai-org/GLM-5.3 LLM_URL=http://127.0.0.1:8091/v1/chat/completions LLM_API_KEY="$model_key" \
   MEMORY_V2=on DESKTOP_NAME=neo-agent RUST_LOG=agentd=info \
   REVIEW_EVERY_STEPS=6 PUSH_DEV_ENDPOINTS=on \
   services/agentd/target/debug/agentd >"$work/agentd.log" 2>&1 &

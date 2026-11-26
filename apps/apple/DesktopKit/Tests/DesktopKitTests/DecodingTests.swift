@@ -225,3 +225,42 @@ import Testing
     // A need it doesn't have isn't sent at all.
     #expect(steps[1].keys.sorted() == ["status", "step"])
 }
+
+// MARK: Model keys (agentd 0.20.0)
+
+@Test func decodesTheProvidersAndTheKeyTheDesktopNeeds() throws {
+    let json = """
+        {"desktop":"d","busy":false,"settings":{"model":"claude-opus-4-6","allow_actions":true},"last_seq":1,
+         "known_models":["zai-org/GLM-5.3"],"shell_tool":true,"version":"0.20.0","provider":"Anthropic",
+         "model_providers":[
+           {"id":"anthropic","name":"Anthropic","models":["claude-opus-4-6","claude-opus-5-5"],"helper":"claude-haiku-5-5","key":null},
+           {"id":"together","name":"Together","models":["zai-org/GLM-5.3"],"helper":"zai-org/GLM-5.3-Flash","key":"deployment"}],
+         "needs_model_key":{"id":"anthropic","name":"Anthropic"}}
+        """
+    let status = try JSONDecoder().decode(AgentStatus.self, from: Data(json.utf8))
+    #expect(status.needsModelKey == ProviderRef(id: "anthropic", name: "Anthropic"))
+    #expect(status.modelProviders?.map(\.hasKey) == [false, true])
+    #expect(status.provider(of: "claude-opus-5-5")?.id == "anthropic")
+    #expect(status.provider(of: "zai-org/GLM-5.3-Flash")?.id == "together", "a helper is its provider's too")
+    #expect(status.provider(of: "gpt-9") == nil)
+    #expect(status.needsModelKey?.keyLabel == "Anthropic API key")
+    #expect(ProviderRef(id: "together", name: "Together").keyLabel == "Together AI API key")
+    // Older desktops have neither field.
+    let old = try JSONDecoder().decode(
+        AgentStatus.self,
+        from: Data(#"{"desktop":"d","busy":false,"settings":{"model":"m","allow_actions":true},"last_seq":1,"known_models":["m"],"shell_tool":true,"version":"0.19.2"}"#.utf8))
+    #expect(old.modelProviders == nil && old.needsModelKey == nil && old.provider(of: "m") == nil)
+    let saved = try JSONDecoder().decode(
+        SavedModelKey.self,
+        from: Data(#"{"checked":false,"providers":[{"id":"anthropic","name":"Anthropic","models":[],"helper":"h","key":"app"}]}"#.utf8))
+    #expect(!saved.checked && saved.providers.first?.key == "app")
+}
+
+@Test func anErrorsWordsComeThroughWithOtherFieldsBesideThem() throws {
+    // A 409 for a message sent before the key: `needs_model_key` is an object.
+    let body = #"{"error":"Your agent needs your Anthropic API key before it can work","needs_model_key":{"id":"anthropic","name":"Anthropic"}}"#
+    let response = HTTPURLResponse(url: URL(string: "http://d")!, statusCode: 409, httpVersion: nil, headerFields: nil)!
+    #expect(throws: AgentError.http(409, "Your agent needs your Anthropic API key before it can work")) {
+        try AgentClient.check(response, Data(body.utf8))
+    }
+}

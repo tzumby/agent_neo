@@ -180,6 +180,51 @@ public struct SavedSecret: Decodable, Sendable, Equatable {
     public let busy: Bool
 }
 
+/// A model provider (Anthropic, Together), its models, and where its key
+/// comes from (agentd 0.20.0). Never the key itself.
+public struct ModelProvider: Decodable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let name: String
+    public let models: [String]
+    /// Memory tidy-up's smaller model.
+    public let helper: String
+    /// "app" (pasted in an app), "deployment" (the desktop's setup), or nil:
+    /// no key yet, so picking one of its models asks for it.
+    public let key: String?
+
+    public var hasKey: Bool { key != nil }
+    public var ref: ProviderRef { ProviderRef(id: id, name: name) }
+
+    public init(id: String, name: String, models: [String], helper: String = "", key: String? = nil) {
+        self.id = id
+        self.name = name
+        self.models = models
+        self.helper = helper
+        self.key = key
+    }
+}
+
+/// A provider by id and name: the one whose key the desktop needs.
+public struct ProviderRef: Decodable, Sendable, Equatable, Identifiable, Hashable {
+    public let id: String
+    public let name: String
+
+    public init(id: String, name: String) {
+        self.id = id
+        self.name = name
+    }
+
+    /// What its key is called: "Anthropic API key", "Together AI API key".
+    public var keyLabel: String { id == "together" ? "Together AI API key" : "\(name) API key" }
+}
+
+/// What saving a model key did. `checked` false: the provider couldn't be
+/// asked whether it takes the key (it was saved anyway).
+public struct SavedModelKey: Decodable, Sendable, Equatable {
+    public let checked: Bool
+    public let providers: [ModelProvider]
+}
+
 public struct AgentStatus: Decodable, Sendable, Equatable {
     public let desktop: String
     public let busy: Bool
@@ -198,6 +243,11 @@ public struct AgentStatus: Decodable, Sendable, Equatable {
     public let sessions: SessionCounts?
     /// The monthly budget and this month's spending (agentd 0.16.0).
     public let budget: Budget?
+    /// Every provider and its models, keyed or not (agentd 0.20.0).
+    /// `knownModels` is then only the models of those with a key.
+    public let modelProviders: [ModelProvider]?
+    /// The chat model's provider when it has no key yet: the app asks for one.
+    public let needsModelKey: ProviderRef?
 
     enum CodingKeys: String, CodingKey {
         case desktop, busy, settings, version, stage, sessions, budget
@@ -206,6 +256,13 @@ public struct AgentStatus: Decodable, Sendable, Equatable {
         case shellTool = "shell_tool"
         case stageDetail = "stage_detail"
         case memoryV2 = "memory_v2"
+        case modelProviders = "model_providers"
+        case needsModelKey = "needs_model_key"
+    }
+
+    /// The provider that lists this model (or has it as its helper).
+    public func provider(of model: String) -> ModelProvider? {
+        modelProviders?.first { $0.models.contains(model) || $0.helper == model }
     }
 }
 
@@ -606,6 +663,20 @@ public struct AgentClient: Sendable {
         let _: [String: Bool] = try await send("DELETE", "/api/v1/secrets/\(name)", body: [String: String]())
     }
 
+    /// Saves a provider's key, pasted in the app (agentd 0.20.0), once the
+    /// provider takes it: the next model call uses it, with no restart. 400
+    /// when the provider refused it. The value travels only over the tailnet,
+    /// isn't kept here, and never goes to the agent's commands.
+    public func saveModelKey(provider: String, value: String) async throws -> SavedModelKey {
+        try await send("PUT", "/api/v1/model-keys/\(provider)", body: ["value": value])
+    }
+
+    /// Removes the key pasted in an app; the deployment's, if any, takes
+    /// over. 404 when none was saved in an app.
+    public func deleteModelKey(provider: String) async throws {
+        try await perform("DELETE", "/api/v1/model-keys/\(provider)")
+    }
+
     // MARK: Plumbing
 
     func get<T: Decodable>(_ path: String) async throws -> T {
@@ -639,7 +710,9 @@ public struct AgentClient: Sendable {
     static func check(_ response: URLResponse, _ data: Data) throws {
         guard let http = response as? HTTPURLResponse else { return }
         guard (200..<300).contains(http.statusCode) else {
-            let message = (try? JSONDecoder().decode([String: String].self, from: data))?["error"]
+            // Only `error`: other fields (a 409's needs_model_key) needn't be strings.
+            struct Problem: Decodable { let error: String }
+            let message = (try? JSONDecoder().decode(Problem.self, from: data))?.error
             throw AgentError.http(http.statusCode, message ?? String(decoding: data, as: UTF8.self))
         }
     }

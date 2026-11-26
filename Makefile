@@ -61,7 +61,7 @@ lint: inventory ## Check formatting, validate Terraform, syntax-check playbooks
 
 # --- Keys (SSM, prompted, never echoed) --------------------------------------
 
-model-key: ## Store your model key in SSM: Anthropic's (Claude), or PROVIDER=together for Together AI's
+model-key: ## Optional: store a model key in SSM (Anthropic's, or PROVIDER=together); else paste it in the app
 	scripts/put-secret.py $(SSM_PREFIX)/llm/$(if $(filter together,$(PROVIDER)),together,anthropic)_api_key
 
 tailscale-key: ## Store a Tailscale auth key (tagged tag:neo-agent) in SSM
@@ -106,7 +106,7 @@ helper-test: ## Unit tests for the desktop's privileged worker and proxy helper 
 agentd-build: ## Build agentd for the desktop (static linux binary for DESKTOP_ARCH)
 	cd services/agentd && cargo zigbuild --release --target $(DESKTOP_RUST_TARGET)
 
-agentd-deploy: agentd-build inventory ## Install agentd on the desktop (needs make model-key first)
+agentd-deploy: agentd-build inventory ## Install agentd on the desktop
 	$(ANSIBLE_PLAYBOOK) playbooks/agentd.yml $(ANSIBLE_ARGS)
 
 agentd-logs: ## Show agentd's recent log

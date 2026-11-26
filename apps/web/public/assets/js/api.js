@@ -75,6 +75,9 @@ export const api = {
   schedules: async () => (await request("GET", "/api/v1/schedules")).schedules,
   deleteSchedule: (id) => request("DELETE", `/api/v1/schedules/${enc(id)}`, {}),
   pauseSchedule: (id, paused) => request("POST", `/api/v1/schedules/${enc(id)}/${paused ? "pause" : "resume"}`, {}),
+  // The model providers' keys (agentd 0.20.0): the value goes once, never back.
+  saveModelKey: (provider, value) => request("PUT", `/api/v1/model-keys/${enc(provider)}`, { value }),
+  deleteModelKey: (provider) => request("DELETE", `/api/v1/model-keys/${enc(provider)}`, {}),
   secrets: async () => (await request("GET", "/api/v1/secrets")).secrets,
   saveSecret: (name, value, label, approval) =>
     request("PUT", `/api/v1/secrets/${enc(name)}`, { value, label, ...(approval ? { approval } : {}) }),

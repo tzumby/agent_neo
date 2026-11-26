@@ -25,8 +25,9 @@ In your AWS account, in one region:
   no inbound rules, its own IAM role (SSM only) and its own KMS key for its
   disk. You administer it with SSM Session Manager only; there's no SSH.
 - An S3 bucket for Terraform's state, one for Ansible's file transfers, and
-  two SSM parameters you create yourself: your model key (Anthropic's, or
-  Together AI's) and a Tailscale auth key.
+  SSM parameters you create yourself: a Tailscale auth key and, optionally,
+  your model key (Anthropic's, or Together AI's). Without one, the app asks
+  for the model key the first time you open it.
 
 On the desktop:
 
@@ -208,7 +209,7 @@ make bootstrap       # once: the S3 bucket for Terraform's state
 make init
 make plan            # review what it will create
 make apply           # VPC, NAT, the desktop (a few minutes)
-make model-key       # paste your Anthropic API key (hidden input; stored in SSM; PROVIDER=together for Together's)
+make model-key       # optional: your Anthropic API key into SSM (hidden input; PROVIDER=together for Together's), or paste it in the app later
 make tailscale-key   # paste the auth key from above
 make deploy          # the desktop, agentd, then tailnet-proxy (first run: 15-20 minutes)
 ```
@@ -461,7 +462,11 @@ make desktop            # OS hardening, the display stack, Chrome
 make app-mac app-device # the apps, if you use them
 ```
 
-To rotate the model key, run `make model-key` and then `make agentd-deploy`.
+To change or rotate a model key, paste the new one in the app (Settings →
+Model keys): agentd checks it with the provider and uses it from the next
+message, with no deploy. Picking a model from another provider asks for that
+provider's key the same way. A key stored with `make model-key` reaches the
+desktop at the next `make agentd-deploy`; one pasted in the app wins over it.
 
 ## Desktop backups
 
@@ -501,9 +506,12 @@ contain data deleted from the desktop. [EBS snapshot encryption](https://docs.aw
   tailnet-proxy dials out to Tailscale and SSM's agent dials out to AWS. Only
   devices on your tailnet reach the web app, and with `make tailscale-allow`,
   only the logins you list.
-- **The model key** is a SecureString in SSM. Ansible reads it on your machine
-  and writes it to `/etc/agentd/secrets.env` (root:agentd, 0640), so on the
-  desktop only agentd can read it. The desktop's own IAM role is denied the
+- **The model keys.** One pasted in the app goes over your tailnet to agentd,
+  which keeps it in its own state directory (`/var/lib/agentd/model-keys`,
+  0600); one stored with `make model-key` is a SecureString in SSM that
+  Ansible reads on your machine and writes to `/etc/agentd/secrets.env`
+  (root:agentd, 0640). Either way, on the desktop only agentd can read it, and
+  no command the agent runs is ever given it. The desktop's own IAM role is denied the
   project's SSM parameters. Prompts go straight from agentd to the model provider (Anthropic or Together AI);
   there is no gateway in between. So anyone with root on the desktop can read
   the key, and that's you, over SSM. Your Apple APNs key, if you set up

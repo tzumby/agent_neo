@@ -428,3 +428,53 @@ private final class SentBodies: @unchecked Sendable {
     #expect(await store.answer(shell, approved: true, text: "", client: stub.client) == nil)
     #expect(store.notice?.contains("the command is empty") == true)
 }
+
+// MARK: Model keys (agentd 0.20.0)
+
+private let needsAnthropic = """
+    {"desktop":"d","busy":false,"settings":{"model":"claude-opus-4-6","allow_actions":true},"last_seq":1,
+     "known_models":[],"shell_tool":true,"version":"0.20.0",
+     "model_providers":[{"id":"anthropic","name":"Anthropic","models":["claude-opus-4-6"],"helper":"h","key":null}],
+     "needs_model_key":{"id":"anthropic","name":"Anthropic"}}
+    """
+
+@MainActor
+@Test func aMessageSentBeforeTheModelKeyWaitsInTheComposer() async throws {
+    let stub = StubAgentd()
+    stub.on(
+        "POST /api/v1/sessions/s2/messages", status: 409,
+        #"{"error":"Your agent needs your Anthropic API key before it can work: add it in Settings, under Model","needs_model_key":{"id":"anthropic","name":"Anthropic"}}"#
+    )
+    stub.on("GET /api/v1/status", needsAnthropic)
+    let store = ChatStore()
+    store.apply(SessionList(sessions: [AgentSession(id: "main", title: "First"), AgentSession(id: "s2", title: "Trip")]))
+    let chat = store.conversation("s2")
+
+    await store.send("Book the hotel", to: "s2", client: stub.client)
+    #expect(chat.draft == "Book the hotel", "back in the composer, to send once the key is in")
+    #expect(store.notice?.hasPrefix("Your agent needs your Anthropic API key") == true)
+    #expect(store.status?.needsModelKey?.id == "anthropic")
+}
+
+@MainActor
+@Test func aModelKeyIsSavedOrRefusedInAgentdsWords() async throws {
+    let stub = StubAgentd()
+    let anthropic = ProviderRef(id: "anthropic", name: "Anthropic")
+    stub.on("GET /api/v1/status", needsAnthropic)
+    stub.on(
+        "PUT /api/v1/model-keys/anthropic", status: 400,
+        #"{"error":"Anthropic didn't accept that key (401): check it and paste it again"}"#)
+    let store = ChatStore()
+    #expect(
+        await store.saveModelKey("sk-ant-wrong-key", for: anthropic, client: stub.client)
+            == "Anthropic didn't accept that key (401): check it and paste it again")
+    #expect(store.status?.needsModelKey == anthropic)
+
+    // Saved, though Anthropic couldn't be asked: said so.
+    stub.on("PUT /api/v1/model-keys/anthropic", #"{"checked":false,"providers":[]}"#)
+    #expect(await store.saveModelKey("sk-ant-good-key", for: anthropic, client: stub.client) == nil)
+    #expect(store.notice?.contains("couldn't be asked") == true)
+    stub.on("DELETE /api/v1/model-keys/anthropic", #"{"providers":[]}"#)
+    #expect(await store.removeModelKey(for: anthropic, client: stub.client) == nil)
+    #expect(stub.count("GET /api/v1/status") == 3, "the status is read again after each")
+}

@@ -50,6 +50,8 @@ pub fn title_from(text: &str) -> String {
 pub enum PostError {
     /// No such conversation, or it's archived or deleted.
     NotFound,
+    /// The chat model's provider has no key yet: the app asks for it.
+    NeedsKey(crate::llm::Provider),
     Failed(anyhow::Error),
 }
 
@@ -133,6 +135,9 @@ impl Agent {
         // leaves a card waiting, so neither the limit nor the budget holds
         // it back. It still waits behind a running task or queued messages.
         let memory_command = self.is_memory_command(&text, by.as_deref());
+        if !memory_command && let Some(provider) = self.needs_model_key() {
+            return Err(PostError::NeedsKey(provider));
+        }
         let paused = self.budget_paused();
         let now = unix_now();
         let mut lanes = self.lanes.lock().unwrap();
@@ -948,7 +953,7 @@ mod tests {
         agent.say_in(&c1, "A note.");
         assert!(events(&agent, "access.allowed")[0].get("session").is_none());
         assert_eq!(events(&agent, "settings").len(), 0);
-        agent.update_settings(None, Some(true)).unwrap();
+        agent.update_settings(None, Some(true)).unwrap().unwrap();
         assert!(events(&agent, "settings")[0].get("session").is_none());
         // The column follows: a conversation's page has its events and the
         // global ones, not another conversation's.

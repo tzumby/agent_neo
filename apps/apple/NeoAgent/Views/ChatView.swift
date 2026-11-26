@@ -121,6 +121,7 @@ struct ChatView: View {
             .animation(.snappy, value: store.status?.stage)
             .animation(.snappy, value: store.status?.budget?.paused)
             .bar(.bottom) { bottomBar }
+            .animation(.snappy, value: store.status?.needsModelKey)
             .background(Color.black)
             .inlineTitle()
             .toolbar { toolbar }
@@ -152,7 +153,12 @@ struct ChatView: View {
                     Task { await store.setArchived(false, conversation.id, client: client) }
                 }
             } else {
-                if empty {
+                if let needed = store.status?.needsModelKey {
+                    // No key for the chat model's provider: asked for here,
+                    // so a new desktop's first message can go.
+                    ModelKeyBanner(provider: needed, store: store, client: client)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                } else if empty {
                     Suggestions { send($0) }
                 }
                 Composer(

@@ -33,7 +33,7 @@ The pieces:
 - **tailnet-proxy** (Go, Tailscale's tsnet): a userspace Tailscale node inside one process, at `https://neo-agent.<your tailnet>.ts.net`. It serves the web app, agentd's API and the noVNC viewer, and port 5900 for the apps' take-over view.
 - **The web app** (`apps/web`, static files, no build step): the chat, approval cards, the desktop (take over), schedules, keys and tokens, and settings.
 - **The iPhone and Mac apps** (`apps/apple`, SwiftUI, optional): the same chat against the same API, a native take-over view over port 5900, a Memory screen, and APNs notifications. Each is a Tailscale node of its own (TailscaleKit), signed in as you (§7.4).
-- **The model provider**, one per desktop (`LLM_PROVIDER`, Ansible's `agentd_llm_provider`): Anthropic's API for Claude, where the default model is `claude-opus-4-6` and `claude-opus-5-5` is the other pick (§6.7), or Together AI (serverless), where the default is `zai-org/GLM-5.3`, which is text-only. A Claude Pro or Max subscription can't stand in for an API key: its sign-in is for Claude's own apps only, under Anthropic's terms. The agent reads pages through the accessibility tree and text, not screenshots. A model checked to see images (`moonshotai/Kimi-K3`) also gets the desktop's screenshots for native apps ([desktop-apps.md](desktop-apps.md) §5). Whether Together keeps prompts is your Together account's setting (zero data retention); agentd doesn't enforce it.
+- **The model providers**: Anthropic's API for Claude (`claude-opus-4-6`, the default, and `claude-opus-5-5`, §6.7) and Together AI (serverless; `zai-org/GLM-5.3`, which is text-only, and others). A desktop uses whichever has a key: you paste a key in the app (Settings, or the chat asks when the model has none), and agentd keeps it on the desktop and uses it from the next message on, with no deploy. Picking a model picks its provider. A key in SSM (`make model-key`) is optional, and Ansible's `agentd_llm_provider` only sets the default. A Claude Pro or Max subscription can't stand in for an API key: its sign-in is for Claude's own apps only, under Anthropic's terms. The agent reads pages through the accessibility tree and text, not screenshots. A model checked to see images (`moonshotai/Kimi-K3`) also gets the desktop's screenshots for native apps ([desktop-apps.md](desktop-apps.md) §5). Whether Together keeps prompts is your Together account's setting (zero data retention); agentd doesn't enforce it.
 
 ```
  Browser on a laptop  ┌──────────────────────── your tailnet (WireGuard, end to end) ─────────────────────────┐
@@ -86,7 +86,7 @@ The rules the code keeps to:
    - Ansible reads them on your machine with `no_log` and writes them to the desktop.
    - The desktop's own IAM role is denied the project's SSM parameters.
    - Logs carry metadata only.
-6. **The model key is on the desktop.** It's in `/etc/agentd/secrets.env` (root:agentd 0640), so agentd and root can read it; the shell user and the browser can't. agentd calls the provider directly, with no gateway in between. Anyone with root on the desktop can read the key, and that's you, over SSM.
+6. **The model keys are on the desktop.** One pasted in the app is in `/var/lib/agentd/model-keys/<provider>` (agentd 0600, in agentd's 0700 state directory); one from SSM is in `/etc/agentd/secrets.env` (root:agentd 0640). agentd and root can read them; the shell user and the browser can't, and no command is ever given one (they're apart from the keys commands use, §6.15). agentd calls the provider directly, with no gateway in between. Anyone with root on the desktop can read the keys, and that's you, over SSM.
 7. **The owner reviews actions that need additional authority.** Browser input, saved credentials, new proxy sites, and direct network access require explicit approval. The owner handles system administration through SSM. Auto approve applies to eligible worker commands and scheduled-task setup (§6.11).
 8. **Untrusted content is data, not instructions.** It's labelled, it taints the task, and the privilege split limits what an injected instruction could do (§6.12).
 9. **No dependency on a single model vendor.** agentd speaks one OpenAI-style chat format inside. Together (or another OpenAI-compatible endpoint, with `LLM_URL`) takes it as it is; for Claude, `claude.rs` translates each request to Anthropic's Messages API and each reply back.
@@ -189,8 +189,8 @@ Terraform creates no parameters. You create these with `scripts/put-secret.py` (
 
 | Parameter | Written by | Read by |
 |---|---|---|
-| `/neo-agent/<env>/llm/anthropic_api_key` | `make model-key` | Ansible on your machine → `/etc/agentd/secrets.env`, when `agentd_llm_provider` is `anthropic` |
-| `/neo-agent/<env>/llm/together_api_key` | `make model-key PROVIDER=together` | The same, when it's `together`; `make agentd-evals` when `TOGETHER_API_KEY` isn't set |
+| `/neo-agent/<env>/llm/anthropic_api_key` | `make model-key` (optional: the app can take the key instead) | Ansible on your machine → `/etc/agentd/secrets.env` (`ANTHROPIC_API_KEY`), when it's there |
+| `/neo-agent/<env>/llm/together_api_key` | `make model-key PROVIDER=together` (optional) | The same (`TOGETHER_API_KEY`); `make agentd-evals` when `TOGETHER_API_KEY` isn't set |
 | `/neo-agent/<env>/tailscale/auth_key` | `make tailscale-key` | Ansible → `/etc/tailnet-proxy.env` |
 | `/neo-agent/<env>/tailscale/allowed_logins` | `make tailscale-allow` (optional) | Ansible → tailnet-proxy's `-allow`. Missing or empty: no login allowlist |
 | `/neo-agent/<env>/apns` | `make apns-key` (optional; `scripts/put-apns-key.py`) | Ansible → `/etc/agentd/secrets.env` (`APNS_AUTH_KEY` base64, `APNS_KEY_ID`, `APNS_TEAM_ID`). One JSON blob. Missing: the apps' notifications are off |
@@ -317,7 +317,8 @@ The desktop is one EC2 instance running Ubuntu 26.04 (x86_64 by default, `deskto
 | `/usr/local/bin/agentd` | root 0755 | The binary |
 | `/etc/agentd/` | root:agentd 0750 | Configuration directory |
 | `/etc/agentd/agentd.env` | root:agentd 0640 | `LISTEN`, `MODEL`, `CDP_URL`, `STATE_DIR`, `WORKDIR`, `RUN_AS=worker`, `POLICY`, `REVIEW_EVERY_SECS`, `REVIEW_EVERY_STEPS`, `SHELL_TOOL`, `MEMORY_V2`, `DESKTOP_NAME`, `SHELL_PROXY=http://127.0.0.1:3128`, `EGRESS_USER_HOSTS`, `EGRESS_BASE_HOSTS` |
-| `/etc/agentd/secrets.env` | root:agentd 0640 | `ANTHROPIC_API_KEY` or `TOGETHER_API_KEY`, read from SSM `<prefix>/llm/<provider>_api_key` on your machine at each deploy (`no_log`; the play stops with what to run if it's missing). agentd reads it; the shell user can't |
+| `/etc/agentd/secrets.env` | root:agentd 0640 | `ANTHROPIC_API_KEY` and `TOGETHER_API_KEY`, those stored in SSM (`<prefix>/llm/<provider>_api_key`), read on your machine at each deploy (`no_log`). Neither is required: a desktop with no key starts and the apps ask for one. agentd reads it; the shell user can't |
+| `/var/lib/agentd/model-keys/<provider>` | agentd 0600 (directory 0700) | Model keys pasted in the app (`PUT /api/v1/model-keys/{provider}`): they win over `secrets.env`'s. Never given to a command |
 | `/etc/agentd/policy.toml` | root:agentd 0640 | Only when `agentd_dangerous` overrides the built-in approval rules |
 | `/etc/agentd/skills/*.md` | root:agentd 0640 | Skills |
 | `/usr/local/libexec/neo-agent-privileged` | root 0755 | Fixed worker launch and stop operations, Squid policy reconciliation, and (with app installs on) `install-snap`. The launcher sets the worker identity, sandbox configuration, and shell limits from Ansible |
@@ -405,7 +406,7 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 
 ## 6. agentd: the agent on the desktop
 
-`services/agentd` is a single static Rust binary (edition 2024, tokio, axum 0.8, rusqlite with bundled SQLite, reqwest with rustls, regex, croner and jiff). It's built with `cargo zigbuild` for `x86_64-unknown-linux-musl` (or aarch64), with Rust 1.93.1 from `rust-toolchain.toml`. It runs the model loop, owns the browser and the shell launcher, keeps all of the agent's state, and serves the API the web app uses. Version 0.19.2: "Allow for this task" on any card a grant can cover; 0.19.1 let a plan cover commands and the saved keys they use. 0.19.0 brought Claude through Anthropic's API as the model provider, Opus 4.6 by default and Opus 5.5 a pick (§6.7); 0.18.0 brought plan approval, one card for the steps of a task that would otherwise ask again and again (§6.11); 0.17.0 brought native apps through the desktop broker and HCU, when the deployment has them ([desktop-apps.md](desktop-apps.md)); 0.16.0 brought several conversations, queued messages, and usage with a monthly budget ([conversations-and-usage.md](conversations-and-usage.md)).
+`services/agentd` is a single static Rust binary (edition 2024, tokio, axum 0.8, rusqlite with bundled SQLite, reqwest with rustls, regex, croner and jiff). It's built with `cargo zigbuild` for `x86_64-unknown-linux-musl` (or aarch64), with Rust 1.93.1 from `rust-toolchain.toml`. It runs the model loop, owns the browser and the shell launcher, keeps all of the agent's state, and serves the API the web app uses. Version 0.20.0: model keys pasted in the app, a key per provider, so switching providers is picking a model, with no deploy (§6.7). 0.19.2: "Allow for this task" on any card a grant can cover; 0.19.1 let a plan cover commands and the saved keys they use. 0.19.0 brought Claude through Anthropic's API as the model provider, Opus 4.6 by default and Opus 5.5 a pick (§6.7); 0.18.0 brought plan approval, one card for the steps of a task that would otherwise ask again and again (§6.11); 0.17.0 brought native apps through the desktop broker and HCU, when the deployment has them ([desktop-apps.md](desktop-apps.md)); 0.16.0 brought several conversations, queued messages, and usage with a monthly budget ([conversations-and-usage.md](conversations-and-usage.md)).
 
 ### 6.1 Process, configuration and startup
 
@@ -416,9 +417,9 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 | Key | Default | Meaning |
 |---|---|---|
 | `LISTEN` | `unix:/run/agentd/agentd.sock` | Unix socket on the desktop; `127.0.0.1:8765` in local development |
-| `LLM_PROVIDER` | `anthropic` if `ANTHROPIC_API_KEY` is set, else `together` | Where the models come from: `anthropic` (Claude) or `together` |
-| `ANTHROPIC_API_KEY` | (none) | The model key on Anthropic, from `secrets.env` on the desktop |
-| `TOGETHER_API_KEY` | (none) | The model key on Together. The provider's key (or `LLM_API_KEY`) is required: without one agentd doesn't start. Held as `secrecy::SecretString`, never printed |
+| `LLM_PROVIDER` | `MODEL`'s provider, else the one with a key (`ANTHROPIC_API_KEY`, then `TOGETHER_API_KEY`), else `together` when only `LLM_API_KEY` is set, else `anthropic` | The default provider: its first model is the default, and `LLM_URL` is its endpoint. Tasks go to their model's provider |
+| `ANTHROPIC_API_KEY` | (none) | The deployment's key on Anthropic, from `secrets.env` on the desktop. Optional: one pasted in the app wins, and with none the apps ask |
+| `TOGETHER_API_KEY` | (none) | The deployment's key on Together, likewise. Held as `secrecy::SecretString`, never printed |
 | `LLM_API_KEY` | (none) | Wins over the provider's own: the key for `LLM_URL` |
 | `LLM_URL` | Anthropic's `https://api.anthropic.com/v1/messages`, or `https://api.together.ai/v1/chat/completions` | Another endpoint, such as Bedrock's (OpenAI-compatible) for the evals or `fake_llm.py` for `make web-dev` |
 | `MODEL` | `claude-opus-4-6` on Anthropic, `zai-org/GLM-5.3` on Together | Default model (the apps pick among the provider's) |
@@ -466,7 +467,7 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 | `sessions.rs` | Conversations: messages started or queued, the queue (`pump`), Stop, titles, create, rename, archive, delete, and their state for the apps (§6.6) |
 | `usage.rs` | Usage figures in the user's time zone, the monthly budget and its alerts (§6.22) |
 | `tools.rs` | The system prompt and the tool schemas the model sees |
-| `llm.rs` | The model client: the provider (`LLM_PROVIDER`) and its models, Together's chat completions (or `LLM_URL`), prices, reasoning handling, usage and cost, retries, `truncate` |
+| `llm.rs` | The model client: the providers and their models, each request to its model's provider (Together's chat completions or `LLM_URL`, Anthropic's through `claude.rs`), the keys (`ModelKeys`: the app's in `model-keys/`, else the deployment's) and checking one before it's saved, prices, reasoning handling, usage and cost, retries, `truncate` |
 | `claude.rs` | Claude through Anthropic's Messages API: each request translated from the OpenAI-style format and each reply back, thinking blocks kept verbatim, Opus 5.5's fallbacks and thinking binding (§6.7) |
 | `browser.rs`, `cdp.rs` | Browser tools over the Chrome DevTools Protocol (§6.9) |
 | `desktop/` | Native apps: the broker's protocol and HCU's text (`mod.rs`), steps and pixel actions (`steps.rs`), the MCP client (`hcu.rs`), the broker itself (`broker.rs`, `agentd desktop-broker`), agentd's client (`client.rs`) ([desktop-apps.md](desktop-apps.md)) |
@@ -536,7 +537,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 
 | Method | Path | What it does |
 |---|---|---|
-| GET | `/api/v1/status` | Desktop name, `busy` (`main` is working: what an older app shows), `sessions {working, waiting, queued, running_limit}` (conversations working and waiting on a card, messages queued, `MAX_PARALLEL_TASKS`), `budget {monthly_usd, spent, fraction, paused, month}` (§6.22; `monthly_usd` and `fraction` null without a budget), `background {running: {task, schedule} or null, queued}` (scheduled runs, 0.15.10), `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models`, `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2`, `memory {active}`, `stage` and `stage_detail` (below the table) |
+| GET | `/api/v1/status` | Desktop name, `busy` (`main` is working: what an older app shows), `sessions {working, waiting, queued, running_limit}` (conversations working and waiting on a card, messages queued, `MAX_PARALLEL_TASKS`), `budget {monthly_usd, spent, fraction, paused, month}` (§6.22; `monthly_usd` and `fraction` null without a budget), `background {running: {task, schedule} or null, queued}` (scheduled runs, 0.15.10), `waiting_on` (a parked approval's id), settings, `last_seq`, `known_models` (the models of the providers with a key), `provider` (the chat model's), `model_providers [{id, name, models, helper, key}]` (0.20.0; `key` is `app`, `deployment` or null, never a value), `needs_model_key` (`{id, name}` of the chat model's provider when it has no key, else null), `shell_tool`, version, `policy_version` (§6.11), `effects {pending, failing: [{kind, key, attempts, last_error}]}` (§6.19), `memory_v2`, `memory {active}`, `stage` and `stage_detail` (below the table) |
 | GET | `/api/v1/messages?limit=` | `main`'s history (default 50, at most 500), with saved keys redacted |
 | POST | `/api/v1/messages` | `{text, timezone, utc_offset}` for `main`, as `POST /sessions/main/messages`: 202 `{task}`, or 202 `{queued: {id, position}}`. Never 409 since 0.16.0. The time zone is remembered for later tasks and schedules |
 | GET | `/api/v1/sessions?archived=` | The conversations (`archived=1`: the archived ones instead; deleted ones never), most recently updated first: `{sessions: [Session], running_limit}`. A `Session` is `{id, title, created, updated, archived, state, needs_you, queued: [{id, text, by, created}], last: {role, text, ts} or null}`: `state` is `working` › `waiting` (parked on a card) › `paused` (messages queued, budget used up) › `queued` › `idle`; `needs_you` is `secret` or `approval` for a waiting card, `action` when its latest task ended on Action needed with the card open, or null; `last` is its newest history entry, the first 160 characters, redacted |
@@ -552,7 +553,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | POST | `/api/v1/actions/{id}` | `{choice: done or skip}` on an Action needed card: a message in the card's conversation, "I've done what you asked… continue" or "I'm skipping that step…", which starts or queues. The card is claimed first: a second answer is a 404. An archived conversation comes back (`session.updated`). 202 `{task}` or `{queued}` |
 | POST | `/api/v1/stop` | `main`'s Stop: `{stopping, stopped, dropped}`, as for a conversation |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
-| GET, PUT | `/api/v1/settings` | Returns model, browser, Auto approve, memory consolidation and `monthly_budget_usd` settings. PUT accepts individual fields for ordinary settings; `monthly_budget_usd` takes a positive number up to 100,000 (400 otherwise) or null to remove it, emits `settings` and lets queued messages go if the budget allows now. Older clients may also disable Auto approve here. `model` is stored as given (§11) |
+| GET, PUT | `/api/v1/settings` | Returns model, browser, Auto approve, memory consolidation and `monthly_budget_usd` settings. PUT accepts individual fields for ordinary settings; a `model` must be a listed one whose provider has a key (400 otherwise, saying which key to add; the same model as now passes, for older apps' whole object); `monthly_budget_usd` takes a positive number up to 100,000 (400 otherwise) or null to remove it, emits `settings` and lets queued messages go if the budget allows now. Older clients may also disable Auto approve here |
 | PUT | `/api/v1/settings/auto-approve` | `{enabled, expected_version?}`. Enabling requires the current `auto_approve_version` from settings or returns 409. Disabling always succeeds if the store is writable and invalidates earlier confirmations |
 | GET | `/api/v1/memory?status=&kind=&q=&limit=` | Up to 500 memories. Memory v2: active ones by default, filtered by status and kind (comma lists) and by full text (`q`, most relevant first), with every v2 field; v1's fields stay, so older clients still read it |
 | POST | `/api/v1/memory/consolidate` | Memory v2: consolidate now (`{ok, tasks, mode}`); it still waits for a running task |
@@ -572,6 +573,9 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/secrets` | Saved keys: name, label, created, updated, last used. **Never values** |
 | PUT | `/api/v1/secrets/{name}` | `{value, label?, approval?}`. Saves or replaces a key. With `approval`, resumes the task whose request card asked for exactly this key. Returns `{secret, resumed, busy}`. The body is never logged |
 | DELETE | `/api/v1/secrets/{name}` | Delete a key |
+| GET | `/api/v1/model-keys` | `{providers}`: as `/status`'s `model_providers`. **Never values** |
+| PUT | `/api/v1/model-keys/{provider}` | `{value}`. agentd asks the provider first (its list of models, a free request): a key it refuses is 400 and isn't saved; one it can't be asked about is saved (`checked: false`). Then it's used from the next model call, with no restart. Returns `{checked, providers}`; emits `model_key.saved` and `settings`. The body is never logged |
+| DELETE | `/api/v1/model-keys/{provider}` | Removes the key pasted in the app (the deployment's, if any, takes over); 404 when there's none. Emits `model_key.removed` and `settings` |
 | GET | `/api/v1/access` | `{enabled, base, allowed: [{host, added, by, task, why}]}`: whether you can add sites on this desktop (`EGRESS_USER_HOSTS` set), the deployment's list as Squid has it, and yours (§6.20) |
 | POST | `/api/v1/access` | `{host}`: a person allows a site from Settings. 400 for a host that isn't an exact public name; 409 if it's allowed already, if there are 100, or if the deployment sets the list |
 | DELETE | `/api/v1/access/{host}` | The shell can no longer reach it; 404 if it wasn't on the list |
@@ -605,7 +609,7 @@ Every change the web app shows is an event: appended to `events` and broadcast o
 - **Replay:** the web app keeps the last `seq` it applied and reconnects with `?after=`, so after a disconnect it catches up exactly.
 - **Pages:** the web app loads the chat newest page first (`/events/page`) and older pages as you scroll up. Replaying the later part of the log gives the chat of that part, so pages can go in front of what's loaded. Replaying from 0 still rebuilds the whole chat.
 - **Redaction:** before an event is stored, `emit()` replaces any saved key's value in it (§6.15). The SSE handler redacts again as it streams, which covers events logged before a key was saved.
-- **Conversations (0.16.0):** every event about a conversation carries `"session": "<id>"`. `emit()` adds it from the event's `task` (a task → conversation map while it runs, else the run's row), and the callers name it for events without a task (`task.stopping`, `action.resolved`, a note outside a task, `message.queued` and `message.unqueued`). It goes into the `events.session` column too. **Global** kinds never carry one, even when they name a task: `settings`, `auto_approve.changed`, `secret.*`, `access.*`, `budget.alert` and `session.*`; nor do schedule changes from the API and memory changes from the apps, which have no task. The apps apply global events to every conversation. Events from before 0.16.0 were tagged `main` by the migration (§6.3), and the stream and pages put the column's value into an event's data as `session` when it isn't there.
+- **Conversations (0.16.0):** every event about a conversation carries `"session": "<id>"`. `emit()` adds it from the event's `task` (a task → conversation map while it runs, else the run's row), and the callers name it for events without a task (`task.stopping`, `action.resolved`, a note outside a task, `message.queued` and `message.unqueued`). It goes into the `events.session` column too. **Global** kinds never carry one, even when they name a task: `settings`, `auto_approve.changed`, `model_key.*`, `secret.*`, `access.*`, `budget.alert` and `session.*`; nor do schedule changes from the API and memory changes from the apps, which have no task. The apps apply global events to every conversation. Events from before 0.16.0 were tagged `main` by the migration (§6.3), and the stream and pages put the column's value into an event's data as `session` when it isn't there.
 
 | Kind | Data | Emitted when |
 |---|---|---|
@@ -637,6 +641,7 @@ Every change the web app shows is an event: appended to `events` and broadcast o
 | `secret.saved` / `secret.deleted` | `name`, `label`, `by` | Key changes (never values) |
 | `settings` | `{model, allow_actions, auto_approve, …}` | Settings changed |
 | `auto_approve.changed` | `{on, by}` | A person turned Auto approve on or off (§6.11) |
+| `model_key.saved`, `model_key.removed` | `{provider, checked?, by}` | A model key pasted in the app, or removed (§6.7). Never the value |
 | `approval.auto` | `{task, card}` | Auto approve let an action through with no card: what the card would have shown (§6.11) |
 | `approval.plan` | `{task, approval, by, card}` | The approved plan covered an action, so it had no card: what the card would have shown (no picture or binding), the plan card's id and who approved it (§6.11) |
 | `session.created` / `session.updated` | The `Session` (§6.4) | A conversation was created; renamed, archived or brought back, or titled from its first message |
@@ -763,7 +768,8 @@ On Together (serverless; GLM and Kimi checked 2026-10-30, DeepSeek 2026-11-02):
 | `deepseek-ai/DeepSeek-V4-Pro-0813` | 1.32 | 0.13 | 3.96 | Pinned snapshot; `reasoning_content` dropped |
 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | 0.30 | 0.006 | 1.20 | Pinned snapshot; `reasoning_content` dropped |
 
-- **The provider's models** are what `/status` lists (`known_models`, with `provider`) for the apps' model menu, what the policy version hashes (§6.11), and, with the provider's helper, what tidy-up's model must be one of. A model picked under another provider gives way to the default. `llm.rs` also prices `zai.glm-4.7-flash` (Bedrock) for the evals; it isn't a known model.
+- **Keys and switching (0.20.0).** Each provider has its key: one pasted in the app (`ModelKeys`, `/var/lib/agentd/model-keys/<provider>`), else the deployment's (`secrets.env`). A request goes to its model's provider, so switching providers is picking a model: the next task uses it, with no deploy or restart (a running task keeps its model). A model can be picked only when its provider has a key, and the apps ask for the key first. When the chat model's provider has none (a new desktop, or one removed), `/status` says so (`needs_model_key`), the chat asks for the key above the message box, and a message is refused with 409 until it's there. A key is checked with the provider before it's saved; a refused key in use later fails the task with "replace it in Settings". Earlier turns go into a task as text, so a conversation can change provider between messages.
+- **The models** are what `/status` lists for the apps (`model_providers`; `known_models` has those with a key, for older apps), and, with each provider's helper, what tidy-up's model must be one of (with a key; else the chat model's provider's helper). The policy version hashes the deployment provider's models (§6.11), so keys coming and going don't change it. `llm.rs` also prices `zai.glm-4.7-flash` (Bedrock) for the evals; it isn't a known model.
 - **Adding a model** takes two places: `prices` in `llm.rs`, and `KNOWN_MODELS` there or `MODELS` in `claude.rs`.
 - **Checked:** both DeepSeek models passed two memory evals on 2026-11-02: a remembered fact recalled in a later task, and a scheduled check reporting a result. V4.1 Flash cost $0.004 for both, V4 Pro $0.018. Together has no non-Flash V4.1; V4 Pro is DeepSeek's larger model there.
 
@@ -997,7 +1003,7 @@ Web pages, emails and command output can carry injected instructions. The defenc
    - the shell user can't reach the browser, agentd's state, the model key, the socket, the metadata service or other tailnet devices;
    - the browser can't open internal addresses.
 5. **Egress allowlist** for the shell (§5.6).
-6. **No secrets in the model's context:** the model key is in agentd's configuration, never in a prompt, and saved keys are redacted.
+6. **No secrets in the model's context:** the model keys are in agentd's configuration and state, never in a prompt, and saved keys are redacted.
 
 ### 6.13 Memory
 
@@ -1316,7 +1322,8 @@ Static HTML, CSS and ES modules in `apps/web/public`, with no build step and no 
 - **Schedules:** each with its name, description, next and last run and instructions, with Pause or Resume and Cancel schedule. No way to add one there: schedules come from the chat.
 - **Keys and tokens:** the saved keys (never their values), add (with suggestions such as GitHub token and Together AI API key), replace and delete. Names are checked as agentd checks them.
 - **Settings:**
-  - Agent: Model (`known_models`), Browser actions, Auto approve (asks for confirmation first);
+  - Agent: Model (every provider's models, grouped; a keyless provider's ask for its key first), Browser actions, Auto approve (asks for confirmation first);
+  - Model keys: each provider, where its key comes from (saved in the app, from the deployment, none), Add or Replace (a secure field; checked with the provider), and Remove for one saved in the app;
   - Notifications: turn them on for this device (permission, then `pushManager.subscribe` with the desktop's VAPID key, from the click, as iOS requires), Send a test, Turn off, and the other devices with Remove. On iPhone and iPad it says to add the app to the Home Screen first: iOS only allows Web Push for Home Screen web apps. `sw.js` (at `/assets/`, its scope) shows each push as a notification (always: browsers penalize silent pushes) and opens or focuses the app on a click; `manifest.json` and the icons make it installable;
   - Sites your agent can reach (§6.20);
   - Appearance: the theme, kept in this browser only;
@@ -1462,7 +1469,7 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 | Screenshots | `/var/lib/agentd/images` | agentd; root; the web app (over the tailnet) |
 | Logged-in sessions (cookies) | `/home/agent/chrome-profile` | `agent` (Chrome); agentd through CDP; root |
 | The agent's files | `/home/worker` | `worker`; root |
-| The model key | SSM SecureString; `/etc/agentd/secrets.env` (root:agentd 0640) | You, with your AWS credentials; agentd; root. Not `worker`, `agent` or the instance role |
+| The model keys | Pasted in the app: `/var/lib/agentd/model-keys/` (agentd 0600). From SSM: SSM SecureString; `/etc/agentd/secrets.env` (root:agentd 0640) | You, in the app (write only) or with your AWS credentials; agentd; root. Not `worker`, `agent`, the model or the instance role |
 | The Tailscale auth key | SSM SecureString; `/etc/tailnet-proxy.env` (root 0600) | You; root |
 | Prompts and answers in transit | TLS from agentd to the provider | The provider (its retention is your account's setting) |
 | Commands' web requests | Squid's `access.log` on the desktop | root |
@@ -1498,11 +1505,11 @@ SwiftUI apps for iPhone (iOS 26+, portrait, dark, Liquid Glass) and Mac (macOS 1
 | `bootstrap`, `init`, `plan`, `apply`, `destroy`, `fmt`, `lint` | Terraform: the state bucket (in the bootstrap stack's workspace `<env>`); init against it; `plan` writes `tfplan`, `apply` applies it; `destroy` (the state bucket stays: `prevent_destroy`). `lint` checks formatting, validates, and syntax-checks the playbooks |
 | `galaxy` | Ansible collections (`amazon.aws` 11.x, `community.general` ≥ 12) |
 | `inventory` | Writes `ansible/inventory/aws_ec2.yml` from its template; every playbook target runs it first |
-| `model-key`, `tailscale-key`, `tailscale-allow` | Store your model key (Anthropic's; `PROVIDER=together` for Together's), a Tailscale auth key, and optionally the allowed logins, in SSM from hidden input (`scripts/put-secret.py`). After `tailscale-allow`, `make tailnet-deploy` |
+| `model-key`, `tailscale-key`, `tailscale-allow` | Store a model key (optional: the app can take it; Anthropic's, `PROVIDER=together` for Together's), a Tailscale auth key, and optionally the allowed logins, in SSM from hidden input (`scripts/put-secret.py`). After `tailscale-allow`, `make tailnet-deploy` |
 | `apns-key` | Optional: store your Apple APNs key for the apps' notifications in SSM (`scripts/put-apns-key.py`: the `.p8`, Key ID and Team ID as one JSON blob). Then `make agentd-deploy` (§6.17, §7.4) |
 | `deploy` | `desktop`, `agentd-deploy` and `tailnet-deploy`, in that order |
 | `desktop` | `common` + `desktop` roles (`TAGS=chrome_policy` for only Chrome's policy) |
-| `agentd-test`, `agentd-build`, `agentd-deploy`, `agentd-logs` | agentd: fmt/clippy/tests; static build for `DESKTOP_ARCH`; deploy (copies the database first when the version changes; needs `model-key`); the last 50 lines of `journalctl -u agentd` over SSM |
+| `agentd-test`, `agentd-build`, `agentd-deploy`, `agentd-logs` | agentd: fmt/clippy/tests; static build for `DESKTOP_ARCH`; deploy (copies the database first when the version changes); the last 50 lines of `journalctl -u agentd` over SSM |
 | `agentd-evals` | Memory evals on your machine: a local agentd against Together, headless Chrome, shell tool off, 41 scripted conversations with assertions (scheduled runs, restarts, real consolidations) (`services/agentd/evals`; results in [memory-v2.md](memory-v2.md) §19). Reports recall@8, the false-memory rate, staleness, the `report_outcome` missing rate and cost per scenario; `--compare OLD NEW` lines two result files up. About $0.30 a run; the key comes from `TOGETHER_API_KEY` or SSM. `MEMORY_V2=on\|off`, `SCENARIO=a,b`, `MODEL=id`; `PROVIDER=bedrock [BEDROCK_REGION=us-east-1]` runs against Bedrock's OpenAI-compatible endpoint with a short-term Bedrock key from your AWS credentials, tidy-up on the same model (for comparing models only: the desktop calls Together) |
 | `agentd-reset` | A clean slate for testing (`scripts/agentd-reset.py`, over SSM). Stops agentd and Chrome, then deletes `/var/lib/agentd`'s database (chat, tasks, memories, schedules, settings), its upgrade copies, screenshots and saved keys, and Chrome's whole profile (cookies and every sign-in, local storage, IndexedDB, history, tabs, cache), its cache and config folders and the Downloads folder's contents; Chrome's user and profile come from `chrome.service`. Starts Chrome, then agentd, empty. Keeps Chrome's policy and the config. Shows counts first, asks for the desktop's name (its `TailnetName` tag), refuses while a task runs. `FILES=1` also empties `/home/worker/work`; `KEEP_COPY=1` moves it all to `/var/lib/agentd-reset/<time>` (root only, with a manifest of paths and owners) instead, and `RESTORE=1` puts the newest copy back; `DRY_RUN=1` only shows the counts |
 | `tailnet-test`, `tailnet-build`, `tailnet-deploy` | tailnet-proxy: `go vet` and tests (with package `door`); static linux build for `DESKTOP_ARCH`; the `tailnet_proxy` role with the web app (needs `tailscale-key`; deploy agentd first) |
@@ -1517,7 +1524,7 @@ There's one desktop: targets reach it by Terraform's `desktop_instance_id` outpu
 
 1. Tailscale, once (§7.1): MagicDNS and HTTPS certificates, the tag `tag:neo-agent`, and a pre-approved auth key with that tag.
 2. `make galaxy`, then `make bootstrap`, `init`, `plan` and `apply`. Optional settings go in `terraform/personal/terraform.tfvars` (from `terraform.tfvars.example`).
-3. Secrets: `make model-key`, `make tailscale-key`, and optionally `make tailscale-allow`.
+3. Secrets: `make tailscale-key`, and optionally `make model-key` (or paste the key in the app later) and `make tailscale-allow`.
 4. Wait a minute or two for the desktop to register with SSM, then `make deploy` (the first run takes 15–20 minutes).
 5. Open `https://neo-agent.<tailnet>.ts.net/` on a device on your tailnet.
 
@@ -1525,7 +1532,7 @@ There's one desktop: targets reach it by Terraform's `desktop_instance_id` outpu
 
 - **The desktop** is updated in place by Ansible: idempotent roles, handlers restart only what changed. `make agentd-deploy` (agentd; schema changes are additive), `make tailnet-deploy` (tailnet-proxy and the web app, whose files show at the next page load), `make desktop` (OS hardening, the display stack, Chrome).
 - **Packages and Chrome** update themselves (§5.2); the maintenance window reboots into them.
-- **The model key:** `make model-key`, then `make agentd-deploy`.
+- **The model keys:** paste a new one in the app (Settings → Model keys → Replace): used from the next message, no deploy. Or `make model-key`, then `make agentd-deploy` (a key pasted in the app still wins over it).
 
 ### 10.4 Watching it
 
@@ -1568,9 +1575,8 @@ About $40/month while the desktop runs. `make stop` brings the desktop's part do
 Found while writing this document. None of them is a known exploit; most are trade-offs this edition makes, or drift between comments and code.
 
 **Security and robustness.**
-- The daemon holds the model key on the desktop. Rotate it with `make model-key` and `make agentd-deploy`.
+- The daemon holds the model keys on the desktop. Rotate one in the app (Settings → Model keys), or with `make model-key` and `make agentd-deploy`.
 - Model calls have no spending limit unless you set a monthly budget (§6.22), and even then tasks already running finish and answered cards resume past it. No cap on a task's steps: the supervisor's checks, the context budget and loop detection limit each task, and a fast loop can run up to 60 turns before the first check.
-- `PUT /api/v1/settings` stores any `model` without checking it; the apps offer only the provider's. One the provider doesn't have gives way to the desktop's default when tasks read the setting.
 - A direct command (`direct_internet`) waits for every running command, and they for it (§6.6).
 - A conversation other than `main` works in one tab of its own window: `open_url` with `new_tab` loads there, since Chrome puts a new tab in whichever window was last at the front. Tabs a page opens in that window are its own. A new tab `main` opens can still land in a conversation's window if that one was last at the front: it's closed and the page loads in `main`'s current tab instead.
 - With no `allowed_logins`, every device your tailnet's rules let through reaches the web app, agentd's API and raw VNC (`-nopw`).

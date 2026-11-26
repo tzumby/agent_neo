@@ -3,28 +3,32 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use secrecy::SecretString;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     /// `unix:/run/agentd/agentd.sock` (production) or `127.0.0.1:8765` (local dev).
     pub listen: String,
-    /// Where the models come from (LLM_PROVIDER: together or anthropic; when
-    /// unset, anthropic if ANTHROPIC_API_KEY is set).
+    /// The deployment's provider (LLM_PROVIDER: anthropic or together; when
+    /// unset, MODEL's, else the one it has a key for, else anthropic): its
+    /// first model is the default, and LLM_URL is its endpoint. Tasks go to
+    /// the provider of their model, whichever has a key (llm.rs).
     pub provider: crate::llm::Provider,
-    /// The provider's key: LLM_API_KEY, else ANTHROPIC_API_KEY or
-    /// TOGETHER_API_KEY. On a desktop it's in AGENTD_SECRETS
+    /// The deployment's keys: ANTHROPIC_API_KEY and TOGETHER_API_KEY, and
+    /// LLM_API_KEY for LLM_PROVIDER's. On a desktop they're in AGENTD_SECRETS
     /// (/etc/agentd/secrets.env, root:agentd 0640, written by Ansible from
-    /// SSM), which the shell user can't read. Never printed (Debug shows
-    /// [REDACTED]).
-    pub api_key: SecretString,
-    /// The provider's endpoint: Anthropic's Messages API, or an
+    /// SSM), which the shell user can't read. Optional: a key pasted in the
+    /// app wins, and a desktop with none starts and asks for one. Never
+    /// printed (Debug shows [REDACTED]).
+    pub keys: Vec<(crate::llm::Provider, SecretString)>,
+    /// The deployment provider's endpoint: Anthropic's Messages API, or an
     /// OpenAI-compatible chat completions URL (default Together's; the evals
     /// can use Bedrock's).
     pub llm_url: String,
     pub model: String,
-    /// Memory tidy-up's model when the user hasn't picked one.
+    /// Memory tidy-up's model when the user hasn't picked one; empty: the
+    /// helper of the chat model's provider.
     pub consolidation_model: String,
     pub cdp_url: String,
     pub state_dir: PathBuf,
@@ -121,28 +125,36 @@ impl Config {
         };
         use crate::llm::Provider;
         let provider = match get("LLM_PROVIDER", "").as_str() {
-            "" if !get("ANTHROPIC_API_KEY", "").is_empty() => Provider::Anthropic,
-            "" => Provider::Together,
+            // MODEL's provider, else the one with a key; LLM_API_KEY alone was
+            // always for an OpenAI-compatible endpoint (the evals, make
+            // web-dev); else Claude.
+            "" => Provider::of(&get("MODEL", ""))
+                .or_else(|| {
+                    Provider::ALL
+                        .into_iter()
+                        .find(|p| !get(p.key_name(), "").is_empty())
+                })
+                .or_else(|| (!get("LLM_API_KEY", "").is_empty()).then_some(Provider::Together))
+                .unwrap_or(Provider::Anthropic),
             name => Provider::parse(name)
-                .with_context(|| format!("LLM_PROVIDER is {name:?}: it's together or anthropic"))?,
+                .with_context(|| format!("LLM_PROVIDER is {name:?}: it's anthropic or together"))?,
         };
-        let (key_name, model) = match provider {
-            Provider::Together => ("TOGETHER_API_KEY", "zai-org/GLM-5.3"),
-            Provider::Anthropic => ("ANTHROPIC_API_KEY", crate::claude::MODELS[0]),
-        };
-        let api_key = Some(get("LLM_API_KEY", ""))
-            .filter(|k| !k.is_empty())
-            .unwrap_or_else(|| get(key_name, ""));
-        if api_key.is_empty() {
-            bail!("set {key_name} (or LLM_API_KEY) in /etc/agentd/secrets.env or the environment");
-        }
+        let keys: Vec<(Provider, SecretString)> = Provider::ALL
+            .into_iter()
+            .filter_map(|p| {
+                let key = Some(get("LLM_API_KEY", ""))
+                    .filter(|k| p == provider && !k.is_empty())
+                    .unwrap_or_else(|| get(p.key_name(), ""));
+                (!key.is_empty()).then(|| (p, SecretString::from(key)))
+            })
+            .collect();
         Ok(Self {
             listen: get("LISTEN", "unix:/run/agentd/agentd.sock"),
             provider,
-            api_key: api_key.into(),
+            keys,
             llm_url: get("LLM_URL", provider.default_url()),
-            model: get("MODEL", model),
-            consolidation_model: get("CONSOLIDATION_MODEL", provider.helper()),
+            model: get("MODEL", provider.models()[0]),
+            consolidation_model: get("CONSOLIDATION_MODEL", ""),
             cdp_url: get("CDP_URL", "http://127.0.0.1:9222"),
             state_dir: get("STATE_DIR", "/var/lib/agentd").into(),
             workdir: get("WORKDIR", "/home/worker/work").into(),

@@ -15,6 +15,8 @@ struct SettingsView: View {
     @State private var stillRegistered = false
     /// A setting that didn't save (the chat's own alert can't show over this sheet).
     @State private var problem: String?
+    /// A model picked whose provider has no key yet: its key is asked for first.
+    @State private var needsKey: KeyFirst?
     private let autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser and app changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content."
 
     var body: some View {
@@ -25,11 +27,33 @@ struct SettingsView: View {
                         "Model",
                         selection: Binding(
                             get: { status.settings.model },
-                            set: { model in
-                                Task { problem = await store.updateSettings(model: model, client: client) }
-                            })
+                            set: { model in pick(model, status) })
                     ) {
-                        ForEach(status.knownModels, id: \.self) { Text(shortName($0)).tag($0) }
+                        if let providers = status.modelProviders {
+                            // agentd 0.20.0: every provider's models; one
+                            // without a key asks for it when picked.
+                            ForEach(providers) { provider in
+                                Section(provider.name) {
+                                    ForEach(provider.models, id: \.self) { model in
+                                        Text(provider.hasKey ? shortName(model) : "\(shortName(model)) · needs a key")
+                                            .tag(model)
+                                    }
+                                }
+                            }
+                        } else {
+                            ForEach(status.knownModels, id: \.self) { Text(shortName($0)).tag($0) }
+                        }
+                    }
+                    if status.modelProviders != nil {
+                        NavigationLink {
+                            ModelKeysView(store: store, client: client)
+                        } label: {
+                            LabeledContent("Model keys") {
+                                if let needed = status.needsModelKey {
+                                    Text("\(needed.name) needs one").foregroundStyle(.orange)
+                                }
+                            }
+                        }
                     }
                     Toggle(
                         "Browser actions",
@@ -132,6 +156,17 @@ struct SettingsView: View {
         }
         .navigationTitle("Settings")
         .inlineTitle()
+        .sheet(item: $needsKey) { pending in
+            NavigationStack {
+                ModelKeySheet(
+                    provider: pending.provider, store: store, client: client,
+                    reason: "\(shortName(pending.model)) needs your \(pending.provider.keyLabel)."
+                ) {
+                    problem = await store.updateSettings(model: pending.model, client: client)
+                }
+            }
+            .macSheetSize(height: 320)
+        }
         .toolbar { Button("Done") { dismiss() }.disabled(loggingOut) }
         // Signing out finishes here (its warning shows on this sheet).
         .interactiveDismissDisabled(loggingOut)
@@ -171,4 +206,21 @@ struct SettingsView: View {
     private func shortName(_ model: String) -> String {
         ModelName.display(model)
     }
+
+    /// Switches the model, or first asks for its provider's key when the
+    /// desktop has none (agentd would refuse the switch).
+    private func pick(_ model: String, _ status: AgentStatus) {
+        if let provider = status.provider(of: model), !provider.hasKey {
+            needsKey = KeyFirst(model: model, provider: provider.ref)
+        } else {
+            Task { problem = await store.updateSettings(model: model, client: client) }
+        }
+    }
+}
+
+/// A model to switch to once its provider's key is saved.
+private struct KeyFirst: Identifiable {
+    let model: String
+    let provider: ProviderRef
+    var id: String { model }
 }

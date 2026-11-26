@@ -264,6 +264,7 @@ impl Posted {
 }
 
 /// Why a key from the app wasn't saved.
+#[derive(Debug)]
 pub enum SecretError {
     /// Bad name or value, or too many keys: tell the user.
     Invalid(String),
@@ -870,29 +871,151 @@ impl Agent {
         let get = |key: &str| self.store.setting(key).ok().flatten();
         let auto_approve = get("auto_approve").unwrap_or_else(|| "initial".into());
         Settings {
-            // A model the provider doesn't have (picked before a switch of
-            // provider) gives way to the desktop's default.
-            model: get("model")
-                .filter(|m| self.cfg.provider.allows(m))
-                .unwrap_or_else(|| self.cfg.model.clone()),
+            model: self.chat_model(),
             // On by default: writing and sending in the browser ask first.
             allow_actions: get("allow_actions").as_deref() != Some("false"),
             // Off by default.
             auto_approve: auto_approve == "true" || auto_approve.starts_with("true:"),
             auto_approve_version: auto_approve,
             memory_consolidation: crate::consolidate::mode(&self.store).name().to_string(),
-            memory_consolidation_model: crate::consolidate::model(
-                &self.store,
-                &self.cfg.consolidation_model,
-                self.cfg.provider,
-            ),
+            memory_consolidation_model: self.consolidation_model(),
             memory_consolidation_daily_cap_usd: crate::consolidate::daily_cap(&self.store),
             monthly_budget_usd: crate::usage::monthly_budget(&self.store),
         }
     }
 
-    pub fn update_settings(&self, model: Option<&str>, allow_actions: Option<bool>) -> Result<Settings> {
-        if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+    /// The chat model: the user's pick, if a provider lists it, else the
+    /// desktop's default. A pick whose provider has no key stays picked: the
+    /// apps ask for the key (`needs_model_key`), rather than the tasks going
+    /// to another provider unasked.
+    fn chat_model(&self) -> String {
+        self.store
+            .setting("model")
+            .ok()
+            .flatten()
+            .filter(|m| llm::Provider::of(m).is_some())
+            .unwrap_or_else(|| self.cfg.model.clone())
+    }
+
+    /// Whether this model's provider has a key.
+    pub fn has_key_for(&self, model: &str) -> bool {
+        self.llm.keys.has(self.llm.provider_for(model))
+    }
+
+    /// The chat model's provider when it has no key: the apps ask for one.
+    pub fn needs_model_key(&self) -> Option<llm::Provider> {
+        let model = self.chat_model();
+        (!self.has_key_for(&model)).then(|| self.llm.provider_for(&model))
+    }
+
+    /// Memory tidy-up's model: the user's pick, if its provider has a key,
+    /// else CONSOLIDATION_MODEL, else the chat model's provider's helper.
+    fn consolidation_model(&self) -> String {
+        let default = if self.cfg.consolidation_model.is_empty() {
+            self.llm.provider_for(&self.chat_model()).helper().to_string()
+        } else {
+            self.cfg.consolidation_model.clone()
+        };
+        crate::consolidate::model(&self.store, &default, |m| self.has_key_for(m))
+    }
+
+    /// Memory v2's consolidation numbers (`/memory/consolidation`).
+    pub fn consolidation_stats(&self) -> Value {
+        crate::consolidate::stats(&self.store, &self.consolidation_model())
+    }
+
+    /// The providers, their models and where their keys come from, for the
+    /// apps: `key` is "app", "deployment" or null (none: picking one of its
+    /// models asks for it). Never a key's value.
+    pub fn model_providers(&self) -> Vec<Value> {
+        llm::Provider::ALL
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "id": p.id(), "name": p.name(), "models": p.models(), "helper": p.helper(),
+                    "key": self.llm.keys.from(p),
+                })
+            })
+            .collect()
+    }
+
+    /// The models tasks can use now: those of the providers with a key.
+    pub fn usable_models(&self) -> Vec<&'static str> {
+        llm::Provider::ALL
+            .into_iter()
+            .filter(|p| self.llm.keys.has(*p))
+            .flat_map(|p| p.models().iter().copied())
+            .collect()
+    }
+
+    /// Saves a provider's key the user pasted in the app, once the provider
+    /// takes it (or can't be asked: `Ok(false)`). Only the provider's name is
+    /// logged; the value never is.
+    pub async fn save_model_key(
+        &self,
+        provider: llm::Provider,
+        value: &str,
+        by: Option<String>,
+    ) -> Result<bool, SecretError> {
+        let value = secrets::check_value(value).map_err(SecretError::Invalid)?;
+        let checked = match self.llm.check_key(provider, value).await {
+            llm::KeyCheck::Accepted => true,
+            llm::KeyCheck::Refused(status) => {
+                return Err(SecretError::Invalid(format!(
+                    "{} didn't accept that key ({status}): check it and paste it again",
+                    provider.name()
+                )));
+            }
+            llm::KeyCheck::Unchecked(why) => {
+                tracing::warn!(provider = provider.id(), why, "saving a model key unchecked");
+                false
+            }
+        };
+        self.llm.keys.put(provider, value).map_err(SecretError::Failed)?;
+        tracing::warn!(provider = provider.id(), checked, "model key saved");
+        self.emit(
+            "model_key.saved",
+            json!({"provider": provider.id(), "checked": checked, "by": by}),
+        );
+        self.emit("settings", json!(self.settings()));
+        Ok(checked)
+    }
+
+    /// Removes the key pasted in the app; false when there was none.
+    pub fn remove_model_key(&self, provider: llm::Provider, by: Option<String>) -> Result<bool> {
+        if !self.llm.keys.remove(provider)? {
+            return Ok(false);
+        }
+        tracing::warn!(provider = provider.id(), "model key removed");
+        self.emit("model_key.removed", json!({"provider": provider.id(), "by": by}));
+        self.emit("settings", json!(self.settings()));
+        Ok(true)
+    }
+
+    /// Err says what's wrong with a value (a model no provider lists, or one
+    /// whose provider has no key yet).
+    pub fn update_settings(
+        &self,
+        model: Option<&str>,
+        allow_actions: Option<bool>,
+    ) -> Result<Result<Settings, String>> {
+        // Older apps send the whole settings object, the model unchanged.
+        if let Some(model) = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty() && *m != self.chat_model())
+        {
+            let Some(provider) = llm::Provider::of(model).filter(|p| p.allows(model)) else {
+                return Ok(Err(format!(
+                    "model must be one of {}",
+                    llm::all_models().join(", ")
+                )));
+            };
+            if !self.llm.keys.has(provider) {
+                return Ok(Err(format!(
+                    "add your {} API key first: {model} needs it",
+                    provider.name()
+                )));
+            }
             self.store.set_setting("model", model)?;
         }
         if let Some(allow) = allow_actions {
@@ -901,7 +1024,7 @@ impl Agent {
         }
         let settings = self.settings();
         self.emit("settings", json!(settings));
-        Ok(settings)
+        Ok(Ok(settings))
     }
 
     /// An enable must match the revision the user reviewed. A disable always
@@ -947,12 +1070,15 @@ impl Agent {
             self.store.set_setting("memory_consolidation", mode.name())?;
         }
         if let Some(model) = model {
-            let provider = self.cfg.provider;
-            if !provider.allows_helper(model) {
+            if !llm::Provider::of(model).is_some_and(|p| self.llm.keys.has(p)) {
+                let usable: Vec<&str> = llm::Provider::ALL
+                    .into_iter()
+                    .filter(|p| self.llm.keys.has(*p))
+                    .flat_map(|p| p.models().iter().copied().chain([p.helper()]))
+                    .collect();
                 return Ok(Err(format!(
-                    "memory_consolidation_model must be one of {}, {}",
-                    provider.models().join(", "),
-                    provider.helper()
+                    "memory_consolidation_model must be one of {}",
+                    usable.join(", ")
                 )));
             }
             self.store.set_setting("memory_consolidation_model", model)?;
@@ -1045,6 +1171,8 @@ impl Agent {
             settings.auto_approve,
             self.cfg.shell_tool,
             &self.cfg.run_as,
+            // The deployment's provider's: the version stays put as keys come
+            // and go in the app.
             self.cfg.provider.models(),
         )
     }
@@ -1497,7 +1625,9 @@ impl Agent {
                 Some("system administration is available through SSM")
             }
             Some("shell") if !self.cfg.shell_tool => Some("the shell tool is off"),
-            _ if model.is_some_and(|m| !self.cfg.provider.allows(m)) => Some("the model isn't allowed"),
+            _ if model.is_some_and(|m| !llm::Provider::of(m).is_some_and(|p| p.allows(m))) => {
+                Some("the model isn't allowed")
+            }
             _ => None,
         }
     }
@@ -4191,7 +4321,7 @@ pub(crate) fn test_agent() -> (Arc<Agent>, std::path::PathBuf) {
     let cfg = Config {
         listen: "127.0.0.1:0".into(),
         provider: llm::Provider::Together,
-        api_key: "test-key-not-used".to_string().into(),
+        keys: vec![(llm::Provider::Together, "test-key-not-used".to_string().into())],
         llm_url: crate::llm::TOGETHER_URL.into(),
         model: "zai-org/GLM-5.3".into(),
         consolidation_model: crate::consolidate::DEFAULT_MODEL.into(),
@@ -4284,7 +4414,7 @@ mod tests {
         let (agent, dir) = test_agent();
         let card = json!({"kind": "browser", "action": "type", "target": "Message #eng", "text": "hi", "site": "app.slack.com"});
         let id = park(&agent, "t1", card, &agent.policy_version());
-        agent.update_settings(None, Some(false)).unwrap();
+        agent.update_settings(None, Some(false)).unwrap().unwrap();
         assert!(matches!(
             agent.answer_approval(&id, true, None, Some("me".into())),
             Err(StartError::NotFound)
@@ -4786,7 +4916,7 @@ mod tests {
         let (agent, dir) = test_agent();
         let mut browser = Browser::new(agent.cdp.clone());
         let (_stop, mut cancel) = watch::channel(false);
-        agent.update_settings(None, Some(false)).unwrap();
+        agent.update_settings(None, Some(false)).unwrap().unwrap();
         let args = json!({"role": "link", "name": "Not assumed safe"});
         let blocked = agent
             .call_tool(
@@ -4802,7 +4932,7 @@ mod tests {
             .await
             .unwrap();
         assert!(blocked.contains("browser inputs are disabled"));
-        agent.update_settings(None, Some(true)).unwrap();
+        agent.update_settings(None, Some(true)).unwrap().unwrap();
         let scheduled = agent
             .call_tool(
                 &mut browser,
@@ -6442,20 +6572,39 @@ mod background_tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = seen.clone();
         let reply = Arc::new(reply);
-        let app = Router::new().route(
-            "/v1/messages",
-            post(
-                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
-                    let (reply, log) = (reply.clone(), log.clone());
-                    async move {
-                        let n = log.lock().unwrap().len();
-                        let answer = reply(n, &body);
-                        log.lock().unwrap().push((headers, body));
-                        axum::Json(answer)
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(
+                    move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                        let (reply, log) = (reply.clone(), log.clone());
+                        async move {
+                            let n = log.lock().unwrap().len();
+                            let answer = reply(n, &body);
+                            log.lock().unwrap().push((headers, body));
+                            axum::Json(answer)
+                        }
+                    },
+                ),
+            )
+            // Checking a key: only one that starts sk-ant-good is taken.
+            .route(
+                "/v1/models",
+                axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                    let key = headers
+                        .get("x-api-key")
+                        .and_then(|k| k.to_str().ok())
+                        .unwrap_or("");
+                    if key.starts_with("sk-ant-good") && headers.get("anthropic-version").is_some() {
+                        (axum::http::StatusCode::OK, axum::Json(json!({"data": []})))
+                    } else {
+                        (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            axum::Json(json!({"type": "error"})),
+                        )
                     }
-                },
-            ),
-        );
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -6494,11 +6643,13 @@ mod background_tests {
         let mut cfg = agent.cfg.clone();
         drop(agent);
         cfg.provider = llm::Provider::Anthropic;
+        cfg.keys = vec![(llm::Provider::Anthropic, "test-key-not-used".to_string().into())];
         cfg.llm_url = url;
         cfg.model = crate::claude::MODELS[0].into();
         let agent = Arc::new(Agent::new(cfg).unwrap());
-        // A model picked before the switch gives way to Claude's default.
-        agent.update_settings(Some("zai-org/GLM-5.3"), None).unwrap();
+        // Together has no key here: its models can't be picked.
+        let refused = agent.update_settings(Some("zai-org/GLM-5.3"), None).unwrap();
+        assert!(refused.unwrap_err().contains("Together API key"));
         assert_eq!(agent.settings().model, "claude-opus-4-6");
         let schedule = a_schedule(&agent);
         let queued = queue(&agent, &schedule, "sched1");
@@ -6559,6 +6710,111 @@ mod background_tests {
             (done["cost"].as_f64().unwrap() - 0.015_281_25).abs() < 1e-9,
             "{done}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_pasted_in_the_app_is_checked_then_used_with_no_restart() {
+        let (url, seen) = claude_api(|_, _| {
+            json!({
+                "model": "claude-opus-4-6", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "Done."}],
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            })
+        })
+        .await;
+        let (agent, dir) = test_agent();
+        let mut cfg = agent.cfg.clone();
+        drop(agent);
+        cfg.provider = llm::Provider::Anthropic;
+        cfg.keys = Vec::new();
+        cfg.llm_url = url;
+        cfg.model = crate::claude::MODELS[0].into();
+        let agent = Arc::new(Agent::new(cfg).unwrap());
+        use llm::Provider::{Anthropic, Together};
+
+        // No key anywhere: agentd still starts, and the apps ask for one
+        // before a message can go.
+        assert_eq!(agent.needs_model_key(), Some(Anthropic));
+        assert!(agent.usable_models().is_empty());
+        assert!(matches!(
+            agent.post(MAIN, "hi".into(), None),
+            Err(crate::sessions::PostError::NeedsKey(Anthropic))
+        ));
+
+        // A key the provider refuses isn't kept.
+        let refused = agent
+            .save_model_key(Anthropic, "sk-ant-wrong-0123456789", None)
+            .await;
+        assert!(matches!(refused, Err(SecretError::Invalid(why)) if why.contains("didn't accept")));
+        assert_eq!(agent.needs_model_key(), Some(Anthropic));
+
+        // One it takes is saved for agentd alone, and used from the next call.
+        let checked = agent
+            .save_model_key(Anthropic, " sk-ant-good-0123456789\n", Some("ana".into()))
+            .await
+            .unwrap();
+        assert!(checked);
+        assert_eq!(agent.needs_model_key(), None);
+        assert_eq!(agent.usable_models(), crate::claude::MODELS);
+        let providers = agent.model_providers();
+        assert_eq!(
+            (&providers[0]["id"], &providers[0]["key"]),
+            (&json!("anthropic"), &json!("app"))
+        );
+        assert_eq!(
+            (&providers[1]["id"], &providers[1]["key"]),
+            (&json!("together"), &Value::Null)
+        );
+        let file = dir.join("model-keys").join("anthropic");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&file), mode(&dir.join("model-keys"))), (0o600, 0o700));
+        assert!(!agent.secrets.has("ANTHROPIC_API_KEY"), "commands never get it");
+        // Together still has none: its models can't be picked.
+        assert!(
+            agent
+                .update_settings(Some("moonshotai/Kimi-K3"), None)
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            agent
+                .update_settings(Some("claude-opus-5-5"), None)
+                .unwrap()
+                .is_ok()
+        );
+
+        assert!(matches!(
+            agent.post(MAIN, "hi".into(), None),
+            Ok(Posted::Started(_))
+        ));
+        until("the task ends", || !agent.is_working()).await;
+        assert_eq!(events(&agent, "task.finished")[0]["status"], "done");
+        {
+            let seen = seen.lock().unwrap();
+            assert!(!seen.is_empty());
+            assert!(
+                seen.iter()
+                    .all(|(headers, _)| headers["x-api-key"] == "sk-ant-good-0123456789")
+            );
+            assert_eq!(seen[0].1["model"], "claude-opus-5-5");
+        }
+        // The log has who and which provider, never the key.
+        let saved = events(&agent, "model_key.saved");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            (&saved[0]["provider"], &saved[0]["checked"], &saved[0]["by"]),
+            (&json!("anthropic"), &json!(true), &json!("ana"))
+        );
+        let log = agent.store.events_after(0, 1000).unwrap();
+        assert!(log.iter().all(|e| !e.data.to_string().contains("sk-ant-")));
+
+        // Removed: none left, so the apps ask again; nothing to remove twice.
+        assert!(agent.remove_model_key(Anthropic, None).unwrap());
+        assert!(!file.exists());
+        assert_eq!(agent.needs_model_key(), Some(Anthropic));
+        assert!(!agent.remove_model_key(Together, None).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

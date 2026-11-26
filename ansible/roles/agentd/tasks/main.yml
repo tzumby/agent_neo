@@ -212,30 +212,37 @@
     agentd_apns: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/apns', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
   no_log: true
 
-# The model key (and the APNs key), read on the controller with your AWS
+# The model keys (and the APNs key), read on the controller with your AWS
 # credentials, never by the desktop itself. root:agentd 0640: agentd reads it,
-# the shell user can't.
-- name: Read the model provider's key (from SSM)
+# the shell user can't. Both optional: a key pasted in the app is kept on the
+# desktop and wins (agentd 0.20.0), and a desktop with none asks for one.
+- name: Read the Anthropic key (from SSM, if stored)
   ansible.builtin.set_fact:
-    agentd_llm_key: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/llm/' ~ agentd_llm_provider ~ '_api_key', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
+    agentd_anthropic_key: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/llm/anthropic_api_key', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
   no_log: true
 
-- name: Check there's a key for the model provider
+- name: Read the Together AI key (from SSM, if stored)
+  ansible.builtin.set_fact:
+    agentd_together_key: "{{ lookup('amazon.aws.ssm_parameter', agentd_ssm_prefix ~ '/llm/together_api_key', region=agentd_ssm_region, on_missing='skip') | default('', true) }}"
+  no_log: true
+
+- name: Check the model provider
   ansible.builtin.assert:
     that:
       - agentd_llm_provider in ['together', 'anthropic']
-      - agentd_llm_key | length > 0
-    fail_msg: >-
-      No {{ agentd_llm_provider }} key in SSM ({{ agentd_ssm_prefix }}/llm/{{ agentd_llm_provider }}_api_key).
-      Store it first: make model-key{{ ' PROVIDER=together' if agentd_llm_provider == 'together' else '' }}
-      (agentd_llm_provider is together or anthropic).
+    fail_msg: agentd_llm_provider is anthropic or together.
     quiet: true
 
 - name: Write the keys agentd reads (from SSM)
   ansible.builtin.copy:
     dest: /etc/agentd/secrets.env
     content: |
-      {{ 'ANTHROPIC_API_KEY' if agentd_llm_provider == 'anthropic' else 'TOGETHER_API_KEY' }}={{ agentd_llm_key }}
+      {% if agentd_anthropic_key | length > 0 %}
+      ANTHROPIC_API_KEY={{ agentd_anthropic_key }}
+      {% endif %}
+      {% if agentd_together_key | length > 0 %}
+      TOGETHER_API_KEY={{ agentd_together_key }}
+      {% endif %}
       {% if agentd_apns | length > 0 %}
       APNS_AUTH_KEY={{ (agentd_apns | from_json).auth_key }}
       APNS_KEY_ID={{ (agentd_apns | from_json).key_id }}

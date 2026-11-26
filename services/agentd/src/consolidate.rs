@@ -101,14 +101,15 @@ pub fn mode(store: &Store) -> Mode {
         .unwrap_or(Mode::Auto)
 }
 
-/// The user's pick, if the provider has it, else `default` (the desktop's
-/// CONSOLIDATION_MODEL, which is the provider's helper unless set).
-pub fn model(store: &Store, default: &str, provider: crate::llm::Provider) -> String {
+/// The user's pick, if a provider lists it and `usable` (its provider has a
+/// key), else `default` (the desktop's CONSOLIDATION_MODEL, or the chat
+/// model's provider's helper).
+pub fn model(store: &Store, default: &str, usable: impl Fn(&str) -> bool) -> String {
     store
         .setting("memory_consolidation_model")
         .ok()
         .flatten()
-        .filter(|m| provider.allows_helper(m))
+        .filter(|m| crate::llm::Provider::of(m).is_some() && usable(m))
         .unwrap_or_else(|| default.to_string())
 }
 
@@ -502,7 +503,7 @@ fn record_run(
 
 /// For the app's Memory screen: the mode, model and cap, this month's cost,
 /// and the last run (when, how it ended, what it did, its cost).
-pub fn stats(store: &Store, default_model: &str, provider: crate::llm::Provider) -> Value {
+pub fn stats(store: &Store, model: &str) -> Value {
     let (month_cost, last) = store
         .read(|conn| {
             let month_cost: f64 = conn.query_row(
@@ -530,7 +531,7 @@ pub fn stats(store: &Store, default_model: &str, provider: crate::llm::Provider)
         })
         .unwrap_or((0.0, None));
     json!({
-        "mode": mode(store).name(), "model": model(store, default_model, provider), "daily_cap_usd": daily_cap(store),
+        "mode": mode(store).name(), "model": model, "daily_cap_usd": daily_cap(store),
         "month_cost": (month_cost * 1e6).round() / 1e6, "last_run": last,
         "waiting_tasks": batch(store).map_or(0, |runs| runs.len()),
     })
@@ -643,7 +644,7 @@ pub async fn run(agent: &Agent) -> Outcome {
     };
     let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
     let started = std::time::Instant::now();
-    let model = model(store, &agent.cfg.consolidation_model, agent.cfg.provider);
+    let model = agent.settings().memory_consolidation_model;
     let worth = match worth_a_call(store, &runs) {
         Ok(worth) => worth,
         Err(err) => return Outcome::Failed(format!("{err:#}")),
@@ -1171,17 +1172,14 @@ mod tests {
     #[test]
     fn stats_show_the_month_and_the_last_run() {
         let (store, keys) = setup();
-        assert_eq!(
-            stats(&store, DEFAULT_MODEL, crate::llm::Provider::Together)["last_run"],
-            Value::Null
-        );
+        assert_eq!(stats(&store, DEFAULT_MODEL)["last_run"], Value::Null);
         task(&store, "t1", "done", None);
         go(
             &store,
             &keys,
             r#"{"work_log": [{"source_run": "t1", "text": "Did a thing"}]}"#,
         );
-        let stats = stats(&store, DEFAULT_MODEL, crate::llm::Provider::Together);
+        let stats = stats(&store, DEFAULT_MODEL);
         // The mode is the setting's (automatic when unset), not the run's.
         assert_eq!(
             (stats["mode"].as_str(), stats["month_cost"].as_f64()),

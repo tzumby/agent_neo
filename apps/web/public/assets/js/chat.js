@@ -8,6 +8,7 @@
 
 import { findKey } from "./keys.js";
 import { modelName } from "./usage.js";
+import { keyLabel, modelKeyForm, savedWords } from "./modelkeys.js";
 import { parse, render, safeHref } from "./markdown.js";
 import { busyButton, fill, h, icon, time, when } from "./dom.js";
 import {
@@ -845,7 +846,9 @@ function mountComposer(store, view, { openKeys, onSent }) {
   const keyNote = form.querySelector(".key-note");
   const budgetNote = form.querySelector(".budget-note");
   const archivedNote = form.querySelector(".archived-note");
+  const modelKeyNote = form.querySelector(".model-key-note");
   const box = form.querySelector(".box");
+  let modelKeyFor = null; // the provider the note asks a key for
   let allowKey = null; // the key the person chose to send anyway
   const drafts = new Map(); // conversation → what was typed there
   let draftFor = store.currentId;
@@ -881,6 +884,27 @@ function mountComposer(store, view, { openKeys, onSent }) {
       save, anyway);
   }
 
+  /**
+   * The chat model's provider has no key (a new desktop, or one removed): the
+   * key is asked for right here, so the first message can go. Drawn once per
+   * provider, so a half-pasted key isn't wiped by an update.
+   */
+  function showModelKeyNote(needs) {
+    const id = needs?.id || null;
+    modelKeyNote.hidden = !id;
+    if (id === modelKeyFor) return;
+    modelKeyFor = id;
+    if (!id) {
+      modelKeyNote.replaceChildren();
+      return;
+    }
+    const provider = (store.status?.model_providers || []).find((p) => p.id === id) || needs;
+    modelKeyNote.replaceChildren(
+      h("p", { class: "strong" }, icon("key"), `Your agent needs your ${keyLabel(provider)} to work.`),
+      h("p", { class: "muted" }, "Paste it once and it's used from your next message on. Or pick another model in Settings."),
+      modelKeyForm(store, provider, { onSaved: (result) => store.notice(savedWords(provider, result)) }));
+  }
+
   /** Another conversation on screen: its draft back in the box. */
   function swapDraft() {
     if (store.currentId === draftFor) return;
@@ -899,8 +923,9 @@ function mountComposer(store, view, { openKeys, onSent }) {
     const older = store.sessionsSupported === false;
     const queued = store.queue().length;
     // Sent while it works, a message queues (an older desktop would refuse it).
+    const needsKey = store.status?.needs_model_key || null;
     send.hidden = busy && (older || !input.value.trim());
-    send.disabled = offline || !input.value.trim();
+    send.disabled = offline || !input.value.trim() || Boolean(needsKey);
     stop.hidden = !busy;
     stop.classList.toggle("is-alone", send.hidden);
     stop.disabled = offline || store.stopping;
@@ -913,6 +938,7 @@ function mountComposer(store, view, { openKeys, onSent }) {
     archivedNote.hidden = !archived;
     box.hidden = archived;
     budgetNote.hidden = store.status?.budget?.paused !== true || archived;
+    showModelKeyNote(archived ? null : needsKey);
     const status = store.status;
     if (status && document.activeElement !== model) {
       const current = status.settings?.model || "";

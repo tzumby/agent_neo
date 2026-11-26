@@ -64,7 +64,7 @@ public final class ChatStore {
         "settings", "task.started", "task.paused", "task.resumed", "task.finished", "approval.requested",
         "approval.resolved", "action_needed", "action.resolved", "secret.saved",
         "memory.confirmed", "memory.forgotten", "schedule.created", "schedule.updated", "schedule.deleted",
-        "budget.alert",
+        "budget.alert", "model_key.saved", "model_key.removed",
     ]
 
     /// Conversations created, renamed, archived or deleted; the budget alerts.
@@ -544,6 +544,13 @@ public final class ChatStore {
             }
         } catch let error as AgentError where error.statusCode == 404 && conversationsAvailable == true {
             notice = "This conversation was archived or deleted on another device."
+        } catch let error as AgentError where error.statusCode == 409 {
+            // agentd 0.20.0: no key for the chat model's provider yet. The
+            // message waits in the composer while the chat asks for the key.
+            await refreshStatus(client: client)
+            guard status?.needsModelKey != nil else { return handle(error) }
+            if chat.draft.isEmpty { chat.draft = text }
+            notice = Self.message(error)
         } catch {
             handle(error)
         }
@@ -669,6 +676,38 @@ public final class ChatStore {
             try await client.setMonthlyBudget(usd)
         } catch {
             problem = "Couldn't save the budget. \(Self.message(error))"
+        }
+        await refreshStatus(client: client)
+        return problem
+    }
+
+    /// Saves a provider's key (agentd 0.20.0). Returns what went wrong (nil:
+    /// saved), in agentd's words when the provider refused it. A key saved
+    /// without the provider being asked says so in a notice.
+    public func saveModelKey(_ value: String, for provider: ProviderRef, client: AgentClient) async -> String? {
+        var problem: String?
+        do {
+            let saved = try await client.saveModelKey(provider: provider.id, value: value)
+            if !saved.checked {
+                notice = "Saved. \(provider.name) couldn't be asked whether it takes the key; your next message will tell."
+            }
+        } catch let error as AgentError where error.statusCode == 400 {
+            problem = Self.message(error)
+        } catch {
+            problem = "Couldn't save the key. \(Self.message(error))"
+        }
+        await refreshStatus(client: client)
+        return problem
+    }
+
+    /// Removes the key pasted in an app; returns what went wrong, as
+    /// `updateSettings` does.
+    public func removeModelKey(for provider: ProviderRef, client: AgentClient) async -> String? {
+        var problem: String?
+        do {
+            try await client.deleteModelKey(provider: provider.id)
+        } catch {
+            problem = "Couldn't remove the key. \(Self.message(error))"
         }
         await refreshStatus(client: client)
         return problem

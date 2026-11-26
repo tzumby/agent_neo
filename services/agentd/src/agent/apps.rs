@@ -751,7 +751,7 @@ mod tests {
             .await
             .unwrap();
         assert!(scheduled.contains("can't ask"), "{scheduled}");
-        agent.update_settings(None, Some(false)).unwrap();
+        agent.update_settings(None, Some(false)).unwrap().unwrap();
         let off = agent
             .app_tool("t1", "app_act", &save(), None, None)
             .await

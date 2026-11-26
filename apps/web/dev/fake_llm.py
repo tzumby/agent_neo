@@ -193,6 +193,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/pushes":
             self.send_json(PUSHES)
+        elif self.path == "/v1/models":
+            # agentd checks a key pasted in the app here: "bad" anywhere in it is refused.
+            if "bad" in self.headers.get("Authorization", "") or not self.headers.get("Authorization"):
+                self.send_error(401)
+            else:
+                self.send_json({"data": [{"id": "zai-org/GLM-5.3"}]})
         elif self.path == "/form":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

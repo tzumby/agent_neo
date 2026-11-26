@@ -9,6 +9,7 @@ import { inline, parse, safeHref } from "../public/assets/js/markdown.js";
 import { deviceLabel, fromBase64Url, iosOutsideHomeScreen, isIOS, ownSubscription, pushState, pushSupported } from "../public/assets/js/push.js";
 import { ApiError, api } from "../public/assets/js/api.js";
 import { Store } from "../public/assets/js/store.js";
+import { keyLabel, keySource, providerOf, savedWords } from "../public/assets/js/modelkeys.js";
 import {
   KINDS, Timeline, andList, appStepWords, clickTarget, coveredWords, duration, megabytes, planAnswer, planCovers, planPhrases,
   planProblem, rowKey, stepNeeds, withoutNeed, workingFor,
@@ -673,4 +674,35 @@ test("Allow for this task: a card that offers it says what it lets through, and 
   await store.answer({ id: "c1" }, true, undefined, true);
   await store.answer({ id: "c1" }, true);
   assert.deepEqual(bodies, [{ approved: true, for_task: true }, { approved: true }]);
+});
+
+test("a model key is pasted once: sent to the desktop, never shown again, and named for its provider", async (t) => {
+  const status = {
+    model_providers: [
+      { id: "anthropic", name: "Anthropic", models: ["claude-opus-4-6", "claude-opus-5-5"], helper: "claude-haiku-5-5", key: "deployment" },
+      { id: "together", name: "Together", models: ["zai-org/GLM-5.3", "moonshotai/Kimi-K3"], helper: "zai-org/GLM-5.3-Flash", key: null },
+    ],
+  };
+  const [anthropic, together] = status.model_providers;
+  assert.equal(providerOf(status, "moonshotai/Kimi-K3"), together);
+  assert.equal(providerOf(status, "claude-haiku-5-5"), anthropic);
+  assert.equal(providerOf(status, "gpt-9"), null);
+  assert.equal(providerOf({}, "claude-opus-4-6"), null); // an older desktop
+  assert.deepEqual([keyLabel(anthropic), keyLabel(together)], ["Anthropic API key", "Together AI API key"]);
+  assert.deepEqual([keySource({ key: "app" }), keySource(anthropic), keySource(together)],
+    ["Saved in the app", "From the deployment", "No key yet"]);
+  assert.match(savedWords(together, { checked: false }), /couldn't be reached/);
+  assert.match(savedWords(anthropic, { checked: true }), /Anthropic accepted it/);
+
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    calls.push([init.method, url, init.body ? JSON.parse(init.body) : null]);
+    return new Response(JSON.stringify({ checked: true, providers: [] }), { status: 200 });
+  });
+  await api.saveModelKey("together", "tgp_v1_example");
+  await api.deleteModelKey("anthropic");
+  assert.deepEqual(calls, [
+    ["PUT", "/api/v1/model-keys/together", { value: "tgp_v1_example" }],
+    ["DELETE", "/api/v1/model-keys/anthropic", {}],
+  ]);
 });

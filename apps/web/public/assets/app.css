@@ -389,6 +389,16 @@ kbd { font: 600 0.85em var(--mono); border: 1px solid var(--slate); border-radiu
 .budget-note .icon { color: var(--signal-text); }
 .archived-note { background: var(--surface); border: 1px solid var(--rule); }
 .budget-note span, .archived-note span { flex: 1 1 14rem; }
+/* A desktop with no key for its model asks for one here. */
+.model-key-note { margin: 0 0 0.5rem; padding: 0.7rem 0.8rem; border-radius: 0.7rem; background: var(--signal-wash); font-size: 0.9rem; }
+.model-key-note > p { margin: 0 0 0.35rem; }
+.model-key-note > p .icon { color: var(--signal-text); vertical-align: -0.15em; margin-right: 0.3rem; }
+.model-key-form { display: flex; flex-direction: column; gap: 0.5rem; }
+.model-key-form .label { margin: 0; }
+.model-key-form .muted { margin: 0; font-size: 0.84rem; }
+.model-key-form .card-actions { margin: 0; }
+.model-key-prompt { margin: 0.5rem 0 1rem; padding: 0.8rem; border: 1px solid var(--rule); border-radius: 0.7rem; background: var(--surface); }
+.model-key-prompt > p { margin: 0 0 0.5rem; }
 .budget-note .button, .archived-note .button { min-height: 2rem; padding: 0.2rem 0.85rem; font-size: 0.86rem; }
 
 /* Messages queued behind the running task: grey, each with its place and a ✕. */

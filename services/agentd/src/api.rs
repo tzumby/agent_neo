@@ -425,6 +425,10 @@ struct Approval {
     text: Option<String>,
     /// A plan card's steps as the user edited them: they replace the agent's.
     plan: Option<Value>,
+    /// "Allow for this task": the card's kind of action goes ahead without
+    /// asking for the rest of the task.
+    #[serde(default)]
+    for_task: bool,
 }
 
 async fn answer_approval(
@@ -446,7 +450,7 @@ async fn answer_approval(
         return error(StatusCode::BAD_REQUEST, &problem);
     }
     let edit = edited.map(Edit::Text).or(plan.map(Edit::Plan));
-    match agent.answer_approval(&id, body.approved, edit, caller(&headers)) {
+    match agent.answer_approval_for(&id, body.approved, edit, body.for_task, caller(&headers)) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(StartError::NotFound) => error(
             StatusCode::NOT_FOUND,

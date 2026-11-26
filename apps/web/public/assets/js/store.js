@@ -526,9 +526,10 @@ export class Store {
     return true;
   }
 
-  async answer(card, approved, text) {
+  /** `forTask`: "Allow for this task", approving the card's kind of action until the task ends. */
+  async answer(card, approved, text, forTask = false) {
     const conversation = this.conversation;
-    return this.attempt(() => this.api.answer(card.id, approved, text), () => this.expire(conversation, card));
+    return this.attempt(() => this.api.answer(card.id, approved, text, undefined, forTask), () => this.expire(conversation, card));
   }
 
   /**

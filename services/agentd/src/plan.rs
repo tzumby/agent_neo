@@ -3,7 +3,7 @@
 //! runs, and the supervisor (supervise.rs) reads it to judge progress.
 //!
 //! A step can say what it needs the user's OK for: input on a site or in a
-//! desktop app, commands that ask, an install. A plan with needs the task
+//! desktop app, commands that would ask, the saved keys they use, an install. A plan with needs the task
 //! hasn't been granted parks on one `plan` card, which the user can edit; once
 //! approved, its needs are the task's grant, and the actions they cover go
 //! ahead without their own cards (docs/architecture.md §6.11).
@@ -16,8 +16,7 @@ use crate::{access, snaps};
 pub const MAX_ITEMS: usize = 20;
 pub const MAX_STEP_CHARS: usize = 120;
 const MAX_APP_CHARS: usize = 60;
-const MAX_COMMANDS: usize = 10;
-const MAX_COMMAND_CHARS: usize = 2000;
+const MAX_KEYS: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,7 +36,14 @@ pub struct Item {
     /// The desktop app it gives input to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
-    /// Commands it runs that ask, exactly.
+    /// It runs commands that would ask (deletes, kills, pushes, uploads...).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shell: bool,
+    /// The saved keys its commands use, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// Exact commands: plans from before 0.19.1 named them; still read in
+    /// a task saved then.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<String>,
     /// A Snap Store app it installs.
@@ -52,10 +58,21 @@ pub struct Needs {
     pub sites: Vec<String>,
     #[serde(default)]
     pub apps: Vec<String>,
+    /// Any command that would ask (not one connecting directly).
+    #[serde(default)]
+    pub shell: bool,
+    /// Commands using these saved keys.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Exact commands (plans from before 0.19.1).
     #[serde(default)]
     pub commands: Vec<String>,
     #[serde(default)]
     pub installs: Vec<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// A task's grant: the needs of the plans the user approved, the last card
@@ -130,18 +147,27 @@ fn items_of(items: &[Value], status_required: bool) -> Result<Vec<Item>, String>
                 }
                 app => app.map(String::from),
             };
-            let commands: Vec<String> = match &item["commands"] {
+            // true, or (as a model may write it) the commands themselves.
+            let shell = item["shell"] == true
+                || match &item["commands"] {
+                    Value::Bool(on) => *on,
+                    Value::Array(list) => list.iter().any(|c| text(c).is_some()),
+                    one => text(one).is_some(),
+                };
+            let keys: Vec<String> = match &item["keys"] {
                 Value::Array(list) => list.iter().filter_map(text).map(String::from).collect(),
                 one => text(one).map(String::from).into_iter().collect(),
             };
-            if commands.len() > MAX_COMMANDS {
+            if keys.len() > MAX_KEYS
+                || keys.iter().any(|k| {
+                    k.len() > 64
+                        || !k
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                })
+            {
                 return Err(format!(
-                    "step {n}: at most {MAX_COMMANDS} commands; split the step"
-                ));
-            }
-            if commands.iter().any(|c| c.chars().count() > MAX_COMMAND_CHARS) {
-                return Err(format!(
-                    "step {n}: a command is too long for the plan; it can ask on its own"
+                    "step {n}'s keys: the saved keys' names, like GITHUB_TOKEN"
                 ));
             }
             let install = match text(&item["install"]) {
@@ -157,7 +183,9 @@ fn items_of(items: &[Value], status_required: bool) -> Result<Vec<Item>, String>
                 status,
                 site,
                 app,
-                commands,
+                shell,
+                keys,
+                commands: Vec::new(),
                 install,
             })
         })
@@ -213,6 +241,10 @@ impl Needs {
             {
                 needs.apps.push(app.clone());
             }
+            needs.shell |= item.shell;
+            for key in &item.keys {
+                push_new(&mut needs.keys, key);
+            }
             for command in &item.commands {
                 if !needs
                     .commands
@@ -230,7 +262,12 @@ impl Needs {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sites.is_empty() && self.apps.is_empty() && self.commands.is_empty() && self.installs.is_empty()
+        self.sites.is_empty()
+            && self.apps.is_empty()
+            && !self.shell
+            && self.keys.is_empty()
+            && self.commands.is_empty()
+            && self.installs.is_empty()
     }
 
     /// What this has that `other` doesn't.
@@ -246,6 +283,13 @@ impl Needs {
                 .apps
                 .iter()
                 .filter(|a| !other.apps.iter().any(|o| o.eq_ignore_ascii_case(a)))
+                .cloned()
+                .collect(),
+            shell: self.shell && !other.shell,
+            keys: self
+                .keys
+                .iter()
+                .filter(|k| !other.keys.contains(k))
                 .cloned()
                 .collect(),
             commands: self
@@ -268,6 +312,8 @@ impl Needs {
         let mut all = self.clone();
         all.sites.extend(other.without(self).sites);
         all.apps.extend(other.without(self).apps);
+        all.shell |= other.shell;
+        all.keys.extend(other.without(self).keys);
         all.commands.extend(other.without(self).commands);
         all.installs.extend(other.without(self).installs);
         all
@@ -279,13 +325,15 @@ impl Needs {
             .first()
             .map(|s| format!("input on {s}"))
             .or_else(|| self.apps.first().map(|a| format!("input in {a}")))
+            .or_else(|| self.shell.then(|| "commands that would ask".to_string()))
+            .or_else(|| self.keys.first().map(|k| format!("using the key {k}")))
             .or_else(|| self.commands.first().map(|c| format!("the command `{c}`")))
             .or_else(|| self.installs.first().map(|i| format!("installing {i}")))
     }
 
     /// Whether the approved plan covers the action a card would ask about.
-    /// Only these kinds: a saved key, a direct connection, a site for the
-    /// proxy, a schedule or another plan always gets its own card.
+    /// Only these kinds: a direct connection, a site for the proxy, a key to
+    /// save, a schedule or another plan always gets its own card.
     pub fn covers(&self, card: &Value) -> bool {
         match card["kind"].as_str() {
             // The site and anything under it: app.slack.com for slack.com.
@@ -302,18 +350,74 @@ impl Needs {
                         .as_array()
                         .is_none_or(|steps| steps.iter().filter_map(|s| s["app"].as_str()).all(covered))
             }
+            // Never a direct one. One using saved keys needs each of them
+            // granted; then it goes ahead, as does any other with commands
+            // granted (or, from before 0.19.1, this exact command).
             Some("shell") => {
+                let keys: Vec<&str> = card["secrets"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
                 card["direct"] != true
-                    && card["secrets"].as_array().is_none_or(Vec::is_empty)
-                    && card["command"].as_str().is_some_and(|command| {
-                        self.commands.iter().any(|c| normalized(c) == normalized(command))
-                    })
+                    && keys.iter().all(|k| self.keys.iter().any(|granted| granted == k))
+                    && (self.shell
+                        || !keys.is_empty()
+                        || card["command"].as_str().is_some_and(|command| {
+                            self.commands.iter().any(|c| normalized(c) == normalized(command))
+                        }))
             }
             Some("install") => card["name"]
                 .as_str()
                 .is_some_and(|name| self.installs.iter().any(|i| i == name)),
             _ => false,
         }
+    }
+
+    /// What "Allow for this task" on a card grants: its site, its app (every
+    /// window's), commands that would ask with the keys this one uses, its
+    /// install. Nothing for what no grant covers (a direct command, a key to
+    /// save, a site for the proxy, a schedule, a plan).
+    pub fn of_card(card: &Value) -> Self {
+        let text = |key: &str| {
+            card[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(String::from)
+        };
+        let mut needs = Self::default();
+        match card["kind"].as_str() {
+            Some("browser") => needs.sites.extend(text("site")),
+            Some("app") => {
+                for app in text("app").into_iter().chain(
+                    card["steps"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|s| s["app"].as_str().map(String::from)),
+                ) {
+                    if !needs.apps.iter().any(|a| a.eq_ignore_ascii_case(&app)) {
+                        needs.apps.push(app);
+                    }
+                }
+            }
+            Some("shell") if card["direct"] != true => {
+                needs.shell = true;
+                for key in card["secrets"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    push_new(&mut needs.keys, key);
+                }
+            }
+            Some("install") => needs.installs.extend(text("name")),
+            _ => {}
+        }
+        needs
     }
 
     /// For the model: what goes ahead without asking.
@@ -324,6 +428,12 @@ impl Needs {
         }
         for app in &self.apps {
             parts.push(format!("input in {app}"));
+        }
+        if self.shell {
+            parts.push("commands that would ask (deletes, kills, pushes, uploads)".to_string());
+        }
+        for key in &self.keys {
+            parts.push(format!("commands using the key {key}"));
         }
         for command in &self.commands {
             parts.push(format!("the command `{command}`"));
@@ -427,7 +537,7 @@ mod tests {
             {"step": "Write the list in Mousepad", "status": "pending", "app": "Mousepad"},
             {"step": "Save it", "status": "pending", "app": "mousepad"},
             {"step": "Post it", "status": "pending", "site": "https://app.slack.com/client/T1"},
-            {"step": "Push", "status": "pending", "commands": ["git  push -u origin fix", ""]},
+            {"step": "Push", "status": "pending", "commands": true, "keys": ["GITHUB_TOKEN", ""]},
             {"step": "Install Slack", "status": "pending", "install": "slack", "site": null},
             {"step": "Tell the user", "status": "pending"},
         ]}))
@@ -438,19 +548,29 @@ mod tests {
     fn a_plans_needs_are_each_named_once() {
         let items = needing();
         assert_eq!(items[2].site.as_deref(), Some("app.slack.com"));
-        assert_eq!(items[3].commands, vec!["git  push -u origin fix"]);
+        assert!(items[3].shell && items[3].commands.is_empty());
+        assert_eq!(items[3].keys, vec!["GITHUB_TOKEN"]);
         assert_eq!(
             serde_json::to_value(&items[0]).unwrap(),
             json!({"step": "Write the list in Mousepad", "status": "pending", "app": "Mousepad"})
         );
+        assert_eq!(
+            serde_json::to_value(&items[3]).unwrap(),
+            json!({"step": "Push", "status": "pending", "shell": true, "keys": ["GITHUB_TOKEN"]})
+        );
+        // Commands a model lists instead of `true` mean the same.
+        let listed =
+            parse(&json!({"items": [{"step": "x", "status": "pending", "commands": ["git push"]}]})).unwrap();
+        assert!(listed[0].shell && listed[0].commands.is_empty());
         let needs = Needs::of(&items);
         assert_eq!(needs.apps, vec!["Mousepad"]);
         assert_eq!(needs.sites, vec!["app.slack.com"]);
         assert_eq!(needs.installs, vec!["slack"]);
+        assert!(needs.shell);
         assert_eq!(
             needs.describe(),
-            "clicks, typing and keys on app.slack.com; input in Mousepad; the command `git  push -u origin \
-             fix`; installing slack"
+            "clicks, typing and keys on app.slack.com; input in Mousepad; commands that would ask (deletes, \
+             kills, pushes, uploads); commands using the key GITHUB_TOKEN; installing slack"
         );
         // Already granted: nothing new to ask about.
         assert!(needs.without(&needs.clone()).is_empty());
@@ -459,8 +579,11 @@ mod tests {
             ..Needs::default()
         };
         assert_eq!(needs.without(&mousepad).apps, Vec::<String>::new());
+        assert!(needs.without(&mousepad).shell && !mousepad.without(&needs).shell);
         assert_eq!(mousepad.and(&needs).apps, vec!["MOUSEPAD"]);
         assert_eq!(mousepad.and(&needs).sites, vec!["app.slack.com"]);
+        assert!(mousepad.and(&needs).shell);
+        assert_eq!(mousepad.and(&needs).keys, vec!["GITHUB_TOKEN"]);
     }
 
     #[test]
@@ -470,7 +593,8 @@ mod tests {
             json!({"kind": "browser", "action": "type", "site": "app.slack.com"}),
             json!({"kind": "app", "action": "act", "app": "Mousepad", "steps": [{"action": "type"}]}),
             json!({"kind": "app", "action": "gui", "app": "Mousepad", "steps": [{"app": "Mousepad"}, {"action": "type"}]}),
-            json!({"kind": "shell", "command": "git push -u  origin fix", "secrets": []}),
+            json!({"kind": "shell", "command": "rm -rf ./old-build", "secrets": []}),
+            json!({"kind": "shell", "command": "git push -u origin fix", "secrets": ["GITHUB_TOKEN"]}),
             json!({"kind": "install", "name": "slack"}),
         ];
         for card in yes {
@@ -484,15 +608,14 @@ mod tests {
             // A pixel batch whose point lands in another app.
             json!({"kind": "app", "action": "gui", "app": "Mousepad", "steps": [{"app": "Slack"}]}),
             json!({"kind": "app", "app": "Slack"}),
-            // Another command, one with a saved key, a direct one, one run
-            // after another on a new line.
-            json!({"kind": "shell", "command": "git push --force -u origin fix"}),
-            json!({"kind": "shell", "command": "git push -u origin fix", "secrets": ["GITHUB_TOKEN"]}),
+            // A key it didn't name, alone or beside one it did; a direct one.
+            json!({"kind": "shell", "command": "curl -H \"$NPM_TOKEN\" x", "secrets": ["NPM_TOKEN"]}),
+            json!({"kind": "shell", "command": "x", "secrets": ["GITHUB_TOKEN", "NPM_TOKEN"]}),
             json!({"kind": "shell", "command": "git push -u origin fix", "direct": true}),
-            json!({"kind": "shell", "command": "git push -u origin\nfix"}),
+            json!({"kind": "shell", "command": "git push", "secrets": ["GITHUB_TOKEN"], "direct": true}),
             json!({"kind": "install", "name": "zoom-client"}),
-            // Never: keys, sites for the proxy, schedules, plans.
-            json!({"kind": "secret", "name": "slack"}),
+            // Never: keys to save, sites for the proxy, schedules, plans.
+            json!({"kind": "secret", "name": "GITHUB_TOKEN"}),
             json!({"kind": "access", "hosts": ["app.slack.com"]}),
             json!({"kind": "schedule", "name": "slack"}),
             json!({"kind": "plan"}),
@@ -500,6 +623,23 @@ mod tests {
         for card in no {
             assert!(!grant.covers(&card), "{card}");
         }
+        // A key alone covers the commands using it, not others.
+        let key = Needs {
+            keys: vec!["GITHUB_TOKEN".into()],
+            ..Needs::default()
+        };
+        assert!(
+            key.covers(&json!({"kind": "shell", "command": "gh pr create", "secrets": ["GITHUB_TOKEN"]}))
+        );
+        assert!(!key.covers(&json!({"kind": "shell", "command": "rm -rf build", "secrets": []})));
+        // A grant from before 0.19.1: its exact command, and nothing else.
+        let exact = Needs {
+            commands: vec!["git  push -u origin fix".into()],
+            ..Needs::default()
+        };
+        assert!(exact.covers(&json!({"kind": "shell", "command": "git push -u  origin fix"})));
+        assert!(!exact.covers(&json!({"kind": "shell", "command": "git push -u origin\nfix"})));
+        assert!(!exact.covers(&json!({"kind": "shell", "command": "git push --force"})));
         // A parent site covers what's under it.
         let slack = Needs {
             sites: vec!["slack.com".into()],
@@ -510,6 +650,39 @@ mod tests {
     }
 
     #[test]
+    fn allowing_a_card_for_the_task_grants_its_kind_of_action() {
+        let browser = Needs::of_card(&json!({"kind": "browser", "action": "click", "site": "github.com"}));
+        assert_eq!(browser.sites, vec!["github.com"]);
+        assert!(browser.covers(&json!({"kind": "browser", "action": "type", "site": "github.com"})));
+        let shell =
+            Needs::of_card(&json!({"kind": "shell", "command": "git push", "secrets": ["GITHUB_TOKEN"]}));
+        assert!(shell.shell && shell.keys == vec!["GITHUB_TOKEN"]);
+        assert!(shell.covers(&json!({"kind": "shell", "command": "rm -rf build"})));
+        assert!(
+            shell.covers(&json!({"kind": "shell", "command": "gh pr create", "secrets": ["GITHUB_TOKEN"]}))
+        );
+        assert!(!shell.covers(&json!({"kind": "shell", "command": "npm publish", "secrets": ["NPM_TOKEN"]})));
+        let app = Needs::of_card(
+            &json!({"kind": "app", "app": "Mousepad", "steps": [{"app": "Mousepad"}, {"app": "Slack"}]}),
+        );
+        assert_eq!(app.apps, vec!["Mousepad", "Slack"]);
+        assert_eq!(
+            Needs::of_card(&json!({"kind": "install", "name": "slack"})).installs,
+            vec!["slack"]
+        );
+        for never in [
+            json!({"kind": "shell", "command": "pip download x", "direct": true}),
+            json!({"kind": "secret", "name": "GITHUB_TOKEN"}),
+            json!({"kind": "access", "hosts": ["a.com"]}),
+            json!({"kind": "schedule"}),
+            json!({"kind": "plan"}),
+            json!({"kind": "browser"}),
+        ] {
+            assert!(Needs::of_card(&never).is_empty(), "{never}");
+        }
+    }
+
+    #[test]
     fn the_user_can_edit_steps_and_drop_needs_but_not_add_them() {
         let card = json!({"kind": "plan", "steps": needing()});
         let plan = edited(
@@ -517,14 +690,15 @@ mod tests {
             &json!([
                 {"step": "Write the list in Mousepad, with eggs", "app": "Mousepad"},
                 {"step": "Post it in #random", "status": "pending"},
-                {"step": "Push", "status": "pending", "commands": ["git push -u origin fix"]},
+                {"step": "Push", "status": "pending", "keys": ["GITHUB_TOKEN"]},
             ]),
         )
         .unwrap();
         assert_eq!(plan[0].status, Status::Pending);
         let needs = Needs::of(&plan);
-        assert!(needs.sites.is_empty() && needs.installs.is_empty());
+        assert!(needs.sites.is_empty() && needs.installs.is_empty() && !needs.shell);
         assert_eq!(needs.apps, vec!["Mousepad"]);
+        assert_eq!(needs.keys, vec!["GITHUB_TOKEN"]);
         // Nothing the agent didn't ask for.
         for (added, says) in [
             (
@@ -532,16 +706,22 @@ mod tests {
                 "input on mail.google.com",
             ),
             (
-                json!({"step": "x", "commands": ["rm -rf ~"]}),
-                "the command `rm -rf ~`",
+                json!({"step": "x", "keys": ["NPM_TOKEN"]}),
+                "using the key NPM_TOKEN",
             ),
             (json!({"step": "x", "app": "Terminal"}), "input in Terminal"),
         ] {
             let problem = edited(&card, &json!([added])).unwrap_err();
             assert!(problem.contains(says), "{problem}");
         }
+        // Commands, on a plan that didn't ask for them.
+        let quiet =
+            json!({"kind": "plan", "steps": [{"step": "Read", "status": "pending", "app": "Mousepad"}]});
+        let problem = edited(&quiet, &json!([{"step": "x", "shell": true}])).unwrap_err();
+        assert!(problem.contains("commands that would ask"), "{problem}");
         assert!(edited(&card, &json!([])).is_err());
         assert!(edited(&card, &json!({"step": "x"})).is_err());
         assert!(edited(&card, &json!([{"step": " "}])).is_err());
+        assert!(edited(&card, &json!([{"step": "x", "keys": ["not a key"]}])).is_err());
     }
 }

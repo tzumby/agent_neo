@@ -3,7 +3,7 @@ as root (copy it over `make shell`): a fixture in Mousepad, a chat request to
 agentd over its socket, and its approval cards answered by a rule.
 
     python3 -I desktop-apps-pilot.py setup [clean]  # notes.txt open in Mousepad, unsaved (clean: saved)
-    python3 -I desktop-apps-pilot.py chat "<request>" [approve|plan-edit|deny|off|tamper|kill] [model]
+    python3 -I desktop-apps-pilot.py chat "<request>" [approve|plan-edit|allow-task|deny|off|tamper|kill] [model]
     python3 -I desktop-apps-pilot.py schedule "<request>"   # as a scheduled run
     python3 -I desktop-apps-pilot.py check      # the file and the window title
     python3 -I desktop-apps-pilot.py cleanup    # the pilot's conversations, memories and files
@@ -11,7 +11,8 @@ agentd over its socket, and its approval cards answered by a rule.
 approve: OKs plan cards as they are and Mousepad's cards (any input), denies
 the rest. plan-edit: approves a plan card as the user would after editing it
 (the first step reworded, a step added, every need but the apps taken off).
-deny: denies all. off: turns Browser actions off first (and on after). tamper: the
+allow-task: answers every card that offers it with "Allow for this task" (and
+plan cards as they are), denies the rest. deny: denies all. off: turns Browser actions off first (and on after). tamper: the
 app saves itself while the first card waits. kill: computer-use is killed
 0.6 s after the first OK. Each chat starts a conversation called "HCU pilot",
 and the agent may remember what it did there; cleanup removes both.
@@ -151,6 +152,14 @@ def chat(request, policy, model=None):
                 status, reply = api("POST", f"/api/v1/approvals/{data['id']}", body)
                 if status != 200:
                     print(f"          !! {status} {reply}")
+                continue
+            if kind == "approval.requested" and policy == "allow-task":
+                cards += 1
+                print(f"          card: {data.get('kind')}; for_task: {data.get('for_task')!r}")
+                offered = bool(data.get("for_task"))
+                body = {"approved": offered or data.get("kind") == "plan", "for_task": offered}
+                print(f"          -> {'allow for this task' if offered else 'approve the plan' if body['approved'] else 'deny'}")
+                api("POST", f"/api/v1/approvals/{data['id']}", body)
                 continue
             if kind == "approval.requested":
                 cards += 1

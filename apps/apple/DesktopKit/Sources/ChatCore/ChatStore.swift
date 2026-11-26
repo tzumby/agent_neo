@@ -590,12 +590,13 @@ public final class ChatStore {
     /// card to show rather than a notice.
     @discardableResult
     public func answer(
-        _ approval: Approval, approved: Bool, text: String? = nil, plan: [PlanEdit]? = nil, client: AgentClient
+        _ approval: Approval, approved: Bool, text: String? = nil, plan: [PlanEdit]? = nil, forTask: Bool = false,
+        client: AgentClient
     ) async -> String? {
         var refused: String?
         await attempt(onGone: { $0.conversations.values.forEach { $0.expire(approval: approval.id) } }) {
             do {
-                try await client.answer(approval: approval.id, approved: approved, text: text, plan: plan)
+                try await client.answer(approval: approval.id, approved: approved, text: text, plan: plan, forTask: forTask)
             } catch let error as AgentError where error.statusCode == 400 && approval.plan != nil {
                 refused = Self.message(error)
             }

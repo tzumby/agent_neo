@@ -233,6 +233,13 @@ struct ApprovalAnswer: Encodable, Equatable {
     let approved: Bool
     let text: String?
     var plan: [PlanEdit]? = nil
+    /// "Allow for this task"; left out when not.
+    var forTask: Bool? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case approved, text, plan
+        case forTask = "for_task"
+    }
 }
 
 /// One step of a plan card's steps as the user approves them, when they
@@ -243,17 +250,21 @@ public struct PlanEdit: Encodable, Sendable, Equatable {
     public var status: String?
     public var site: String?
     public var app: String?
+    public var shell: Bool?
+    public var keys: [String]?
     public var commands: [String]?
     public var install: String?
 
     public init(
-        step: String, status: String? = nil, site: String? = nil, app: String? = nil, commands: [String]? = nil,
-        install: String? = nil
+        step: String, status: String? = nil, site: String? = nil, app: String? = nil, shell: Bool? = nil,
+        keys: [String]? = nil, commands: [String]? = nil, install: String? = nil
     ) {
         self.step = step
         self.status = status
         self.site = site
         self.app = app
+        self.shell = shell
+        self.keys = keys
         self.commands = commands
         self.install = install
     }
@@ -388,9 +399,14 @@ public struct AgentClient: Sendable {
     /// `text`: what the user changed the card's text to, on a card that takes
     /// an edit; `plan`: their version of a plan card's steps. Each only when
     /// they changed it.
-    public func answer(approval id: String, approved: Bool, text: String? = nil, plan: [PlanEdit]? = nil) async throws {
+    /// `forTask`: "Allow for this task", the card's kind of action without
+    /// asking until the task ends.
+    public func answer(
+        approval id: String, approved: Bool, text: String? = nil, plan: [PlanEdit]? = nil, forTask: Bool = false
+    ) async throws {
         let _: [String: Bool] = try await post(
-            "/api/v1/approvals/\(id)", body: ApprovalAnswer(approved: approved, text: text, plan: plan))
+            "/api/v1/approvals/\(id)",
+            body: ApprovalAnswer(approved: approved, text: text, plan: plan, forTask: forTask ? true : nil))
     }
 
     /// "I'm done" (true) or "Skip" (false) on an action-needed card; starts a

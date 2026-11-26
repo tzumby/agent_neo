@@ -343,7 +343,7 @@ test("a plan card: its steps with what each needs, and what approving covers", (
   const card = t.visible()[1];
   assert.deepEqual([card.type, card.kind, card.editable, card.tainted, card.command], ["approval", "plan", true, false, ""]);
   assert.deepEqual(card.plan.steps, PLAN_CARD.steps, "a need is there only when the step has it");
-  assert.deepEqual(card.plan.covers, PLAN_CARD.covers);
+  assert.deepEqual(card.plan.covers, { ...PLAN_CARD.covers, shell: false, keys: [] });
   assert.deepEqual(stepNeeds(card.plan.steps[3]), [{ kind: "command", value: "git push -u origin fix" }]);
   assert.deepEqual(stepNeeds(card.plan.steps[5]), []);
   // The summary, as the card says it.
@@ -358,7 +358,7 @@ test("a plan card: its steps with what each needs, and what approving covers", (
     covers: { sites: ["a.com", "a.com"], apps: null },
   })]).visible()[0];
   assert.deepEqual(odd.plan.steps, [{ step: "Go", status: "pending", commands: ["ls"] }]);
-  assert.deepEqual(odd.plan.covers, { sites: ["a.com"], apps: [], commands: [], installs: [] });
+  assert.deepEqual(odd.plan.covers, { sites: ["a.com"], apps: [], shell: false, keys: [], commands: [], installs: [] });
   assert.equal(odd.editable, false, "only a card that says it takes an edit offers one");
 
   t.apply(ev("approval.resolved", { task: "t1", id: PLAN_CARD.id, approved: true, by: "someone@example.com", edited: true, plan: [] }));
@@ -384,7 +384,9 @@ test("a plan card's edits: needs only come off, the summary follows, and only a 
   assert.deepEqual(mine[0], { step: "Open notes.txt in Mousepad", status: "pending" });
   assert.deepEqual(planCovers(covers, mine).apps, ["Mousepad"]);
   mine = mine.map((s, i) => (i === 1 ? withoutNeed(s, 0) : s));
-  assert.deepEqual(planCovers(covers, mine), { sites: ["app.slack.com"], apps: [], commands: ["git push -u origin fix"], installs: ["slack"] });
+  assert.deepEqual(planCovers(covers, mine), {
+    sites: ["app.slack.com"], apps: [], shell: false, keys: [], commands: ["git push -u origin fix"], installs: ["slack"],
+  });
 
   // One command at a time.
   const two = { step: "Ship", status: "pending", commands: ["git push", "npm publish"], site: "github.com" };
@@ -625,4 +627,50 @@ test("Auto approve confirms the desktop's current revision and reports what it h
   result = await store.setAutoApprove(false);
   assert.equal(result.on, true);
   assert.equal(result.error.status, 0);
+});
+
+test("a plan's commands and saved keys: chips that come off, and the summary says them", () => {
+  const card = new Timeline([ev("approval.requested", {
+    id: "p3", task: "t1", kind: "plan", editable: true,
+    steps: [
+      { step: "Push the branch and open the PR", status: "pending", shell: true, keys: ["GITHUB_TOKEN", "GITHUB_TOKEN", ""] },
+      { step: "Tell the user", status: "pending" },
+    ],
+    covers: { sites: [], apps: [], shell: true, keys: ["GITHUB_TOKEN"], commands: [], installs: [] },
+  })]).visible()[0];
+  const [push, tell] = card.plan.steps;
+  assert.deepEqual(push, { step: "Push the branch and open the PR", status: "pending", shell: true, keys: ["GITHUB_TOKEN"] });
+  assert.deepEqual(stepNeeds(push).map((n) => n.kind), ["shell", "key"]);
+  const say = (steps) => planPhrases(planCovers(card.plan.covers, steps)).map((p) => p.lead + andList(p.items).join("")).join(" · ");
+  assert.equal(say(card.plan.steps), "running commands that would ask (deletes, pushes, uploads) · commands using your key GITHUB_TOKEN");
+  const noShell = withoutNeed(push, 0);
+  assert.deepEqual(noShell, { step: "Push the branch and open the PR", status: "pending", keys: ["GITHUB_TOKEN"] });
+  assert.equal(say([noShell, tell]), "commands using your key GITHUB_TOKEN");
+  const noKey = withoutNeed(push, 1);
+  assert.deepEqual(noKey, { step: "Push the branch and open the PR", status: "pending", shell: true });
+  assert.equal(say([noKey, tell]), "running commands that would ask (deletes, pushes, uploads)");
+  assert.deepEqual(planAnswer(card.plan.steps, [noKey, tell]), [noKey, tell], "taking a key off is a change");
+  assert.deepEqual(planPhrases(planCovers(card.plan.covers, [withoutNeed(noKey, 0), tell])), []);
+});
+
+test("Allow for this task: a card that offers it says what it lets through, and the answer asks for it", async (t) => {
+  const visible = new Timeline([
+    ev("approval.requested", { id: "c1", task: "t1", kind: "shell", command: "git push", reason: "uses your saved key", secrets: ["GITHUB_TOKEN"],
+      for_task: "commands that would ask (deletes, kills, pushes, uploads); commands using the key GITHUB_TOKEN" }),
+    ev("approval.requested", { id: "c2", task: "t1", kind: "shell", command: "pip download x", reason: "connects directly", direct: true }),
+    ev("approval.requested", { id: "c3", task: "t1", kind: "plan", steps: [{ step: "Go", status: "pending" }], for_task: "x" }),
+  ]).visible();
+  assert.equal(visible[0].forTask, "commands that would ask (deletes, kills, pushes, uploads); commands using the key GITHUB_TOKEN");
+  assert.equal(visible[1].forTask, null, "a direct command can't be allowed for the task");
+  assert.equal(visible[2].forTask, null, "a plan card is the task's grant already");
+
+  const bodies = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  });
+  const store = new Store(api);
+  await store.answer({ id: "c1" }, true, undefined, true);
+  await store.answer({ id: "c1" }, true);
+  assert.deepEqual(bodies, [{ approved: true, for_task: true }, { approved: true }]);
 });

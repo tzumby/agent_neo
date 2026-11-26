@@ -660,6 +660,7 @@ mod tests {
             by: None,
             edited: None,
             plan: None,
+            for_task: false,
         })
     }
 

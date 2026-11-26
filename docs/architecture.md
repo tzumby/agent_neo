@@ -405,7 +405,7 @@ The desktop has a separate browser network table (§5.3). File permissions prote
 
 ## 6. agentd: the agent on the desktop
 
-`services/agentd` is a single static Rust binary (edition 2024, tokio, axum 0.8, rusqlite with bundled SQLite, reqwest with rustls, regex, croner and jiff). It's built with `cargo zigbuild` for `x86_64-unknown-linux-musl` (or aarch64), with Rust 1.93.1 from `rust-toolchain.toml`. It runs the model loop, owns the browser and the shell launcher, keeps all of the agent's state, and serves the API the web app uses. Version 0.19.0: Claude through Anthropic's API as the model provider, Opus 4.6 by default and Opus 5.5 a pick (§6.7); 0.18.0 brought plan approval, one card for the steps of a task that would otherwise ask again and again (§6.11); 0.17.0 brought native apps through the desktop broker and HCU, when the deployment has them ([desktop-apps.md](desktop-apps.md)); 0.16.0 brought several conversations, queued messages, and usage with a monthly budget ([conversations-and-usage.md](conversations-and-usage.md)).
+`services/agentd` is a single static Rust binary (edition 2024, tokio, axum 0.8, rusqlite with bundled SQLite, reqwest with rustls, regex, croner and jiff). It's built with `cargo zigbuild` for `x86_64-unknown-linux-musl` (or aarch64), with Rust 1.93.1 from `rust-toolchain.toml`. It runs the model loop, owns the browser and the shell launcher, keeps all of the agent's state, and serves the API the web app uses. Version 0.19.2: "Allow for this task" on any card a grant can cover; 0.19.1 let a plan cover commands and the saved keys they use. 0.19.0 brought Claude through Anthropic's API as the model provider, Opus 4.6 by default and Opus 5.5 a pick (§6.7); 0.18.0 brought plan approval, one card for the steps of a task that would otherwise ask again and again (§6.11); 0.17.0 brought native apps through the desktop broker and HCU, when the deployment has them ([desktop-apps.md](desktop-apps.md)); 0.16.0 brought several conversations, queued messages, and usage with a monthly budget ([conversations-and-usage.md](conversations-and-usage.md)).
 
 ### 6.1 Process, configuration and startup
 
@@ -548,7 +548,7 @@ Everything lives under `/var/lib/agentd` (directory mode 0700, owner `agentd`). 
 | GET | `/api/v1/usage?days=` | The usage figures (§6.22): `days` 1–90, default 30 |
 | GET | `/api/v1/events?after=&kinds=&session=` | Server-Sent Events from the durable log in sequence order: every conversation's, or with `session` that conversation's and the global ones. `kinds` (comma-separated) filters what is sent. Each event has `id: seq`, `event: kind` and the JSON event. The live bus wakes the stream when it is caught up, including when a subscriber has fallen behind. Keep-alive comments every 15 s |
 | GET | `/api/v1/events/page?before=&limit=&kinds=&session=` | A page of the log, oldest first: up to `limit` (default 100, at most 500) events of `kinds` before `before` (from the newest when absent); with `session`, that conversation's and the global ones (`session = ? OR session IS NULL`). `{events, more, last_seq}`: `more` says older ones remain, and `last_seq` is the log's newest seq, read under the same lock, for the stream to go on from. Keys redacted as in the stream (0.15.1) |
-| POST | `/api/v1/approvals/{id}` | `{approved, text?, plan?}`. Resumes the parked task in its conversation at once, past `MAX_PARALLEL_TASKS` and a used-up budget; `text` replaces the card's text, and `plan` (a `plan` card's steps, `[{step, status?, site?, app?, commands?, install?}]`) the agent's plan (§6.11). 400 if it can't (an edit that adds a need the card didn't have, an empty step, none or more than 20), 404 if unknown or expired, 409 only while another card of the same conversation is being resumed |
+| POST | `/api/v1/approvals/{id}` | `{approved, text?, plan?, for_task?}`; `for_task: true` is "Allow for this task" (§6.11). Resumes the parked task in its conversation at once, past `MAX_PARALLEL_TASKS` and a used-up budget; `text` replaces the card's text, and `plan` (a `plan` card's steps, `[{step, status?, site?, app?, commands?, install?}]`) the agent's plan (§6.11). 400 if it can't (an edit that adds a need the card didn't have, an empty step, none or more than 20), 404 if unknown or expired, 409 only while another card of the same conversation is being resumed |
 | POST | `/api/v1/actions/{id}` | `{choice: done or skip}` on an Action needed card: a message in the card's conversation, "I've done what you asked… continue" or "I'm skipping that step…", which starts or queues. The card is claimed first: a second answer is a 404. An archived conversation comes back (`session.updated`). 202 `{task}` or `{queued}` |
 | POST | `/api/v1/stop` | `main`'s Stop: `{stopping, stopped, dropped}`, as for a conversation |
 | GET | `/api/v1/images/{id}` | A saved screenshot (hex ids only) |
@@ -619,9 +619,9 @@ Every change the web app shows is an event: appended to `events` and broadcast o
 | `review` | `task`, `verdict` (progressing, nudge, stuck or failed), `reason` | Each supervisor check (§6.6) |
 | `shell` | `task`, `command`, `as_root`, `direct` (outside the proxy, §6.21), `needs_approval`, `secrets` (key names) | A command is about to run or ask |
 | `shell.output` | `task`, `command`, `exit_code`, `timed_out`, `stopped`, `output` (last 4,000 characters), `seconds` | A command ended |
-| `approval.requested` | The card: `id`, `task`, `kind` (`shell`, `browser`, `app`, `install`, `schedule`, `secret`, `access`, `plan` or `stuck`) and its fields. A `shell` card has `command`, `reason`, `secrets`, `summary` (the model's plain words, one line, at most 120 characters), `tainted` (asked after outside content) and, only for a direct command, `direct: true` (§6.21). A `plan` card has `steps` (as in `plan`, with each step's needs), `covers` (`{sites, apps, commands, installs}`, what approving adds), `tainted` and `editable: true` | A task parks |
+| `approval.requested` | The card: `id`, `task`, `kind` (`shell`, `browser`, `app`, `install`, `schedule`, `secret`, `access`, `plan` or `stuck`) and its fields. A `shell` card has `command`, `reason`, `secrets`, `summary` (the model's plain words, one line, at most 120 characters), `tainted` (asked after outside content) and, only for a direct command, `direct: true` (§6.21). A `plan` card has `steps` (as in `plan`, with each step's needs), `covers` (`{sites, apps, shell, keys, commands, installs}`, what approving adds), `tainted` and `editable: true`. A card a grant can cover has `for_task`: what "Allow for this task" would let through, in words | A task parks |
 | `task.paused` | `task`, `approval` | Right after the card |
-| `approval.resolved` | `task`, `id`, `approved`, `by`, `edited`, `text`, `plan`, `expired`, `reason` (`policy_changed`) | Answered (`text` or `plan`: what the person changed it to), or given up on |
+| `approval.resolved` | `task`, `id`, `approved`, `by`, `edited`, `text`, `plan`, `for_task`, `expired`, `reason` (`policy_changed`) | Answered (`text` or `plan`: what the person changed it to), or given up on |
 | `task.resumed` | `task` | A parked task carries on |
 | `task.stopping` | `session` | Stop was pressed while a task ran |
 | `task.finished` | `task`, `status`, `steps`, `seconds`, `model`, `usage` ({input, output, cached}), `cost` (USD) | A chat task ends |
@@ -915,14 +915,15 @@ effects.
 **Plans.** When a task would ask more than once, the prompt has the agent
 start with `update_plan` and name, on each step, what it needs an OK for. Models
 don't always do that unprompted, so agentd also asks once per chat task:
-before the task's first card for browser input, app input or an install
-(with no plan approved yet), the call isn't carried out and the model is
-told to plan first, or to call it again if it's the only thing that needs
-an OK (a command's card isn't held back: its row is already showing). Each
-step can name: a
+before the task's first card for browser input, app input, a command or an
+install (with no plan approved yet; not a direct command), the call isn't
+carried out and the model is told to plan first, or to call it again if
+it's the only thing that needs an OK. Each step can name: a
 `site` (a host it clicks, types or presses keys on), an `app` (a desktop app
-it gives input to), `commands` (exact ones that ask; agentd drops those that
-never would) or an `install` (a Snap Store name). A plan with needs the task
+it gives input to), `commands: true` (it runs commands that would ask:
+deletes, kills, pushes, uploads, data going out after outside content),
+`keys` (the saved keys its commands use; each must be saved) or an `install`
+(a Snap Store name). A plan with needs the task
 hasn't been granted parks on one `plan` card: the steps, each with its
 needs, and `covers`, what approving adds. The user can edit the steps' text,
 delete, add and reorder steps, and take needs off; agentd refuses an edit
@@ -931,13 +932,29 @@ the task's grant (what the user took off is revoked, even from an earlier
 plan), and the model gets the user's version to follow. For the rest of that
 task, `approve` lets through what the grant covers before anything else: a
 browser action on the site or a host under it, an app batch whose every
-window is the app's, a shell command equal to a named one (lines trimmed,
-spaces collapsed; line breaks still count), an install of the named app.
+window is the app's, a command that would ask (with `commands`), a command
+using saved keys when each of them is granted, an install of the named app.
+(Plans from before 0.19.1 named exact commands; a task saved then still
+matches them: lines trimmed, spaces collapsed, line breaks counting.)
 Each goes on record as `approval.plan`, which the chat shows, with no card,
-picture or notification. Everything else asks as before: other sites, apps
-and commands, saved keys, direct connections, new sites for the proxy,
-schedules, stuck checks and a later plan that adds needs (that card shows
-only what's new). The grant only removes the wait for an OK: the checks
+picture or notification. Everything else asks as before: other sites and
+apps, commands when the plan didn't name them, keys it didn't name, direct
+connections (never covered: they get around the proxy), new sites for the
+proxy, schedules, stuck checks and a later plan that adds needs (that card
+shows only what's new). A plan card also carries `summary`, `reason` and
+`command` (the numbered steps), which an app from before 0.18.0 shows as a
+command's card; its Approve approves the plan as it is.
+
+**Allow for this task.** Models don't reliably plan (Opus 5.5, told to plan
+before two deletes, ran each on its own card), so every card a grant can
+cover also offers its own: `for_task` on the card says, in words, what it
+would let through. Answered with `{approved: true, for_task: true}`, the
+card's kind of action joins the task's grant before the resumed call runs:
+a browser card's site, an app card's apps, a command card's commands that
+would ask with the saved keys it uses, an install's app. Direct commands,
+keys to save, proxy sites, schedules and plans never offer it. It's the
+same grant a plan makes (`approval.plan` records what it then lets through),
+it ends with the task, and the model is told what it now covers. The grant only removes the wait for an OK: the checks
 around it still run. Browser actions off, Take over targets, typed text
 with a saved key's value, and the bindings agentd and the broker check just
 before input all apply as before. A plan card is always a person's: Auto approve never answers one, a

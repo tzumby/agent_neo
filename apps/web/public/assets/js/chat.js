@@ -282,18 +282,23 @@ function plan(item) {
 }
 
 // What a step needs the person's OK for, each a chip: a site (clicks, typing
-// and keys there), an app (input in it), a command, an install.
-const NEED_ICONS = { site: "globe", app: "desktop", command: "terminal", install: "download" };
+// and keys there), an app (input in it), commands that would ask, a saved key
+// they use, an exact command (agentd before 0.19.1), an install.
+const NEED_ICONS = { site: "globe", app: "desktop", shell: "terminal", key: "key", command: "terminal", install: "download" };
 
 /** A step's chips; `onRemove(i)` gives each an × that takes the `i`th off. */
 function needChips(step, onRemove) {
   const needs = stepNeeds(step);
   if (!needs.length) return null;
   return h("span", { class: "plan-needs" }, needs.map((need, i) => {
-    const label = need.kind === "command" ? h("code", null, need.value) : need.kind === "install" ? `Install ${need.value}` : need.value;
+    const label = need.kind === "command" ? h("code", null, need.value)
+      : need.kind === "key" ? ["Uses ", h("code", null, need.value)]
+      : need.kind === "install" ? `Install ${need.value}` : need.value;
     let remove = null;
     if (onRemove) {
-      const said = need.kind === "install" ? `installing ${need.value}` : `“${need.value}”`;
+      const said = need.kind === "install" ? `installing ${need.value}`
+        : need.kind === "shell" ? "running commands without asking"
+        : need.kind === "key" ? `using the key ${need.value}` : `“${need.value}”`;
       remove = h("button", { class: "plan-need-remove", type: "button", "aria-label": `Take ${said} off this step`, title: "Take it off" }, icon("close"));
       remove.addEventListener("click", () => onRemove(i));
     }
@@ -466,9 +471,21 @@ function answerButtons(card, ctx, edit, approvalDisabled = false) {
   const approve = h("button", { class: "button button-primary", type: "button", disabled: approvalDisabled }, "Approve");
   deny.addEventListener("click", () => busyButton(deny, () => ctx.store.answer(card, false)));
   approve.addEventListener("click", () => busyButton(approve, () => ctx.store.answer(card, true, edit?.changed())));
-  if (!edit?.button) return buttons(deny, approve);
-  edit.onChange = () => (approve.disabled = approvalDisabled || edit.blank());
-  return buttons(edit.button, deny, approve);
+  // "Allow for this task": this, and what's like it, without asking again
+  // until the task ends (a card a grant can cover offers it).
+  let allow = null;
+  let note = null;
+  if (card.forTask) {
+    allow = h("button", { class: "button", type: "button", disabled: approvalDisabled }, "Allow for this task");
+    allow.addEventListener("click", () => busyButton(allow, () => ctx.store.answer(card, true, edit?.changed(), true)));
+    note = h("p", { class: "card-note card-for-task" }, `Allow for this task also lets ${card.forTask} go ahead without asking, until this task ends.`);
+  }
+  if (!edit?.button) return [note, buttons(deny, allow, approve)];
+  edit.onChange = () => {
+    approve.disabled = approvalDisabled || edit.blank();
+    if (allow) allow.disabled = approve.disabled;
+  };
+  return [note, buttons(edit.button, deny, allow, approve)];
 }
 
 // The text a card asks about, with Edit: what gets approved can be the person's

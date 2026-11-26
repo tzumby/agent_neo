@@ -116,12 +116,16 @@ export function appStepWords(step, { pixels = false, window = "" } = {}) {
 
 /**
  * A plan step's needs, in order, one per chip: its site (clicks, typing and
- * keys there), its app (input in it), each of its commands, its install.
+ * keys there), its app (input in it), commands that would ask, each saved
+ * key its commands use, each exact command (agentd before 0.19.1), its
+ * install.
  */
 export function stepNeeds(step) {
   return [
     ...(step.site ? [{ kind: "site", value: step.site }] : []),
     ...(step.app ? [{ kind: "app", value: step.app }] : []),
+    ...(step.shell ? [{ kind: "shell", value: "Commands that would ask" }] : []),
+    ...(step.keys || []).map((value) => ({ kind: "key", value })),
     ...(step.commands || []).map((value) => ({ kind: "command", value })),
     ...(step.install ? [{ kind: "install", value: step.install }] : []),
   ];
@@ -129,11 +133,13 @@ export function stepNeeds(step) {
 
 /** The step without its `index`th need (a chip's ×). */
 export function withoutNeed(step, index) {
-  const { site, app, commands, install, ...rest } = step;
+  const { site, app, shell, keys, commands, install, ...rest } = step;
   const next = { ...rest };
   stepNeeds(step).forEach((need, i) => {
     if (i === index) return;
     if (need.kind === "command") (next.commands ||= []).push(need.value);
+    else if (need.kind === "key") (next.keys ||= []).push(need.value);
+    else if (need.kind === "shell") next.shell = true;
     else next[need.kind] = need.value;
   });
   return next;
@@ -144,10 +150,13 @@ export function withoutNeed(step, index) {
  * (only what's new), less what the person's edits took off every step.
  */
 export function planCovers(covers, steps) {
-  const left = { sites: new Set(), apps: new Set(), commands: new Set(), installs: new Set() };
+  const left = { sites: new Set(), apps: new Set(), shells: new Set(), keys: new Set(), commands: new Set(), installs: new Set() };
   for (const step of steps) for (const need of stepNeeds(step)) left[`${need.kind}s`].add(need.value);
-  const keep = (key) => covers[key].filter((value) => left[key].has(value));
-  return { sites: keep("sites"), apps: keep("apps"), commands: keep("commands"), installs: keep("installs") };
+  const keep = (key) => (covers[key] || []).filter((value) => left[key].has(value));
+  return {
+    sites: keep("sites"), apps: keep("apps"), shell: covers.shell === true && left.shells.size > 0,
+    keys: keep("keys"), commands: keep("commands"), installs: keep("installs"),
+  };
 }
 
 /**
@@ -158,9 +167,11 @@ export function planPhrases(covered) {
   return [
     { lead: "clicking, typing and pressing keys on ", items: covered.sites },
     { lead: "input in ", items: covered.apps },
+    { lead: "running commands that would ask (deletes, pushes, uploads)", items: [], on: covered.shell },
+    { lead: "commands using your key ", items: covered.keys, code: true },
     { lead: "running ", items: covered.commands, code: true },
     { lead: "installing ", items: covered.installs },
-  ].filter((phrase) => phrase.items.length);
+  ].filter((phrase) => phrase.items.length || phrase.on);
 }
 
 /** "a, b and c", each item through `wrap` (as code, say). */
@@ -323,6 +334,9 @@ export class Timeline {
           kind: ["secret", "schedule", "browser", "app", "install", "access", "stuck", "plan"].includes(d.kind) ? d.kind : "shell",
           command: str(d.command), reason: str(d.reason), summary: d.summary || null, tainted: d.tainted === true,
           editable: d.editable === true,
+          // "Allow for this task": what approving with it would also let
+          // through until the task ends (a card a grant can cover says).
+          forTask: d.kind !== "plan" && str(d.for_task) ? str(d.for_task) : null,
         };
         if (card.kind === "shell") {
           card.savedKeys = Array.isArray(d.secrets)
@@ -352,7 +366,10 @@ export class Timeline {
           const list = (key) => [...new Set(Array.isArray(d.covers?.[key]) ? d.covers[key].filter((v) => typeof v === "string" && v) : [])];
           card.plan = {
             steps: Array.isArray(d.steps) ? planSteps(d.steps) : [],
-            covers: { sites: list("sites"), apps: list("apps"), commands: list("commands"), installs: list("installs") },
+            covers: {
+              sites: list("sites"), apps: list("apps"), shell: d.covers?.shell === true, keys: list("keys"),
+              commands: list("commands"), installs: list("installs"),
+            },
           };
         } else if (card.kind === "install") {
           // An app from a store (the Snap Store), installed on the desktop as
@@ -534,6 +551,9 @@ function planSteps(items) {
     const step = { step: i.step, status: PLAN_STATUSES.includes(i.status) ? i.status : "pending" };
     if (str(i.site)) step.site = i.site;
     if (str(i.app)) step.app = i.app;
+    if (i.shell === true) step.shell = true;
+    const keys = Array.isArray(i.keys) ? [...new Set(i.keys.filter((k) => typeof k === "string" && k))] : [];
+    if (keys.length) step.keys = keys;
     const commands = Array.isArray(i.commands) ? i.commands.filter((c) => typeof c === "string" && c) : [];
     if (commands.length) step.commands = commands;
     if (str(i.install)) step.install = i.install;

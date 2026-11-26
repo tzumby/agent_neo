@@ -238,6 +238,7 @@ mod tests {
             by: None,
             edited: None,
             plan: None,
+            for_task: false,
         };
         let denied = agent
             .install_app("t1", &args, None, true, Some(answer))

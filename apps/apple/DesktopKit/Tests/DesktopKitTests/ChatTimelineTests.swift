@@ -744,3 +744,56 @@ private func said(_ covers: PlanCovers) -> String {
             Line(place: "", what: "An action"),
         ])
 }
+
+@Test func aPlansCommandsAndSavedKeysAreChipsThatComeOff() throws {
+    let (_, plan) = try planApproval(
+        #"""
+        {"id":"p3","task":"t1","kind":"plan","editable":true,
+         "summary":"Approve a plan of 2 steps","command":"1. Push the branch\n2. Tell the user",
+         "steps":[{"step":"Push the branch and open the PR","status":"pending","shell":true,"keys":["GITHUB_TOKEN","GITHUB_TOKEN",""]},
+                  {"step":"Tell the user","status":"pending"}],
+         "covers":{"sites":[],"apps":[],"shell":true,"keys":["GITHUB_TOKEN"],"commands":[],"installs":[]}}
+        """#)
+    let push = plan.steps[0]
+    #expect(push == PlanStep(step: "Push the branch and open the PR", status: .pending, shell: true, keys: ["GITHUB_TOKEN"]))
+    #expect(push.needs.map(\.kind) == [.shell, .key])
+    #expect(plan.covers == PlanCovers(shell: true, keys: ["GITHUB_TOKEN"]))
+    #expect(
+        said(plan.covers)
+            == "running commands that would ask (deletes, pushes, uploads) · commands using your key `GITHUB_TOKEN`")
+    let noShell = push.removing(need: 0)
+    #expect(noShell == PlanStep(step: push.step, status: .pending, keys: ["GITHUB_TOKEN"]))
+    #expect(said(plan.covers.needed(by: [noShell, plan.steps[1]])) == "commands using your key `GITHUB_TOKEN`")
+    let noKey = push.removing(need: 1)
+    #expect(noKey == PlanStep(step: push.step, status: .pending, shell: true))
+    #expect(said(plan.covers.needed(by: [noKey])) == "running commands that would ask (deletes, pushes, uploads)")
+    #expect(plan.covers.needed(by: [noKey.removing(need: 0)]).phrases.isEmpty)
+    // What goes back to agentd.
+    let sent = try JSONSerialization.jsonObject(with: JSONEncoder().encode([push.edit, noKey.edit])) as? [[String: Any]]
+    #expect(sent?[0]["shell"] as? Bool == true && sent?[0]["keys"] as? [String] == ["GITHUB_TOKEN"])
+    #expect(sent?[1]["keys"] == nil)
+}
+
+@Test func allowForThisTaskIsOfferedWhereAGrantCoversTheCard() throws {
+    var timeline = ChatTimeline()
+    timeline.apply(
+        try event(
+            1, "approval.requested",
+            #"{"id":"c1","task":"t1","kind":"shell","command":"git push","reason":"uses your saved key","secrets":["GITHUB_TOKEN"],"for_task":"commands that would ask (deletes, kills, pushes, uploads); commands using the key GITHUB_TOKEN"}"#
+        ))
+    timeline.apply(
+        try event(2, "approval.requested", #"{"id":"c2","task":"t1","kind":"shell","command":"pip download x","reason":"r","direct":true}"#))
+    timeline.apply(
+        try event(3, "approval.requested", #"{"id":"c3","task":"t1","kind":"plan","steps":[{"step":"Go","status":"pending"}],"for_task":"x"}"#))
+    let cards = timeline.visibleItems.compactMap { item -> Approval? in
+        if case .approval(let card) = item { return card }
+        return nil
+    }
+    #expect(cards.map(\.forTask) == [
+        "commands that would ask (deletes, kills, pushes, uploads); commands using the key GITHUB_TOKEN", nil, nil,
+    ])
+    // The answer says so only when it's asked for.
+    let encoded = { (answer: ApprovalAnswer) in String(decoding: try JSONEncoder().encode(answer), as: UTF8.self) }
+    #expect(try encoded(ApprovalAnswer(approved: true, text: nil, forTask: true)).contains(#""for_task":true"#))
+    #expect(try !encoded(ApprovalAnswer(approved: true, text: nil)).contains("for_task"))
+}

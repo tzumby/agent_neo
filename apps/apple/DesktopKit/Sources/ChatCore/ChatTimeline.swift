@@ -216,6 +216,9 @@ public struct ChatTimeline: Sendable, Equatable {
             approval.editable = data["editable"]?.bool ?? false
             approval.savedKeys = data["secrets"]?.array?.compactMap(\.string).filter { !$0.isEmpty } ?? []
             approval.directInternet = data["direct"]?.bool ?? false
+            if data["kind"]?.string != "plan" {
+                approval.forTask = data["for_task"]?.string.flatMap { $0.isEmpty ? nil : $0 }
+            }
             if data["kind"]?.string == "secret" {
                 approval.secret = SecretRequest(
                     name: data["name"]?.string ?? "", label: data["label"]?.string ?? "",
@@ -466,6 +469,9 @@ public struct Approval: Sendable, Equatable {
     public var stuck: StuckCheck?
     /// Set when it's the task's plan, to approve as a whole.
     public var plan: PlanApproval?
+    /// "Allow for this task": what approving with it would also let through
+    /// until the task ends, in words; nil on a card no grant covers.
+    public var forTask: String?
 }
 
 /// "Looks stuck": a check on the running task (agentd's supervisor) found it
@@ -519,21 +525,26 @@ public struct PlanStep: Sendable, Equatable {
     public var step: String
     public var status: Status
     /// What it needs the user's OK for, when it says: a site (clicks, typing
-    /// and keys there), an app (input in it), commands that would ask, an
-    /// install. A plan card approves them for the rest of the task.
+    /// and keys there), an app (input in it), commands that would ask, the
+    /// saved keys they use, an install. A plan card approves them for the
+    /// rest of the task. `commands`: exact ones, from agentd before 0.19.1.
     public var site: String?
     public var app: String?
+    public var shell = false
+    public var keys: [String] = []
     public var commands: [String] = []
     public var install: String?
 
     public init(
-        step: String, status: Status, site: String? = nil, app: String? = nil, commands: [String] = [],
-        install: String? = nil
+        step: String, status: Status, site: String? = nil, app: String? = nil, shell: Bool = false,
+        keys: [String] = [], commands: [String] = [], install: String? = nil
     ) {
         self.step = step
         self.status = status
         self.site = site
         self.app = app
+        self.shell = shell
+        self.keys = keys
         self.commands = commands
         self.install = install
     }
@@ -542,15 +553,20 @@ public struct PlanStep: Sendable, Equatable {
     init?(_ json: JSONValue) {
         guard let step = json["step"]?.string, !step.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
         let named = { (key: String) in json[key]?.string.flatMap { $0.isEmpty ? nil : $0 } }
+        var seen = Set<String>()
         self.init(
             step: step, status: Status(rawValue: json["status"]?.string ?? "") ?? .pending, site: named("site"),
-            app: named("app"), commands: json["commands"]?.array?.compactMap(\.string).filter { !$0.isEmpty } ?? [],
+            app: named("app"), shell: json["shell"]?.bool == true,
+            keys: json["keys"]?.array?.compactMap(\.string).filter { !$0.isEmpty && seen.insert($0).inserted } ?? [],
+            commands: json["commands"]?.array?.compactMap(\.string).filter { !$0.isEmpty } ?? [],
             install: named("install"))
     }
 
-    /// Its needs in order, one per chip: one per command.
+    /// Its needs in order, one per chip: one per key and per command.
     public var needs: [PlanNeed] {
         [site.map { PlanNeed(kind: .site, value: $0) }, app.map { PlanNeed(kind: .app, value: $0) }].compactMap { $0 }
+            + (shell ? [PlanNeed(kind: .shell, value: "Commands that would ask")] : [])
+            + keys.map { PlanNeed(kind: .key, value: $0) }
             + commands.map { PlanNeed(kind: .command, value: $0) }
             + (install.map { [PlanNeed(kind: .install, value: $0)] } ?? [])
     }
@@ -562,6 +578,8 @@ public struct PlanStep: Sendable, Equatable {
             switch need.kind {
             case .site: step.site = need.value
             case .app: step.app = need.value
+            case .shell: step.shell = true
+            case .key: step.keys.append(need.value)
             case .command: step.commands.append(need.value)
             case .install: step.install = need.value
             }
@@ -572,14 +590,14 @@ public struct PlanStep: Sendable, Equatable {
     /// As agentd takes it back, in a plan card's answer.
     var edit: PlanEdit {
         PlanEdit(
-            step: step, status: status.rawValue, site: site, app: app, commands: commands.isEmpty ? nil : commands,
-            install: install)
+            step: step, status: status.rawValue, site: site, app: app, shell: shell ? true : nil,
+            keys: keys.isEmpty ? nil : keys, commands: commands.isEmpty ? nil : commands, install: install)
     }
 }
 
 /// One thing a plan step needs the user's OK for: a chip on the plan card.
 public struct PlanNeed: Sendable, Equatable {
-    public enum Kind: Sendable { case site, app, command, install }
+    public enum Kind: Sendable { case site, app, shell, key, command, install }
     public let kind: Kind
     public let value: String
 
@@ -591,8 +609,7 @@ public struct PlanNeed: Sendable, Equatable {
 
 /// A plan card: the task's plan, approved as a whole. What its steps need then
 /// goes ahead without cards of its own for the rest of the task; anything
-/// else still asks, and saved keys, direct internet, proxy sites and
-/// schedules always do.
+/// else still asks, and direct internet, proxy sites and schedules always do.
 public struct PlanApproval: Sendable, Equatable {
     /// The whole plan, as the agent wrote it.
     public let steps: [PlanStep]
@@ -604,12 +621,21 @@ public struct PlanApproval: Sendable, Equatable {
 public struct PlanCovers: Sendable, Equatable {
     public var sites: [String] = []
     public var apps: [String] = []
+    /// Commands that would ask, any of them (not direct ones).
+    public var shell = false
+    /// Commands using these saved keys.
+    public var keys: [String] = []
     public var commands: [String] = []
     public var installs: [String] = []
 
-    public init(sites: [String] = [], apps: [String] = [], commands: [String] = [], installs: [String] = []) {
+    public init(
+        sites: [String] = [], apps: [String] = [], shell: Bool = false, keys: [String] = [], commands: [String] = [],
+        installs: [String] = []
+    ) {
         self.sites = sites
         self.apps = apps
+        self.shell = shell
+        self.keys = keys
         self.commands = commands
         self.installs = installs
     }
@@ -620,7 +646,9 @@ public struct PlanCovers: Sendable, Equatable {
             var seen = Set<String>()
             return (json?[key]?.array ?? []).compactMap(\.string).filter { !$0.isEmpty && seen.insert($0).inserted }
         }
-        self.init(sites: list("sites"), apps: list("apps"), commands: list("commands"), installs: list("installs"))
+        self.init(
+            sites: list("sites"), apps: list("apps"), shell: json?["shell"]?.bool == true, keys: list("keys"),
+            commands: list("commands"), installs: list("installs"))
     }
 
     /// Only what some step still needs: the user may have taken needs off.
@@ -631,8 +659,8 @@ public struct PlanCovers: Sendable, Equatable {
             return list.filter(values.contains)
         }
         return PlanCovers(
-            sites: left(.site, sites), apps: left(.app, apps), commands: left(.command, commands),
-            installs: left(.install, installs))
+            sites: left(.site, sites), apps: left(.app, apps), shell: shell && needs.contains { $0.kind == .shell },
+            keys: left(.key, keys), commands: left(.command, commands), installs: left(.install, installs))
     }
 
     /// The plan card's summary, a phrase per kind of need. None: approving
@@ -641,17 +669,21 @@ public struct PlanCovers: Sendable, Equatable {
         [
             Phrase(lead: "clicking, typing and pressing keys on ", items: sites),
             Phrase(lead: "input in ", items: apps),
+            Phrase(lead: "running commands that would ask (deletes, pushes, uploads)", items: [], on: shell),
+            Phrase(lead: "commands using your key ", items: keys, code: true),
             Phrase(lead: "running ", items: commands, code: true),
             Phrase(lead: "installing ", items: installs),
-        ].filter { !$0.items.isEmpty }
+        ].filter { !$0.items.isEmpty || $0.on }
     }
 
     /// "running `a` and `b`": `lead`, then its items in a list.
     public struct Phrase: Sendable, Equatable {
         public let lead: String
         public let items: [String]
-        /// The items are commands, shown as code.
+        /// The items are commands or keys, shown as code.
         public var code = false
+        /// Said even with no items (commands that would ask).
+        public var on = false
 
         /// The phrase in pieces: the words, and each item (as code, or not).
         public var pieces: [Piece] {

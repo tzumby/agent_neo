@@ -140,7 +140,7 @@ short, and name on each step what it needs: site, the host you'll click, type or
 app.slack.com){plan_needs}. The user approves the plan once, and may change it, instead of a card for each \
 action; for the rest of the task, what it names goes ahead without asking. Name only what the task needs. Follow \
 the plan as approved: the result has the user's version if they changed it. Anything it doesn't name still \
-asks, and so do saved keys, direct internet and new sites for the shell. If it's denied, don't start on it.
+asks, and so do direct internet and new sites for the shell. If it's denied, don't start on it.
 {memory_rule}- When done, reply with the answer only, without a tool call. Be concise and never repeat passwords, \
     security phrases, one-time codes, booking codes or full account numbers.",
         and_shell = if shell { ", and a bash shell" } else { "" },
@@ -178,7 +178,10 @@ fn plan_needs(shell: bool, desktop: &Desktop) -> String {
         needs.push_str("; app, a desktop app you'll give input to (like Mousepad)");
     }
     if shell {
-        needs.push_str("; commands, the exact commands that will ask (deletes, kills, pushes, uploads)");
+        needs.push_str(
+            "; commands: true when it runs commands that may ask (deletes, kills, pushes, uploads, or anything \
+             sending data after you've read a page or a command's output); keys, the saved keys its commands use",
+        );
     }
     if desktop.installs {
         needs.push_str("; install, an app you'll install with install_app (its store name)");
@@ -233,8 +236,12 @@ fn plan_step(shell: bool, desktop: &Desktop) -> Value {
     }
     if shell {
         step["commands"] = json!({
+            "type": "boolean",
+            "description": "true when this step runs commands that may ask: deletes, kills, pushes, uploads",
+        });
+        step["keys"] = json!({
             "type": "array", "items": {"type": "string"},
-            "description": "the exact commands this step runs that will ask",
+            "description": "the saved keys (by name, like GITHUB_TOKEN) this step's commands use",
         });
     }
     if desktop.installs {
@@ -373,7 +380,7 @@ pub fn schemas(shell: bool, skills: bool, memory_v2: bool, scheduled: bool, desk
             "update_plan",
             "Write or update your plan for this task, the whole list each time. The user sees it as a \
              checklist while you work. Steps that name what they need the user's OK for (site, app, commands, \
-             install) are approved together on one card: until then the task waits.",
+             keys, install) are approved together on one card: until then the task waits.",
             json!({"items": {
                 "type": "array",
                 "description": "every step, in order (at most 20)",
@@ -814,7 +821,7 @@ mod tests {
         };
         assert_eq!(
             step(true, all),
-            ["app", "commands", "install", "site", "status", "step"]
+            ["app", "commands", "install", "keys", "site", "status", "step"]
         );
         assert_eq!(step(false, Desktop::default()), ["site", "status", "step"]);
         let prompt = system_prompt(true, "now", "", "", "", true, all);
@@ -822,6 +829,10 @@ mod tests {
         assert!(prompt.contains("; install, an app you'll install"));
         let bare = system_prompt(false, "now", "", "", "", true, Desktop::default());
         assert!(bare.contains("(like app.slack.com). The user approves"));
-        assert!(!bare.contains("; app, a desktop app") && !bare.contains("; commands, the exact"));
+        assert!(!bare.contains("; app, a desktop app") && !bare.contains("; commands: true"));
+        assert!(
+            prompt.contains("; commands: true when it runs commands")
+                && prompt.contains("; keys, the saved keys")
+        );
     }
 }

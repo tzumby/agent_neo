@@ -483,14 +483,17 @@ private struct ApprovalCard: View {
                 .disabled(draft.isBlank)
             }
             .controlSize(.large)
+            if let what = approval.forTask {
+                AllowForTask(what: what, disabled: draft.isBlank) { answer(true, forTask: true) }
+            }
         }
         .card()
     }
 
-    private func answer(_ approved: Bool) {
+    private func answer(_ approved: Bool, forTask: Bool = false) {
         guard let store, let client else { return }
         let text = approved ? draft.changed(from: approval.command) : nil
-        Task { await store.answer(approval, approved: approved, text: text, client: client) }
+        Task { await store.answer(approval, approved: approved, text: text, forTask: forTask, client: client) }
     }
 }
 
@@ -584,6 +587,9 @@ private struct BrowserApprovalCard: View {
                 .disabled(draft.isBlank || legacySend)
             }
             .controlSize(.large)
+            if let what = approval.forTask {
+                AllowForTask(what: what) { answer(true, forTask: true) }
+            }
         }
         .card()
     }
@@ -644,10 +650,10 @@ private struct BrowserApprovalCard: View {
         action.action == "type" && action.sends && !action.submit
     }
 
-    private func answer(_ approved: Bool) {
+    private func answer(_ approved: Bool, forTask: Bool = false) {
         guard let store, let client else { return }
         let text = approved ? draft.changed(from: action.text ?? "") : nil
-        Task { await store.answer(approval, approved: approved, text: text, client: client) }
+        Task { await store.answer(approval, approved: approved, text: text, forTask: forTask, client: client) }
     }
 }
 
@@ -698,6 +704,9 @@ private struct AppApprovalCard: View {
                 .primaryGlass()
             }
             .controlSize(.large)
+            if let what = approval.forTask {
+                AllowForTask(what: what) { answer(true, forTask: true) }
+            }
         }
         .card()
     }
@@ -806,9 +815,9 @@ private struct AppApprovalCard: View {
         }
     }
 
-    private func answer(_ approved: Bool) {
+    private func answer(_ approved: Bool, forTask: Bool = false) {
         guard let store, let client else { return }
-        Task { await store.answer(approval, approved: approved, text: nil, client: client) }
+        Task { await store.answer(approval, approved: approved, text: nil, forTask: forTask, client: client) }
     }
 }
 
@@ -999,6 +1008,9 @@ private struct InstallApprovalCard: View {
                 .primaryGlass()
             }
             .controlSize(.large)
+            if let what = approval.forTask {
+                AllowForTask(what: what) { answer(true, forTask: true) }
+            }
         }
         .card()
     }
@@ -1038,9 +1050,9 @@ private struct InstallApprovalCard: View {
         return "Install \(app)?"
     }
 
-    private func answer(_ approved: Bool) {
+    private func answer(_ approved: Bool, forTask: Bool = false) {
         guard let store, let client else { return }
-        Task { await store.answer(approval, approved: approved, text: nil, client: client) }
+        Task { await store.answer(approval, approved: approved, text: nil, forTask: forTask, client: client) }
     }
 }
 
@@ -1467,6 +1479,28 @@ private struct PlanApprovalCard: View {
     }
 }
 
+/// "Allow for this task": approve, and let what's like it go ahead without
+/// asking until the task ends (on a card a grant can cover), with what that
+/// lets through.
+private struct AllowForTask: View {
+    let what: String
+    var disabled = false
+    let allow: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button(action: allow) { Text("Allow for this task").frame(maxWidth: .infinity) }
+                .glassButton()
+                .controlSize(.large)
+                .disabled(disabled)
+            Text("Also lets \(what) go ahead without asking, until this task ends.")
+                .font(.app(.caption))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 /// A need of a plan step as a chip: what for, with its icon (a command as
 /// code); with `remove`, an × that takes it off the step.
 private struct NeedChip: View {
@@ -1476,7 +1510,7 @@ private struct NeedChip: View {
     var body: some View {
         HStack(spacing: 5) {
             Image(systemName: icon).font(.app(.caption2)).foregroundStyle(.secondary)
-            Text(need.kind == .install ? "Install \(need.value)" : need.value)
+            label
                 .font(need.kind == .command ? .app(.caption).monospaced() : .app(.caption))
                 .foregroundStyle(.primary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1489,7 +1523,7 @@ private struct NeedChip: View {
                         .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Take \(need.kind == .install ? "installing \(need.value)" : "“\(need.value)”") off this step")
+                .accessibilityLabel("Take \(Self.said(need)) off this step")
             }
         }
         .padding(.leading, 9)
@@ -1498,19 +1532,38 @@ private struct NeedChip: View {
         .background(Color.white.opacity(0.08), in: .rect(cornerRadius: 11))
     }
 
+    /// A key's name and a command are code; the rest, words.
+    private var label: Text {
+        switch need.kind {
+        case .install: Text("Install \(need.value)")
+        case .key: Text("Uses ") + Text(need.value).monospaced()
+        default: Text(need.value)
+        }
+    }
+
     private var icon: String {
         switch need.kind {
         case .site: "globe"
         case .app: "macwindow"
-        case .command: "terminal"
+        case .shell, .command: "terminal"
+        case .key: "key"
         case .install: "arrow.down.app"
+        }
+    }
+
+    /// A need in words, for VoiceOver.
+    static func said(_ need: PlanNeed) -> String {
+        switch need.kind {
+        case .install: "installing \(need.value)"
+        case .shell: "running commands without asking"
+        case .key: "using the key \(need.value)"
+        default: "“\(need.value)”"
         }
     }
 
     /// The needs read out after a step's words (empty without any).
     static func spoken(_ needs: [PlanNeed]) -> String {
-        needs.isEmpty ? "" : ". Needs your OK for: " + needs.map { $0.kind == .install ? "installing \($0.value)" : $0.value }
-            .joined(separator: ", ")
+        needs.isEmpty ? "" : ". Needs your OK for: " + needs.map(said).joined(separator: ", ")
     }
 }
 

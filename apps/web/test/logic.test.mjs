@@ -414,6 +414,13 @@ test("a plan card's edits: needs only come off, the summary follows, and only a 
   // A later card covers only what's new, though its steps are the whole plan.
   assert.deepEqual(planPhrases(planCovers({ sites: [], apps: [], commands: [], installs: ["slack"] }, original)),
     [{ lead: "installing ", items: ["slack"] }]);
+  // A site that reaches the rest of its domain says so (agentd 0.21.1).
+  assert.deepEqual(planPhrases(planCovers({ sites: ["app.slack.com"] }, original), { "app.slack.com": "slack.com" }),
+    [{ lead: "clicking, typing and pressing keys on ", items: ["app.slack.com (and the rest of slack.com)"] }]);
+  const reach = new Timeline([ev("approval.requested", { kind: "plan", id: "p9", task: "t1", steps: original,
+    covers: { sites: ["app.slack.com"] }, domains: { "app.slack.com": "slack.com", "x": 3 } })]).visible()
+    .find((i) => i.type === "approval");
+  assert.deepEqual(reach.plan.domains, { "app.slack.com": "slack.com" }, "only names, as text");
 
   // What agentd would refuse can't be approved.
   assert.equal(planProblem(original), "");

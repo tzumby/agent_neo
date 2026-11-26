@@ -275,7 +275,7 @@ private struct DailyChart: View {
                     width: .ratio(0.62)
                 )
                 .cornerRadius(2.5)
-                .foregroundStyle(Color.white.opacity(picked == nil || picked?.id == bar.id ? 0.9 : 0.28))
+                .foregroundStyle(Theme.prominent.opacity(picked == nil || picked?.id == bar.id ? 0.85 : 0.25))
             }
             .chartXSelection(value: $selected)
             .chartYAxis {
@@ -360,9 +360,9 @@ private struct CostRow: View {
             }
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.07))
+                    Capsule().fill(Theme.chip)
                     Capsule()
-                        .fill(Color.white.opacity(0.7))
+                        .fill(Theme.prominent.opacity(0.75))
                         .frame(width: max(3, geometry.size.width * share))
                 }
             }

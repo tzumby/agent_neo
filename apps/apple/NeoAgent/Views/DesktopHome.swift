@@ -32,7 +32,7 @@ struct DesktopHome: View {
                 systemImage: "display",
                 description: Text("No device tagged tag:neo-agent is on your tailnet. Deploy the desktop (make deploy), and sign in here with the Tailscale account it's on.")
             )
-            .background(Color.black)
+            .background(Theme.background)
         }
     }
 }

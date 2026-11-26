@@ -17,6 +17,12 @@ public final class MacDesktopView: NSView {
     /// Run the desktop's session with this, so the view draws it.
     public let renderer: RemoteDesktop.Renderer
 
+    /// Around the desktop, where its shape doesn't fill the view (swift-rfb
+    /// draws black there). A dynamic colour follows the window's appearance.
+    public var letterbox: NSColor = .black {
+        didSet { applyLetterbox() }
+    }
+
     public init?(desktop: RemoteDesktop) {
         guard let screen = RFBView() else { return nil }
         self.screen = screen
@@ -32,6 +38,17 @@ public final class MacDesktopView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not supported")
+    }
+
+    public override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyLetterbox()
+    }
+
+    private func applyLetterbox() {
+        var color: CGColor?
+        effectiveAppearance.performAsCurrentDrawingAppearance { color = letterbox.cgColor }
+        screen.layer?.backgroundColor = color
     }
 
     public override func viewDidMoveToWindow() {

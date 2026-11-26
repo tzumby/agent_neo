@@ -8,6 +8,8 @@ struct NeoAgentApp: App {
     @State private var grace = BackgroundGrace()
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
+    /// Light unless Settings says otherwise.
+    @AppStorage(Appearance.key) private var appearance = Appearance.light
 
     var body: some Scene {
         WindowGroup {
@@ -24,7 +26,7 @@ struct NeoAgentApp: App {
                     root
                 #endif
             }
-            .preferredColorScheme(.dark)  // Grok-style: dark only
+            .appearance(appearance)
             .environment(PushCenter.shared)
             .environment(session)
         }

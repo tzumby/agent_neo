@@ -49,10 +49,10 @@ private struct BlockView: View {
                 .foregroundStyle(.secondary)
                 .padding(.leading, 14)
                 .overlay(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 1.5).fill(.white.opacity(0.22)).frame(width: 3)
+                    RoundedRectangle(cornerRadius: 1.5).fill(Theme.border).frame(width: 3)
                 }
         case .rule:
-            Rectangle().fill(.white.opacity(0.15)).frame(height: 1).padding(.vertical, 4)
+            Rectangle().fill(Theme.hairline).frame(height: 1).padding(.vertical, 6)
         case .table(let columns, let header, let rows):
             TableBlock(columns: columns, header: header, rows: rows)
         }
@@ -78,7 +78,7 @@ private struct Prose: View {
 
     var body: some View {
         MarkdownText.text(text)
-            .lineSpacing(3)
+            .lineSpacing(4)
             .textRenderer(CodeChipRenderer())
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -159,12 +159,10 @@ private struct TableBlock: View {
             }
         }
         .scrollIndicators(.hidden)
-        .background(Theme.inset, in: .rect(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.hairline, lineWidth: 0.5))
     }
 
     private var line: some View {
-        Rectangle().fill(Theme.hairline).frame(height: 0.5).gridCellUnsizedAxes(.horizontal)
+        Rectangle().fill(Theme.hairline).frame(height: 1).gridCellUnsizedAxes(.horizontal)
     }
 
     /// Columns with long text get a fixed width and wrap, rather than make the
@@ -193,8 +191,10 @@ private struct TableBlock: View {
                 content.fixedSize()
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        // The first column lines up with the text around the table.
+        .padding(.leading, column == 0 ? 0 : 12)
+        .padding(.trailing, 12)
+        .padding(.vertical, 10)
         .gridColumnAlignment(alignment)
     }
 
@@ -223,7 +223,11 @@ enum MarkdownText {
             // and keep that room on the code's line when it wraps.
             var code = AttributedString("\u{202F}\(String(piece.characters))\u{202F}")
             code.font = .app(.callout, design: .monospaced)
-            code.foregroundColor = Color(white: 0.95)
+            #if os(macOS)
+                // The Mac's text is selectable, which skips the renderer's
+                // rounded chip: a plain background there instead.
+                code.backgroundColor = Theme.codeChip
+            #endif
             result = Text("\(result)\(Text(prose))\(Text(code).customAttribute(InlineCode()))")
             prose = AttributedString()
         }
@@ -253,10 +257,13 @@ struct CodeChipRenderer: TextRenderer {
                 }
             }
             if let chip = open { chips.append(chip) }
+            #if os(macOS)
+                chips = []  // the text's own background marks code there (MarkdownText)
+            #endif
             for chip in chips {
                 context.fill(
                     Path(roundedRect: chip.insetBy(dx: 0, dy: -1.5), cornerRadius: 6),
-                    with: .color(.white.opacity(0.12)))
+                    with: .color(Theme.codeChip))
             }
             for run in line { context.draw(run) }
         }
@@ -276,19 +283,20 @@ struct CodeBlock: View {
                 CopyButton(text: code).font(.app(.caption))
             }
             .foregroundStyle(.secondary)
-            .padding(.leading, 12)
+            .padding(.leading, 14)
             .padding(.trailing, 4)
-            .padding(.vertical, 2)
-            Rectangle().fill(Theme.hairline).frame(height: 0.5)
+            .padding(.vertical, 4)
             ScrollView(.horizontal) {
                 Text(code)
                     .font(.app(.footnote, design: .monospaced))
                     .textSelection(.enabled)
-                    .padding(12)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 2)
+                    .padding(.bottom, 14)
             }
             .scrollIndicators(.hidden)
         }
-        .background(Theme.inset, in: .rect(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Theme.hairline, lineWidth: 0.5))
+        .background(Theme.inset, in: .rect(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Theme.hairline, lineWidth: 1))
     }
 }

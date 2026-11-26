@@ -83,6 +83,8 @@ private struct ConversationList: View {
                     NavigationLink(value: ConversationRoute.chat(session.id)) {
                         ConversationRow(session: session)
                     }
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Theme.background)
                     .conversationActions(
                         session, rename: { renaming = session },
                         archive: { Task { await store.setArchived(true, session.id, client: client) } },
@@ -94,15 +96,17 @@ private struct ConversationList: View {
                     Label("Archived", systemImage: "archivebox")
                         .foregroundStyle(.secondary)
                 }
+                .listRowSeparator(.hidden)
+                .listRowBackground(Theme.background)
             } footer: {
                 if store.runningLimit > 1 {
                     Text("Up to \(store.runningLimit) conversations work at the same time; messages to others wait their turn.")
                 }
             }
         }
-        .listStyle(.insetGrouped)
+        .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .background(Color.black)
+        .background(Theme.background)
         .navigationTitle("Conversations")
         .navigationSubtitle(subtitle)
         .toolbar {

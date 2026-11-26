@@ -628,6 +628,11 @@ private func said(_ covers: PlanCovers) -> String {
     #expect(!plan.notes && !oddPlan.notes, "only a card that says it reads them offers more details")
     let (_, noted) = try planApproval(planCard.replacingOccurrences(of: #""editable":true,"#, with: #""editable":true,"notes":true,"#))
     #expect(noted.notes)
+    // A site that reaches the rest of its domain says so (agentd 0.21.1).
+    let (_, reaching) = try planApproval(
+        planCard.replacingOccurrences(of: #""editable":true,"#, with: #""editable":true,"domains":{"app.slack.com":"slack.com","x":3},"#))
+    #expect(reaching.covers.domains == ["app.slack.com": "slack.com"])
+    #expect(said(reaching.covers).hasPrefix("clicking, typing and pressing keys on app.slack.com (and the rest of slack.com) · "))
 
     var timeline = ChatTimeline(replaying: [try event(1, "approval.requested", planCard)])
     timeline.apply(

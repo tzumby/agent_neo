@@ -3,36 +3,35 @@ import ChatCore
 import SwiftUI
 
 // The pieces of the conversation list both apps share: the iPhone's list
-// screen (iOS/PhoneHome.swift) and the Mac's sidebar (macOS/MacHome.swift).
+// screen (iOS/PhoneHome.swift) and the Mac's sidebar (macOS/MacHome.swift),
+// which has rows of its own (titles only).
 
 /// A conversation in the list: its title and when, the last message's first
 /// line, and what it's doing (working, needs you, queued, paused).
 struct ConversationRow: View {
     let session: AgentSession
-    /// The Mac's sidebar: one line of the last message.
-    var compact = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: compact ? 2 : 4) {
+        VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(session.displayTitle)
-                    .font(.app(compact ? .body : .headline).weight(.semibold))
+                    .font(.app(.body).weight(.medium))
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 Text(Self.when(session.updated))
                     .font(.app(.footnote))
                     .monospacedDigit()
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.tertiary)
             }
             HStack(alignment: .center, spacing: 8) {
                 preview
                     .font(.app(.subheadline))
-                    .lineLimit(compact ? 1 : 2, reservesSpace: !compact)
+                    .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 ConversationBadge(session: session)
             }
         }
-        .padding(.vertical, compact ? 3 : 6)
+        .padding(.vertical, 7)
         .accessibilityElement(children: .combine)
     }
 
@@ -81,7 +80,7 @@ struct ConversationBadge: View {
             if session.needsYou != nil || session.state == .waiting {
                 Pill(text: "Needs you", icon: "hand.raised.fill", tint: .orange)
             } else if session.state == .paused {
-                Pill(text: "Paused", icon: "pause.fill", tint: .yellow)
+                Pill(text: "Paused", icon: "pause.fill", tint: Theme.amber)
             } else if !session.queued.isEmpty {
                 Pill(text: "\(session.queued.count) queued", icon: nil, tint: nil)
             }
@@ -105,7 +104,7 @@ struct Pill: View {
         .foregroundStyle(tint.map { AnyShapeStyle($0) } ?? AnyShapeStyle(.secondary))
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
-        .background((tint ?? .white).opacity(tint == nil ? 0.1 : 0.16), in: .capsule)
+        .background(tint.map { $0.opacity(0.14) } ?? Theme.chip, in: .capsule)
     }
 }
 

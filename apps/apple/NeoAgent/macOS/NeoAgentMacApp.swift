@@ -10,6 +10,8 @@ struct NeoAgentMacApp: App {
     @State private var tailnet = TailnetService(hostName: "neo-agent-mac")
     @State private var session = DesktopSession()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    /// Light unless Settings says otherwise.
+    @AppStorage(Appearance.key) private var appearance = Appearance.light
 
     var body: some Scene {
         // One chat window: two would each stream the same chat.
@@ -29,7 +31,9 @@ struct NeoAgentMacApp: App {
             }
             .frame(minWidth: 420, minHeight: 520)
             .font(.app(.body))  // text without a style of its own: the Mac's larger body
-            .preferredColorScheme(.dark)
+            .appearance(appearance)
+            // White behind the toolbar too, over the chat; the sidebar has its own grey.
+            .containerBackground(Theme.background, for: .window)
             .environment(PushCenter.shared)
             .environment(tailnet)
             .environment(session)
@@ -42,7 +46,6 @@ struct NeoAgentMacApp: App {
             DesktopWindow()
                 .frame(minWidth: 640, minHeight: 440)
                 .font(.app(.body))
-                .preferredColorScheme(.dark)
                 .environment(tailnet)
                 .environment(session)
         }

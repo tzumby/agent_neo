@@ -2246,6 +2246,9 @@ impl Agent {
                 // "Allow for this task": the card's kind of action, granted
                 // for the rest of it, from this call on.
                 let allowed = resumed.as_ref().and_then(|a| self.allow_for_task(state, a));
+                // A key the user just saved for this task, on its own request
+                // card: commands the task runs without asking may use it.
+                let allowed = allowed.or_else(|| resumed.as_ref().and_then(|a| self.key_for_task(state, a)));
                 let mut edited_note = resumed
                     .as_ref()
                     .and_then(|answer| answer.edited.as_deref())
@@ -2641,6 +2644,35 @@ impl Agent {
         Some(needs)
     }
 
+    /// A key the user saved on this task's own request card joins the
+    /// task's grant, when the grant already lets commands go ahead without
+    /// asking: they gave it for this work, so the commands it's for don't
+    /// each ask again (0.21.1). Without commands granted, nothing changes:
+    /// a granted key alone would let any command using it through. What it
+    /// grants, if anything.
+    fn key_for_task(&self, state: &mut RunState, answer: &Answer) -> Option<plan::Needs> {
+        let name = answer.card["name"].as_str()?;
+        if !(answer.approved
+            && answer.card["kind"] == "secret"
+            && state.grant.needs.shell
+            && self.secrets.has(name))
+            || state.grant.needs.keys.iter().any(|k| k == name)
+        {
+            return None;
+        }
+        let key = plan::Needs {
+            keys: vec![name.to_string()],
+            ..Default::default()
+        };
+        state.grant.needs = state.grant.needs.and(&key);
+        self.plan_grants
+            .lock()
+            .unwrap()
+            .insert(state.task.clone(), state.grant.clone());
+        tracing::info!(task = %state.task, "a key saved for the task joins its grant");
+        Some(key)
+    }
+
     /// update_plan: the plan, saved and shown. One whose steps need what the
     /// task hasn't been granted parks on a plan card first; approved (as the
     /// user edited it, if they did), its needs are the task's grant.
@@ -2662,7 +2694,8 @@ impl Agent {
                 }
             ));
         }
-        let new = plan::Needs::of(&items).without(&state.grant.needs);
+        // Only what the grant doesn't cover asks: another host of a granted site doesn't.
+        let new = plan::Needs::of(&items).beyond(&state.grant.needs);
         let background = state.scheduled.is_some();
         if new.is_empty() || background {
             self.save_plan(state, items);
@@ -2677,8 +2710,10 @@ impl Agent {
         // `summary`, `reason` and `command`: what an app from before 0.18.0
         // shows on a card it doesn't know (a command's card).
         // `notes`: the user can add to their answer in their own words (0.21.0).
+        // `domains`: how far a step's site reaches (0.21.1), for the apps to say.
         let card = json!({
             "kind": "plan", "steps": items, "covers": new, "editable": true, "notes": true, "tainted": state.tainted,
+            "domains": plan::reaches(&items),
             "summary": format!("Approve a plan of {} step{}", items.len(), if items.len() == 1 { "" } else { "s" }),
             "reason": format!("lets the agent go ahead without asking again, for this task: {}", new.describe()),
             "command": plan::numbered(&items),
@@ -7507,6 +7542,149 @@ mod plan_tests {
         assert!(state.plan_asked && !agent.unplanned.lock().unwrap().contains("t1"));
         let slack = json!({"kind": "browser", "action": "click", "site": "mail.google.com"});
         assert!(agent.approve("t1", slack, None, false).unwrap_err().is::<Park>());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_site_grant_covers_the_other_hosts_of_that_site_and_no_one_elses() {
+        // Task c0007f809463 on the desktop: the plan named web.postman.co,
+        // then apxlending.postman.co asked on a card of its own.
+        let (agent, dir) = test_agent();
+        let mut state = a_task(&agent);
+        let browser =
+            |host: &str| json!({"kind": "browser", "action": "click", "target": "Export", "site": host});
+        let args = json!({"items": [
+            {"step": "Find what's public in Postman", "status": "pending", "site": "web.postman.co"},
+        ]});
+        let park = parks(agent.update_plan(&mut state, &args, None));
+        assert!(
+            park.card["reason"]
+                .as_str()
+                .unwrap()
+                .contains("web.postman.co and the rest of postman.co"),
+            "{}",
+            park.card["reason"]
+        );
+        assert_eq!(park.card["domains"], json!({"web.postman.co": "postman.co"}));
+        let said = agent
+            .update_plan(&mut state, &args, answer(&park.card, true, None))
+            .unwrap();
+        assert!(said.starts_with("approved:"), "{said}");
+        // The team's workspace is the same site: no card.
+        assert!(matches!(
+            agent.approve("t1", browser("apxlending.postman.co"), None, false),
+            Ok(Decision::Approved)
+        ));
+        // Another domain still asks, and its card says how far Allow goes.
+        let park = agent
+            .approve("t1", browser("identity.getpostman.com"), None, false)
+            .unwrap_err()
+            .downcast::<Park>()
+            .unwrap();
+        assert_eq!(
+            park.card["for_task"],
+            "clicks, typing and keys on identity.getpostman.com and the rest of getpostman.com"
+        );
+        let mut allow = answer(&park.card, true, None).unwrap();
+        allow.for_task = true;
+        agent.allow_for_task(&mut state, &allow).unwrap();
+        assert!(matches!(
+            agent.approve("t1", browser("www.getpostman.com"), None, false),
+            Ok(Decision::Approved)
+        ));
+        // A later plan naming another host of a granted site asks nothing new.
+        let more = json!({"items": [
+            {"step": "Open the team's workspace", "status": "pending", "site": "apxlending.postman.co"},
+            {"step": "Sign in again", "status": "pending", "site": "go.getpostman.com"},
+        ]});
+        let said = agent.update_plan(&mut state, &more, None).unwrap();
+        assert!(said.starts_with("ok: plan saved"), "{said}");
+        // Someone else's pages on a shared suffix are another site.
+        let pages =
+            json!({"items": [{"step": "Edit the docs", "status": "pending", "site": "alice.github.io"}]});
+        let park = parks(agent.update_plan(&mut state, &pages, None));
+        agent
+            .update_plan(&mut state, &pages, answer(&park.card, true, None))
+            .unwrap();
+        assert!(
+            agent
+                .approve("t1", browser("mallory.github.io"), None, false)
+                .unwrap_err()
+                .is::<Park>()
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_key_saved_for_the_task_goes_with_the_commands_it_was_granted() {
+        // Task 70ae4e1bdacc: commands were granted, the agent asked for
+        // POSTMAN_API_KEY, and each command using it asked again.
+        let (agent, dir) = test_agent();
+        let mut state = a_task(&agent);
+        let request = json!({"kind": "secret", "name": "POSTMAN_API_KEY", "label": "Postman API key"});
+        let curl = json!({"kind": "shell", "command": "curl -H \"X-Api-Key: $POSTMAN_API_KEY\" https://api.getpostman.com/me",
+                          "reason": "uses your saved key", "secrets": ["POSTMAN_API_KEY"], "timeout": 10});
+        agent
+            .secrets
+            .put("POSTMAN_API_KEY", "PMAK-test-value-123456")
+            .unwrap();
+
+        // Without commands granted, saving the key grants nothing.
+        assert!(
+            agent
+                .key_for_task(&mut state, &answer(&request, true, None).unwrap())
+                .is_none()
+        );
+        assert!(
+            agent
+                .approve("t1", curl.clone(), None, false)
+                .unwrap_err()
+                .is::<Park>()
+        );
+
+        // With them, the key saved on this task's card joins the grant.
+        let rm = json!({"kind": "shell", "command": "rm -rf build", "reason": "deletes", "timeout": 10});
+        let park = agent
+            .approve("t1", rm, None, false)
+            .unwrap_err()
+            .downcast::<Park>()
+            .unwrap();
+        let mut allow = answer(&park.card, true, None).unwrap();
+        allow.for_task = true;
+        agent.allow_for_task(&mut state, &allow).unwrap();
+        assert!(
+            agent
+                .approve("t1", curl.clone(), None, false)
+                .unwrap_err()
+                .is::<Park>(),
+            "commands granted, but not with that key yet"
+        );
+        // Denied, or not saved: nothing.
+        assert!(
+            agent
+                .key_for_task(&mut state, &answer(&request, false, None).unwrap())
+                .is_none()
+        );
+        let unsaved = json!({"kind": "secret", "name": "NPM_TOKEN", "label": "npm token"});
+        assert!(
+            agent
+                .key_for_task(&mut state, &answer(&unsaved, true, None).unwrap())
+                .is_none()
+        );
+        let granted = agent
+            .key_for_task(&mut state, &answer(&request, true, None).unwrap())
+            .unwrap();
+        assert_eq!(granted.keys, vec!["POSTMAN_API_KEY"]);
+        assert!(matches!(
+            agent.approve("t1", curl.clone(), None, false),
+            Ok(Decision::Approved)
+        ));
+        // Once.
+        assert!(
+            agent
+                .key_for_task(&mut state, &answer(&request, true, None).unwrap())
+                .is_none()
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -54,9 +54,11 @@
     group: "{{ agentd_shell_user }}"
     mode: "0700"
 
-- name: Install the firewall, proxy, and trusted credential client
+# publicsuffix: the Public Suffix List, by which a site grant covers the
+# rest of its domain (agentd 0.21.1, site.rs) and no one else's.
+- name: Install the firewall, proxy, trusted credential client, and public suffix list
   ansible.builtin.apt:
-    name: [nftables, squid, gh]
+    name: [nftables, squid, gh, publicsuffix]
     state: present
 
 - name: Look up user IDs for the firewall

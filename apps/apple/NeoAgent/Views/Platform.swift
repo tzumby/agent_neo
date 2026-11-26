@@ -8,7 +8,7 @@ import SwiftUI
 
 // What the iPhone and the Mac do differently, in one place, so the screens
 // themselves are shared. The Mac app also runs on macOS 15, before Liquid
-// Glass: there, glass falls back to the system's materials and bordered buttons.
+// Glass.
 
 enum Clipboard {
     static func copy(_ text: String) {
@@ -57,40 +57,15 @@ enum Device {
 }
 
 extension View {
-    /// Liquid Glass, or a material before macOS 26.
-    @ViewBuilder func glass<S: Shape>(_ shape: S, interactive: Bool = false) -> some View {
-        #if os(iOS)
-            glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
-        #else
-            if #available(macOS 26, *) {
-                glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
-            } else {
-                background(.regularMaterial, in: shape)
-                    .overlay(shape.stroke(Theme.hairline, lineWidth: 0.5))
-            }
-        #endif
+    /// A secondary button: an outlined pill.
+    func secondaryButton() -> some View {
+        buttonStyle(PillButtonStyle(prominent: false))
     }
 
-    /// A secondary button: glass, or bordered before macOS 26.
-    @ViewBuilder func glassButton() -> some View {
-        #if os(iOS)
-            buttonStyle(.glass)
-        #else
-            if #available(macOS 26, *) { buttonStyle(.glass) } else { buttonStyle(CapsuleButtonStyle(prominent: false)) }
-        #endif
-    }
-
-    /// The white button for the main action (its label is set black).
-    @ViewBuilder func primaryGlass() -> some View {
-        #if os(iOS)
-            buttonStyle(.glassProminent).tint(.white)
-        #else
-            if #available(macOS 26, *) {
-                buttonStyle(.glassProminent).tint(.white)
-            } else {
-                buttonStyle(CapsuleButtonStyle(prominent: true))
-            }
-        #endif
+    /// The button for the main action: a near-black pill with white text
+    /// (white with black text in the dark).
+    func primaryButton() -> some View {
+        buttonStyle(PillButtonStyle(prominent: true))
     }
 
     /// A bar over the content's top or bottom edge (the content scrolls under it).
@@ -134,43 +109,26 @@ extension View {
     }
 }
 
-#if os(macOS)
-    /// Buttons before Liquid Glass, in the same colours: white for the main
-    /// action, a faint white for the others. (The system's bordered buttons
-    /// ignore a white tint.)
-    private struct CapsuleButtonStyle: ButtonStyle {
-        let prominent: Bool
-        @Environment(\.isEnabled) private var isEnabled
-        @Environment(\.controlSize) private var controlSize
+/// Flat pill buttons, as ChatGPT's: the main action near-black with white
+/// text, the others a surface with a hairline edge. Dimmed when disabled.
+private struct PillButtonStyle: ButtonStyle {
+    let prominent: Bool
+    @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.controlSize) private var controlSize
 
-        func makeBody(configuration: Configuration) -> some View {
-            configuration.label
-                .fontWeight(.medium)
-                .foregroundStyle(prominent ? Color.black : Color.white)
-                .padding(.horizontal, 14)
-                .padding(.vertical, controlSize == .large ? 9 : 6)
-                .background(prominent ? Color.white : Color.white.opacity(0.12), in: .capsule)
-                .contentShape(.capsule)
-                .opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.4)
-        }
-    }
-#endif
-
-/// Groups glass shapes so they blend; just the content before macOS 26.
-struct GlassGroup<Content: View>: View {
-    var spacing: CGFloat
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        #if os(iOS)
-            GlassEffectContainer(spacing: spacing) { content }
-        #else
-            if #available(macOS 26, *) {
-                GlassEffectContainer(spacing: spacing) { content }
-            } else {
-                content
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .fontWeight(.medium)
+            .foregroundStyle(prominent ? Theme.onProminent : Color.primary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, controlSize == .large ? 11 : controlSize == .small ? 5 : 8)
+            .background(prominent ? Theme.prominent : Theme.surface, in: .capsule)
+            .overlay {
+                if !prominent { Capsule().strokeBorder(Theme.border, lineWidth: 1) }
             }
-        #endif
+            .contentShape(.capsule)
+            .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.35)
+            .animation(.snappy(duration: 0.12), value: configuration.isPressed)
     }
 }
 

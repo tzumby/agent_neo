@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The loading screen for every step of getting to the chat (Tailscale, the
-/// desktop, the first sync), so they read as one: the app's mark on black and
+/// desktop, the first sync), so they read as one: the app's mark and
 /// a line saying what's happening.
 struct SplashView: View {
     let status: String
@@ -13,7 +13,7 @@ struct SplashView: View {
             Image(systemName: "display")
                 .font(.system(size: 38, weight: .light))
                 .frame(width: 92, height: 92)
-                .glass(.circle)
+                .floating(.circle)
                 .scaleEffect(breathing ? 1.04 : 0.97)
                 .animation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true), value: breathing)
             Text("Agent Neo")
@@ -36,7 +36,7 @@ struct SplashView: View {
         }
         // Same spot on every step: centred on the whole screen.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black)
+        .background(Theme.background)
         .ignoresSafeArea()
         .toolbarVisibility(.hidden, for: .appBar)
         .onAppear { breathing = true }

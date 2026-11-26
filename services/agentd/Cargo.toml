@@ -1,6 +1,6 @@
 [package]
 name = "agentd"
-version = "0.21.0"
+version = "0.21.1"
 edition = "2024"
 description = "Agent for a cloud desktop: model loop, browser and shell tools, chat API"
 publish = false

@@ -17,6 +17,8 @@ struct SettingsView: View {
     @State private var problem: String?
     /// A model picked whose provider has no key yet: its key is asked for first.
     @State private var needsKey: KeyFirst?
+    /// Light (the default), Dark, or as the system is set: this device only.
+    @AppStorage(Appearance.key) private var appearance = Appearance.light
     private let autoApproveDescription = "Eligible shell commands and schedules can run without asking. Browser and app changes, saved keys, direct internet access, and changes to the proxy allowlist still require approval. So do commands flagged for possible data transfer after reading outside content."
 
     var body: some View {
@@ -117,6 +119,13 @@ struct SettingsView: View {
                 NavigationLink("Keys & tokens") { SecretsView(client: client) }
             } footer: {
                 Text("What the agent remembers between conversations, the tasks it runs on its own, and the keys it can use without seeing them.").sectionFooter()
+            }
+            Section {
+                Picker("Appearance", selection: $appearance) {
+                    ForEach(Appearance.allCases) { Text($0.label).tag($0) }
+                }
+            } footer: {
+                Text("On this \(Device.noun) only.").sectionFooter()
             }
             Section("Desktop") {
                 LabeledContent("Name", value: store.status?.desktop ?? "…")

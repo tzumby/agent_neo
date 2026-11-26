@@ -23,6 +23,7 @@ mod schedule;
 mod secrets;
 mod sessions;
 mod shell;
+mod site;
 mod skills;
 mod snaps;
 mod store;
@@ -73,6 +74,9 @@ async fn main() -> Result<()> {
     // A desktop with no key starts all the same: the apps ask for one.
     if let Some(provider) = agent.needs_model_key() {
         tracing::warn!(provider = provider.id(), "no model key yet: the apps ask for one");
+    }
+    if !site::available() {
+        tracing::warn!("no public suffix list (the publicsuffix package): a site grant covers only its host");
     }
     let app = api::router(agent.clone());
 

@@ -163,10 +163,12 @@ export function planCovers(covers, steps) {
 /**
  * The plan card's summary, a phrase per kind of need: `lead`, then its
  * `items` in a list (`code`: as code). None: approving only starts the plan.
+ * `domains`: how far a site reaches (agentd 0.21.1: the rest of its domain).
  */
-export function planPhrases(covered) {
+export function planPhrases(covered, domains = {}) {
+  const site = (host) => (domains[host] ? `${host} (and the rest of ${domains[host]})` : host);
   return [
-    { lead: "clicking, typing and pressing keys on ", items: covered.sites },
+    { lead: "clicking, typing and pressing keys on ", items: covered.sites.map(site) },
     { lead: "input in ", items: covered.apps },
     { lead: "running commands that would ask (deletes, pushes, uploads)", items: [], on: covered.shell },
     { lead: "commands using your key ", items: covered.keys, code: true },
@@ -368,6 +370,9 @@ export class Timeline {
           card.plan = {
             // The person can add to their answer in their own words (agentd 0.21.0).
             notes: d.notes === true,
+            // How far a step's site reaches: the rest of its domain (agentd 0.21.1).
+            domains: Object.fromEntries(Object.entries(d.domains && typeof d.domains === "object" ? d.domains : {})
+              .filter(([host, domain]) => typeof domain === "string" && domain && host)),
             steps: Array.isArray(d.steps) ? planSteps(d.steps) : [],
             covers: {
               sites: list("sites"), apps: list("apps"), shell: d.covers?.shell === true, keys: list("keys"),

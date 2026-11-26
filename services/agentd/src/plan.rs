@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{access, snaps};
+use crate::{access, site, snaps};
 
 pub const MAX_ITEMS: usize = 20;
 pub const MAX_STEP_CHARS: usize = 120;
@@ -84,6 +84,21 @@ pub struct Grant {
     pub needs: Needs,
     pub approval: Option<String>,
     pub by: Option<String>,
+}
+
+/// Each step's site whose grant reaches past its own host and the hosts
+/// under it: to the rest of its registrable domain (site.rs). On a plan
+/// card as `domains`, so the apps say how far approving it goes.
+pub fn reaches(items: &[Item]) -> std::collections::BTreeMap<String, String> {
+    items
+        .iter()
+        .filter_map(|item| item.site.as_deref())
+        .filter_map(|host| {
+            site::domain(host)
+                .filter(|domain| domain != host)
+                .map(|domain| (host.to_string(), domain))
+        })
+        .collect()
 }
 
 /// update_plan's arguments, as the plan they replace the old one with, or
@@ -346,17 +361,32 @@ impl Needs {
             .or_else(|| self.installs.first().map(|i| format!("installing {i}")))
     }
 
+    /// Whether a granted site covers this host: the host itself, a host
+    /// under it (app.slack.com for slack.com), or another host of the same
+    /// site (apxlending.postman.co for web.postman.co: the same registrable
+    /// domain, site.rs). Never another one under a shared suffix
+    /// (mallory.github.io for alice.github.io).
+    pub fn covers_site(&self, host: &str) -> bool {
+        self.sites
+            .iter()
+            .any(|site| host == site || host.ends_with(&format!(".{site}")) || site::same(host, site))
+    }
+
+    /// What this needs that `grant` doesn't already cover: a later plan's
+    /// card shows (and asks about) only that. Sites by what the grant
+    /// covers, the rest as `without` compares them.
+    pub fn beyond(&self, grant: &Self) -> Self {
+        let mut new = self.without(grant);
+        new.sites.retain(|site| !grant.covers_site(site));
+        new
+    }
+
     /// Whether the approved plan covers the action a card would ask about.
     /// Only these kinds: a direct connection, a site for the proxy, a key to
     /// save, a schedule or another plan always gets its own card.
     pub fn covers(&self, card: &Value) -> bool {
         match card["kind"].as_str() {
-            // The site and anything under it: app.slack.com for slack.com.
-            Some("browser") => card["site"].as_str().is_some_and(|host| {
-                self.sites
-                    .iter()
-                    .any(|site| host == site || host.ends_with(&format!(".{site}")))
-            }),
+            Some("browser") => card["site"].as_str().is_some_and(|host| self.covers_site(host)),
             // Every window it acts in, for pixels too: each step's app.
             Some("app") => {
                 let covered = |app: &str| self.apps.iter().any(|a| a.eq_ignore_ascii_case(app.trim()));
@@ -439,7 +469,14 @@ impl Needs {
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
         for site in &self.sites {
-            parts.push(format!("clicks, typing and keys on {site}"));
+            // Say how far it goes: the rest of the site's domain too.
+            match site::domain(site) {
+                Some(domain) if domain != *site => parts.push(format!(
+                    "clicks, typing and keys on {site} and the rest of {domain}"
+                )),
+                Some(_) => parts.push(format!("clicks, typing and keys on {site} and its subdomains")),
+                None => parts.push(format!("clicks, typing and keys on {site}")),
+            }
         }
         for app in &self.apps {
             parts.push(format!("input in {app}"));
@@ -584,8 +621,8 @@ mod tests {
         assert!(needs.shell);
         assert_eq!(
             needs.describe(),
-            "clicks, typing and keys on app.slack.com; input in Mousepad; commands that would ask (deletes, \
-             kills, pushes, uploads); commands using the key GITHUB_TOKEN; installing slack"
+            "clicks, typing and keys on app.slack.com and the rest of slack.com; input in Mousepad; commands \
+             that would ask (deletes, kills, pushes, uploads); commands using the key GITHUB_TOKEN; installing slack"
         );
         // Already granted: nothing new to ask about.
         assert!(needs.without(&needs.clone()).is_empty());
@@ -606,6 +643,9 @@ mod tests {
         let grant = Needs::of(&needing());
         let yes = [
             json!({"kind": "browser", "action": "type", "site": "app.slack.com"}),
+            // The same site: its other hosts (site.rs).
+            json!({"kind": "browser", "action": "type", "site": "slack.com"}),
+            json!({"kind": "browser", "action": "type", "site": "files.slack.com"}),
             json!({"kind": "app", "action": "act", "app": "Mousepad", "steps": [{"action": "type"}]}),
             json!({"kind": "app", "action": "gui", "app": "Mousepad", "steps": [{"app": "Mousepad"}, {"action": "type"}]}),
             json!({"kind": "shell", "command": "rm -rf ./old-build", "secrets": []}),
@@ -617,7 +657,7 @@ mod tests {
         }
         let no = [
             // Another site, or one that only ends the same way.
-            json!({"kind": "browser", "action": "click", "site": "slack.com"}),
+            json!({"kind": "browser", "action": "click", "site": "slack.co"}),
             json!({"kind": "browser", "action": "click", "site": "evilapp.slack.com.example"}),
             json!({"kind": "browser", "action": "click"}),
             // A pixel batch whose point lands in another app.

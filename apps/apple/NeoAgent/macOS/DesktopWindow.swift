@@ -49,7 +49,7 @@ struct MacTakeOverView: View {
     var body: some View {
         DesktopCanvas(desktop: desktop, endpoint: endpoint)
             .overlay(alignment: .top) { status }
-            .background(Color.black)
+            .background(Theme.sidebar)
             .navigationTitle("Your desktop")
             .navigationSubtitle(action?.reason ?? "")
             .toolbar {
@@ -75,9 +75,10 @@ struct MacTakeOverView: View {
                                 dismissWindow(id: DesktopSession.desktopWindow)
                             }
                         } label: {
-                            Text("I'm done").padding(.horizontal, 6)
+                            Text("I'm done")
                         }
-                        .buttonStyle(.borderedProminent)
+                        .primaryButton()
+                        .controlSize(.small)
                         .help("Tell the agent to carry on")
                     }
                 }
@@ -94,7 +95,7 @@ struct MacTakeOverView: View {
                     .font(.app(.subheadline).weight(.medium))
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
-                    .glass(.capsule)
+                    .floating(.capsule)
                     .padding(.top, 12)
             }
         case .offline(let reason):
@@ -104,7 +105,7 @@ struct MacTakeOverView: View {
             }
             .padding(.horizontal, 18)
             .padding(.vertical, 10)
-            .glass(.rect(cornerRadius: 20))
+            .floating(.rect(cornerRadius: 20))
             .padding(12)
         }
     }
@@ -127,6 +128,8 @@ private struct DesktopCanvas: NSViewRepresentable {
         guard let view = MacDesktopView(desktop: desktop) else {
             return NSHostingView(rootView: Text("This Mac can't draw the desktop (no Metal device).").padding())
         }
+        // The window's grey around the desktop, light or dark as the app is.
+        view.letterbox = NSColor(Theme.sidebar)
         start(view, context.coordinator)
         return view
     }

@@ -32,17 +32,17 @@ struct ModelKeyForm: View {
                     .padding(.leading, framed ? 14 : 0)
                     .padding(.trailing, framed ? 4 : 0)
                     .padding(.vertical, framed ? 4 : 0)
-                    .background(framed ? Color.white.opacity(0.08) : .clear, in: .capsule)
+                    .background(framed ? Theme.chip : .clear, in: .capsule)
                 Button {
                     Task { await save() }
                 } label: {
                     if saving {
                         ProgressView().controlSize(.small)
                     } else {
-                        Text("Save").foregroundStyle(.black)
+                        Text("Save")
                     }
                 }
-                .primaryGlass()
+                .primaryButton()
                 .disabled(!canSave)
             }
             if let problem {
@@ -185,7 +185,7 @@ struct ModelKeyBanner: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                Image(systemName: "key.fill").foregroundStyle(.yellow)
+                Image(systemName: "key.fill").foregroundStyle(Theme.amber)
                 // Wraps at the width it gets (not fixedSize: see BudgetBanner).
                 Text("Your agent needs your \(provider.keyLabel) to work.")
                     .font(.app(.subheadline).weight(.medium))
@@ -195,7 +195,7 @@ struct ModelKeyBanner: View {
             ModelKeyForm(provider: provider, store: store, client: client, framed: true)
         }
         .padding(14)
-        .glass(.rect(cornerRadius: 22))
+        .floating(.rect(cornerRadius: 22))
         .accessibilityElement(children: .contain)
     }
 }

@@ -53,9 +53,11 @@ private struct UserBubble: View {
             #if os(macOS)
             .textSelection(.enabled)
             #endif
-            .padding(.horizontal, 16)
-            .padding(.vertical, 11)
-            .background(Theme.userBubble, in: .rect(cornerRadius: 22))
+            .foregroundStyle(Theme.userText)
+            .lineSpacing(2)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .background(Theme.userBubble, in: .rect(cornerRadius: 24))
             .contextMenu {
                 Button("Copy", systemImage: "doc.on.doc") { Clipboard.copy(text) }
                 Button("Select Text", systemImage: "text.cursor") { selecting = true }
@@ -66,8 +68,8 @@ private struct UserBubble: View {
     }
 }
 
-/// The agent's answer: Markdown on the background, as in Grok, with code
-/// blocks and tables as cards.
+/// The agent's answer: Markdown right on the background, no bubble, with
+/// code blocks as cards.
 private struct AssistantMessage: View {
     let text: String
 
@@ -475,11 +477,11 @@ private struct ApprovalCard: View {
             // Shown only while it waits: answered, it leaves the chat.
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                    .glassButton()
+                    .secondaryButton()
                 Button { answer(true) } label: {
-                    Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    Text("Approve").frame(maxWidth: .infinity)
                 }
-                .primaryGlass()
+                .primaryButton()
                 .disabled(draft.isBlank)
             }
             .controlSize(.large)
@@ -579,11 +581,11 @@ private struct BrowserApprovalCard: View {
             // Shown only while it waits: answered, it leaves the chat.
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                    .glassButton()
+                    .secondaryButton()
                 Button { answer(true) } label: {
-                    Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    Text("Approve").frame(maxWidth: .infinity)
                 }
-                .primaryGlass()
+                .primaryButton()
                 .disabled(draft.isBlank || legacySend)
             }
             .controlSize(.large)
@@ -697,11 +699,11 @@ private struct AppApprovalCard: View {
             // Shown only while it waits: answered, it leaves the chat.
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                    .glassButton()
+                    .secondaryButton()
                 Button { answer(true) } label: {
-                    Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    Text("Approve").frame(maxWidth: .infinity)
                 }
-                .primaryGlass()
+                .primaryButton()
             }
             .controlSize(.large)
             if let what = approval.forTask {
@@ -846,7 +848,7 @@ private struct StepNumber: View {
     var body: some View {
         Text("\(number)")
             .font(.app(.caption2).weight(.bold).monospacedDigit())
-            .foregroundStyle(marked ? AnyShapeStyle(.black) : AnyShapeStyle(.secondary))
+            .foregroundStyle(marked ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
             .frame(minWidth: 20, minHeight: 20)
             .background {
                 if marked {
@@ -1001,11 +1003,11 @@ private struct InstallApprovalCard: View {
             // Shown only while it waits: answered, it leaves the chat.
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                    .glassButton()
+                    .secondaryButton()
                 Button { answer(true) } label: {
-                    Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    Text("Approve").frame(maxWidth: .infinity)
                 }
-                .primaryGlass()
+                .primaryButton()
             }
             .controlSize(.large)
             if let what = approval.forTask {
@@ -1115,11 +1117,11 @@ private struct ScheduleApprovalCard: View {
                 .foregroundStyle(.secondary)
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                    .glassButton()
+                    .secondaryButton()
                 Button { answer(true) } label: {
-                    Text("Approve").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    Text("Approve").frame(maxWidth: .infinity)
                 }
-                .primaryGlass()
+                .primaryButton()
                 .disabled(draft.isBlank)
             }
             .controlSize(.large)
@@ -1175,11 +1177,11 @@ private struct AccessApprovalCard: View {
             }
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Don't allow").frame(maxWidth: .infinity) }
-                    .glassButton()
+                    .secondaryButton()
                 Button { answer(true) } label: {
-                    Text("Allow").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    Text("Allow").frame(maxWidth: .infinity)
                 }
-                .primaryGlass()
+                .primaryButton()
             }
             .controlSize(.large)
         }
@@ -1353,11 +1355,11 @@ private struct PlanApprovalCard: View {
             // Shown only while it waits: answered, it leaves the chat.
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Deny").frame(maxWidth: .infinity) }
-                    .glassButton()
+                    .secondaryButton()
                 Button { answer(true) } label: {
-                    Text("Approve plan").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    Text("Approve plan").frame(maxWidth: .infinity)
                 }
-                .primaryGlass()
+                .primaryButton()
                 .disabled(draft.problem != nil || sending)
             }
             .controlSize(.large)
@@ -1524,7 +1526,7 @@ private struct AllowForTask: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button(action: allow) { Text("Allow for this task").frame(maxWidth: .infinity) }
-                .glassButton()
+                .secondaryButton()
                 .controlSize(.large)
                 .disabled(disabled)
             Text("Also lets \(what) go ahead without asking, until this task ends.")
@@ -1563,7 +1565,7 @@ private struct NeedChip: View {
         .padding(.leading, 9)
         .padding(.trailing, remove == nil ? 9 : 2)
         .padding(.vertical, remove == nil ? 4 : 1)
-        .background(Color.white.opacity(0.08), in: .rect(cornerRadius: 11))
+        .background(Theme.chip, in: .rect(cornerRadius: 11))
     }
 
     /// A key's name and a command are code; the rest, words.
@@ -1751,11 +1753,11 @@ private struct StuckCard: View {
                 .foregroundStyle(.secondary)
             HStack(spacing: 10) {
                 Button { answer(false) } label: { Text("Stop").frame(maxWidth: .infinity) }
-                    .glassButton()
+                    .secondaryButton()
                 Button { answer(true) } label: {
-                    Text("Keep going").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    Text("Keep going").frame(maxWidth: .infinity)
                 }
-                .primaryGlass()
+                .primaryButton()
             }
             .controlSize(.large)
         }
@@ -1798,7 +1800,7 @@ private struct SecretRequestCard: View {
             Label {
                 Text(request.replace ? "A new \(request.label)" : request.label).font(.app(.headline))
             } icon: {
-                Image(systemName: "key.fill").foregroundStyle(.yellow)
+                Image(systemName: "key.fill").foregroundStyle(Theme.amber)
             }
             if !request.why.isEmpty {
                 Text(request.why)
@@ -1808,7 +1810,7 @@ private struct SecretRequestCard: View {
                 HStack {
                     Outcome(text: "Saved on your desktop", icon: "lock.fill", color: .green)
                     Spacer()
-                    Button("Continue") { answer(true) }.glassButton()
+                    Button("Continue") { answer(true) }.secondaryButton()
                 }
             } else {
                 form
@@ -1830,7 +1832,7 @@ private struct SecretRequestCard: View {
                 Label("Open \(request.host ?? url.host() ?? "the page")", systemImage: "arrow.up.right")
                     .frame(maxWidth: .infinity)
             }
-            .glassButton()
+            .secondaryButton()
             .controlSize(.large)
         }
         KeyField(prompt: "Paste your \(request.label)", value: $value, pasted: $pasted)
@@ -1839,15 +1841,14 @@ private struct SecretRequestCard: View {
             .background(Theme.inset, in: .rect(cornerRadius: 14))
         HStack(spacing: 10) {
             Button { answer(false) } label: { Text("Not now").frame(maxWidth: .infinity) }
-                .glassButton()
+                .secondaryButton()
             Button { save() } label: {
                 Group {
-                    if saving { ProgressView().tint(.black) } else { Text("Save") }
+                    if saving { ProgressView().tint(Theme.onProminent) } else { Text("Save") }
                 }
-                .foregroundStyle(.black)
                 .frame(maxWidth: .infinity)
             }
-            .primaryGlass()
+            .primaryButton()
             .disabled(!ready)
         }
         .controlSize(.large)
@@ -1910,13 +1911,13 @@ private struct ActionCard: View {
             }
             HStack(spacing: 8) {
                 Button { resolve(false) } label: { Text("Skip").frame(maxWidth: .infinity) }
-                    .glassButton()
+                    .secondaryButton()
                 Button { resolve(true) } label: { Text("I'm done").frame(maxWidth: .infinity) }
-                    .glassButton()
+                    .secondaryButton()
                 Button { takeOver?.open(action) } label: {
-                    Text("Take over").foregroundStyle(.black).frame(maxWidth: .infinity)
+                    Text("Take over").frame(maxWidth: .infinity)
                 }
-                .primaryGlass()
+                .primaryButton()
                 .disabled(takeOver == nil)
             }
             .controlSize(.large)

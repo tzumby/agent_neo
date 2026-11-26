@@ -35,6 +35,9 @@ struct ChatView: View {
     #if os(macOS)
         /// Scrolled to the end: what the agent adds keeps it there (`followEnd`).
         @State private var atEnd = true
+        /// How far the chat's content starts below the window's top (the
+        /// toolbar and the banners): the height of the white the title sits on.
+        @State private var topInset: CGFloat = 0
     #endif
     @State private var sent = 0
     /// A key in the message about to be sent: offer to save it instead.
@@ -93,6 +96,10 @@ struct ChatView: View {
     private var chat: some View {
         messages
             .scrollDismissesKeyboard(.interactively)
+            #if os(macOS)
+                // Under the banners (they're added after): the white the title sits on.
+                .overlay(alignment: .top) { TitleScrim(height: topInset) }
+            #endif
             .overlay {
                 if empty {
                     EmptyChat(desktopName: desktopName)
@@ -122,12 +129,18 @@ struct ChatView: View {
             .animation(.snappy, value: store.status?.budget?.paused)
             .bar(.bottom) { bottomBar }
             .animation(.snappy, value: store.status?.needsModelKey)
-            .background(Color.black)
+            .background(Theme.background)
             .inlineTitle()
             .toolbar { toolbar }
             #if os(macOS)
-                // With a sidebar, the conversation's title; alone, the model menu is the title, as on the iPhone.
-                .modifier(MacChatTitle(title: conversations ? title : nil))
+                // The conversation's title (alone, the desktop's): the window's,
+                // and in the toolbar as an item of its own (MacTitle), with room
+                // from the sidebar's edge.
+                .navigationTitle(conversations ? title : desktopName)
+                // The toolbar over the chat is the chat's white, not the window's
+                // grey (its own background would cover the sidebar's grey too): no
+                // background, and TitleScrim under it.
+                .toolbarBackground(.hidden, for: .windowToolbar)
             #endif
             .confirmationDialog(
                 "Stop the task?", isPresented: $confirmingStop, titleVisibility: .visible
@@ -164,12 +177,17 @@ struct ChatView: View {
                 Composer(
                     text: Bindable(conversation).draft, busy: conversation.busy, stopping: conversation.stopping,
                     canSend: store.connection == .live, queues: conversations, focus: $composing,
-                    onSend: { send(conversation.draft) }, onStop: stop)
+                    onSend: { send(conversation.draft) }, onStop: stop
+                ) {
+                    DesktopMenu(store: store, client: client, desktopName: desktopName)
+                } trailing: {
+                    ModelPicker(store: store, client: client)
+                }
             }
         }
         .frame(maxWidth: Theme.column)
-        .padding(.horizontal, 12)
-        .padding(.bottom, 6)
+        .padding(.horizontal, 14)
+        .padding(.bottom, 10)
     }
 
     /// Settings, Memory, Usage, the key dialog and editor, and (on the
@@ -197,15 +215,19 @@ struct ChatView: View {
             }
             #if os(iOS)
                 .fullScreenCover(item: $takeOver) { request in
-                    if let endpoint {
-                        TakeOverView(endpoint: endpoint, actionID: request.actionID, store: store, client: client)
-                    } else {
-                        // Tailscale is restarting (e.g. the app was in the background).
-                        VStack(spacing: 16) {
-                            ProgressView("Reconnecting to Tailscale…")
-                            Button("Close") { takeOver = nil }.glassButton()
+                    Group {
+                        if let endpoint {
+                            TakeOverView(endpoint: endpoint, actionID: request.actionID, store: store, client: client)
+                        } else {
+                            // Tailscale is restarting (e.g. the app was in the background).
+                            VStack(spacing: 16) {
+                                ProgressView("Reconnecting to Tailscale…")
+                                Button("Close") { takeOver = nil }.secondaryButton()
+                            }
                         }
                     }
+                    // The desktop viewer stays dark, whatever the chat's appearance.
+                    .preferredColorScheme(.dark)
                 }
             #else
                 // ⌘, opens Settings while this window is in front.
@@ -290,6 +312,7 @@ struct ChatView: View {
             keepPlace(old, new)
             #if os(macOS)
                 followEnd(old, new, olderPage: olderPage)
+                if new.contentInsets.top != topInset { topInset = new.contentInsets.top }
             #endif
         }
         #if os(macOS)
@@ -411,23 +434,22 @@ struct ChatView: View {
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .barLeading) {
-            #if os(iOS)
-                // With conversations, Settings is on the list (the back button is here).
-                if !conversations { settingsButton }
-            #else
-                settingsButton
-            #endif
+        // With conversations, Settings is on the iPhone's list (the back
+        // button is here) and at the foot of the Mac's sidebar.
+        if !conversations {
+            ToolbarItemGroup(placement: .barLeading) { settingsButton }
         }
-        ToolbarItem(placement: .principal) {
-            #if os(iOS)
-                ModelMenu(
-                    store: store, client: client, desktopName: desktopName,
-                    conversationTitle: conversations ? title : nil, rename: renameAction, archive: archiveAction)
-            #else
-                ModelMenu(store: store, client: client, desktopName: desktopName)
-            #endif
-        }
+        #if os(iOS)
+            ToolbarItem(placement: .principal) {
+                ConversationTitle(
+                    title: conversations ? title : desktopName, rename: renameAction, archive: archiveAction)
+            }
+        #else
+            // Room between the sidebar's edge and the title, as in ChatGPT.
+            ToolbarItem(placement: .navigation) {
+                Color.clear.frame(width: 6, height: 1).accessibilityHidden(true)
+            }
+        #endif
         ToolbarItemGroup(placement: .barTrailing) {
             Button("Your desktop", systemImage: "display") { openDesktop(for: nil) }
                 .disabled(endpoint == nil)
@@ -515,29 +537,14 @@ private struct OlderPage: Equatable {
     let oldest: Int?
 }
 
-#if os(macOS)
-    /// The conversation's title in the window's toolbar, or none (the model
-    /// menu is the title).
-    private struct MacChatTitle: ViewModifier {
-        let title: String?
-
-        func body(content: Content) -> some View {
-            if let title {
-                content.navigationTitle(title)
-            } else {
-                content.toolbar(removing: .title)
-            }
-        }
-    }
-#endif
-
 // MARK: - Composer
 
-/// The floating input: a glass field that grows to six lines, with a white
-/// send button that turns into Stop while the agent works. On a desktop with
-/// conversations, typing while it works brings Send back beside Stop:
+/// The floating input, as ChatGPT's: a white card that grows to eight lines,
+/// with a row under the text for the desktop (left), the model and Send
+/// (right). Send turns into Stop while the agent works; on a desktop with
+/// conversations, typing while it works brings Send back beside Stop, and
 /// sending then queues the message.
-private struct Composer: View {
+private struct Composer<Leading: View, Trailing: View>: View {
     @Binding var text: String
     let busy: Bool
     let stopping: Bool
@@ -547,6 +554,8 @@ private struct Composer: View {
     var focus: FocusState<Bool>.Binding
     let onSend: () -> Void
     let onStop: () -> Void
+    @ViewBuilder let leading: Leading
+    @ViewBuilder let trailing: Trailing
 
     private var empty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
@@ -554,71 +563,191 @@ private struct Composer: View {
     private var showsSend: Bool { !busy || (queues && !empty) }
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             TextField(busy && queues ? "Queue a message" : "Ask your desktop", text: $text, axis: .vertical)
-                .lineLimit(1...6)
+                .lineLimit(1...8)
                 .focused(focus)
+                .textFieldStyle(.plain)
                 #if os(macOS)
                     // Return sends, as in Messages (⌥Return starts a new line).
                     .onSubmit { if showsSend, canSend { onSend() } }
-                    .textFieldStyle(.plain)
                 #endif
-                .padding(.leading, 18)
-                .padding(.vertical, 14)
-            HStack(spacing: 6) {
-                if busy && stopping {
-                    // Pressed: feedback at once, until the task has ended.
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(showsSend ? .white : .black)
-                        .frame(width: 38, height: 38)
-                        .background(showsSend ? Color.white.opacity(0.14) : .white, in: .circle)
-                        .accessibilityLabel("Stopping")
-                        .transition(.scale.combined(with: .opacity))
-                } else if busy {
-                    // Beside Send, Stop steps back to the same circle in grey.
-                    Button(action: onStop) {
-                        Image(systemName: "stop.fill").font(.system(size: 14, weight: .bold))
-                    }
-                    .buttonStyle(SendButtonStyle(prominent: !showsSend))
-                    .accessibilityLabel("Stop")
-                    .transition(.scale.combined(with: .opacity))
-                }
-                if showsSend {
-                    Button(action: onSend) {
-                        Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold))
-                    }
-                    .buttonStyle(SendButtonStyle())
-                    .accessibilityLabel(busy ? "Queue" : "Send")
-                    .disabled(empty || !canSend)
-                    .transition(.scale.combined(with: .opacity))
-                }
+                .padding(.horizontal, 18)
+                .padding(.top, 15)
+            HStack(spacing: 10) {
+                leading
+                Spacer(minLength: 8)
+                trailing
+                buttons
             }
-            .padding(6)
-            .animation(.snappy(duration: 0.2), value: busy)
-            .animation(.snappy(duration: 0.2), value: stopping)
-            .animation(.snappy(duration: 0.2), value: showsSend)
+            .padding(.leading, 12)
+            .padding(.trailing, 9)
+            .padding(.bottom, 9)
         }
-        .glass(.rect(cornerRadius: 26), interactive: true)
+        .contentShape(.rect)
+        // A tap anywhere on it (not a control) goes to the text.
+        .onTapGesture { focus.wrappedValue = true }
+        .floating(.rect(cornerRadius: 26))
+    }
+
+    private var buttons: some View {
+        HStack(spacing: 6) {
+            if busy && stopping {
+                // Pressed: feedback at once, until the task has ended.
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(showsSend ? Color.primary : Theme.onProminent)
+                    .frame(width: 34, height: 34)
+                    .background(showsSend ? Theme.chip : Theme.prominent, in: .circle)
+                    .accessibilityLabel("Stopping")
+                    .transition(.scale.combined(with: .opacity))
+            } else if busy {
+                // Beside Send, Stop steps back to a grey circle.
+                Button(action: onStop) {
+                    Image(systemName: "stop.fill").font(.system(size: 12, weight: .bold))
+                }
+                .buttonStyle(SendButtonStyle(prominent: !showsSend))
+                .accessibilityLabel("Stop")
+                .help("Stop")
+                .transition(.scale.combined(with: .opacity))
+            }
+            if showsSend {
+                Button(action: onSend) {
+                    Image(systemName: "arrow.up").font(.system(size: 15, weight: .bold))
+                }
+                .buttonStyle(SendButtonStyle())
+                .accessibilityLabel(busy ? "Queue" : "Send")
+                .help(busy ? "Queue" : "Send")
+                .disabled(empty || !canSend)
+                .transition(.scale.combined(with: .opacity))
+            }
+        }
+        .animation(.snappy(duration: 0.2), value: busy)
+        .animation(.snappy(duration: 0.2), value: stopping)
+        .animation(.snappy(duration: 0.2), value: showsSend)
     }
 }
 
-/// A white circle with a black glyph (or, not prominent, a grey one with a
-/// white glyph), dimmed when disabled; shrinks on press.
+/// A near-black circle with a white glyph (or, not prominent, a grey one),
+/// faded when disabled; shrinks on press.
 private struct SendButtonStyle: ButtonStyle {
     var prominent = true
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .foregroundStyle(prominent ? .black : .white)
-            .frame(width: 38, height: 38)
-            .background(
-                prominent ? Color.white.opacity(isEnabled ? 1 : 0.25) : Color.white.opacity(0.14), in: .circle
-            )
+            .foregroundStyle(prominent ? Theme.onProminent : Color.primary)
+            .frame(width: 34, height: 34)
+            .background(prominent ? Theme.prominent.opacity(isEnabled ? 1 : 0.2) : Theme.chip, in: .circle)
             .contentShape(.circle)
             .scaleEffect(configuration.isPressed ? 0.9 : 1)
             .animation(.snappy(duration: 0.15), value: configuration.isPressed)
+    }
+}
+
+/// The composer's left: the desktop, with a dot for the connection; its menu
+/// says how it's connected and turns browser actions on or off.
+private struct DesktopMenu: View {
+    let store: ChatStore
+    let client: AgentClient
+    let desktopName: String
+
+    var body: some View {
+        Menu {
+            Section(desktopName) {
+                Text(connectionText)
+            }
+            if let status = store.status {
+                Toggle("Browser actions", isOn: actionsBinding(status))
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Circle().fill(dotColor).frame(width: 7, height: 7)
+                Text(desktopName).lineLimit(1)
+            }
+            .font(.app(.subheadline))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 5)
+            .contentShape(.rect)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityLabel("\(desktopName): \(connectionText)")
+        .help("\(desktopName): \(connectionText)")
+    }
+
+    private var dotColor: Color {
+        switch store.connection {
+        case .live: .green
+        case .connecting: .gray
+        case .offline: .orange
+        }
+    }
+
+    private var connectionText: String {
+        switch store.connection {
+        case .live: "Connected"
+        case .connecting: "Connecting…"
+        case .offline(let reason): "Offline: \(reason)"
+        }
+    }
+
+    private func actionsBinding(_ status: AgentStatus) -> Binding<Bool> {
+        Binding(
+            get: { status.settings.allowActions },
+            set: { allow in
+                Task {
+                    if let problem = await store.updateSettings(allowActions: allow, client: client) {
+                        store.notice = problem
+                    }
+                }
+            })
+    }
+}
+
+/// The composer's right, beside Send: the model, with a menu to switch it.
+private struct ModelPicker: View {
+    let store: ChatStore
+    let client: AgentClient
+
+    var body: some View {
+        if let status = store.status {
+            Menu {
+                Picker("Model", selection: modelBinding(status)) {
+                    ForEach(status.knownModels, id: \.self) { Text(ModelName.display($0)).tag($0) }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                HStack(spacing: 4) {
+                    Text(ModelName.display(status.settings.model)).lineLimit(1)
+                    Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold))
+                }
+                .font(.app(.subheadline))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 5)
+                .contentShape(.rect)
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("Model: \(ModelName.display(status.settings.model))")
+            .help("Model")
+        }
+    }
+
+    private func modelBinding(_ status: AgentStatus) -> Binding<String> {
+        Binding(
+            get: { status.settings.model },
+            set: { model in
+                Task {
+                    if let problem = await store.updateSettings(model: model, client: client) { store.notice = problem }
+                }
+            })
     }
 }
 
@@ -651,20 +780,20 @@ private struct QueuedBubble: View {
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(.secondary)
                         .frame(width: 22, height: 22)
-                        .background(Color.white.opacity(0.1), in: .circle)
+                        .background(Theme.chip, in: .circle)
                         .contentShape(.circle.inset(by: -8))
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Remove from the queue")
                 .help("Remove from the queue")
             }
-            .padding(.leading, 16)
+            .padding(.leading, 18)
             .padding(.trailing, 10)
-            .padding(.vertical, 11)
-            .background(Theme.userBubble.opacity(0.4), in: .rect(cornerRadius: 22))
+            .padding(.vertical, 12)
+            .background(Theme.inset, in: .rect(cornerRadius: 24))
             .overlay(
-                RoundedRectangle(cornerRadius: 22)
-                    .strokeBorder(Color.white.opacity(0.2), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                RoundedRectangle(cornerRadius: 24)
+                    .strokeBorder(Theme.border, style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
             )
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
@@ -687,7 +816,7 @@ private struct BudgetBanner: View {
         HStack(spacing: 12) {
             Image(systemName: "gauge.with.dots.needle.100percent")
                 .font(.app(.title3))
-                .foregroundStyle(.yellow)
+                .foregroundStyle(Theme.amber)
             // Wraps at the width it gets. Not fixedSize: the Mac's split view
             // measures the chat's minimum height at a sliver of width, where
             // the text would stand a thousand points tall and push the
@@ -698,12 +827,12 @@ private struct BudgetBanner: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button("Usage", action: openUsage)
                 .font(.app(.subheadline).weight(.semibold))
-                .glassButton()
+                .secondaryButton()
         }
         .padding(.leading, 14)
         .padding(.trailing, 8)
         .padding(.vertical, 8)
-        .glass(.rect(cornerRadius: 22))
+        .floating(.rect(cornerRadius: 22))
         .accessibilityElement(children: .contain)
     }
 }
@@ -720,146 +849,81 @@ private struct ArchivedBar: View {
             Spacer()
             Button("Unarchive", action: unarchive)
                 .font(.app(.subheadline).weight(.semibold))
-                .glassButton()
+                .secondaryButton()
         }
         .padding(.leading, 18)
         .padding(.trailing, 8)
         .padding(.vertical, 8)
-        .glass(.capsule)
+        .floating(.capsule)
     }
 }
 
-// MARK: - Title: model and connection
+// MARK: - Title
 
-/// The centre of the bar, as in Grok: the model, with a menu to switch it,
-/// and a dot for the connection to the desktop. On the iPhone with
-/// conversations, the conversation's title above it, and the menu renames or
-/// archives it too.
-private struct ModelMenu: View {
-    let store: ChatStore
-    let client: AgentClient
-    let desktopName: String
-    var conversationTitle: String? = nil
-    var rename: (() -> Void)? = nil
-    var archive: (() -> Void)? = nil
+#if os(macOS)
+    /// What the title sits on: the chat's white behind the toolbar (which has
+    /// no background of its own) and the banners, fading to clear below them,
+    /// so messages scrolled up go under it rather than through the title.
+    /// `height`: where the chat's content starts (its scroll view's top inset).
+    private struct TitleScrim: View {
+        let height: CGFloat
 
-    var body: some View {
-        #if os(macOS)
-            // A Mac toolbar menu shows only its label's text and first image:
-            // the dot goes beside it, and the menu has the system's arrow.
-            HStack(spacing: 6) {
-                Circle().fill(dotColor).frame(width: 7, height: 7)
-                Menu(title) { items }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
+        var body: some View {
+            VStack(spacing: 0) {
+                Theme.background.frame(height: height)
+                LinearGradient(
+                    colors: [Theme.background, Theme.background.opacity(0)], startPoint: .top, endPoint: .bottom
+                )
+                .frame(height: 28)
             }
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("Model and connection")
-        #else
-            Menu {
-                items
-            } label: {
-                label
-                    .padding(.horizontal, 4)
-                    .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(conversationTitle.map { "\($0), model and connection" } ?? "Model and connection")
-        #endif
+            // From the window's top, wherever the chat's frame starts.
+            .ignoresSafeArea(edges: .top)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
     }
+#endif
 
-    #if os(iOS)
-        @ViewBuilder private var label: some View {
-            if let conversationTitle {
-                VStack(spacing: 1) {
-                    Text(conversationTitle)
-                        .font(.app(.headline))
-                        .lineLimit(1)
-                    HStack(spacing: 4) {
-                        Circle().fill(dotColor).frame(width: 6, height: 6)
-                        Text(title).lineLimit(1)
-                        Image(systemName: "chevron.down").font(.app(.caption2).weight(.bold))
-                    }
-                    .font(.app(.caption))
-                    .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: 220)
+#if os(iOS)
+    /// The iPhone's bar: the conversation's title (alone, the desktop's), with
+    /// a menu to rename or archive it.
+    private struct ConversationTitle: View {
+        let title: String
+        var rename: (() -> Void)?
+        var archive: (() -> Void)?
+
+        var body: some View {
+            if rename == nil && archive == nil {
+                label(chevron: false)
             } else {
-                HStack(spacing: 6) {
-                    Circle().fill(dotColor).frame(width: 7, height: 7)
-                    Text(title)
-                        .font(.app(.headline))
-                        .lineLimit(1)
-                    Image(systemName: "chevron.down").font(.app(.caption2).weight(.bold)).foregroundStyle(.secondary)
+                Menu {
+                    if let rename { Button("Rename…", systemImage: "pencil", action: rename) }
+                    if let archive { Button("Archive", systemImage: "archivebox", action: archive) }
+                } label: {
+                    label(chevron: true)
+                        .padding(.horizontal, 4)
+                        .contentShape(.rect)
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(title), conversation menu")
             }
         }
-    #endif
 
-    private var title: String {
-        store.status.map { shortName($0.settings.model) } ?? desktopName
-    }
-
-    @ViewBuilder private var items: some View {
-        if rename != nil || archive != nil {
-            Section {
-                if let rename { Button("Rename…", systemImage: "pencil", action: rename) }
-                if let archive { Button("Archive", systemImage: "archivebox", action: archive) }
-            }
-        }
-        if let status = store.status {
-            Picker("Model", selection: modelBinding(status)) {
-                ForEach(status.knownModels, id: \.self) { Text(shortName($0)).tag($0) }
-            }
-            Toggle("Browser actions", isOn: actionsBinding(status))
-        }
-        Section(desktopName) {
-            Text(connectionText)
-        }
-    }
-
-    private var dotColor: Color {
-        switch store.connection {
-        case .live: .green
-        case .connecting: .gray
-        case .offline: .orange
-        }
-    }
-
-    private var connectionText: String {
-        switch store.connection {
-        case .live: "Connected"
-        case .connecting: "Connecting…"
-        case .offline(let reason): "Offline: \(reason)"
-        }
-    }
-
-    private func shortName(_ model: String) -> String {
-        ModelName.display(model)
-    }
-
-    private func modelBinding(_ status: AgentStatus) -> Binding<String> {
-        Binding(
-            get: { status.settings.model },
-            set: { model in
-                Task {
-                    if let problem = await store.updateSettings(model: model, client: client) { store.notice = problem }
+        private func label(chevron: Bool) -> some View {
+            HStack(spacing: 5) {
+                Text(title)
+                    .font(.app(.headline))
+                    .lineLimit(1)
+                if chevron {
+                    Image(systemName: "chevron.down")
+                        .font(.app(.caption2).weight(.bold))
+                        .foregroundStyle(.secondary)
                 }
-            })
+            }
+            .frame(maxWidth: 200)
+        }
     }
-
-    private func actionsBinding(_ status: AgentStatus) -> Binding<Bool> {
-        Binding(
-            get: { status.settings.allowActions },
-            set: { allow in
-                Task {
-                    if let problem = await store.updateSettings(allowActions: allow, client: client) {
-                        store.notice = problem
-                    }
-                }
-            })
-    }
-}
+#endif
 
 // MARK: - Working
 
@@ -903,19 +967,16 @@ private struct EmptyChat: View {
     let desktopName: String
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 34, weight: .light))
-                .frame(width: 76, height: 76)
-                .glass(.circle)
+        VStack(spacing: 8) {
             Text("What should your desktop do?")
-                .font(.app(.title2).weight(.semibold))
+                .font(.app(.title).weight(.medium))
                 .multilineTextAlignment(.center)
             Text(desktopName)
                 .font(.app(.subheadline))
                 .foregroundStyle(.secondary)
         }
-        .padding(.bottom, 80)
+        .padding(.horizontal, 24)
+        .padding(.bottom, 120)
         .allowsHitTesting(false)
     }
 }
@@ -932,17 +993,21 @@ private struct Suggestions: View {
 
     var body: some View {
         ScrollView(.horizontal) {
-            GlassGroup(spacing: 8) {
-                HStack(spacing: 8) {
-                    ForEach(items, id: \.1) { icon, text in
-                        Button { pick(text) } label: {
-                            Label(text, systemImage: icon).font(.app(.subheadline))
+            HStack(spacing: 8) {
+                ForEach(items, id: \.1) { icon, text in
+                    Button { pick(text) } label: {
+                        Label {
+                            Text(text)
+                        } icon: {
+                            Image(systemName: icon).foregroundStyle(.secondary)
                         }
-                        .glassButton()
+                        .font(.app(.subheadline))
                     }
+                    .secondaryButton()
                 }
-                .padding(.horizontal, 4)
             }
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
         }
         .scrollIndicators(.hidden)
     }
@@ -1001,7 +1066,7 @@ private struct StageBanner: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .glass(.capsule, interactive: true)
+        .floating(.capsule)
     }
 
     /// `here`: the conversation on screen; `title`: another one's title.
@@ -1032,7 +1097,7 @@ private struct StageBanner: View {
                 target: detail?["card"]?.string.map { .item("approval-\($0)") } ?? .none)
         case "needs_you/secret":
             return Banner(
-                text: "Needs you: a key or token", icon: "key.fill", tint: .yellow,
+                text: "Needs you: a key or token", icon: "key.fill", tint: Theme.amber,
                 target: detail?["card"]?.string.map { .item("approval-\($0)") } ?? .none)
         case "needs_you/action":
             return Banner(text: "Needs you: action needed on the desktop", icon: "hand.raised.fill", tint: .orange, target: .lastAction)

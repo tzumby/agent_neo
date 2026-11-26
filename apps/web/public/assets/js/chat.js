@@ -362,7 +362,7 @@ function planCard(card, ctx) {
 
   /** What depends on the steps: the summary, and whether it can be approved. */
   function refresh() {
-    const phrases = planPhrases(planCovers(p.covers, steps));
+    const phrases = planPhrases(planCovers(p.covers, steps), p.domains);
     if (phrases.length) {
       const said = phrases.flatMap((phrase, i) => [i ? " · " : "", phrase.lead,
         andList(phrase.items, (item) => (phrase.code ? h("code", null, item) : item))]);

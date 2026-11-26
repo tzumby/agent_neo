@@ -243,8 +243,12 @@ public struct ChatTimeline: Sendable, Equatable {
             } else if data["kind"]?.string == "app" {
                 approval.app = AppAction(data)
             } else if data["kind"]?.string == "plan" {
+                var covers = PlanCovers(data["covers"])
+                if case .object(let domains)? = data["domains"] {
+                    covers.domains = domains.compactMapValues { $0.string.flatMap { $0.isEmpty ? nil : $0 } }
+                }
                 approval.plan = PlanApproval(
-                    steps: data["steps"]?.array?.compactMap { PlanStep($0) } ?? [], covers: PlanCovers(data["covers"]),
+                    steps: data["steps"]?.array?.compactMap { PlanStep($0) } ?? [], covers: covers,
                     notes: data["notes"]?.bool ?? false)
             } else if data["kind"]?.string == "install" {
                 // Its summary is the store's description, kept with the store's facts.
@@ -631,10 +635,13 @@ public struct PlanCovers: Sendable, Equatable {
     public var keys: [String] = []
     public var commands: [String] = []
     public var installs: [String] = []
+    /// How far a site reaches past its own host: the rest of its domain
+    /// (the card's `domains`, agentd 0.21.1), by host.
+    public var domains: [String: String] = [:]
 
     public init(
         sites: [String] = [], apps: [String] = [], shell: Bool = false, keys: [String] = [], commands: [String] = [],
-        installs: [String] = []
+        installs: [String] = [], domains: [String: String] = [:]
     ) {
         self.sites = sites
         self.apps = apps
@@ -642,6 +649,7 @@ public struct PlanCovers: Sendable, Equatable {
         self.keys = keys
         self.commands = commands
         self.installs = installs
+        self.domains = domains
     }
 
     /// agentd's `covers`, any of whose lists may be missing.
@@ -664,14 +672,17 @@ public struct PlanCovers: Sendable, Equatable {
         }
         return PlanCovers(
             sites: left(.site, sites), apps: left(.app, apps), shell: shell && needs.contains { $0.kind == .shell },
-            keys: left(.key, keys), commands: left(.command, commands), installs: left(.install, installs))
+            keys: left(.key, keys), commands: left(.command, commands), installs: left(.install, installs),
+            domains: domains)
     }
 
     /// The plan card's summary, a phrase per kind of need. None: approving
     /// only starts the plan.
     public var phrases: [Phrase] {
         [
-            Phrase(lead: "clicking, typing and pressing keys on ", items: sites),
+            Phrase(
+                lead: "clicking, typing and pressing keys on ",
+                items: sites.map { site in domains[site].map { "\(site) (and the rest of \($0))" } ?? site }),
             Phrase(lead: "input in ", items: apps),
             Phrase(lead: "running commands that would ask (deletes, pushes, uploads)", items: [], on: shell),
             Phrase(lead: "commands using your key ", items: keys, code: true),

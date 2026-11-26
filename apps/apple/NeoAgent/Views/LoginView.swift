@@ -18,14 +18,14 @@ struct LoginView: View {
             Image(systemName: "display")
                 .font(.system(size: 40, weight: .light))
                 .frame(width: 96, height: 96)
-                .glass(.circle)
+                .floating(.circle)
             Text("Agent Neo")
                 .font(.app(.largeTitle).bold())
             Text("Sign in with the Tailscale account your desktop is on.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
             Spacer()
-            loginButton.primaryGlass().controlSize(.large)
+            loginButton.primaryButton().controlSize(.large)
             Text("This \(Device.noun) joins your tailnet as a device of its own.")
                 .font(.app(.footnote))
                 .foregroundStyle(.tertiary)
@@ -34,7 +34,7 @@ struct LoginView: View {
         .padding(28)
         .frame(maxWidth: 480)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black)
+        .background(Theme.background)
         #if os(iOS)
             // Closes by itself: once you've signed in, the root view moves on.
             .sheet(isPresented: $showingLogin) {
@@ -57,7 +57,7 @@ struct LoginView: View {
                 if loginURL == nil {
                     ProgressView()
                 } else {
-                    Text("Log in with Tailscale").font(.app(.headline)).foregroundStyle(.black)
+                    Text("Log in with Tailscale").font(.app(.headline))
                 }
             }
             .frame(maxWidth: .infinity)
